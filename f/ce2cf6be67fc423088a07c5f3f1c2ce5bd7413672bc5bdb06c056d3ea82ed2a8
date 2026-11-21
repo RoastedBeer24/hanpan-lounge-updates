@@ -1,0 +1,2013 @@
+/* 피구 4:4 — realtime top-down team dodgeball (2v2 / 3v3 / 4v4; bots fill the empty spots).
+   One person per phone (realtime): alone you play with/against AI; friends play through online / LAN rooms.
+   Court: two inner courts (내야) split by the centre line; each team's outfield (외야) wraps the OTHER team's court.
+   A live ball thrown by the enemy that touches an inner player before the ground = out (go to the outfield), unless the
+   player catches it (timing window). An outfielder who outs someone comes back in. A team with nobody inside loses the round.
+   The world engine (movement, ball physics, rules, AI) is pure and lives outside the view so node can run headless matches.
+   The host (or the local phone) runs it; guests publish their stick + action events and draw the host's snapshots
+   (their own player is predicted locally). Round flow travels in the small coarse state. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ---------- world units ≈ metres·0.5.  x across, y down the screen; team 0 (A) inner court is y > 0. ---------- */
+  const PR = 0.55, BR = 0.3, HS = 2.05, Z0 = 1.35, G = 15;
+  const VRUN = 6.6, ACC = 52, VDASH = 13.5, DASH_T = 0.2, DASH_CD = 1.05;
+  const VQ = 11, VP = 18, CHG_T = 0.6, TAP_T = 0.16;
+  const CWIN_Q = 0.3, CWIN_P = 0.16, CWIN_REM = 0.1, WHIFF_CD = 0.42;
+  const HOLD_WARN = 5, HOLD_MAX = 8, PICK_CD = 0.35;
+  const OT_T = 30, COUNT_T = 2.6, FIRST_T = 7.5, END_T = 3, LAST_T = 0.7;
+  const SUB = 1 / 120;
+  /* round 2 additions: curve (side spin), low pass, duck/hop dodge, catch counter, 「공 줘」 call, fakes */
+  const SPIN_A = 9, SPIN_K = 0.9;               // side-spin lateral accel at full spin (units/s²) and its decay rate (/s)
+  const VLOW = 20, LOW_REACH = 0.4, LOW_ZMAX = 2.5;   // low pass: max speed, extra reach + reach height for snagging it
+  const DUCK_T = 0.45, HOP_T = 0.42, DUCK_H = 1.15, HOP_H = 0.75;   // duck: head height while ducking; hop: feet lift at the top
+  const CTR_T = 0.6, CTR_V = 1.13;              // catch counter: throw within 0.6 s after a catch = 13 % faster
+  const CALL_T = 1.6, CALL_CD = 1.2;            // 「공 줘」 bubble time / cooldown
+  const FAKE_MIN = 0.12;                        // a wind-up shorter than this isn't a fake
+  /* courts: cw/ch = half inner court, os/ob = outfield side/back depth, acc = grip, spd = run speed, e = bounce,
+     gf = ground hit friction, rf = rolling friction, wind = gusts, nb = balls */
+  const MAPS = [
+    { id: 'gym', nm: '체육관', d: '나무 바닥 · 기본', cw: 7.5, ch: 11, os: 2.4, ob: 2.8, acc: ACC, spd: 1, e: 0.55, gf: 0.2, rf: 0.8, wind: 0, nb: 1 },
+    { id: 'sand', nm: '모래사장', d: '공이 덜 튀고 발이 무거워요', cw: 7.5, ch: 11, os: 2.4, ob: 2.8, acc: 40, spd: 0.88, e: 0.2, gf: 0.5, rf: 2.8, wind: 0, nb: 1 },
+    { id: 'snow', nm: '눈밭', d: '쭉쭉 미끄러워요', cw: 7.5, ch: 11, os: 2.4, ob: 2.8, acc: 10, spd: 1.04, e: 0.32, gf: 0.3, rf: 1.3, wind: 0, nb: 1 },
+    { id: 'roof', nm: '지붕 옥상', d: '바람이 공을 밀어요', cw: 7.5, ch: 11, os: 2.4, ob: 2.8, acc: ACC, spd: 1, e: 0.5, gf: 0.22, rf: 0.9, wind: 1, nb: 1 },
+    { id: 'twin', nm: '공 두 개', d: '공 2개로 정신없이!', cw: 7.5, ch: 11, os: 2.4, ob: 2.8, acc: ACC, spd: 1, e: 0.55, gf: 0.2, rf: 0.8, wind: 0, nb: 2 },
+    { id: 'hall', nm: '좁은 강당', d: '코트가 작아 빨라요', cw: 6.2, ch: 9, os: 2.2, ob: 2.5, acc: ACC, spd: 1, e: 0.5, gf: 0.22, rf: 0.9, wind: 0, nb: 1 },
+  ];
+  const AI_DIFF = {
+    /* read = use of what they learned about each player, crv = curve use, tac = team tactics, ctrU = catch-counter use,
+       ic = go for enemy low passes, bait = chance a fake fools them, tgt = target-choice quality, hgt = throw at the feet */
+    1: { react: 0.42, think: 0.5, wait: [1.0, 2.0], lead: 0.2, err: 1.35, pw: [0, 0.45], catchP: 0.25, cErr: 0.11, dodgeP: 0.32, dash: 0.08, pass: 0.08, spd: 0.85, fetch: 0.6, comp: 0, back: 0.35, pos: 0.25, fake: 0,
+      read: 0, crv: 0.03, tac: 0, ctrU: 0.1, ic: 0.12, bait: 0.6, tgt: 0.2, hgt: 0 },
+    2: { react: 0.27, think: 0.3, wait: [0.75, 1.5], lead: 0.7, err: 0.85, pw: [0.2, 0.8], catchP: 0.5, cErr: 0.06, dodgeP: 0.68, dash: 0.35, pass: 0.4, spd: 0.94, fetch: 0.3, comp: 0.6, back: 0.7, pos: 0.7, fake: 0.15,
+      read: 0.3, crv: 0.1, tac: 0.2, ctrU: 0.2, ic: 0.2, bait: 0.4, tgt: 0.45, hgt: 0.1 },
+    3: { react: 0.17, think: 0.17, wait: [0.45, 1.0], lead: 0.95, err: 0.5, pw: [0.45, 1], catchP: 0.6, cErr: 0.035, dodgeP: 0.8, dash: 0.7, pass: 0.75, spd: 1, fetch: 0.12, comp: 1, back: 0.9, pos: 1, fake: 0.25,
+      read: 0.85, crv: 0.4, tac: 1, ctrU: 0.75, ic: 0.7, bait: 0.25, tgt: 1, hgt: 0.35 },
+  };
+
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const hyp = Math.hypot;
+  /* seeded PRNG (mulberry32) — the world engine and the AI never use Math.random (deterministic from the world seed) */
+  function rngStep(s) { let t = (s + 0x6D2B79F5) | 0; const n = t; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return [n, ((t ^ (t >>> 14)) >>> 0) / 4294967296]; }
+  function rnd(W) { const r = rngStep(W.rs | 0); W.rs = r[0]; return r[1]; }
+  function gauss(W) { let u = 0; while (!u) u = rnd(W); return Math.sqrt(-2 * Math.log(u)) * Math.cos(6.2832 * rnd(W)); }
+  /* per-match bot habits (blended weights, seeded by the match id + seat — same habits every round of a match) */
+  function habOf(rid, i) {
+    let s = ((rid | 0) * 2654435761 + (i + 1) * 40503) | 0; const r = () => { const q = rngStep(s); s = q[0]; return q[1]; };
+    r(); r();
+    const h = { agg: r(), ctc: r(), pas: r(), cau: r(), crv: r(), fk: r(), jit: r() };
+    // soften: cautious and aggressive pull against each other a little
+    h.agg = clamp(h.agg * 0.8 + (1 - h.cau) * 0.2, 0, 1);
+    return h;
+  }
+  /* the core's AI style (공격형·수비형·도박형·균형형, shown in the result) nudges the seeded habits that way */
+  function styleTint(h, sty) {
+    const up = (k, w) => { h[k] = h[k] + (1 - h[k]) * w; }, dn = (k, w) => { h[k] = h[k] * (1 - w); };
+    if (sty === 'agg') { up('agg', 0.5); dn('cau', 0.4); }
+    else if (sty === 'def') { up('cau', 0.5); up('ctc', 0.35); dn('agg', 0.3); }
+    else if (sty === 'gamble') { up('fk', 0.45); up('crv', 0.45); up('jit', 0.3); }
+    return h;
+  }
+  function wrapA(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
+  const NOIN = { ax: 0, ay: 0, chg: 0, ev: null, spd: 1, rem: 0 };
+  const sgnOf = (t) => (t ? -1 : 1);            // team 0 lives in y > 0, team 1 in y < 0
+
+  /* ---------- zones ---------- */
+  function zoneOf(W, x, y) {                    // 0 A-inner, 1 A-outfield (y<0 side), 2 B-inner, 3 B-outfield (y>0 side)
+    if (Math.abs(x) <= W.cw && Math.abs(y) <= W.ch) return y >= 0 ? 0 : 2;
+    return y < 0 ? 1 : 3;
+  }
+  const pZone = (p) => p.t * 2 + p.o;
+  const CPT = { x: 0, y: 0 };
+  function clampZone(W, t, o, x, y, r) {
+    const s = sgnOf(t), cw = W.cw, ch = W.ch, aw = W.aw, ah = W.ah, cl = r * 0.5, gap = 0.22 + r * 0.3;
+    if (!o) {
+      CPT.x = clamp(x, -cw + r, cw - r);
+      const yy = clamp(y * s, cl, ch - r); CPT.y = yy * s;
+      return CPT;
+    }
+    // outfield: U around the other court — on the −s side of the centre line
+    const ly = -y * s;                          // >0 inside that half
+    let bx = 0, by = 0, bd = 1e9;
+    const tryR = (x0, x1, y0, y1) => {
+      const cx = clamp(x, x0, x1), cy = clamp(ly, y0, y1), d = (cx - x) * (cx - x) + (cy - ly) * (cy - ly);
+      if (d < bd) { bd = d; bx = cx; by = cy; }
+    };
+    tryR(-aw + r, aw - r, ch + gap, ah - r);                  // back band
+    tryR(-aw + r, -cw - gap, cl, ah - r);                     // left side band
+    tryR(cw + gap, aw - r, cl, ah - r);                       // right side band
+    CPT.x = bx; CPT.y = -by * s;
+    return CPT;
+  }
+
+  function emit(W, hooks, code, a, b, c, d) {
+    W.fxn++;
+    W.fx.push([W.fxn, code, a, b, c, d]); if (W.fx.length > 12) W.fx.shift();
+    if (hooks && hooks.fx) hooks.fx(code, a, b, c, d);
+  }
+
+  /* ---------- world ---------- */
+  function innerSpots(W, t, n) {
+    const s = sgnOf(t), out = [];
+    const cols = n <= 2 ? [-0.4, 0.4] : n === 3 ? [-0.55, 0, 0.55] : [-0.6, -0.2, 0.2, 0.6];
+    for (let k = 0; k < n; k++) out.push([cols[k % cols.length] * W.cw * 1.4, s * W.ch * (k % 2 ? 0.62 : 0.42)]);
+    return out;
+  }
+  function outSpot(W, t, k) {                   // k-th outfield spot of team t (behind the other court)
+    const s = sgnOf(t), xs = [0, -0.55, 0.55, -0.85, 0.85];
+    return [xs[k % xs.length] * W.cw, -s * (W.ch + W.mp.ob * 0.5)];
+  }
+  /* per-player read of habits (bots learn humans within a match): dodge side, catch attempts, power, fakes */
+  const mkRead = () => ({ ds: 0, dn: 0, tn: 0, cn: 0, wf: 0, pw: 0, pn: 0, fk: 0, th: 0 });
+  function newWorld(st, prev) {
+    const mp = MAPS[st.mk] || MAPS[0];
+    const W = { cw: mp.cw, ch: mp.ch, aw: mp.cw + mp.os, ah: mp.ch + mp.ob, mp, pl: [], balls: [], t: 0, ot: 0, res: null, endT: 0,
+      fx: [], fxn: 0, bid: 0, wind: 0, wv: 0, wT: 2, outs: Array(st.N).fill(0), cat: Array(st.N).fill(0), got: Array(st.N).fill(0), rt: st.rt || 120,
+      rs: ((st.rid | 0) * 7919 + (st.rd | 0) * 104729 + 17) | 0, rid: st.rid,
+      hab: [], hr: [], tb: [{ foc: -1, focT: 0, syn: 0 }, { foc: -1, focT: 0, syn: 0 }],
+      sx: { tap: 0, pow: 0, crv: 0, fo: 0, lowP: 0, lowI: 0, hiP: 0, hiI: 0, ctr: 0, fake: 0, call: 0, duck: 0, hop: 0, dk: 0 } };
+    for (let i = 0; i < st.N; i++) {
+      W.hab.push(habOf(st.rid, i));
+      W.hr.push(prev && prev.rid === st.rid && prev.hr && prev.hr[i] ? prev.hr[i] : mkRead());
+    }
+    for (let t = 0; t < 2; t++) {
+      const mem = []; for (let i = 0; i < st.N; i++) if (st.tm[i] === t) mem.push(i);
+      const so = st.so ? st.so[t] : -1;
+      const ins = mem.filter((i) => i !== so), sp = innerSpots(W, t, ins.length);
+      ins.forEach((i, k) => W.pl[i] = mkPl(i, t, 0, sp[k][0], sp[k][1]));
+      if (so >= 0) { const o = outSpot(W, t, 0); W.pl[so] = mkPl(so, t, 1, o[0], o[1]); }
+    }
+    for (let i = 0; i < st.N; i++) if (!W.pl[i]) W.pl[i] = mkPl(i, st.tm[i] | 0, 0, 0, sgnOf(st.tm[i] | 0) * 4);
+    // balls: first team gets one (two-ball court: each team one)
+    const give = (t) => {
+      const c = W.pl.filter((p) => p.t === t && !p.o && !W.balls.some((b) => b.h === p.i));
+      if (!c.length) return;
+      const p = c[Math.floor(rnd(W) * c.length)];
+      const b = mkBall(W); b.h = p.i; b.x = p.x; b.y = p.y; b.z = 1.1; W.balls.push(b);
+    };
+    give(st.fb | 0);
+    if (mp.nb > 1) give(1 - (st.fb | 0));
+    if (mp.wind) { W.wv = (rnd(W) < 0.5 ? -1 : 1) * (1.2 + rnd(W) * 1.8); W.wind = W.wv; W.wT = 9 + rnd(W) * 5; }
+    return W;
+  }
+  /* dk = duck timer, hp = hop timer, ctr = catch-counter window, cl = 「공 줘」 bubble, clc = its cooldown,
+     pc/cT = charge last tick / charge time (fake detection), fkT = "just faked" (bots read it) */
+  function mkPl(i, t, o, x, y) {
+    return { i, t, o, x, y, vx: 0, vy: 0, a: t ? Math.PI / 2 : -Math.PI / 2, dash: 0, dcd: 0, dx: 0, dy: 0, cw: 0, cwE: 0, cwW: 0, ccd: 0,
+      chg: 0, hT: 0, pk: 0, ta: 0, tp: 0, hit: 0, rcv: 0, dk: 0, hp: 0, ctr: 0, cl: 0, clc: 0, pc: 0, cT: 0, fkT: 0, hpD: 0 };
+  }
+  function mkBall(W) { return { id: ++W.bid, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, h: -1, lv: 0, ps: 0, rf: 0, o: -1, tm: -1, pw: 0, fo: 0, tg: -1, ag: 0, dt: 0, sp: 0, lp: 0, cx: 0, cv: 0 }; }
+  /* the body's vertical extent right now: ducking lowers the head, hopping lifts the feet */
+  function hiOf(p) { return p.dk > 0 ? DUCK_H : HS + loOf(p); }
+  function loOf(p) { if (!(p.hp > 0) || p.hpD > 0) return 0; const k = 1 - p.hp / HOP_T; return HOP_H * Math.sin(Math.PI * clamp(k, 0, 1)); }
+  const holding = (W, p) => { for (const b of W.balls) if (b.h === p.i) return b; return null; };
+  const innerOf = (W, t) => W.pl.filter((p) => p.t === t && !p.o);
+  const innerCount = (W, t) => { let n = 0; for (const p of W.pl) if (p.t === t && !p.o) n++; return n; };
+
+  /* ---------- throwing ---------- */
+  function leadPoint(W, p, q, V, lead) {
+    let ex = q.x, ey = q.y;
+    for (let k = 0; k < 3; k++) { const T = hyp(ex - p.x, ey - p.y) / V; ex = q.x + q.vx * T * lead; ey = q.y + q.vy * T * lead; }
+    const c = clampZone(W, q.t, q.o, ex, ey, PR);
+    return { x: c.x, y: c.y };
+  }
+  /* side spin: lateral offset after T seconds for a ball with spin accel a0 (small-angle model of curveStep) */
+  function curveLat(a0, T) { const l = SPIN_K; return a0 / (l * l) * (l * T - 1 + Math.exp(-l * T)); }
+  /* one sub-step of Magnus-like curve: turn the horizontal velocity (speed kept), spin decays */
+  function curveStep(b, h) {
+    const sp = hyp(b.vx, b.vy);
+    if (sp > 1) { const a = b.sp * h, nx = -b.vy / sp, ny = b.vx / sp; b.vx += nx * a; b.vy += ny * a; const s2 = hyp(b.vx, b.vy) || 1; b.vx *= sp / s2; b.vy *= sp / s2; }
+    b.sp *= 1 - SPIN_K * h;
+    if (Math.abs(b.sp) < 0.05) b.sp = 0;
+  }
+  /* fill `b` with a throw from p toward (tx, ty) at horizontal speed V, arriving at height ha (wind compensated by comp).
+     sp = side spin −1…1: the launch is turned the other way so the bent path still arrives at the aim point */
+  function aimBall(W, p, b, tx, ty, V, ha, comp, sp) {
+    let dx = tx - p.x, dy = ty - p.y, d = hyp(dx, dy);
+    if (d < 0.5) { dx = Math.cos(p.a); dy = Math.sin(p.a); d = 1; }
+    let T = Math.max(0.08, (d - 0.5) / V);
+    if (W.mp.wind && comp) { dx -= 0.5 * W.wind * T * T * comp; d = hyp(dx, dy); }
+    let ux = dx / d, uy = dy / d;
+    const a0 = clamp(+sp || 0, -1, 1) * SPIN_A;
+    if (a0) {
+      const th = -Math.atan2(curveLat(a0, T), Math.max(1, d - 0.5)) * 1.0, c = Math.cos(th), s = Math.sin(th);
+      const nx = ux * c - uy * s, ny = ux * s + uy * c; ux = nx; uy = ny;
+      T *= 1 + Math.abs(th) * 0.25;               // the bent path is a little longer
+    }
+    b.x = p.x + ux * 0.5; b.y = p.y + uy * 0.5; b.z = Z0;
+    b.vx = ux * V; b.vy = uy * V; b.vz = (ha - Z0 + 0.5 * G * T * T) / T;
+    b.sp = a0; b.ag = 0; b.dt = 0;
+    return T;
+  }
+  function enemiesIn(W, p) { return W.pl.filter((q) => q.t !== p.t && !q.o); }
+  function nearestEnemy(W, p) { let best = null, bd = 1e9; for (const q of enemiesIn(W, p)) { const d = hyp(q.x - p.x, q.y - p.y); if (d < bd) { bd = d; best = q; } } return best; }
+  const throwV = (p, pw) => (VQ + (VP - VQ) * pw) * (p.ctr > 0 ? CTR_V : 1);
+  /* aim a throw (pure: only touches b) — shared by the real throw and the view's aim preview */
+  function planThrow(W, p, b, q, pw, ox, oy, lead, comp, sp, ha) {
+    const V = throwV(p, pw), e = leadPoint(W, p, q, V, clamp(+lead || 0, 0, 1));
+    return aimBall(W, p, b, e.x + clamp(+ox || 0, -4, 4), e.y + clamp(+oy || 0, -4, 4), V, fin(+ha) && ha > 0 ? clamp(+ha, 0.35, 1.9) : 1.05, clamp(+comp || 0, 0, 1), sp);
+  }
+  function doThrow(W, p, b, tg, pw, ox, oy, lead, comp, hooks, sp, ha) {
+    let q = tg >= 0 && tg < W.pl.length ? W.pl[tg] : null;
+    if (!q || q.t === p.t || q.o) q = nearestEnemy(W, p);
+    if (!q) return false;
+    pw = clamp(+pw || 0, 0, 1);
+    const ctr = p.ctr > 0;
+    planThrow(W, p, b, q, pw, ox, oy, lead, comp, sp, ha);
+    b.h = -1; b.lv = 1; b.ps = 0; b.lp = 0; b.rf = 0; b.o = p.i; b.tm = p.t; b.pw = pw; b.fo = p.o; b.tg = q.i; b.cx = ctr ? 1 : 0; b.cv = b.sp ? 1 : 0;
+    p.a = Math.atan2(b.vy, b.vx); p.pk = PICK_CD; p.ta = 0.25; p.chg = 0; p.pc = 0; p.cT = 0; p.hT = 0; p.rcv = 0; p.ctr = 0;
+    const R = W.hr && W.hr[p.i]; if (R) { R.pw = (R.pw * R.pn + pw) / (R.pn + 1); R.pn = Math.min(30, R.pn + 1); }
+    const Q = W.hr && W.hr[q.i]; if (Q) Q.tn++;
+    if (W.sx) { W.sx.thr = (W.sx.thr || 0) + 1; if (pw > 0.15) W.sx.thrP = (W.sx.thrP || 0) + 1; if (b.sp) W.sx.crv++; if (ctr) W.sx.ctr++; }
+    emit(W, hooks, 0, r1(p.x), r1(p.y), p.i, (pw > 0.55 ? 1 : 0) | (b.sp ? 2 : 0) | (ctr ? 4 : 0));
+    return true;
+  }
+  function bestMate(W, p, dirx, diry) {
+    let best = null, bs = 1e9;
+    for (const q of W.pl) {
+      if (q.t !== p.t || q === p) continue;
+      const dx = q.x - p.x, dy = q.y - p.y, d = hyp(dx, dy) || 1;
+      let s;
+      if (dirx || diry) s = (1 - (dx * dirx + dy * diry) / d) * 20 + d * 0.1;
+      else {   // no direction: the outfield mate closest to an enemy (they can throw from behind), else any mate far away
+        let ne = 1e9; for (const e of enemiesIn(W, p)) ne = Math.min(ne, hyp(e.x - q.x, e.y - q.y));
+        s = (q.o !== p.o ? 0 : 12) + ne;
+      }
+      if (s < bs) { bs = s; best = q; }
+    }
+    return best;
+  }
+  function lobTo(W, b, from, q, refT) {        // a soft high pass from `from` ({x,y,a}) to player q
+    let tx = q.x + q.vx * 0.5, ty = q.y + q.vy * 0.5;
+    const c = clampZone(W, q.t, q.o, tx, ty, PR); tx = c.x; ty = c.y;
+    const d = hyp(tx - from.x, ty - from.y), T = clamp(d / 13, 0.5, 1.15), V = Math.max(4, d / T);
+    aimBall(W, from, b, tx, ty, V, 1.3, 1);
+    b.h = -1; b.lv = 1; b.ps = 1; b.lp = 0; b.cv = 0; b.cx = 0; b.tg = q.i; b.pw = 0; b.fo = 0;
+    if (refT != null) { b.rf = 1; b.tm = refT; b.o = -1; }
+  }
+  /* a fast, flat pass: quicker to arrive, but enemies under its path can snag it */
+  function lowTo(W, b, from, q) {
+    let tx = q.x, ty = q.y, T = 0.5;
+    for (let k = 0; k < 2; k++) { const c = clampZone(W, q.t, q.o, q.x + q.vx * T, q.y + q.vy * T, PR); tx = c.x; ty = c.y; T = Math.max(0.28, hyp(tx - from.x, ty - from.y) / VLOW); }
+    const d = hyp(tx - from.x, ty - from.y), V = clamp(d / Math.max(0.28, d / VLOW), 6, VLOW);
+    aimBall(W, from, b, tx, ty, V, 1.0, 1);
+    b.h = -1; b.lv = 1; b.ps = 1; b.lp = 1; b.tg = q.i; b.pw = 0; b.fo = 0; b.sp = 0; b.cv = 0;
+  }
+  function doPass(W, p, b, tg, dx, dy, hooks, low) {
+    let q = tg >= 0 && tg < W.pl.length ? W.pl[tg] : null;
+    if (!q || q.t !== p.t || q === p) q = bestMate(W, p, +dx || 0, +dy || 0);
+    if (!q) return false;
+    b.o = p.i; b.tm = p.t; b.rf = 0; b.cx = 0;
+    if (low) lowTo(W, b, p, q); else { lobTo(W, b, p, q, null); b.lp = 0; b.sp = 0; b.cv = 0; }
+    p.a = Math.atan2(b.vy, b.vx); p.pk = PICK_CD; p.ta = 0.2; p.chg = 0; p.pc = 0; p.cT = 0; p.hT = 0; p.ctr = 0;
+    if (W.sx) { if (low) W.sx.lowP++; else W.sx.hiP++; }
+    if (q.cl > 0) q.cl = 0;                    // request answered
+    emit(W, hooks, 7, r1(p.x), r1(p.y), p.i, q.i);
+    return true;
+  }
+  /* the incoming enemy ball that would reach p first (used for the automatic duck / hop) */
+  function firstThreat(W, p, hz) {
+    let best = null;
+    for (const b of W.balls) {
+      if (b.h >= 0 || !b.lv || b.ps || b.tm === p.t) continue;
+      const th = threat(W, b, p, hz || 1.1, true);
+      if (th && (!best || th.t < best.t)) { best = th; best.b = b; }
+    }
+    return best;
+  }
+  function doEvent(W, p, ev, rem, hooks) {
+    if (!Array.isArray(ev)) return;
+    const b = holding(W, p);
+    if (ev[0] === 't' && b) doThrow(W, p, b, ev[1] | 0, ev[2], ev[3], ev[4], ev[5], ev[6], hooks, ev[7], ev[8]);
+    else if (ev[0] === 'p' && b) doPass(W, p, b, ev[1] | 0, ev[2], ev[3], hooks, !!ev[4]);
+    else if (ev[0] === 'c' && !b && !p.o && p.ccd <= 0 && p.cw <= 0 && p.tp <= 0) {
+      p.cw = CWIN_Q + (rem ? CWIN_REM : 0) + 0.05; p.cwE = 0; p.cwW = rem ? CWIN_REM : 0;
+      const R = W.hr && W.hr[p.i]; if (R && W.balls.some((x) => x.lv && !x.ps && x.tg === p.i && x.tm !== p.t)) R.cn++;
+    }
+    else if (ev[0] === 'k' && !b && p.clc <= 0 && p.tp <= 0) {     // 「공 줘」
+      p.cl = CALL_T; p.clc = CALL_CD;
+      if (W.sx) W.sx.call++;
+      emit(W, hooks, 16, r1(p.x), r1(p.y), p.i, 0);
+    }
+    else if (ev[0] === 'd' && !b && p.dcd <= 0 && p.tp <= 0) {
+      let dx = +ev[1] || 0, dy = +ev[2] || 0, l = hyp(dx, dy);
+      if (l < 0.2) { dx = Math.cos(p.a + Math.PI / 2); dy = Math.sin(p.a + Math.PI / 2); l = 1; }
+      p.dx = dx / l; p.dy = dy / l; p.dash = DASH_T; p.dcd = DASH_CD; p.cw = 0; p.chg = 0;
+      // automatic duck (high ball) / hop (low ball) from the height the nearest incoming ball will have when it reaches me
+      let kind = 0;
+      if (!p.o) {
+        const th = firstThreat(W, p, 1.1);
+        if (th) {
+          if (th.z > 1.3) { p.dk = clamp(th.t + 0.15, DUCK_T * 0.7, 0.8); kind = 1; }
+          else if (th.z < 0.85) { p.hp = HOP_T; p.hpD = clamp(th.t - HOP_T * 0.5, 0, 0.4); kind = 2; }
+          const R = W.hr && W.hr[p.i], b2 = th.b;
+          if (R) { const cr = b2.vx * p.dy - b2.vy * p.dx; R.ds = clamp(R.ds + (cr >= 0 ? 1 : -1), -12, 12); R.dn = Math.min(24, R.dn + 1); }
+          if (W.sx) { if (kind === 1) W.sx.duck++; else if (kind === 2) W.sx.hop++; else W.sx.dk++; }
+        }
+      }
+      emit(W, hooks, 8, r1(p.x), r1(p.y), p.i, kind);
+    }
+  }
+
+  /* ---------- outs / returns ---------- */
+  function sendOut(W, p, by, hooks) {
+    const b = holding(W, p);
+    if (b) { b.h = -1; b.lv = 0; b.ps = 0; b.sp = 0; b.z = 1; b.vx = (rnd(W) - 0.5) * 3; b.vy = (rnd(W) - 0.5) * 3; b.vz = 2; b.dt = 0; }
+    emit(W, hooks, 1, r1(p.x), r1(p.y), p.i, by);
+    let k = 0; for (const q of W.pl) if (q.t === p.t && q.o) k++;
+    const o = outSpot(W, p.t, k);
+    p.o = 1; p.fx = p.x; p.fy = p.y; p.x = o[0]; p.y = o[1]; p.vx = 0; p.vy = 0; p.cw = 0; p.dash = 0; p.chg = 0; p.tp = 0.7; p.hit = 0.6; p.hT = 0;
+    if (by >= 0 && by < W.outs.length) W.outs[by]++;
+    if (W.got && p.i >= 0 && p.i < W.got.length) W.got[p.i]++;
+    if (W.ot && !W.res) W.res = { w: 1 - p.t, why: 'sd' };
+  }
+  function bringIn(W, q, hooks) {
+    const s = sgnOf(q.t);
+    let x = 0, bd = -1;
+    for (let k = 0; k < 7; k++) {            // the free-est spot on our back line
+      const cx = (k / 6 * 2 - 1) * (W.cw - 1); let md = 99;
+      for (const p of W.pl) if (p.t === q.t && !p.o) md = Math.min(md, hyp(p.x - cx, p.y - s * (W.ch - 1.2)));
+      if (md > bd) { bd = md; x = cx; }
+    }
+    q.o = 0; q.x = x; q.y = s * (W.ch - 1.2); q.vx = 0; q.vy = 0; q.tp = 0.7; q.hT = 0;
+    emit(W, hooks, 3, r1(q.x), r1(q.y), q.i, 0);
+  }
+
+  /* ---------- movement ---------- */
+  function movePlayer(W, p, I, h) {
+    if (p.dcd > 0) p.dcd -= h; if (p.ta > 0) p.ta -= h; if (p.tp > 0) p.tp -= h; if (p.hit > 0) p.hit -= h; if (p.pk > 0) p.pk -= h;
+    if (p.ccd > 0) p.ccd -= h;
+    if (p.cw > 0) { p.cw -= h; p.cwE += h; if (p.cw <= 0) { p.cw = 0; p.ccd = WHIFF_CD; const R = W.hr && W.hr[p.i]; if (R) R.wf++; } }
+    if (p.dk > 0) p.dk -= h; if (p.hpD > 0) p.hpD -= h; else if (p.hp > 0) p.hp -= h;
+    if (p.ctr > 0) p.ctr -= h; if (p.cl > 0) p.cl -= h; if (p.clc > 0) p.clc -= h; if (p.fkT > 0) p.fkT -= h;
+    const mp = W.mp;
+    let mx = clamp(+I.ax || 0, -1, 1), my = clamp(+I.ay || 0, -1, 1); const m = hyp(mx, my); if (m > 1) { mx /= m; my /= m; }
+    if (p.dash > 0) {
+      p.dash -= h;
+      p.vx = p.dx * VDASH; p.vy = p.dy * VDASH;
+      if (p.dash <= 0) { p.vx *= 0.45; p.vy *= 0.45; }
+    } else {
+      let vm = VRUN * mp.spd * (I.spd || 1);
+      const hold = I.chg ? 0.55 : 1;
+      vm *= hold; if (p.cw > 0) vm *= 0.4; if (p.tp > 0) vm = 0;
+      const acc = mp.acc;
+      let ax = mx * vm - p.vx, ay = my * vm - p.vy; const al = hyp(ax, ay), am = acc * h;
+      if (al > am) { ax *= am / al; ay *= am / al; }
+      p.vx += ax; p.vy += ay;
+      if (hyp(mx, my) > 0.15 && p.ta <= 0) { const d = wrapA(Math.atan2(my, mx) - p.a); p.a = wrapA(p.a + clamp(d, -12 * h, 12 * h)); }
+    }
+    p.chg = I.chg ? 1 : 0;
+    p.x += p.vx * h; p.y += p.vy * h;
+    const c = clampZone(W, p.t, p.o, p.x, p.y, PR);
+    if (c.x !== p.x) { p.vx *= 0.2; p.x = c.x; }
+    if (c.y !== p.y) { p.vy *= 0.2; p.y = c.y; }
+  }
+
+  /* ---------- ball ---------- */
+  /* catch window: power shrinks it; a curving ball and a ball at the feet are a bit harder to catch */
+  function catchWin(b, z) { return (CWIN_Q - (CWIN_Q - CWIN_P) * (b.pw || 0)) * (1 - 0.12 * Math.min(1, Math.abs(b.sp || 0) / SPIN_A)) * (z != null && z < 0.65 ? 0.8 : 1); }
+  function stepBall(W, b, h, hooks, host) {
+    if (b.h >= 0) {
+      const p = W.pl[b.h];
+      if (p) { b.x = p.x + Math.cos(p.a) * 0.45; b.y = p.y + Math.sin(p.a) * 0.45; b.z = p.chg ? 1.7 : 1.1; b.vx = p.vx; b.vy = p.vy; b.vz = 0; }
+      return;
+    }
+    b.ag += h;
+    const air = b.z > 0.001 || b.vz > 0;
+    if (air && W.mp.wind) b.vx += W.wind * h;
+    if (b.sp) { if (air) curveStep(b, h); else b.sp = 0; }
+    b.x += b.vx * h; b.y += b.vy * h;
+    if (air) { b.z += b.vz * h; b.vz -= G * h; }
+    // walls of the hall
+    const lx = W.aw + 0.6 - BR, ly = W.ah + 0.6 - BR;
+    if (Math.abs(b.x) > lx) { b.x = Math.sign(b.x) * lx; b.vx = -b.vx * 0.55; if (host && b.lv) { b.lv = 0; b.ps = 0; } if (host && Math.abs(b.vx) > 2) emit(W, hooks, 5, r1(b.x), r1(b.y), 0, 0); }
+    if (Math.abs(b.y) > ly) { b.y = Math.sign(b.y) * ly; b.vy = -b.vy * 0.55; if (host && b.lv) { b.lv = 0; b.ps = 0; } if (host && Math.abs(b.vy) > 2) emit(W, hooks, 5, r1(b.x), r1(b.y), 0, 0); }
+    // ground
+    if (b.z <= 0 && air) {
+      b.z = 0; b.sp = 0;
+      if (host && b.lv) { b.lv = 0; b.ps = 0; }
+      if (b.vz < -1.6) { if (host && b.vz < -3) emit(W, hooks, 4, r1(b.x), r1(b.y), 0, 0); b.vz = -b.vz * W.mp.e; b.vx *= 1 - W.mp.gf; b.vy *= 1 - W.mp.gf; if (b.vz < 1.2) b.vz = 0; }
+      else b.vz = 0;
+    }
+    if (b.z <= 0.001 && b.vz <= 0) {
+      b.z = 0; b.vz = 0;
+      const sp = hyp(b.vx, b.vy);
+      if (sp > 0) { const ns = Math.max(0, sp - (W.mp.rf * sp + 0.9) * h); b.vx *= ns / sp; b.vy *= ns / sp; }
+    }
+    if (!host) return;
+    // players
+    for (const p of W.pl) {
+      if (p.tp > 0) continue;
+      const d = hyp(p.x - b.x, p.y - b.y);
+      if (b.lv && !b.ps) {
+        if (b.z > HS + 0.9 || d > PR + BR + 0.05 || p.i === b.o) continue;
+        if (p.t !== b.tm && !p.o) {                       // enemy inner player: out, unless caught
+          if (b.z > hiOf(p) || b.z < loOf(p)) continue;   // ducked under / hopped over it
+          if (p.cw > 0 && p.cwE <= catchWin(b, b.z) + (p.cwW || 0) && !holding(W, p)) { grab(W, b, p); p.cw = 0; p.ccd = 0; p.ctr = CTR_T; if (W.cat && p.i < W.cat.length) W.cat[p.i]++; emit(W, hooks, 2, r1(p.x), r1(p.y), p.i, b.o); return; }
+          const thr = W.pl[b.o];
+          b.lv = 0; b.sp = 0; b.vx = -b.vx * 0.22 + (rnd(W) - 0.5) * 2; b.vy = -b.vy * 0.22 + (rnd(W) - 0.5) * 2; b.vz = Math.max(2.5, b.vz * 0.3);
+          if (W.sx) { if (b.fo) W.sx.fo++; if (b.pw > 0.15) W.sx.pow++; else W.sx.tap++; if (b.cx) W.sx.ctrO = (W.sx.ctrO || 0) + 1; if (b.cv) W.sx.crvO = (W.sx.crvO || 0) + 1; }
+          sendOut(W, p, b.o, hooks);
+          if (thr && b.fo && thr.o && !W.res) bringIn(W, thr, hooks);
+          return;
+        }
+        if (b.z <= HS + 0.2 && !holding(W, p) && b.ag > 0.15) { grab(W, b, p); emit(W, hooks, 6, r1(p.x), r1(p.y), p.i, 1); return; }   // teammate / outfielder snags it
+        continue;
+      }
+      if (b.lv && b.ps) {                                 // a pass: anyone allowed there may take it (referee lobs: only that team)
+        const foe = p.t !== b.tm, snag = foe && b.lp && b.ag > 0.08;     // a low pass can be snagged by reaching / jumping for it
+        if (b.z > (snag ? LOW_ZMAX : 2.4) || d > PR + BR + (snag ? LOW_REACH : 0.15) || (p.i === b.o && b.ag < 0.4) || holding(W, p)) continue;
+        if (b.rf && foe) continue;
+        if (pZone(p) !== zoneOf(W, b.x, b.y) && p.i !== b.tg) continue;
+        if (W.sx) { if (foe) { if (b.lp) W.sx.lowI++; else W.sx.hiI++; } else if (b.lp) W.sx.lowOk = (W.sx.lowOk || 0) + 1; else W.sx.hiOk = (W.sx.hiOk || 0) + 1; }
+        grab(W, b, p); p.rcv = foe ? 0 : 1; emit(W, hooks, 6, r1(p.x), r1(p.y), p.i, foe ? 3 : 2); return;
+      }
+      // dead ball: pick up if it lies in my zone
+      if (b.z > 1.1 || d > PR + BR + 0.3 || p.pk > 0 || holding(W, p)) continue;
+      if (pZone(p) !== zoneOf(W, b.x, b.y)) continue;
+      grab(W, b, p); emit(W, hooks, 6, r1(p.x), r1(p.y), p.i, 0); return;
+    }
+  }
+  function grab(W, b, p) { b.h = p.i; b.lv = 0; b.ps = 0; b.rf = 0; b.lp = 0; b.sp = 0; b.cx = 0; b.vx = 0; b.vy = 0; b.vz = 0; b.dt = 0; p.hT = 0; p.cw = 0; p.chg = 0; }
+
+  function stepWorld(W, h, inputs, hooks) {
+    for (const p of W.pl) {
+      const I = inputs[p.i] || NOIN;
+      if (I.ev) { doEvent(W, p, I.ev, I.rem, hooks); I.ev = null; }
+      movePlayer(W, p, I, h);
+      const b = holding(W, p);
+      if (b) {
+        p.hT += h;
+        // fake: a wind-up let go without a throw (bots watch p.fkT; reads count how often someone fakes)
+        if (p.chg) p.cT += h;
+        else if (p.pc && p.cT >= FAKE_MIN) {
+          p.fkT = 0.5; p.cT = 0;
+          const R = W.hr && W.hr[p.i]; if (R) R.fk = Math.min(20, R.fk + 1);
+          if (W.sx) W.sx.fake++;
+          emit(W, hooks, 14, r1(p.x), r1(p.y), p.i, 0);
+        } else p.cT = 0;
+        p.pc = p.chg;
+        if (p.hT >= HOLD_MAX) { emit(W, hooks, 10, r1(p.x), r1(p.y), p.i, 0); doThrow(W, p, b, -1, 0, 0, 0, 0.5, 0.5, hooks); }
+        if (p.cw > 0) p.cw = 0;
+      } else { p.pc = 0; p.cT = 0; if (p.ctr > 0 && p.o) p.ctr = 0; }
+    }
+    // bodies push apart (same zone only — zones never overlap anyway)
+    const pl = W.pl;
+    for (let i = 0; i < pl.length; i++) for (let j = i + 1; j < pl.length; j++) {
+      const a = pl[i], c = pl[j];
+      if (pZone(a) !== pZone(c)) continue;
+      let dx = c.x - a.x, dy = c.y - a.y; const d2 = dx * dx + dy * dy, R = 2 * PR;
+      if (d2 >= R * R) continue;
+      let d = Math.sqrt(d2); if (d < 1e-6) { dx = 0.01; dy = 0; d = 0.01; }
+      const nx = dx / d, ny = dy / d, o = (R - d) / 2;
+      a.x -= nx * o; a.y -= ny * o; c.x += nx * o; c.y += ny * o;
+      let k = clampZone(W, a.t, a.o, a.x, a.y, PR); a.x = k.x; a.y = k.y;
+      k = clampZone(W, c.t, c.o, c.x, c.y, PR); c.x = k.x; c.y = k.y;
+    }
+    for (const b of W.balls) stepBall(W, b, h, hooks, true);
+  }
+  /* dead balls nobody can (or does) pick up → the referee lobs it to the team that owns that spot */
+  function refCheck(W, dt, hooks) {
+    for (const b of W.balls) {
+      if (b.h >= 0 || b.lv) { b.dt = 0; continue; }
+      if (b.z > 0.05 || hyp(b.vx, b.vy) > 1.2) { b.dt = Math.min(b.dt, 0.5); b.dt += dt * 0.3; continue; }
+      b.dt += dt;
+      const z = zoneOf(W, b.x, b.y), t = z >> 1, o = z & 1;
+      const there = W.pl.filter((p) => p.t === t && p.o === o && p.tp <= 0 && !holding(W, p));
+      if (b.dt < (there.length ? 4.5 : 1.0)) continue;
+      let cand = there.length ? there : W.pl.filter((p) => p.t === t && !holding(W, p));
+      if (!cand.length) cand = W.pl.filter((p) => !holding(W, p));
+      if (!cand.length) { b.dt = 0; continue; }
+      let q = cand[0], bd = 1e9; for (const p of cand) { const d = hyp(p.x - b.x, p.y - b.y); if (d < bd) { bd = d; q = p; } }
+      lobTo(W, b, { x: b.x, y: b.y, a: 0 }, q, q.t);
+      b.z = 0.6;
+      emit(W, hooks, 13, r1(b.x), r1(b.y), q.t, q.i);
+    }
+  }
+  /* one game tick while playing; returns {w: team | −1} once the round is decided */
+  function tickWorld(W, dt, inputs, hooks) {
+    if (W.res) { W.endT += dt; return W.endT >= LAST_T ? W.res : null; }
+    W.t += dt;
+    if (W.mp.wind) {
+      W.wT -= dt;
+      if (W.wT <= 0) { W.wT = 9 + rnd(W) * 6; W.wv = (rnd(W) < 0.5 ? -1 : 1) * (1 + rnd(W) * 2.2); emit(W, hooks, 11, Math.round(W.wv * 10), 0, 0, 0); }
+      W.wind += (W.wv - W.wind) * Math.min(1, dt * 1.5);
+    }
+    const n = Math.min(40, Math.max(1, Math.ceil(dt / SUB))), h = dt / n;
+    for (let k = 0; k < n && !W.res; k++) stepWorld(W, h, inputs, hooks);
+    refCheck(W, dt, hooks);
+    if (!W.res) {
+      const a = innerCount(W, 0), b = innerCount(W, 1);
+      if (!a || !b) W.res = { w: !a && !b ? -1 : a ? 0 : 1, why: 'ko' };
+      else if (!W.ot && W.t >= W.rt) {
+        if (a !== b) W.res = { w: a > b ? 0 : 1, why: 'time' };
+        else { W.ot = 1; emit(W, hooks, 12, 0, 0, 0, 0); }
+      } else if (W.ot && W.t >= W.rt + OT_T) W.res = { w: -1, why: 'time' };
+    }
+    return null;
+  }
+
+  /* ---------- AI ---------- */
+  /* Every bot decision = situational scores + its seeded habits (W.hab) + what it has read about the others (W.hr).
+     No fixed thresholds that always fire the same way; the world PRNG (rnd) keeps it deterministic. */
+  const HAB0 = { agg: 0.5, ctc: 0.5, pas: 0.5, cau: 0.5, crv: 0.5, fk: 0.5, jit: 0.5 };
+  const TMP = { vx: 0, vy: 0, sp: 0 };
+  /* when / where a flying ball would touch p if p kept its current velocity for a moment (null = it won't) */
+  function threat(W, b, p, horizon, still) {
+    let x = b.x, y = b.y, z = b.z, vz = b.vz; TMP.vx = b.vx; TMP.vy = b.vy; TMP.sp = b.sp || 0;
+    const r = PR + BR + 0.12, dt = 0.02;
+    const pvx = still ? 0 : p.vx, pvy = still ? 0 : p.vy;
+    for (let t = 0; t < (horizon || 1.3); t += dt) {
+      if (W.mp.wind) TMP.vx += W.wind * dt;
+      if (TMP.sp) curveStep(TMP, dt);
+      x += TMP.vx * dt; y += TMP.vy * dt; z += vz * dt; vz -= G * dt;
+      if (z <= 0) return null;
+      const tt = Math.min(t, 0.45), c = clampZone(W, p.t, p.o, p.x + pvx * tt, p.y + pvy * tt, PR);
+      if (z < HS && hyp(x - c.x, y - c.y) < r) return { t, z, x, y };
+    }
+    return null;
+  }
+  function landing(W, b) {            // where a pass comes down to catch height
+    let x = b.x, y = b.y, z = b.z, vx = b.vx, vz = b.vz; const dt = 0.03;
+    for (let t = 0; t < 2; t += dt) { if (W.mp.wind) vx += W.wind * dt; x += vx * dt; y += b.vy * dt; z += vz * dt; vz -= G * dt; if (vz < 0 && z < 1.3) break; }
+    return { x, y };
+  }
+  /* the first point of an enemy low pass I could reach in time (null = can't) */
+  function lowIntercept(W, b, p, spd) {
+    let x = b.x, y = b.y, z = b.z, vx = b.vx, vz = b.vz; const dt = 0.03, myZ = pZone(p), reach = PR + BR + LOW_REACH;
+    for (let t = dt; t < 1.4; t += dt) {
+      if (W.mp.wind) vx += W.wind * dt;
+      x += vx * dt; y += b.vy * dt; z += vz * dt; vz -= G * dt;
+      if (z <= 0.2) return null;
+      if (z > LOW_ZMAX - 0.1 || zoneOf(W, x, y) !== myZ) continue;
+      const c = clampZone(W, p.t, p.o, x, y, PR), d = hyp(c.x - p.x, c.y - p.y), dc = hyp(c.x - x, c.y - y);
+      if (dc < reach * 0.8 && d <= VRUN * spd * t * 0.85 + 0.2) return { x: c.x, y: c.y };
+    }
+    return null;
+  }
+  function steerTo(p, gx, gy, I, slow) {
+    const dx = gx - p.x, dy = gy - p.y, d = hyp(dx, dy);
+    if (d < 0.3) { I.ax = 0; I.ay = 0; return d; }
+    const k = d < (slow || 1.2) ? Math.max(0.3, d / (slow || 1.2)) : 1;
+    I.ax = dx / d * k; I.ay = dy / d * k;
+    return d;
+  }
+  /* how often q tries to catch a ball thrown at them (prior 0.35 until there is data) */
+  function catchRate(W, q) { const R = W.hr && W.hr[q.i]; return R && R.tn >= 2 ? (R.cn + 0.7) / (R.tn + 2) : 0.35; }
+  function holderThreats(W, p, D) {   // enemy positions that may throw at p soon (holders count most; hard throwers more)
+    const out = [];
+    for (const b of W.balls) {
+      if (b.h >= 0) {
+        const q = W.pl[b.h]; if (q.t === p.t) continue;
+        const R = W.hr[q.i], hard = R && R.pn >= 3 ? R.pw * D.read : 0;
+        out.push([q.x, q.y, (q.o ? 1.2 : 1) * (1 + 0.4 * hard)]);
+      } else if (!b.lv) { const z = zoneOf(W, b.x, b.y); if ((z >> 1) !== p.t) out.push([b.x, b.y, 0.7]); }
+    }
+    for (const q of W.pl) if (q.t !== p.t && q.o) out.push([q.x, q.y, 0.35]);
+    return out;
+  }
+  function safeSpot(W, p, M, D, H) {
+    const s = sgnOf(p.t), th = holderThreats(W, p, D);
+    let best = null, bs = -1e9;
+    for (let k = 0; k < 9; k++) {
+      let x, y;
+      if (k === 0) { const g = M.goal && !M.goal.f ? M.goal : p; x = g.x; y = g.y; }
+      else { x = (rnd(W) * 2 - 1) * (W.cw - PR); y = s * (0.8 + rnd(W) * (W.ch - 1.6)); }
+      let sc = 0;
+      for (const t of th) sc += Math.min(14, hyp(t[0] - x, t[1] - y)) * t[2] * (0.85 + 0.3 * H.cau);
+      for (const q of W.pl) if (q !== p && q.t === p.t && !q.o) { const dd = hyp(q.x - x, q.y - y); if (dd < 3) sc -= (3 - dd) * 1.3 * D.pos; }   // spread out
+      sc -= hyp(x - p.x, y - p.y) * 0.12;
+      if (k === 0) sc += 3 * D.pos;                 // keep the current spot unless clearly better (no jitter)
+      if (Math.abs(y) < 1.2) sc -= 3 * D.pos;       // don't hug the centre line when the enemy has the ball
+      sc += (rnd(W) - 0.5) * 8 * (1 - D.pos);
+      if (sc > bs) { bs = sc; best = { x, y }; }
+    }
+    return best;
+  }
+  /* what stands in the lane from p to q: own teammates the ball would clip (blk, bs = their side), ready enemy catchers */
+  function laneInfo(W, p, q, V) {
+    const d = hyp(q.x - p.x, q.y - p.y) || 1, T = d / V, ux = (q.x - p.x) / d, uy = (q.y - p.y) / d;
+    let blk = 0, bs = 0, wall = 0;
+    for (const o of W.pl) {
+      if (o === p || o === q || o.tp > 0) continue;
+      const rx = o.x - p.x, ry = o.y - p.y, al = rx * ux + ry * uy, lat = -rx * uy + ry * ux;
+      if (al < 0.6 || al > d - 0.6 || Math.abs(lat) > PR + BR + 0.35) continue;
+      const k = al / d, z = Z0 + (1.05 - Z0) * k + 0.5 * G * T * T * k * (1 - k);
+      if (o.t === p.t) { if (z < HS + 0.2) { blk++; bs += lat >= 0 ? 1 : -1; } }
+      else if (!o.o && z < HS && !holding(W, o) && o.ccd <= 0) wall++;
+    }
+    return { blk, bs, wall };
+  }
+  /* enemies that could snag a low pass from p to q */
+  function lowLane(W, p, q) {
+    const d = hyp(q.x - p.x, q.y - p.y) || 1, T = Math.max(0.28, d / VLOW), ux = (q.x - p.x) / d, uy = (q.y - p.y) / d;
+    let n = 0;
+    for (const o of W.pl) {
+      if (o.t === p.t || o.o || o.tp > 0 || holding(W, o)) continue;
+      const rx = o.x - p.x, ry = o.y - p.y, al = rx * ux + ry * uy, lat = -rx * uy + ry * ux;
+      if (al < 0.5 || al > d) continue;
+      const k = al / d, z = Z0 + (1.0 - Z0) * k + 0.5 * G * T * T * k * (1 - k);
+      if (z <= LOW_ZMAX + 0.3 && Math.abs(lat) < PR + BR + LOW_REACH + 0.6 + VRUN * T * k * 0.8) n++;
+    }
+    return n;
+  }
+  /* best target for a thrower standing at `from` (lower score = better). noise=false for "what would a mate get" */
+  function bestShot(W, p, from, D, lv, H, noise) {
+    let best = null, bs = 1e9;
+    const tb = W.tb && W.tb[p.t], V = VQ + (VP - VQ) * 0.5;
+    for (const q of enemiesIn(W, p)) {
+      if (q.tp > 0) continue;
+      const dist = hyp(q.x - from.x, q.y - from.y);
+      let s = dist, off = 0;
+      const tq = D.tgt;
+      // unprepared targets: just threw / picked up, looking away, mid-dash recovery, whiffed, holding a ball (can't catch)
+      if (q.ta > 0 || q.pk > 0.2) off += 1.5;
+      const fa = Math.cos(q.a) * (from.x - q.x) + Math.sin(q.a) * (from.y - q.y);
+      if (fa < 0) off += 2;
+      if (q.dcd > 0.3 && q.dash <= 0) off += 2;
+      if (holding(W, q)) off += 1.5;
+      if (q.cw > 0 || q.ccd > 0) off += 2.5;
+      if (hyp(q.vx, q.vy) < 1) off += 0.8;
+      if (!q.o && Math.abs(q.y) > W.ch - 1.6) off += 0.8;          // pinned at the back line
+      s -= off * tq;
+      s += (catchRate(W, q) - 0.35) * 4 * D.read;                    // known catchers are worse targets
+      const ln = laneInfo(W, p, q, V);
+      s += ln.wall * 1.6 * tq + ln.blk * 3 * tq;
+      if (tb && tb.foc === q.i && W.t - tb.focT < 2.5) s -= 0.8 * D.tac;   // focus the same target as the team
+      if (noise !== false) s += rnd(W) * 6 * (1 - tq);
+      if (s < bs) { bs = s; best = { q, d: s, dist, off: off * tq, blk: ln.blk, bsd: ln.bs }; }
+    }
+    return best;
+  }
+  /* pass plan: a mate with a clearly better shot (or who asked for it), low pass when the lane is clean */
+  function passPlan(W, p, bs, D, lv, H) {
+    let best = null, bv = -1e9;
+    for (const q of W.pl) {
+      if (q.t !== p.t || q === p || q.tp > 0 || holding(W, q)) continue;
+      if (q.o === p.o && !(q.cl > 0)) continue;                    // same zone: only on request
+      const t = bestShot(W, q, q, D, 2, null, false);
+      if (!t) continue;
+      let v = bs.d - t.d;
+      if (q.cl > 0) v += t.dist < 11 ? 2.5 : 0.5;                   // asked for it — and has a decent shot
+      if (q.o && !p.o) {                                             // pinch: the target is looking at me, the outfield hits it from behind
+        const e = t.q, fa = Math.cos(e.a) * (p.x - e.x) + Math.sin(e.a) * (p.y - e.y);
+        if (fa > 0) v += 1.5 * D.tac;
+      }
+      v += (H.pas - 0.5) * 3;
+      if (v > bv) { bv = v; best = q; }
+    }
+    if (!best) return null;
+    if (p.rcv && !(best.cl > 0)) return null;                       // just got a pass: don't ping-pong
+    if (rnd(W) > D.pass * clamp((bv - 2) / 3, 0, 1.2)) return null;
+    const lanes = lowLane(W, p, best);
+    const low = lanes === 0 ? rnd(W) < 0.45 + 0.5 * D.tac : rnd(W) < 0.3 * (1 - D.tac);
+    return { q: best, low };
+  }
+  function aiThink(W, p, M, lv, dt) {
+    const D = AI_DIFF[lv] || AI_DIFF[2], H = (W.hab && W.hab[p.i]) || HAB0;
+    const I = M.inp || (M.inp = { ax: 0, ay: 0, chg: 0, ev: null, spd: 1, rem: 0 });
+    if (M.t == null) Object.assign(M, { t: 0, seen: {}, sn: 0, goal: null, cAt: -1, dAt: -1, dgT: 0, ux: 0, uy: 0, wait: null, chgT: -1, fT: 0, bt: {}, icB: 0, icP: null, clT: 1 + rnd(W) * 2 });
+    I.spd = D.spd;
+    M.t -= dt; M.dgT -= dt; M.clT -= dt;
+    if (p.tp > 0) { I.ax = 0; I.ay = 0; I.chg = 0; M.wait = null; M.chgT = -1; return I; }
+    const b0 = holding(W, p), tb = W.tb[p.t];
+    // incoming enemy balls → catch, dodge or freeze (decided once per ball, after the reaction time)
+    if (!p.o && !b0) {
+      for (const b of W.balls) {
+        if (b.h >= 0 || !b.lv || b.ps || b.tm === p.t || M.seen[b.id] || b.ag < D.react) continue;
+        const th = threat(W, b, p, 1.3);
+        if (!th) continue;               // keep watching it: I may still walk into it
+        M.seen[b.id] = 1;
+        const thr = W.pl[b.o];
+        if (thr && thr.o && rnd(W) > D.back) continue;          // didn't notice the throw from behind
+        const w = catchWin(b, th.z), R = thr && W.hr[thr.i];
+        const hard = R && R.pn >= 3 ? R.pw * D.read : 0, last = innerCount(W, p.t) === 1;
+        const cp = D.catchP * (1 - 0.35 * b.pw) * (0.72 + 0.56 * H.ctc) * (th.z < 0.65 ? 0.75 : 1) * (b.sp ? 0.85 : 1) * (1 - 0.25 * hard) * (last ? 0.85 : 1);
+        if (rnd(W) < cp && th.t > 0.08) {
+          M.cAt = Math.max(0, th.t - w * 0.45 + gauss(W) * D.cErr);
+          M.cId = b.id;
+        } else if (rnd(W) < D.dodgeP * (0.85 + 0.3 * H.cau)) {
+          let nx = -b.vy, ny = b.vx; const l = hyp(nx, ny) || 1; nx /= l; ny /= l;
+          let sd = (p.x - th.x) * nx + (p.y - th.y) * ny >= 0 ? 1 : -1;
+          const c = clampZone(W, p.t, p.o, p.x + nx * sd * 2, p.y + ny * sd * 2, PR);
+          if (hyp(c.x - p.x, c.y - p.y) < 1.2) sd = -sd;
+          M.ux = nx * sd; M.uy = ny * sd; M.dgT = Math.min(0.75, th.t + 0.25);
+          const dsh = D.dash * (0.8 + 0.4 * H.jit) + (th.z > 1.3 || th.z < 0.85 ? 0.2 * D.hgt : 0);   // a duck / hop helps here
+          if (p.dcd <= 0 && rnd(W) < dsh) { if (th.t < 0.5) I.ev = ['d', M.ux, M.uy]; else M.dAt = th.t - 0.4; }
+        }
+      }
+      if (++M.sn > 120) { M.sn = 0; const keep = {}; for (const b of W.balls) if (M.seen[b.id]) keep[b.id] = 1; M.seen = keep; }
+      if (M.cAt >= 0) { M.cAt -= dt; if (M.cAt <= 0) { M.cAt = -1; if (!I.ev) I.ev = ['c']; } }
+      if (M.dAt >= 0) { M.dAt -= dt; if (M.dAt <= 0) { M.dAt = -1; if (!I.ev && p.dcd <= 0) I.ev = ['d', M.ux, M.uy]; } }
+      // a wind-up that turned out to be a fake: some bots flinch (catch too early → whiff, or dodge for nothing)
+      for (const b of W.balls) {
+        if (b.h < 0) continue;
+        const q = W.pl[b.h]; if (q.t === p.t || !(q.fkT > 0.3)) continue;
+        const Rq = W.hr[q.i], k = (Rq ? Rq.fk : 0) | 0;
+        if (M.bt[q.i] === k) continue; M.bt[q.i] = k;
+        const dx = p.x - q.x, dy = p.y - q.y, dd = hyp(dx, dy) || 1;
+        if (dd > 12 || (Math.cos(q.a) * dx + Math.sin(q.a) * dy) / dd < 0.8) continue;
+        const know = Math.min(0.6, Math.max(0, k - 1) * 0.08 * D.read);   // this one fakes a lot → harder to fool
+        if (rnd(W) < D.bait * (0.6 + 0.6 * H.jit) * (1 - know) && !I.ev) {
+          if (W.sx) W.sx.bait = (W.sx.bait || 0) + 1;
+          if (H.ctc > 0.5 && p.ccd <= 0 && p.cw <= 0) I.ev = ['c'];
+          else if (p.dcd <= 0) { const sd = rnd(W) < 0.5 ? -1 : 1; I.ev = ['d', -dy / dd * sd, dx / dd * sd]; }
+        }
+      }
+    } else { M.cAt = -1; M.dAt = -1; }
+    // holding the ball: walk to a throwing spot, wait a little, then throw (or pass)
+    if (b0) {
+      if (M.wait == null) {
+        M.wait = (D.wait[0] + rnd(W) * (D.wait[1] - D.wait[0])) * (1.08 - 0.16 * H.agg); M.chgT = -1; M.sy = 0; M.shift = null;
+        if (p.hT > 3) M.wait = 0.3;
+        M.qk = p.ctr > 0.25 && rnd(W) < D.ctrU * (0.6 + 0.6 * H.agg) ? 1 : 0;   // catch counter: throw right back
+        if (M.qk) M.wait = 0.05;
+      }
+      M.wait -= dt;
+      if (tb.syn > W.t && !M.sy && M.chgT < 0 && D.tac > 0) M.wait = Math.min(M.wait, 0);   // a mate started a two-ball volley
+      const bs = bestShot(W, p, p, D, lv, H);
+      if (!bs) { I.ax = 0; I.ay = 0; return I; }
+      if (bs.off > 2.5 && M.wait > 0.12) M.wait = 0.12;                  // the target is off guard right now: quick throw
+      if (M.chgT >= 0) {                     // charging a power throw
+        I.chg = 1; I.ax = 0; I.ay = 0;
+        M.chgT -= dt;
+        const tq = W.pl[M.tg] && !W.pl[M.tg].o && W.pl[M.tg].t !== p.t ? W.pl[M.tg] : bs.q;
+        p.a = Math.atan2(tq.y - p.y, tq.x - p.x);
+        if (M.chgT < 0 && M.fk) { I.chg = 0; M.fk = 0; M.wait = 0.25 + rnd(W) * 0.35; M.chgT = -1; return I; }   // fake: wind up, hold the ball
+        if (M.chgT < 0) {
+          I.chg = 0;
+          const dx = tq.x - p.x, dy = tq.y - p.y, dd = hyp(dx, dy) || 1, nx = -dy / dd, ny = dx / dd;
+          I.ev = ['t', tq.i, M.pw, gauss(W) * M.err + nx * M.lx, gauss(W) * M.err + ny * M.lx, D.lead, D.comp, M.sp, M.ha];
+          M.wait = null;
+        }
+        return I;
+      }
+      // move: inner → toward the centre line across from the target; outfield → slide behind the target
+      const s = sgnOf(p.t);
+      let gx, gy;
+      if (!p.o) { gx = clamp(bs.q.x * 0.6 + p.x * 0.4, -W.cw + 1, W.cw - 1); gy = s * (lv >= 2 ? 1.4 + H.cau * 1.4 : 3 + rnd(W)); }
+      else { const c = clampZone(W, p.t, 1, bs.q.x * 1.6, bs.q.y + (bs.q.y - p.y) * 0.1, PR); gx = c.x; gy = c.y; }
+      if (M.shift && M.shift.T > 0) { M.shift.T -= dt; gx = clamp(p.x + M.shift.s * 2.5, -W.aw + 1, W.aw - 1); }
+      steerTo(p, gx, gy, I);
+      I.chg = 0;
+      if (M.wait <= 0 || p.hT > HOLD_MAX - 1.5) {
+        if (!M.qk) { const pp = passPlan(W, p, bs, D, lv, H); if (pp) { I.ev = ['p', pp.q.i, 0, 0, pp.low ? 1 : 0]; M.wait = null; return I; } }
+        const q = bs.q, d = bs.dist, Rq = W.hr[q.i], cr = catchRate(W, q);
+        let pw = D.pw[0] + rnd(W) * (D.pw[1] - D.pw[0]);
+        if (lv >= 2) pw += ((d < 8 ? 0.35 : d > 14 ? -0.25 : 0) - (bs.off > 2 ? 0.35 : 0)) * D.tgt + (cr - 0.35) * D.read * 1.2 + (H.agg - 0.5) * 0.3;
+        if (lv >= 3 && d < 8) pw = Math.max(pw, 0.85);
+        if (M.qk) pw = Math.min(pw, 0.3);           // counter: no long wind-up (the window is short)
+        pw = clamp(pw, 0, 1);
+        M.pw = pw; M.err = D.err * (0.4 + d / 12); M.tg = q.i;
+        // height: at the feet vs known catchers / standing targets (harder to catch, but a hop beats it)
+        M.ha = rnd(W) < D.hgt * (0.2 + cr * 0.8) * (hyp(q.vx, q.vy) < 2 ? 1.2 : 0.7) ? 0.55 : 1.05;
+        // read their dodge side → lean the aim that way
+        const tend = Rq && Rq.dn >= 3 ? Rq.ds / Math.max(4, Rq.dn) : 0;
+        M.lx = tend * D.read * 0.8;
+        // curve: bend around a teammate in the lane, or now and then by habit
+        M.sp = 0;
+        if (bs.blk && rnd(W) < D.crv * 1.6) M.sp = bs.bsd >= 0 ? 1 : -1;
+        else if (rnd(W) < D.crv * (0.3 + H.crv * 0.7) * 0.6) M.sp = (tend ? Math.sign(tend) : rnd(W) < 0.5 ? -1 : 1) * (0.5 + rnd(W) * 0.5);
+        if (bs.blk && !M.sp && p.hT < HOLD_MAX - 2 && lv >= 2) { M.shift = { s: bs.bsd >= 0 ? -1 : 1, T: 0.5 }; M.wait = 0.4; return I; }   // step out of the mate's shadow
+        tb.foc = q.i; tb.focT = W.t;
+        // fake: by habit, more against early catchers
+        const fp = D.fake * (0.5 + H.fk) + Math.max(0, cr - 0.45) * D.read + (Rq && Rq.tn >= 3 ? Rq.wf / Rq.tn * D.read * 0.5 : 0);
+        if (!M.fk && !M.fd && !M.qk && rnd(W) < fp && p.hT < HOLD_MAX - 3) { M.fk = 1; M.fd = 1; M.chgT = 0.3 + rnd(W) * 0.25; I.chg = 1; return I; }
+        M.fd = 0;
+        // two balls on our side: throw together at the same target (twin court)
+        let rel = pw > 0.15 || M.sp ? Math.max(pw * CHG_T, M.sp ? 0.22 : 0) : 0;
+        if (D.tac > 0 && lv >= 2 && W.balls.length > 1) {
+          const mate = W.balls.some((x) => x.h >= 0 && x.h !== p.i && W.pl[x.h].t === p.t);
+          if (mate) {
+            if (tb.syn > W.t) { const e = W.pl[tb.foc]; if (e && !e.o && e.t !== p.t) M.tg = e.i; rel = Math.max(rel, tb.syn - W.t); M.sy = 1; }
+            else if (rnd(W) < D.tac * 0.8) { tb.syn = W.t + Math.max(0.45, rel); tb.foc = M.tg; tb.focT = W.t; rel = tb.syn - W.t; M.sy = 1; if (W.sx) W.sx.syn = (W.sx.syn || 0) + 1; }
+          }
+        }
+        if (rel > 0) { M.chgT = rel; I.chg = 1; }
+        else {
+          const dx = q.x - p.x, dy = q.y - p.y, dd = hyp(dx, dy) || 1;
+          I.ev = ['t', q.i, pw, gauss(W) * M.err - dy / dd * M.lx, gauss(W) * M.err + dx / dd * M.lx, D.lead, D.comp, 0, M.ha]; M.wait = null;
+        }
+      }
+      return I;
+    }
+    M.wait = null; M.chgT = -1; I.chg = 0; M.fk = 0; M.fd = 0;
+    // dodging overrides walking
+    if (M.dgT > 0) { I.ax = M.ux; I.ay = M.uy; return I; }
+    if (M.cAt >= 0) return I;            // hold course: the catch was timed for this path
+    // a pass coming to me → meet it
+    for (const b of W.balls) if (b.lv && b.ps && b.tg === p.i) { const l = landing(W, b); const c = clampZone(W, p.t, p.o, l.x, l.y, PR); steerTo(p, c.x, c.y, I, 0.6); return I; }
+    // an enemy low pass going past me → go snag it
+    for (const b of W.balls) {
+      if (b.h >= 0 || !b.lv || !b.ps || !b.lp || b.rf || b.tm === p.t) continue;
+      if (M.icB !== b.id) { M.icB = b.id; M.icP = rnd(W) < D.ic ? lowIntercept(W, b, p, D.spd) : null; }
+      if (M.icP) { steerTo(p, M.icP.x, M.icP.y, I, 0.3); return I; }
+    }
+    // 「공 줘」: ask the mate holding the ball when my shot would be clearly better
+    if (M.clT <= 0) {
+      M.clT = 1.4 + rnd(W) * 1.6;
+      if (D.tac > 0 && p.clc <= 0) {
+        let mate = null; for (const b of W.balls) if (b.h >= 0 && W.pl[b.h].t === p.t) mate = W.pl[b.h];
+        if (mate && (mate.o !== p.o)) {
+          const mine = bestShot(W, p, p, D, 2, null, false), theirs = bestShot(W, mate, mate, D, 2, null, false);
+          if (mine && theirs && mine.d < theirs.d - 2.5 && rnd(W) < D.tac * 0.6 * (0.5 + H.pas)) I.ev = ['k'];
+        }
+      }
+    }
+    if (M.t <= 0) {
+      M.t = D.think * (0.7 + rnd(W) * 0.6);
+      M.goal = null;
+      // loose dead ball in my zone: the nearest one of us goes for it
+      const myZ = pZone(p);
+      for (const b of W.balls) {
+        if (b.h >= 0 || b.lv || zoneOf(W, b.x, b.y) !== myZ) continue;
+        let near = true; const d = hyp(b.x - p.x, b.y - p.y);
+        for (const q of W.pl) if (q !== p && pZone(q) === myZ && q.tp <= 0 && !holding(W, q) && hyp(b.x - q.x, b.y - q.y) < d - 0.3) near = false;
+        if (near) { M.fT += M.t; if (M.fT >= D.fetch) { M.goal = { x: b.x + b.vx * 0.25, y: b.y + b.vy * 0.25, f: 1 }; } break; }
+      }
+      if (!M.goal) {
+        M.fT = 0;
+        const ours = W.balls.some((b) => (b.h >= 0 && W.pl[b.h].t === p.t) || (b.lv && b.tm === p.t && !b.rf));
+        if (p.o) {        // outfield: get right behind / beside an enemy (the team's focus target when we have the ball)
+          const es = enemiesIn(W, p);
+          if (es.length) {
+            const mates = W.pl.filter((q) => q.t === p.t && q.o).sort((a, c) => a.i - c.i), k = Math.max(0, mates.indexOf(p));
+            es.sort((a, c) => a.x - c.x);
+            let e = es[(k * 2 + 1) % es.length];
+            const f = W.pl[tb.foc];
+            if (ours && f && !f.o && f.t !== p.t && W.t - tb.focT < 4 && rnd(W) < D.tac) e = f;
+            const s = sgnOf(p.t);
+            const c = clampZone(W, p.t, 1, e.x * 1.35 + (k ? (k % 2 ? 1.5 : -1.5) : 0) + (lv <= 1 ? (rnd(W) - 0.5) * 6 : 0), -s * (W.ch + 1), PR);
+            M.goal = { x: c.x, y: c.y };
+          }
+        } else if (ours) {
+          const s = sgnOf(p.t);
+          if (!M.rest || rnd(W) < 0.15) M.rest = { x: (rnd(W) * 2 - 1) * (W.cw - 1.5), y: s * (W.ch * (0.45 + rnd(W) * 0.35)) };
+          M.goal = { x: M.rest.x, y: M.rest.y };
+          // keep the lane clear for a mate who holds the ball (e.g. just caught it → counter throw)
+          if (D.tac > 0) for (const b of W.balls) {
+            if (b.h < 0 || b.h === p.i) continue;
+            const h = W.pl[b.h]; if (h.t !== p.t || h.o) continue;
+            const e = nearestEnemy(W, h); if (!e) continue;
+            const dx = e.x - h.x, dy = e.y - h.y, d = hyp(dx, dy) || 1, rx = M.goal.x - h.x, ry = M.goal.y - h.y;
+            const al = (rx * dx + ry * dy) / d, lat = (-rx * dy + ry * dx) / d;
+            if (al > 0 && al < d && Math.abs(lat) < 1.8) { const sd = lat >= 0 ? 1 : -1; M.goal.x = clamp(M.goal.x - dy / d * sd * 2.2 * D.tac, -W.cw + PR, W.cw - PR); }
+          }
+        } else M.goal = safeSpot(W, p, M, D, H);
+      }
+    }
+    const g = M.goal || { x: p.x, y: p.y };
+    steerTo(p, g.x, g.y, I, g.f ? 0.3 : 1.2);
+    // an enemy is winding up nearby → shuffle sideways so a led throw misses (보통·어려움)
+    if (!p.o && !g.f && lv >= 2) {
+      let hq = null;
+      for (const b of W.balls) if (b.h >= 0 && W.pl[b.h].t !== p.t && hyp(W.pl[b.h].x - p.x, W.pl[b.h].y - p.y) < 11) hq = W.pl[b.h];
+      if (hq) {
+        M.jT = (M.jT || 0) - dt;
+        if (M.jT <= 0) { M.jT = 0.35 + rnd(W) * 0.5; M.js = rnd(W) < 0.5 ? -1 : 1; }
+        let nx = -(hq.y - p.y), ny = hq.x - p.x; const l = hyp(nx, ny) || 1;
+        const k = (hq.chg ? 0.9 : 0.45) * D.pos;
+        I.ax = I.ax * (1 - k) + nx / l * M.js * k; I.ay = I.ay * (1 - k) + ny / l * M.js * k;
+      }
+    }
+    return I;
+  }
+
+  /* ---------- coarse state ---------- */
+  function pickMap(mp, prev, seed) {
+    if (mp >= 0 && mp < MAPS.length) return mp;
+    const a = rngStep(seed | 0), b = rngStep(a[0]);
+    let k = Math.floor(a[1] * MAPS.length);
+    if (k === prev) k = (k + 1 + Math.floor(b[1] * (MAPS.length - 1))) % MAPS.length;
+    return k;
+  }
+  function init(players, opts) {
+    const o = opts || {};
+    const T = [2, 3, 4].includes(+o.ts) ? +o.ts : 4, N = 2 * T;
+    const np = clamp(players.length | 0, 1, N);
+    const tm = [], nm = [], ai = [];
+    for (let i = 0; i < np; i++) { tm.push(i % 2); nm.push(String((players[i] && players[i].name) || '').slice(0, 10)); ai.push(players[i] && players[i].ai ? 1 : 0); }
+    let bn = 0;
+    for (let i = np; i < N; i++) {
+      const a = tm.filter((t) => t === 0).length, b = tm.filter((t) => t === 1).length;
+      tm.push(a <= b ? 0 : 1); nm.push('봇 ' + (++bn)); ai.push(1);
+    }
+    // starting outfielder (3:3 and 4:4): one per team, a bot if possible
+    const so = [-1, -1];
+    if (T >= 3) for (let t = 0; t < 2; t++) {
+      const mem = []; for (let i = 0; i < N; i++) if (tm[i] === t) mem.push(i);
+      const bots = mem.filter((i) => ai[i]);
+      so[t] = bots.length ? bots[bots.length - 1] : mem[mem.length - 1];
+    }
+    const mp = typeof o.map === 'number' && o.map >= -1 && o.map < MAPS.length ? o.map : -1;
+    const need = [1, 2, 3].includes(+o.need) ? +o.need : 2;
+    const rt = [90, 120, 180].includes(+o.time) ? +o.time : 120;
+    const fb = U.rand(2);
+    const rid = 1 + U.rand(99999);
+    return { rid, np, N, T, tm, nm, so, mp, need, rt, mk: pickMap(mp, -1, rid * 31 + 1), fb,
+      ph: 'count', rd: 1, wins: [0, 0], outs: Array(N).fill(0), rw: -1, why: '', res: null };
+  }
+  function seatsOfTeam(st, t) { const out = []; for (let i = 0; i < st.np; i++) if (st.tm[i] === t) out.push(i); return out; }
+  function roundOver(st, rw, why, outs, cat, got) {
+    const n = Object.assign({}, st, { wins: st.wins.slice(), outs: st.outs.slice(), ph: 'end', rw, why: why || '' });
+    const addTo = (k, a) => { if (!Array.isArray(a)) return; const b = (st[k] || []).slice(0, st.np); for (let i = 0; i < st.np; i++) b[i] = Math.min(999, (b[i] | 0) + (a[i] | 0)); n[k] = b; };
+    addTo('cat', cat); addTo('got', got);   // stats: catches, times hit out (playing seats only)
+    if (rw === 0 || rw === 1) n.wins[rw]++;
+    if (Array.isArray(outs)) outs.forEach((v, i) => { if (i < n.outs.length) n.outs[i] = Math.min(999, (n.outs[i] | 0) + (v | 0)); });
+    return n;
+  }
+  function nextRound(st) {
+    const mx = Math.max(st.wins[0], st.wins[1]);
+    if (mx >= st.need || st.rd >= st.need * 2 + 3) {
+      const w = st.wins[0] === st.wins[1] ? -1 : st.wins[0] > st.wins[1] ? 0 : 1;
+      return Object.assign({}, st, { ph: 'done', res: [w] });
+    }
+    return Object.assign({}, st, { rd: st.rd + 1, mk: pickMap(st.mp, st.mk, st.rid * 31 + st.rd + 1), fb: 1 - (st.fb | 0), ph: 'count', rw: -1, why: '' });
+  }
+  const TEAM_NM = ['빨강 팀', '파랑 팀'];
+  function result(st) {
+    const r = result0(st);
+    if (r) try {
+      const P = [...Array(st.np).keys()], g = (k, i) => String((st[k] && st[k][i]) | 0);
+      r.stats = [
+        { label: '아웃시킴', values: P.map((i) => g('outs', i)) },
+        { label: '받아냄', values: P.map((i) => g('cat', i)) },
+        { label: '맞고 나감', values: P.map((i) => g('got', i)) },
+      ];
+    } catch (e) {}
+    return r;
+  }
+  function result0(st) {
+    if (!st || st.ph !== 'done' || !Array.isArray(st.res)) return null;
+    const w = st.res[0];
+    const nm = (i) => (st.nm && st.nm[i]) || (i + 1) + '번';
+    let mvp = -1, mv = 0; (st.outs || []).forEach((v, i) => { if (v > mv) { mv = v; mvp = i; } });
+    const lines = [TEAM_NM[0] + ' ' + st.wins[0] + ' : ' + st.wins[1] + ' ' + TEAM_NM[1] + ' (' + st.T + ':' + st.T + ')'];
+    for (let t = 0; t < 2; t++) lines.push(TEAM_NM[t] + ': ' + st.nm.map((n, i) => (st.tm[i] === t ? nm(i) + ' ' + (st.outs[i] | 0) : null)).filter(Boolean).join(' · '));
+    if (mvp >= 0) lines.push('최다 아웃: ' + nm(mvp) + ' (' + mv + '명)');
+    if (w !== 0 && w !== 1) return { winners: [], title: '무승부', text: lines.join('\n') };
+    return { winners: seatsOfTeam(st, w), title: TEAM_NM[w] + ' 승리!', text: lines.join('\n') };
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const TC = ['#ee6a55', '#4fa6e8'];
+  const TCD = ['#a8392b', '#24609a'];
+  let STICK_R = 46; const TOPH = 50, ZK = 0.55;
+  const KC = () => { const v = L.ui && L.ui.ctlScale ? +L.ui.ctlScale() : 1; return v > 0 ? v : 1; };
+  const CSS = `
+.db-btn{position:absolute;border-radius:50%;border:2px solid rgba(242,233,216,.35);background:rgba(30,24,40,.82);color:#f2e9d8;
+  font:700 16px var(--f-body,system-ui);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;
+  touch-action:none;user-select:none;-webkit-user-select:none;z-index:3;padding:0;box-shadow:0 4px 12px rgba(0,0,0,.4);
+  -webkit-tap-highlight-color:transparent;cursor:pointer}
+.db-btn small{font-size:10px;font-weight:600;opacity:.75;line-height:1}
+.db-btn.cd{opacity:.45}
+.db-btn.hot{border-color:#ffd27a;animation:dbp .5s ease-in-out infinite}
+.db-btn.ball{border-color:#ee6a55;background:rgba(80,30,26,.88)}
+.db-btn.on,.db-btn.ball.on{background:#e3ae45;color:#2a1d05;border-color:#fff3cf}
+.db-btn.fk,.db-btn.ball.fk{background:#3d4d66;color:#dfeaff;border-color:#bfe3ff}
+@keyframes dbp{50%{box-shadow:0 0 0 8px rgba(255,210,122,.5),0 4px 12px rgba(0,0,0,.4)}}
+.db-main{width:84px;height:84px;right:12px;bottom:16px;font-size:18px}
+.db-sub{width:64px;height:64px;right:106px;bottom:12px;font-size:15px}
+`;
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS });
+    root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    const auto = () => !!(L.debug && L.debug.autoplay);
+    const P = (s) => api.players[s] || { name: '봇', color: '#888', ai: true };
+    const host = () => !api.online || api.isHost;
+    const localHuman = (s) => { const p = api.players[s]; return !!p && !p.ai && !!p.local; };
+    const isAIseat = (s) => !st || s >= st.np || !!P(s).ai || (auto() && localHuman(s));
+    const lvOf = (s) => { if (!st || s >= st.np) return 2; const v = P(s).lv | 0; return v >= 1 && v <= 3 ? v : 2; };
+    let st = null, key = null, W = null, phase = 'wait', cd = 0, endT = 0, lay = null, flip = false, shake = 0, tipT = 0, startT = 0;
+    let bgCv = null, bgKey = '';
+    const name = (s) => (st && st.nm && st.nm[s]) || P(s).name || (s + 1) + '번';
+    function me() { if (!st) return -1; for (let s = 0; s < st.np; s++) if (localHuman(s)) return s; return -1; }
+    const ctrlOn = () => me() >= 0 && !auto();
+    const myTeam = () => { const m = me(); return m >= 0 && st ? st.tm[m] : 0; };
+    const curKey = () => (st ? st.rid + '.' + st.rd : null);
+
+    /* ----- round start ----- */
+    let aiMem = [], vis = [], parts = [], rings = [], floats = [], conf = [], trails = [];
+    function startRound() {
+      key = curKey();
+      W = newWorld(st, W);
+      for (let i = 0; i < W.pl.length; i++) if (isAIseat(i)) styleTint(W.hab[i], (L.aiStyle && L.aiStyle(i)) || 'bal');
+      aiMem = W.pl.map(() => ({}));
+      vis = W.pl.map((p) => ({ x: p.x, y: p.y, bob: Math.random() * 6, hitT: 0, catchT: 0 }));
+      parts = []; rings = []; floats = []; snaps = []; trails = []; lastFx = 0; lastQ = -1; for (const k in remIn) delete remIn[k];
+      locIn.ev = null; netA.n = 0; charge = null; banner = null; passHold = null; fakeT = 0; callCand = null;
+      phase = st.ph === 'play' ? 'play' : st.ph === 'count' ? 'count' : 'end';
+      let seen = 0; try { seen = +localStorage.getItem('lounge.dodgeball.tips') || 0; } catch (e) {}
+      const first = st.rd === 1 && ctrlOn() && seen < 3;
+      if (first) try { localStorage.setItem('lounge.dodgeball.tips', String(seen + 1)); } catch (e) {}
+      cd = first ? FIRST_T : COUNT_T; endT = END_T;
+      tipT = first ? FIRST_T + 0.6 : 0;
+      layout();
+    }
+
+    /* ----- layout: the whole hall fits (no camera) ----- */
+    function layout() {
+      if (!W) return;
+      const k = KC(), stack = k > 1.2; STICK_R = Math.round(46 * k);
+      const mb = Math.round(84 * k), sb = Math.round(64 * k);
+      const w = cv.w, h = cv.h, bot = ctrlOn() ? (stack ? 16 + mb + 8 + sb + 8 : Math.round(128 * Math.max(1, k))) : 10, M = 0.7;
+      const ww = 2 * (W.aw + M), wh = 2 * (W.ah + M) + 1.0, visH = Math.max(160, h - TOPH - bot);
+      const s = Math.max(4, Math.min((w - 6) / ww, visH / wh));
+      lay = { s, ox: w / 2, cy0: TOPH + visH / 2 + 0.5 * s * 0.6, visH, bot, M };
+      flip = myTeam() === 1;
+      buildBg();
+      showBtns(); placeBtns();
+    }
+    function placeBtns() {
+      if (!btn.main) return;
+      const k = KC(), mb = Math.round(84 * k), sb = Math.round(64 * k), m = btn.main.style, u = btn.sub.style;
+      m.width = m.height = mb + 'px'; m.fontSize = Math.round(18 * Math.min(1.4, Math.max(0.8, k))) + 'px';
+      u.width = u.height = sb + 'px'; u.fontSize = Math.round(15 * Math.min(1.4, Math.max(0.8, k))) + 'px';
+      if (k > 1.2) { u.right = (12 + (mb - sb) / 2) + 'px'; u.bottom = (16 + mb + 8) + 'px'; }
+      else { u.right = (12 + mb + 10) + 'px'; u.bottom = '12px'; }
+    }
+    cv.onresize = layout;
+    const onCtl = () => layout(); window.addEventListener('lounge-ctl', onCtl);
+    const VX = (x) => (flip ? -x : x), VY = (y) => (flip ? -y : y);
+    const SX = (x) => lay.ox + VX(x) * lay.s;
+    const SY = (y) => lay.cy0 + VY(y) * lay.s;
+    const ZH = (z) => z * lay.s * ZK;
+    const VA = (a) => (flip ? a + Math.PI : a);
+    function toWorld(px, py) { const x = (px - lay.ox) / lay.s, y = (py - lay.cy0) / lay.s; return { x: flip ? -x : x, y: flip ? -y : y }; }
+
+    /* ----- static layer: floor, zones, lines, walls (world space, unflipped) ----- */
+    const FLOOR = {
+      gym: { out: '#2b1f2a', wall: '#2c4f86', a: '#c88f50', b: '#bd8447', line: '#fbf6ea', zone: 'rgba(60,30,10,.16)' },
+      sand: { out: '#2a6c88', wall: '#8a6a45', a: '#e2c48b', b: '#dabc82', line: '#2f6fb0', zone: 'rgba(120,80,30,.12)' },
+      snow: { out: '#1a2236', wall: '#6b4a33', a: '#eef3f9', b: '#e3ebf5', line: '#d2453c', zone: 'rgba(90,120,170,.12)' },
+      roof: { out: '#0c0b16', wall: '#5b5f6b', a: '#7c808b', b: '#73777f', line: '#f2c94c', zone: 'rgba(0,0,0,.14)' },
+      twin: { out: '#1d1626', wall: '#7a2f50', a: '#2f7f7a', b: '#2a7570', line: '#f7f1e4', zone: 'rgba(0,0,0,.14)' },
+      hall: { out: '#1d1626', wall: '#5a3c28', a: '#3c7a52', b: '#377049', line: '#f7f1e4', zone: 'rgba(0,0,0,.14)' },
+    };
+    function buildBg() {
+      if (!lay || !W) return;
+      const k = st.mk + '|' + lay.s + '|' + cv.dpr + '|' + flip;
+      if (k === bgKey && bgCv) return;
+      bgKey = k;
+      const s = lay.s, dpr = cv.dpr, M = lay.M + 0.6, ww = 2 * (W.aw + M), wh = 2 * (W.ah + M);
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(ww * s * dpr)); c.height = Math.max(1, Math.round(wh * s * dpr));
+      const g = c.getContext('2d');
+      g.setTransform(s * dpr, 0, 0, s * dpr, (W.aw + M) * s * dpr, (W.ah + M) * s * dpr);
+      const id = W.mp.id, F = FLOOR[id] || FLOOR.gym;
+      let seed = 11 + st.mk * 17; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+      const aw = W.aw + 0.6, ah = W.ah + 0.6;
+      // surroundings + wall
+      g.fillStyle = F.out; g.fillRect(-W.aw - M, -W.ah - M, ww, wh);
+      if (id === 'roof') { for (let i = 0; i < 120; i++) { g.fillStyle = rnd() < 0.5 ? 'rgba(255,214,120,.55)' : 'rgba(127,227,255,.35)'; g.fillRect(-aw - M + rnd() * ww, -ah - M + rnd() * wh, 0.18, 0.18); } }
+      if (id === 'sand') { g.fillStyle = 'rgba(255,255,255,.3)'; for (let i = 0; i < 30; i++) { const y = -ah - M + rnd() * wh; g.fillRect(-aw - M, y, M * rnd(), 0.1); g.fillRect(aw + M * (1 - rnd()), y, M, 0.1); } }
+      g.fillStyle = F.wall; rrc(g, -aw - 0.45, -ah - 0.45, 2 * aw + 0.9, 2 * ah + 0.9, 0.5); g.fill();
+      // floor
+      g.save(); g.beginPath(); g.rect(-aw, -ah, 2 * aw, 2 * ah); g.clip();
+      if (id === 'gym' || id === 'twin' || id === 'hall') { for (let y = -ah, i = 0; y < ah; y += 0.9, i++) { g.fillStyle = i % 2 ? F.a : F.b; g.fillRect(-aw, y, 2 * aw, 0.9); } g.strokeStyle = 'rgba(0,0,0,.08)'; g.lineWidth = 0.04; for (let i = 0; i < 160; i++) { const y = -ah + Math.floor(rnd() * 2 * ah / 0.9) * 0.9, x = -aw + rnd() * 2 * aw; g.beginPath(); g.moveTo(x, y); g.lineTo(x, y + 0.9); g.stroke(); } }
+      else if (id === 'roof') { g.fillStyle = F.a; g.fillRect(-aw, -ah, 2 * aw, 2 * ah); g.strokeStyle = 'rgba(0,0,0,.25)'; g.lineWidth = 0.05; for (let x = -aw; x < aw; x += 2) { g.beginPath(); g.moveTo(x, -ah); g.lineTo(x, ah); g.stroke(); } for (let y = -ah; y < ah; y += 2) { g.beginPath(); g.moveTo(-aw, y); g.lineTo(aw, y); g.stroke(); } for (let i = 0; i < 500; i++) { g.fillStyle = rnd() < 0.5 ? 'rgba(0,0,0,.12)' : 'rgba(255,255,255,.08)'; g.fillRect(-aw + rnd() * 2 * aw, -ah + rnd() * 2 * ah, 0.1, 0.1); } }
+      else { g.fillStyle = F.a; g.fillRect(-aw, -ah, 2 * aw, 2 * ah); for (let i = 0; i < 1500; i++) { g.fillStyle = id === 'sand' ? (rnd() < 0.5 ? 'rgba(150,110,60,.18)' : 'rgba(255,250,230,.25)') : (rnd() < 0.6 ? 'rgba(150,170,205,.14)' : 'rgba(255,255,255,.85)'); g.fillRect(-aw + rnd() * 2 * aw, -ah + rnd() * 2 * ah, 0.1, 0.1); } if (id === 'snow') { g.strokeStyle = 'rgba(255,255,255,.65)'; g.lineWidth = 0.06; for (let i = 0; i < 14; i++) { const x = -aw + rnd() * 2 * aw, y = -ah + rnd() * 2 * ah; g.beginPath(); g.moveTo(x, y); g.lineTo(x + 2 + rnd() * 2, y - 0.6); g.stroke(); } } }
+      // outfield zones: darker, tinted with the owner's colour (team 0's outfield is the y < 0 side)
+      for (let t = 0; t < 2; t++) {
+        const sy = t ? 1 : -1;
+        g.save(); g.beginPath();
+        g.rect(-aw, sy < 0 ? -ah : 0, 2 * aw, ah);
+        g.rect(W.cw, sy < 0 ? -W.ch : 0, -2 * W.cw, W.ch);
+        g.fillStyle = F.zone; g.fill('evenodd');
+        g.globalAlpha = 0.13; g.fillStyle = TC[t]; g.fill('evenodd');
+        g.restore();
+      }
+      for (let t = 0; t < 2; t++) { g.globalAlpha = 0.09; g.fillStyle = TC[t]; g.fillRect(-W.cw, t ? -W.ch : 0, 2 * W.cw, W.ch); g.globalAlpha = 1; }
+      g.restore();
+      // lines
+      g.strokeStyle = F.line; g.lineWidth = 0.14; g.lineJoin = 'round';
+      g.strokeRect(-W.cw, -W.ch, 2 * W.cw, 2 * W.ch);
+      g.lineWidth = 0.2; g.beginPath(); g.moveTo(-W.cw, 0); g.lineTo(W.cw, 0); g.stroke();
+      g.lineWidth = 0.08; g.beginPath(); g.arc(0, 0, 1.6, 0, 7); g.stroke();
+      // zone words (drawn upright for the viewer)
+      const word = (t, x, y) => { g.save(); g.translate(x, y); if (flip) g.rotate(Math.PI); g.font = '700 0.9px ' + FONT; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = 'rgba(255,255,255,.22)'; g.fillText(t, 0, 0); g.restore(); };
+      word('외야', 0, -(W.ch + W.mp.ob * 0.55)); word('외야', 0, W.ch + W.mp.ob * 0.55);
+      word('내야', 0, W.ch * 0.82); word('내야', 0, -W.ch * 0.82);
+      if (id === 'roof') { g.strokeStyle = '#9aa0ad'; g.lineWidth = 0.12; g.strokeRect(-aw - 0.3, -ah - 0.3, 2 * aw + 0.6, 2 * ah + 0.6); for (let x = -aw; x <= aw; x += 1.2) { g.beginPath(); g.moveTo(x, -ah - 0.45); g.lineTo(x, -ah - 0.15); g.moveTo(x, ah + 0.15); g.lineTo(x, ah + 0.45); g.stroke(); } }
+      bgCv = c;
+    }
+
+    /* ----- input: floating stick (left), two context buttons (right); keys/pad via api.input ----- */
+    const locIn = { ax: 0, ay: 0, chg: 0, ev: null, spd: 1, rem: 0 };
+    let stick = null, charge = null, lockT = -1, passHold = null, fakeT = 0, callCand = null, callT = 0;
+    const PASS_HOLD = 0.22, FAKE_DRAG = 64;
+    const netA = { n: 0, e: null };
+    function stickVec() {
+      let sx = 0, sy = 0;
+      if (stick) {
+        const dx = stick.x - stick.bx, dy = stick.y - stick.by, d = hyp(dx, dy);
+        if (d > 5) { const m = Math.min(1, d / STICK_R); sx = dx / d * m; sy = dy / d * m; }
+      }
+      if (api.input && !sx && !sy) {
+        const kx = api.input.axis('left', 'right'), ky = api.input.axis('up', 'down');
+        if (kx || ky) { const m = hyp(kx, ky); sx = m > 1 ? kx / m : kx; sy = m > 1 ? ky / m : ky; }
+      }
+      return { x: flip ? -sx : sx, y: flip ? -sy : sy };
+    }
+    function readMove() {
+      const v = stickVec();
+      locIn.ax = v.x; locIn.ay = v.y; locIn.chg = charge || fakeT > 0 ? 1 : 0;
+    }
+    function myP() { const m = me(); return W && m >= 0 ? W.pl[m] : null; }
+    function pickTarget(p, pt) {
+      const es = enemiesIn(W, p); if (!es.length) return -1;
+      if (lockT >= 0 && es.some((q) => q.i === lockT) && !pt) return lockT;
+      let best = -1, bs = 1e9;
+      const v = pt ? null : stickVec(), mv = v ? hyp(v.x, v.y) : 0;
+      for (const q of es) {
+        const dx = q.x - p.x, dy = q.y - p.y, d = hyp(dx, dy) || 1;
+        let s = d;
+        if (pt) s = hyp(q.x - pt.x, q.y - pt.y);
+        else if (mv > 0.35) s = (1 - (dx * v.x + dy * v.y) / (d * mv)) * 14 + d * 0.25;
+        if (s < bs) { bs = s; best = q.i; }
+      }
+      return best;
+    }
+    function sendEv(ev) {
+      const p = myP(); if (!p) return;
+      if (host()) locIn.ev = ev;
+      else { netA.n = (netA.n + 1) % 1000; netA.e = ev; pubT = 0; inT = 0; if (ev[0] === 'c') { p.cw = CWIN_Q; p.cwE = 0; } }
+    }
+    function mainDown(pt) {
+      const p = myP(); if (!p || phase !== 'play' || p.tp > 0) return false;
+      if (holding(W, p)) { charge = { t0: performance.now(), tg: pickTarget(p, pt), pt }; tipT = Math.min(tipT, 0.3); return true; }
+      if (p.o) { floats.push({ x: p.x, y: p.y, t: 0, life: 1, txt: '외야는 맞지 않아요', c: '#bfe3ff', z: 2.6 }); return false; }
+      sendEv(['c']); api.buzz(8);
+      vis[p.i].catchT = 0.3;
+      pend = myThreat() ? null : { t0: performance.now(), pt, held: true };   // pressed just before picking a ball up / catching: becomes the throw press
+      return true;
+      return true;
+    }
+    let pend = null;
+    function pendCheck() {   // a press buffered while empty-handed turns into a throw charge if a ball lands in my hands soon after
+      if (!pend) return;
+      const p = myP(), age = performance.now() - pend.t0;
+      if (!p || phase !== 'play' || age > 320) { pend = null; return; }
+      if (!holding(W, p)) return;
+      const pb = pend; pend = null;
+      charge = { t0: pb.t0, tg: pickTarget(p, pb.pt), pt: pb.pt };
+      if (!pb.held) mainUp(false);
+    }
+    function mainUp(cancel) {
+      if (pend && !charge) { pend.held = false; if (cancel) pend = null; return; }
+      if (!charge) return;
+      const p = myP(), c = charge; charge = null;
+      if (cancel || !p || phase !== 'play' || !holding(W, p)) return;
+      if (c.fk) { api.buzz(6); return; }          // let go off the button / far from the tap point = fake (keep the ball)
+      const held = (performance.now() - c.t0) / 1000 * SPD();
+      const pw = held < TAP_T ? 0 : clamp((held - TAP_T) / CHG_T, 0, 1);
+      const tg = c.pt || held >= TAP_T ? c.tg : pickTarget(p, null);
+      sendEv(['t', tg, r2(pw), 0, 0, 0.85, 0.6, held >= TAP_T ? r2(c.sp || 0) : 0, 0]);
+      api.buzz(pw > 0.6 ? 25 : 12);
+    }
+    /* side spin from the stick while charging: the part of the stick across the aim line */
+    function curveOf(p, c) {
+      const q = c && c.tg >= 0 ? W.pl[c.tg] : null; if (!q) return 0;
+      const v = stickVec(), dx = q.x - p.x, dy = q.y - p.y, d = hyp(dx, dy) || 1;
+      const lat = (-dy * v.x + dx * v.y) / d;
+      return Math.abs(lat) < 0.3 ? 0 : Math.sign(lat) * clamp((Math.abs(lat) - 0.3) / 0.5, 0, 1);
+    }
+    function sendPass(low) {
+      const p = myP(); if (!p || phase !== 'play' || !holding(W, p)) return;
+      const v = stickVec();
+      sendEv(['p', -1, r2(v.x), r2(v.y), low ? 1 : 0]); api.buzz(10);
+    }
+    function callReq() {
+      const p = myP(); if (!p || phase !== 'play' || holding(W, p) || p.tp > 0 || callT > 0) return false;
+      callT = CALL_CD; sendEv(['k']); api.buzz(8);
+      return true;
+    }
+    function fakeKey() {      // PC / pad: cancel a charge, or a quick pump fake
+      const p = myP(); if (!p || phase !== 'play' || !holding(W, p)) return;
+      if (charge) { charge = null; return; }
+      fakeT = 0.3;
+    }
+    function nearMe(pt) {     // screen point on my own character?
+      const p = myP(); if (!p || !lay) return false;
+      const v = vis[p.i], x = SX(v.x), y = SY(v.y) - lay.s * 0.6;
+      return hyp(pt.x - x, pt.y - y) < Math.max(28, lay.s * 1.4);
+    }
+    function subDown() {
+      const p = myP(); if (!p || phase !== 'play' || p.tp > 0) return false;
+      const v = stickVec();
+      if (holding(W, p)) { charge = null; passHold = { t0: performance.now() }; return true; }   // tap = low pass, hold = high lob
+      if (p.dcd > 0) return false;
+      let dx = v.x, dy = v.y;
+      if (hyp(dx, dy) < 0.3) { const th = myThreat(); if (th) { const b = th.b; let nx = -b.vy, ny = b.vx; const l = hyp(nx, ny) || 1; nx /= l; ny /= l; const sd = (p.x - th.x) * nx + (p.y - th.y) * ny >= 0 ? 1 : -1; dx = nx * sd; dy = ny * sd; } }
+      sendEv(['d', r2(dx), r2(dy)]);
+      if (!host()) { p.dash = DASH_T; let l = hyp(dx, dy); if (l < 0.2) { dx = Math.cos(p.a + Math.PI / 2); dy = Math.sin(p.a + Math.PI / 2); l = 1; } p.dx = dx / l; p.dy = dy / l; p.dcd = DASH_CD; }
+      api.buzz(10);
+      return true;
+    }
+    function subUp() {
+      if (!passHold) return;
+      const ph = passHold; passHold = null;
+      if ((performance.now() - ph.t0) / 1000 * SPD() < PASS_HOLD) sendPass(true);
+    }
+    function onDown(e) {
+      if (!ctrlOn() || !lay) return;
+      const pt = cv.local(e);
+      e.preventDefault();
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      const mp_ = myP(), callable = mp_ && !holding(W, mp_) && !myThreat() && nearMe(pt);
+      if (e.pointerType === 'mouse' || pt.x > cv.w * 0.56) {   // tap the court: throw at the enemy nearest that spot (or catch)
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        if (callable) { callReq(); return; }                   // tap myself = 「공 줘」
+        const w = toWorld(pt.x, pt.y);
+        if (mainDown(w)) { tapId = e.pointerId; tapPt = pt; }
+        return;
+      }
+      stick = { id: e.pointerId, bx: pt.x, by: pt.y, x: pt.x, y: pt.y };
+      callCand = callable ? { id: e.pointerId, t0: performance.now(), x: pt.x, y: pt.y } : null;
+      tipT = Math.min(tipT, 0.6);
+    }
+    let tapId = null, tapPt = null;
+    function onMove(e) {
+      if (tapId === e.pointerId && charge && charge.pt) {
+        const pt = cv.local(e), p = myP();
+        if (tapPt && hyp(pt.x - tapPt.x, pt.y - tapPt.y) > FAKE_DRAG) { charge.fk = true; return; }   // dragged far away = fake
+        charge.fk = false;
+        const w = toWorld(pt.x, pt.y); if (p) { charge.pt = w; charge.tg = pickTarget(p, w); } return;
+      }
+      if (!stick || e.pointerId !== stick.id) return;
+      const pt = cv.local(e); stick.x = pt.x; stick.y = pt.y;
+      const dx = stick.x - stick.bx, dy = stick.y - stick.by, d = hyp(dx, dy), mx = STICK_R * 1.25;
+      if (d > mx) { stick.bx = stick.x - dx / d * mx; stick.by = stick.y - dy / d * mx; }
+    }
+    function onUp(e) {
+      if (tapId === e.pointerId) { tapId = null; mainUp(e.type === 'pointercancel'); return; }
+      if (stick && e.pointerId === stick.id) {
+        if (callCand && callCand.id === e.pointerId && e.type !== 'pointercancel' && performance.now() - callCand.t0 < 260 && hyp(stick.x - callCand.x, stick.y - callCand.y) < 14) callReq();
+        stick = null; callCand = null;
+      }
+    }
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    cv.cv.addEventListener('contextmenu', noCtx);
+    const btn = {};
+    function mkBtn(cls, down, up) {
+      const lb = L.h('span', { class: 'lb', text: '' }), sm = L.h('small', { text: '' });
+      const b = L.h('button', { class: 'db-btn ' + cls, type: 'button', 'aria-label': cls }, lb, sm);
+      b._lb = lb; b._sm = sm;
+      b.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); try { b.setPointerCapture(e.pointerId); } catch (er) {} b.classList.add('on'); if (!down(e)) { /* keep the press look short */ setTimeout(() => b.classList.remove('on'), 120); } });
+      const off = (e) => { if (!b.classList.contains('on')) return; b.classList.remove('on'); if (up) up(e); };
+      b.addEventListener('pointerup', off); b.addEventListener('pointercancel', off); b.addEventListener('lostpointercapture', off);
+      b.addEventListener('contextmenu', noCtx);
+      root.appendChild(b);
+      return b;
+    }
+    btn.main = mkBtn('db-main', () => mainDown(null), (e) => mainUp(e && e.type === 'pointercancel'));
+    btn.sub = mkBtn('db-sub', () => subDown(), () => subUp());
+    // drag the finger off 「던지기」 while charging → letting go there is a fake
+    btn.main.addEventListener('pointermove', (e) => {
+      if (!charge || charge.pt) return;
+      const r = btn.main.getBoundingClientRect(), d = hyp(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2));
+      charge.fk = d > r.width / 2 + 22;
+    });
+    btn.main.dataset.action = 'main'; btn.sub.dataset.action = 'sub';
+    function showBtns() { const v = ctrlOn(); for (const k in btn) btn[k].style.display = v ? '' : 'none'; }
+    let btnSig = '', btnVis = null;
+    function setBtn(b, lb, sm) { if (b._lb.textContent !== lb) b._lb.textContent = lb; if (b._sm.textContent !== sm) b._sm.textContent = sm; }
+    function syncBtns() {
+      if (btnVis !== ctrlOn()) { btnVis = ctrlOn(); showBtns(); if (W && lay && (lay.bot > 20) !== btnVis) layout(); }
+      const p = myP(); if (!p || !ctrlOn()) return;
+      pendCheck();
+      const hb = !!holding(W, p), th = !hb && !p.o ? myThreat() : null, fk = !!(charge && charge.fk);
+      const sig = [hb, !!th, p.o, p.dcd > 0, p.ccd > 0 || p.cw > 0, phase, fk].join('|');
+      if (sig === btnSig) return;
+      btnSig = sig;
+      if (hb && fk) { setBtn(btn.main, '속임', '여기서 떼요'); setBtn(btn.sub, '패스', ''); }
+      else if (hb) { setBtn(btn.main, '던지기', '톡 · 꾹=세게'); setBtn(btn.sub, '패스', '톡낮게·꾹높게'); }
+      else if (p.o) { setBtn(btn.main, '잡기', '외야'); setBtn(btn.sub, '피하기', ''); }
+      else { setBtn(btn.main, '잡기', th ? '지금!' : '타이밍'); setBtn(btn.sub, '피하기', ''); }
+      btn.main.classList.toggle('ball', hb);
+      btn.main.classList.toggle('hot', !!th);
+      btn.main.classList.toggle('fk', fk);
+      btn.main.classList.toggle('cd', !hb && (p.o || p.ccd > 0 || phase !== 'play'));
+      btn.sub.classList.toggle('cd', (!hb && p.dcd > 0) || phase !== 'play');
+    }
+    const offIn = api.input ? api.input.on((type, id) => {
+      if (!ctrlOn()) return;
+      if (id === 'main') { if (type === 'down') mainDown(null); else mainUp(false); return; }
+      if (id === 'sub') { if (type === 'down') subDown(); else subUp(); return; }
+      if (id === 'fake' && type === 'down') { fakeKey(); return; }
+      if (id === 'call' && type === 'down') { callReq(); return; }
+      if (id === 'target' && type === 'down') {
+        const p = myP(); if (!p) return;
+        const es = enemiesIn(W, p).map((q) => q.i).sort((a, b) => a - b);
+        if (!es.length) return;
+        lockT = es[(es.indexOf(lockT) + 1) % es.length];
+        if (charge) charge.tg = lockT;
+        sfx('tick', 40);
+      }
+    }) : null;
+    const releaseAll = () => { stick = null; charge = null; tapId = null; passHold = null; callCand = null; for (const k in btn) btn[k].classList.remove('on'); };
+    window.addEventListener('blur', releaseAll);
+    function myThreat() {
+      const p = myP(); if (!p || p.o || !W) return null;
+      let best = null;
+      for (const b of W.balls) {
+        if (b.h >= 0 || !b.lv || b.ps || b.tm === p.t) continue;
+        const th = threat(W, b, p, 1.1);
+        if (th && (!best || th.t < best.t)) best = { t: th.t, z: th.z, x: th.x, y: th.y, b };
+      }
+      return best;
+    }
+
+    /* ----- effects ----- */
+    let lastSfx = {};
+    function sfx(n, gap) { const t = performance.now(); if (t - (lastSfx[n] || 0) < (gap || 60)) return; lastSfx[n] = t; api.sfx(n); }
+    function puff(x, y, z, n, sp, col, life) {
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * 6.283, v = sp * (0.3 + Math.random());
+        parts.push({ x, y, z: z || 0.3, vx: Math.cos(a) * v, vy: Math.sin(a) * v, vz: 1.5 + Math.random() * 3, t: 0, life: (life || 0.5) * (0.6 + Math.random() * 0.6), c: col || '#ffffff', r: 0.08 + Math.random() * 0.1 });
+      }
+      if (parts.length > 200) parts.splice(0, parts.length - 200);
+    }
+    function addFloat(x, y, txt, c, z) { floats.push({ x, y, t: 0, life: 1.1, txt, c, z: z == null ? 3 : z }); if (floats.length > 10) floats.shift(); }
+    const dustCol = () => (W && W.mp.id === 'snow' ? '#ffffff' : W && W.mp.id === 'sand' ? '#f0dcae' : 'rgba(255,255,255,.7)');
+    function onFx(code, a, b, c, d) {
+      const m = me(), mt = myTeam();
+      switch (code) {
+        case 0: sfx(d & 1 ? 'hit' : 'whoosh', 70); if (d & 1) { rings.push({ x: a, y: b, t: 0, life: 0.3, r0: 0.3, r1: 1.6, c: '#ffd27a' }); if (c === m) shake = Math.max(shake, 0.18); } if (vis[c]) vis[c].thrT = 0.25;
+          if (d & 4) { addFloat(a, b, '반격!', '#ffb347', 3.2); rings.push({ x: a, y: b, t: 0, life: 0.35, r0: 0.6, r1: 2.4, c: '#ffb347' }); }
+          else if (d & 2 && c === m) addFloat(a, b, '커브!', '#bfe3ff', 3.2);
+          break;
+        case 1: {
+          sfx('hit', 40); setTimeout(() => sfx('thud', 0), 60);
+          rings.push({ x: a, y: b, t: 0, life: 0.4, r0: 0.4, r1: 2.0, c: '#ffffff' });
+          puff(a, b, 1.2, 12, 4, '#fff3cf');
+          addFloat(a, b, '아웃!', '#ee6a55', 2.6);
+          if (c === m) { api.buzz(90); shake = Math.max(shake, 0.8); } else shake = Math.max(shake, 0.25);
+          if (d === m && c !== m) { addFloat(a, b - 0.6, '명중!', '#e3ae45', 3.4); api.buzz(25); }
+          if (vis[c]) { vis[c].hitT = 1; vis[c].gx = a; vis[c].gy = b; }
+          break;
+        }
+        case 2: sfx('chip', 40); rings.push({ x: a, y: b, t: 0, life: 0.45, r0: 0.5, r1: 2.2, c: '#ffd27a' }); addFloat(a, b, '잡았다!', '#ffd27a', 2.6); rings.push({ x: a, y: b, t: 0, life: 0.25, r0: 1.2, r1: 3.2, c: '#fff3cf' }); if (vis[c]) vis[c].catchT = 0.45; if (c === m) { api.buzz(40); shake = Math.max(shake, 0.2); } if (d === m) addFloat(a, b, '잡혔어요', '#bfe3ff', 4.4); break;
+        case 3: sfx('pop', 50); rings.push({ x: a, y: b, t: 0, life: 0.6, r0: 0.3, r1: 2.0, c: TC[W && W.pl[c] ? W.pl[c].t : 0] }); addFloat(a, b, '부활!', '#7cdc8a', 2.6); if (c === m) api.buzz(30); break;
+        case 4: sfx('bounce', 90); puff(a, b, 0.05, 4, 1.6, dustCol(), 0.4); break;
+        case 5: sfx('click', 90); break;
+        case 6: sfx('click', 70); if (c === m && d === 3) addFloat(a, b, '가로챘다!', '#e3ae45', 2.6); break;
+        case 7: sfx('whoosh', 70); break;
+        case 8: puff(a, b, 0.05, 6, 2.2, dustCol(), 0.35); if (c === m) { sfx('tick', 50); if (d) addFloat(a, b, d === 1 ? '숙여서 피하기' : '폴짝!', '#bfe3ff', 2.4); } break;
+        case 14: sfx('tick', 60); addFloat(a, b, '속임!', '#bfe3ff', 3); break;
+        case 16: if (W && W.pl[c] && (W.pl[c].t === mt || !ctrlOn()) && c !== m) sfx('pop', 120); break;
+        case 10: addFloat(a, b, '8초! 자동으로 던져요', '#ffd27a', 3); break;
+        case 11: banner = { t: '바람이 바뀌었어요', sub: (a > 0 ? '→ 오른쪽' : '← 왼쪽') + '으로 ' + (Math.abs(a) >= 25 ? '세게' : '살살'), c: '#bfe3ff', life: 1.6, max: 1.6 }; break;
+        case 12: sfx('whoosh'); banner = { t: '한 명 승부!', sub: '먼저 맞히는 팀이 이겨요', c: '#ee6a55', life: 1.6, max: 1.6 }; api.buzz(40); break;
+        case 13: sfx('pop', 100); if (c === mt) addFloat(a, b, '공 넘겨줌', '#f2e9d8', 1.6); break;
+      }
+    }
+    const hooks = { fx: onFx };
+    let banner = null;
+
+    /* ----- host flow ----- */
+    const remIn = {};
+    function inputsFor() {
+      const out = [];
+      for (let s = 0; s < W.pl.length; s++) {
+        if (isAIseat(s)) out[s] = aiThink(W, W.pl[s], aiMem[s], lvOf(s), curDt);
+        else if (localHuman(s)) out[s] = locIn;
+        else out[s] = remIn[s] || (remIn[s] = { ax: 0, ay: 0, chg: 0, ev: null, spd: 1, rem: 1, seen: -1 });
+      }
+      return out;
+    }
+    let curDt = 0;
+    function hostFlow(dt) {
+      if (!host() || !st || !W) return;
+      if (st.ph === 'count' && phase === 'play') { api.setState(Object.assign({}, st, { ph: 'play' })); return; }
+      if (st.ph === 'play' && phase === 'play' && W.res && W.endT >= LAST_T && !W.res.sent) { W.res.sent = 1; api.setState(roundOver(st, W.res.w, W.res.why, W.outs, W.cat, W.got)); return; }
+      if (st.ph === 'end') { endT -= dt; if (endT <= 0) { endT = 1e9; api.setState(nextRound(st)); } }
+    }
+
+    /* ----- online ----- */
+    let pubT = 0, hsQ = 0, inQ = 0, lastQ = -1, lastFx = 0, snaps = [], lastSig = '', inT = 0;
+    function pollHost() {
+      if (!api.online || !api.isHost || !W) return;
+      let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+      if (!rem || typeof rem !== 'object') return;
+      for (const k in rem) {
+        const s = +k, o = rem[k];
+        if (!(s >= 0 && s < st.np) || isAIseat(s) || localHuman(s) || !o || typeof o !== 'object' || o.k !== key) continue;
+        const R = remIn[s] || (remIn[s] = { ax: 0, ay: 0, chg: 0, ev: null, spd: 1, rem: 1, seen: -1 });
+        R.ax = fin(+o.ax) ? clamp(+o.ax, -1, 1) : 0; R.ay = fin(+o.ay) ? clamp(+o.ay, -1, 1) : 0;
+        R.chg = o.c ? 1 : 0;
+        const n = o.n | 0;
+        if (R.seen >= 0 && n !== R.seen && Array.isArray(o.e) && typeof o.e[0] === 'string') R.ev = o.e.slice(0, 9);
+        R.seen = n;
+      }
+    }
+    function encode() {
+      const Pp = [];
+      for (const p of W.pl) {
+        const fl = (p.o ? 1 : 0) | (p.cw > 0 ? 2 : 0) | (p.dash > 0 ? 4 : 0) | (p.chg ? 8 : 0) | (p.ta > 0 ? 16 : 0) | (p.tp > 0 ? 32 : 0) | (p.dcd > 0 ? 64 : 0) | (p.ccd > 0 ? 128 : 0)
+          | (p.dk > 0 ? 256 : 0) | (p.hp > 0 && !(p.hpD > 0) ? 512 : 0) | (p.ctr > 0 && holding(W, p) ? 1024 : 0) | (p.cl > 0 ? 2048 : 0);
+        Pp.push(r1(p.x), r1(p.y), r1(p.vx), r1(p.vy), r1(p.a), fl, Math.floor(p.hT));
+      }
+      const B = [];
+      for (const b of W.balls) B.push(r1(b.x), r1(b.y), r1(b.z), r1(b.vx), r1(b.vy), r1(b.vz), b.h, (b.lv ? 1 : 0) | (b.ps ? 2 : 0) | (b.tm === 1 ? 4 : 0) | (b.pw > 0.55 ? 8 : 0) | (b.rf ? 16 : 0) | (b.lp ? 32 : 0) | (b.cx ? 64 : 0), b.o, b.id, r1(b.sp));
+      return { k: key, q: hsQ, t: r1(W.t), ot: W.ot, w: r1(W.wind), P: Pp, B, fx: W.fx.slice(-10) };
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !W) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || typeof hs !== 'object' || hs.k !== key || hs.q === lastQ || !Array.isArray(hs.P)) return;
+      lastQ = hs.q;
+      if (fin(hs.t)) W.t = hs.t;
+      W.ot = hs.ot ? 1 : 0; if (fin(hs.w)) W.wind = hs.w;
+      if (Array.isArray(hs.fx)) for (const e of hs.fx) if (Array.isArray(e) && e[0] > lastFx) { lastFx = e[0]; try { onFx(e[1], +e[2] || 0, +e[3] || 0, e[4] | 0, e[5] | 0); } catch (er) {} }
+      const m = me();
+      W.pl.forEach((p, i) => {
+        const o = i * 7, A = hs.P;
+        if (!fin(+A[o]) || !fin(+A[o + 1])) return;
+        const fl = A[o + 5] | 0;
+        const wasO = p.o; p.o = fl & 1 ? 1 : 0;
+        p.tp = fl & 32 ? 0.1 : 0; p.hT = A[o + 6] | 0;
+        p.nx = +A[o]; p.ny = +A[o + 1]; p.nvx = +A[o + 2] || 0; p.nvy = +A[o + 3] || 0; p.nat = now;
+        if (wasO !== p.o) { p.x = p.nx; p.y = p.ny; }
+        if (i !== m || auto()) { p.cw = fl & 2 ? 0.1 : 0; p.dash = fl & 4 ? 0.05 : 0; p.chg = fl & 8 ? 1 : 0; p.ta = fl & 16 ? 0.1 : 0; p.na = +A[o + 4] || 0; }
+        p.dcd = fl & 64 ? Math.max(p.dcd, 0.05) : 0; p.ccd = fl & 128 ? 0.05 : 0;
+        p.dk = fl & 256 ? 0.1 : 0; p.hp = fl & 512 ? HOP_T * 0.5 : 0; p.hpD = 0; p.ctr = fl & 1024 ? 0.2 : 0; p.cl = fl & 2048 ? 0.5 : 0;
+      });
+      snaps.push({ at: now, P: hs.P }); if (snaps.length > 5) snaps.shift();
+      const B = Array.isArray(hs.B) ? hs.B : [], nb = [];
+      for (let i = 0; i + 10 < B.length; i += 11) {
+        const f = B[i + 7] | 0;
+        nb.push({ x: +B[i], y: +B[i + 1], z: +B[i + 2], vx: +B[i + 3], vy: +B[i + 4], vz: +B[i + 5], h: B[i + 6] | 0, lv: f & 1 ? 1 : 0, ps: f & 2 ? 1 : 0, tm: f & 4 ? 1 : 0, pw: f & 8 ? 1 : 0, rf: f & 16 ? 1 : 0, lp: f & 32 ? 1 : 0, cx: f & 64 ? 1 : 0, o: B[i + 8] | 0, id: B[i + 9] | 0, sp: fin(+B[i + 10]) ? +B[i + 10] : 0, ag: 0.3, dt: 0 });
+      }
+      W.balls = nb;
+      let lag = 0.05 * SPD(); while (lag > 1e-4) { const h = Math.min(1 / 60, lag); for (const b of W.balls) stepBall(W, b, h, null, false); lag -= h; }
+    }
+    function guestStep(dt, rdt, now) {
+      const m = auto() ? -1 : me();
+      const rt = now - 100;
+      let A = null, Bs = snaps.length ? snaps[snaps.length - 1] : null, k = 1;
+      for (let i = snaps.length - 1; i > 0; i--) if (snaps[i - 1].at <= rt) { A = snaps[i - 1]; Bs = snaps[i]; break; }
+      if (A) k = clamp((rt - A.at) / Math.max(1, Bs.at - A.at), 0, 1.3);
+      W.pl.forEach((p, i) => {
+        if (!Bs) return;
+        const o = i * 7;
+        if (i === m && phase === 'play') {
+          readMove();
+          const n = Math.max(1, Math.ceil(dt / SUB)), h = dt / n;
+          for (let j = 0; j < n; j++) movePlayer(W, p, locIn, h);
+          if (fin(p.nx)) {
+            const age = Math.min(0.15, (now - p.nat) / 1000);
+            const tx = p.nx + p.nvx * age, ty = p.ny + p.nvy * age, d = hyp(tx - p.x, ty - p.y);
+            if (d > 3) { p.x = tx; p.y = ty; } else { const kk = 1 - Math.exp(-rdt * 5); p.x += (tx - p.x) * kk; p.y += (ty - p.y) * kk; }
+          }
+          return;
+        }
+        const b = Bs.P, a = A ? A.P : null;
+        const bx = +b[o], by = +b[o + 1], ba = +b[o + 4] || 0;
+        if (a && hyp(bx - a[o], by - a[o + 1]) < 5) { p.x = a[o] + (bx - a[o]) * k; p.y = a[o + 1] + (by - a[o + 1]) * k; p.a = a[o + 4] + wrapA(ba - a[o + 4]) * k; }
+        else { p.x = bx; p.y = by; p.a = ba; }
+        p.vx = p.nvx || 0; p.vy = p.nvy || 0;
+        if (p.ta > 0) p.ta -= dt;
+      });
+      const n = Math.min(20, Math.max(1, Math.ceil(dt / (1 / 60)))), h = dt / n;
+      for (let j = 0; j < n; j++) for (const b of W.balls) stepBall(W, b, h, null, false);
+    }
+    function publish(rdt) {
+      if (!api.online || !W) return;
+      pubT -= rdt; inT -= rdt;
+      try {
+        if (api.isHost) {
+          if (pubT > 0) return;
+          pubT = 1 / 20;
+          hsQ = (hsQ + 1) % 100000;
+          api.net.hostSend(encode());
+        } else {
+          const m = me(); if (m < 0) return;
+          readMove();
+          const sig = [r2(locIn.ax), r2(locIn.ay), locIn.chg, netA.n].join('|');
+          if (sig === lastSig && inT > 0) return;
+          if (pubT > 0 && sig !== lastSig && inT > 0.1) return;
+          lastSig = sig; inT = 0.2; pubT = 1 / 30;
+          inQ = (inQ + 1) % 100000;
+          api.net.publish({ k: key, q: inQ, ax: r2(locIn.ax), ay: r2(locIn.ay), c: locIn.chg, n: netA.n, e: netA.e });
+        }
+      } catch (e) {}
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      if (!st) return;
+      if (curKey() !== key) startRound();
+      if (!W) return;
+      const dt = rdt * SPD();
+      curDt = dt;
+      if (phase === 'count') {
+        const a = Math.ceil(cd); cd -= dt; const b = Math.ceil(cd);
+        if (b !== a && b > 0 && b <= 3) sfx('tick', 40);
+        if (cd <= 0 && (host() || st.ph === 'play')) { phase = 'play'; sfx('pop'); api.buzz(16); startT = 0.9; }
+      }
+      if (phase === 'play' && (st.ph === 'end' || st.ph === 'done')) phase = 'end';
+      if (tipT > 0) tipT -= rdt;
+      if (startT > 0) startT -= rdt;
+      readMove();
+      const p = myP();
+      if (charge && p && !holding(W, p)) charge = null;
+      if (charge && p) {
+        const held = (performance.now() - charge.t0) / 1000 * SPD();
+        if (!charge.pt && held < TAP_T) { const t = pickTarget(p, null); if (t >= 0) charge.tg = t; }   // aim locks once the wind-up starts
+        charge.sp = held >= TAP_T ? curveOf(p, charge) : 0;                                             // then the stick bends it
+      }
+      if (passHold && (!p || !holding(W, p))) passHold = null;
+      if (passHold && (performance.now() - passHold.t0) / 1000 * SPD() >= PASS_HOLD) { passHold = null; sendPass(false); }
+      if (fakeT > 0) fakeT -= rdt * SPD();
+      if (callT > 0) callT -= rdt * SPD();
+      if (host()) {
+        pollHost();
+        if (phase === 'play' && (!W.res || W.endT < LAST_T)) tickWorld(W, Math.min(dt, 0.1), inputsFor(), hooks);
+        else if (phase !== 'play') {
+          for (const q of W.pl) { q.vx *= 0.85; q.vy *= 0.85; }
+          for (const b of W.balls) if (b.h < 0) stepBall(W, b, Math.min(dt, 0.1), null, false);
+        }
+        hostFlow(dt);
+      } else {
+        pollGuest(now);
+        guestStep(Math.min(dt, 0.1), rdt, now);
+        if (st.ph === 'end') phase = 'end';
+      }
+      // visuals: smooth teleports (out → outfield, back in), trails
+      W.pl.forEach((q, i) => {
+        const v = vis[i]; if (!v) return;
+        const d = hyp(q.x - v.x, q.y - v.y);
+        if (d > 2.5) { const k = Math.min(1, rdt * 7); v.x += (q.x - v.x) * k; v.y += (q.y - v.y) * k; v.fly = 1; }
+        else { v.x = q.x; v.y = q.y; v.fly = 0; }
+        if (v.hitT > 0) v.hitT -= rdt * 1.6; if (v.catchT > 0) v.catchT -= rdt; if (v.thrT > 0) v.thrT -= rdt;
+        if (q.dash > 0 && Math.random() < rdt * 30) puff(q.x, q.y, 0.05, 1, 1.2, dustCol(), 0.3);
+      });
+      for (const b of W.balls) {
+        if (b.h < 0 && b.lv && !b.ps) { trails.push({ x: b.x, y: b.y, z: b.z, t: 0, c: b.sp ? '#bfe3ff' : TC[b.tm === 1 ? 1 : 0], pw: b.sp ? 0 : b.pw }); }
+        else if (b.h < 0 && b.lv && b.lp) { trails.push({ x: b.x, y: b.y, z: b.z, t: 0.08, c: '#f2e9d8', pw: 0 }); }
+      }
+      for (let i = trails.length - 1; i >= 0; i--) { trails[i].t += rdt; if (trails[i].t > 0.22) trails.splice(i, 1); }
+      if (trails.length > 60) trails.splice(0, trails.length - 60);
+      for (let i = parts.length - 1; i >= 0; i--) { const q = parts[i]; q.t += rdt; q.x += q.vx * rdt; q.y += q.vy * rdt; q.z = Math.max(0, q.z + q.vz * rdt); q.vz -= 12 * rdt; q.vx *= 0.94; q.vy *= 0.94; if (q.t > q.life) parts.splice(i, 1); }
+      for (let i = rings.length - 1; i >= 0; i--) { rings[i].t += rdt; if (rings[i].t > rings[i].life) rings.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t += rdt; if (floats[i].t > floats[i].life) floats.splice(i, 1); }
+      for (let i = conf.length - 1; i >= 0; i--) { const c = conf[i]; c.t += rdt; c.x += c.vx * rdt; c.y += c.vy * rdt; c.vy += 420 * rdt; c.rot += c.vr * rdt; if (c.t > c.life) conf.splice(i, 1); }
+      if (banner) { banner.life -= rdt; if (banner.life <= 0) banner = null; }
+      shake = Math.max(0, shake - rdt * 2.6);
+      publish(rdt);
+    }
+
+    /* ----- drawing ----- */
+    function txt(t, x, y, col, font, al, stroke) {
+      ctx.font = font; ctx.textAlign = al || 'center'; ctx.textBaseline = 'middle';
+      if (stroke) { ctx.lineWidth = stroke; ctx.strokeStyle = 'rgba(16,12,22,.85)'; ctx.lineJoin = 'round'; ctx.strokeText(t, x, y); }
+      ctx.fillStyle = col; ctx.fillText(t, x, y);
+    }
+    const SKIN = ['#f3d2b5', '#e8b98f', '#c98d63', '#f6dcc4'];
+    const HAIR = ['#2a1d1a', '#5a3a22', '#1d1a22', '#7a4a2e', '#3a2a40'];
+    function drawPlayer(p, now) {
+      const s = lay.s, v = vis[p.i], x = SX(v.x), y = SY(v.y), u = s * 1.05, col = TC[p.t], dk = TCD[p.t];
+      const mine = p.i === me() && !auto();
+      if (v.fly) { ctx.save(); ctx.globalAlpha = 0.55; }
+      // shadow + ring for me
+      ctx.fillStyle = 'rgba(0,0,0,.26)'; ctx.beginPath(); ctx.ellipse(x, y + u * 0.1, u * 0.62, u * 0.3, 0, 0, 7); ctx.fill();
+      if (mine) { ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 2.2; ctx.beginPath(); ctx.ellipse(x, y + u * 0.1, u * 0.8, u * 0.4, 0, 0, 7); ctx.stroke(); }
+      const hb0 = W.balls.some((b) => b.h === p.i);
+      if (p.ctr > 0 && hb0) {   // catch counter ready: pulsing orange ring
+        ctx.save(); ctx.globalAlpha = 0.55 + 0.35 * Math.sin(now / 60); ctx.strokeStyle = '#ffb347'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.ellipse(x, y + u * 0.1, u * 1.0, u * 0.5, 0, 0, 7); ctx.stroke(); ctx.restore();
+      }
+      v.lift = (v.lift || 0) + (loOf(p) - (v.lift || 0)) * 0.5;
+      const lift = v.lift * s * ZK;
+      ctx.save(); ctx.translate(0, -lift);
+      const fa = VA(p.a), fx = Math.cos(fa), fy = Math.sin(fa);
+      const mv = hyp(p.vx, p.vy) > 1 && !v.fly;
+      const step = mv ? Math.sin(now / 75 + v.bob) * u * 0.13 : 0;
+      const crouch = p.dk > 0 ? 0.6 : p.cw > 0 || v.catchT > 0 ? 0.82 : 1;
+      // legs
+      ctx.fillStyle = '#2b2430';
+      ctx.beginPath(); ctx.ellipse(x - u * 0.2, y + step * 0.6, u * 0.15, u * 0.12, 0, 0, 7); ctx.ellipse(x + u * 0.2, y - step * 0.6, u * 0.15, u * 0.12, 0, 0, 7); ctx.fill();
+      // body
+      const by = y - u * 0.5 * crouch, bw = u * 0.42, bh = u * 0.42 * crouch + u * 0.06;
+      const g = ctx.createLinearGradient(x - bw, by - bh, x + bw, by + bh);
+      g.addColorStop(0, shade(col, 0.2)); g.addColorStop(1, shade(col, -0.25));
+      ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(x, by, bw, bh, 0, 0, 7); ctx.fill();
+      ctx.strokeStyle = 'rgba(12,9,18,.45)'; ctx.lineWidth = 1; ctx.stroke();
+      // jersey stripe + number
+      ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fillRect(x - bw * 0.85, by - bh * 0.15, bw * 1.7, Math.max(1.2, bh * 0.16));
+      // arms
+      ctx.fillStyle = SKIN[p.i % 4];
+      const hb = W.balls.some((b) => b.h === p.i);
+      if (p.chg) { ctx.beginPath(); ctx.arc(x - fx * u * 0.55, by - u * 0.45, u * 0.13, 0, 7); ctx.arc(x + u * 0.45 * (fx >= 0 ? -1 : 1) * 0.3, by, u * 0.12, 0, 7); ctx.fill(); }
+      else if (p.cw > 0 || v.catchT > 0) { ctx.beginPath(); ctx.arc(x + fx * u * 0.4 - u * 0.25, by + fy * u * 0.25, u * 0.13, 0, 7); ctx.arc(x + fx * u * 0.4 + u * 0.25, by + fy * u * 0.25, u * 0.13, 0, 7); ctx.fill(); }
+      else if (p.ta > 0 || v.thrT > 0) { ctx.beginPath(); ctx.arc(x + fx * u * 0.75, by + fy * u * 0.4 - u * 0.15, u * 0.13, 0, 7); ctx.arc(x - u * 0.45, by + u * 0.05, u * 0.12, 0, 7); ctx.fill(); }
+      else { ctx.beginPath(); ctx.arc(x - u * 0.47, by + u * 0.08 - step * 0.3, u * 0.12, 0, 7); ctx.arc(x + u * 0.47, by + u * 0.08 + step * 0.3, u * 0.12, 0, 7); ctx.fill(); }
+      // head
+      const hr = u * 0.3, hy = by - bh - hr * 0.7;
+      ctx.fillStyle = SKIN[p.i % 4]; ctx.beginPath(); ctx.arc(x, hy, hr, 0, 7); ctx.fill();
+      const back = fy < -0.55;
+      ctx.fillStyle = HAIR[(p.i * 3 + p.t) % 5];
+      if (back) { ctx.beginPath(); ctx.arc(x, hy, hr * 1.02, 0, 7); ctx.fill(); }
+      else {
+        ctx.beginPath(); ctx.arc(x, hy - hr * 0.1, hr * 1.04, Math.PI * 1.05, Math.PI * 1.95); ctx.closePath(); ctx.fill();
+        const ex = fx * hr * 0.35, ey = Math.max(0, fy) * hr * 0.15;
+        ctx.fillStyle = '#2a2230';
+        ctx.beginPath(); ctx.arc(x + ex - hr * 0.33, hy + ey, Math.max(1, hr * 0.13), 0, 7); ctx.arc(x + ex + hr * 0.33, hy + ey, Math.max(1, hr * 0.13), 0, 7); ctx.fill();
+      }
+      // headband in team colour (dark) so teams read even on matching floors
+      ctx.fillStyle = dk; ctx.fillRect(x - hr * 1.02, hy - hr * 0.42, hr * 2.04, hr * 0.3);
+      if (v.hitT > 0) { ctx.globalAlpha = v.hitT * 0.7; ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.ellipse(x, by - u * 0.2, u * 0.65, bh + hr * 1.4, 0, 0, 7); ctx.fill(); ctx.globalAlpha = v.fly ? 0.55 : 1; }
+      ctx.restore();
+      if (v.fly) ctx.restore();
+      // labels
+      const top = hy - hr - 4 - lift;
+      if (p.cl > 0 && (!ctrlOn() || p.t === myTeam())) drawBubble(x, top - (mine ? 18 : 14), mine ? '공 줘!' : '공 줘!');
+      if (mine && p.ctr > 0 && hb0) txt('반격 찬스!', x, top - 22, '#ffb347', '800 11px ' + FONT, 'center', 3);
+      if (mine) txt('나', x, top - 6, '#e3ae45', '800 ' + Math.max(11, Math.round(u * 0.62)) + 'px ' + FONT, 'center', 3);
+      else if (p.i < st.np && !P(p.i).ai && api.online) txt(name(p.i).slice(0, 4), x, top - 5, '#f2e9d8', '700 10px ' + FONT, 'center', 3);
+      if (hb && p.hT >= HOLD_WARN) txt(String(Math.max(1, HOLD_MAX - Math.floor(p.hT))), x + u * 0.7, top, '#ffd27a', '800 12px ' + MONO, 'center', 3);
+    }
+    function drawBubble(x, y, t) {      // 「공 줘」 speech bubble
+      ctx.save();
+      ctx.font = '800 11px ' + FONT;
+      const w = ctx.measureText(t).width + 12, h = 18, bx = clamp(x - w / 2, 2, cv.w - w - 2), by = Math.max(TOPH + 2, y - h);
+      rr(ctx, bx, by, w, h, 8); ctx.fillStyle = '#fff3cf'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x - 4, by + h - 0.5); ctx.lineTo(x + 4, by + h - 0.5); ctx.lineTo(x, by + h + 5); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = 'rgba(42,29,5,.5)'; ctx.lineWidth = 1; rr(ctx, bx, by, w, h, 8); ctx.stroke();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#2a1d05'; ctx.fillText(t, bx + w / 2, by + h / 2 + 0.5);
+      ctx.restore();
+    }
+    function drawBall(b) {
+      const s = lay.s, r = Math.max(3.2, BR * s * 1.25), x = SX(b.x), y = SY(b.y), z = Math.max(0, b.z), yz = y - ZH(z);
+      const g = ctx.createRadialGradient(x - r * 0.35, yz - r * 0.35, r * 0.1, x, yz, r);
+      g.addColorStop(0, '#ffb39a'); g.addColorStop(0.6, '#e2553f'); g.addColorStop(1, '#8e2a20');
+      if (b.lv && !b.ps && (b.pw || b.cx)) { ctx.save(); ctx.shadowColor = b.cx ? '#ffb347' : '#ffd27a'; ctx.shadowBlur = 10; }
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, yz, r, 0, 7); ctx.fill();
+      if (b.lv && !b.ps && (b.pw || b.cx)) ctx.restore();
+      ctx.strokeStyle = 'rgba(255,240,220,.7)'; ctx.lineWidth = Math.max(0.8, r * 0.16);
+      ctx.beginPath(); ctx.arc(x, yz, r * 0.92, -0.6, 0.9); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - r * 0.9, yz + r * 0.1); ctx.quadraticCurveTo(x, yz - r * 0.4, x + r * 0.9, yz + r * 0.1); ctx.stroke();
+      ctx.strokeStyle = 'rgba(40,10,8,.55)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x, yz, r, 0, 7); ctx.stroke();
+    }
+    function drawBallShadow(b) {
+      const s = lay.s, r = Math.max(3.2, BR * s * 1.25), x = SX(b.x), y = SY(b.y), k = clamp(1 - b.z / 6, 0.35, 1);
+      ctx.fillStyle = 'rgba(0,0,0,' + (0.3 * k) + ')'; ctx.beginPath(); ctx.ellipse(x, y, r * k, r * 0.5 * k, 0, 0, 7); ctx.fill();
+    }
+    const AIMB = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, sp: 0, ag: 0, dt: 0 };
+    function drawAim(now) {
+      const p = myP(); if (!p || !charge || !holding(W, p)) return;
+      const q = charge.tg >= 0 ? W.pl[charge.tg] : null; if (!q || q.o) return;
+      const held = (performance.now() - charge.t0) / 1000 * SPD();
+      const pw = held < TAP_T ? 0 : clamp((held - TAP_T) / CHG_T, 0, 1);
+      // power ring around me
+      const x = SX(p.x), y = SY(p.y) - lay.s * 0.5;
+      ctx.save();
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(16,12,22,.6)'; ctx.beginPath(); ctx.arc(x, y, lay.s * 1.3, 0, 7); ctx.stroke();
+      ctx.strokeStyle = pw >= 1 ? '#ee6a55' : '#ffd27a'; ctx.beginPath(); ctx.arc(x, y, lay.s * 1.3, -Math.PI / 2, -Math.PI / 2 + pw * 6.283); ctx.stroke();
+      // the flight path the throw would take right now (same aim + curve physics as the real throw) + reticle on the target
+      const tx = SX(q.x), ty = SY(q.y) - lay.s * 0.6, fk = !!charge.fk, sp = charge.sp || 0;
+      const pb = AIMB; planThrow(W, p, pb, q, pw, 0, 0, 0.85, 0.6, held >= TAP_T ? sp : 0, 0);
+      const reach = hyp(q.x - p.x, q.y - p.y) + 1.2;
+      ctx.setLineDash([5, 6]); ctx.lineDashOffset = -now / 40; ctx.strokeStyle = fk ? 'rgba(191,227,255,.45)' : sp ? 'rgba(191,227,255,.85)' : 'rgba(255,210,122,.75)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(SX(pb.x), SY(pb.y) - ZH(pb.z));
+      for (let k = 0, dd = 0; k < 60 && pb.z > 0 && dd < reach; k++) {
+        const h = 0.025;
+        if (W.mp.wind) pb.vx += W.wind * h;
+        if (pb.sp) curveStep(pb, h);
+        pb.x += pb.vx * h; pb.y += pb.vy * h; pb.z += pb.vz * h; pb.vz -= G * h;
+        dd = hyp(pb.x - p.x, pb.y - p.y);
+        ctx.lineTo(SX(pb.x), SY(pb.y) - ZH(Math.max(0, pb.z)));
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+      const rr_ = lay.s * 0.95;
+      ctx.strokeStyle = fk ? 'rgba(191,227,255,.6)' : '#ffd27a'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(tx, ty, rr_, 0, 7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(tx - rr_ * 1.5, ty); ctx.lineTo(tx - rr_ * 0.5, ty); ctx.moveTo(tx + rr_ * 0.5, ty); ctx.lineTo(tx + rr_ * 1.5, ty); ctx.moveTo(tx, ty - rr_ * 1.5); ctx.lineTo(tx, ty - rr_ * 0.5); ctx.moveTo(tx, ty + rr_ * 0.5); ctx.lineTo(tx, ty + rr_ * 1.5); ctx.stroke();
+      const lab = fk ? '떼면 속임' : (pw >= 1 ? '최대!' : pw > 0 ? '세게' : '빠르게') + (sp && held >= TAP_T ? ' · 커브' : '') + (p.ctr > 0 ? ' · 반격' : '');
+      txt(lab, x, y - lay.s * 1.3 - 10, fk ? '#bfe3ff' : pw >= 1 ? '#ee6a55' : '#ffd27a', '800 12px ' + FONT, 'center', 3);
+      ctx.restore();
+    }
+    function drawCatchRing() {
+      const p = myP(); if (!p || p.o || !ctrlOn()) return;
+      const th = myThreat(); if (!th) return;
+      const x = SX(p.x), y = SY(p.y) - lay.s * 0.5, r0 = lay.s * 0.95;
+      const best = catchWin(th.b) * 0.45, r = r0 + Math.max(0, th.t - best) * lay.s * 5;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,210,122,.95)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, r0, 0, 7); ctx.stroke();
+      ctx.strokeStyle = th.t - best < 0.06 ? '#7cdc8a' : '#ffffff'; ctx.lineWidth = 2.5; ctx.globalAlpha = 0.9; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke();
+      ctx.restore();
+    }
+    const dl = [];
+    function drawWorld(now) {
+      const s = lay.s, M = lay.M + 0.6;
+      ctx.save(); ctx.translate(SX(0), SY(0)); if (flip) ctx.rotate(Math.PI);
+      ctx.drawImage(bgCv, -(W.aw + M) * s, -(W.ah + M) * s, 2 * (W.aw + M) * s, 2 * (W.ah + M) * s);
+      ctx.restore();
+      for (const r of rings) {
+        const k = r.t / r.life, rad = (r.r0 + (r.r1 - r.r0) * k) * s;
+        ctx.beginPath(); ctx.ellipse(SX(r.x), SY(r.y), rad, rad * 0.6, 0, 0, 7);
+        ctx.strokeStyle = hexA(r.c, 0.85 * (1 - k)); ctx.lineWidth = 2.5; ctx.stroke();
+      }
+      for (const b of W.balls) if (b.h < 0) drawBallShadow(b);
+      for (const tr of trails) { const k = tr.t / 0.22; ctx.fillStyle = hexA(tr.pw ? '#ffd27a' : tr.c, 0.35 * (1 - k)); ctx.beginPath(); ctx.arc(SX(tr.x), SY(tr.y) - ZH(tr.z), Math.max(2, BR * s * (1.1 - k * 0.6)), 0, 7); ctx.fill(); }
+      const list = dl; list.length = 0;
+      for (const p of W.pl) list.push({ y: VY(vis[p.i].y), t: 0, p });
+      for (const b of W.balls) list.push({ y: VY(b.y) + (b.h >= 0 ? 0.05 : 0), t: 1, b });
+      list.sort((a, b) => a.y - b.y);
+      for (const it of list) { if (it.t === 0) drawPlayer(it.p, now); else drawBall(it.b); }
+      for (const q of parts) { const k = q.t / q.life; ctx.globalAlpha = Math.max(0, 1 - k); ctx.fillStyle = q.c; ctx.beginPath(); ctx.arc(SX(q.x), SY(q.y) - ZH(q.z), Math.max(1, q.r * s), 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+      drawCatchRing();
+      drawAim(now);
+      for (const f of floats) {
+        const k = f.t / f.life, x = SX(f.x), y = SY(f.y) - ZH(f.z) - 8 - k * 20;
+        ctx.save(); ctx.globalAlpha = Math.min(1, (1 - k) * 2.2);
+        txt(f.txt, x, y, f.c, '800 14px ' + FONT, 'center', 3.5);
+        ctx.restore();
+      }
+    }
+    function drawStick() {
+      if (!ctrlOn()) return;
+      const sd = 20 + STICK_R, bx = stick ? stick.bx : sd, by = stick ? stick.by : cv.h - sd;
+      ctx.save();
+      ctx.globalAlpha = stick ? 0.9 : 0.5;
+      ctx.beginPath(); ctx.arc(bx, by, STICK_R, 0, 7); ctx.fillStyle = 'rgba(16,12,24,.45)'; ctx.fill();
+      ctx.strokeStyle = 'rgba(242,233,216,.45)'; ctx.lineWidth = 2; ctx.stroke();
+      let kx = bx, ky = by;
+      if (stick) { const dx = stick.x - bx, dy = stick.y - by, d = hyp(dx, dy), m = Math.min(d, STICK_R); if (d > 0) { kx = bx + dx / d * m; ky = by + dy / d * m; } }
+      ctx.beginPath(); ctx.arc(kx, ky, Math.round(22 * KC()), 0, 7); ctx.fillStyle = stick ? '#e3ae45' : 'rgba(242,233,216,.6)'; ctx.fill();
+      if (!stick) txt('이동', kx, ky + 0.5, '#2a1d05', '700 12px ' + FONT);
+      ctx.restore();
+    }
+    function fmt(t) { t = Math.max(0, Math.ceil(t)); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); }
+    function drawHud(now) {
+      const w = cv.w, mt = myTeam(), y0 = 5, ch = 36, cw = Math.min(150, (w - 12 - 70) / 2);
+      const teamLab = (t) => (ctrlOn() ? (t === mt ? '우리 팀' : '상대 팀') : TEAM_NM[t]);
+      for (let side = 0; side < 2; side++) {
+        const t = side === 0 ? mt : 1 - mt, x = side === 0 ? 6 : w - 6 - cw;
+        ctx.save();
+        rr(ctx, x, y0, cw, ch, 10); ctx.fillStyle = 'rgba(23,19,31,.86)'; ctx.fill();
+        ctx.strokeStyle = TC[t]; ctx.lineWidth = 1.6; ctx.stroke();
+        ctx.beginPath(); ctx.arc(x + 11, y0 + 11, 5, 0, 7); ctx.fillStyle = TC[t]; ctx.fill();
+        txt(teamLab(t), x + 20, y0 + 11.5, '#f2e9d8', '700 11px ' + FONT, 'left');
+        let stars = ''; for (let k = 0; k < st.need; k++) stars += k < st.wins[t] ? '★' : '☆';
+        txt(stars, x + cw - 7, y0 + 11.5, '#e3ae45', '700 11px ' + FONT, 'right');
+        // inner players: filled dots; outfield: hollow
+        const mem = W.pl.filter((p) => p.t === t), dr = Math.min(5, (cw - 20) / (mem.length * 2.6));
+        mem.sort((a, b) => a.o - b.o).forEach((p, k) => {
+          const cx = x + 12 + k * dr * 2.7, cy = y0 + 26;
+          ctx.beginPath(); ctx.arc(cx, cy, dr, 0, 7);
+          if (!p.o) { ctx.fillStyle = TC[t]; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke(); }
+          else { ctx.strokeStyle = 'rgba(242,233,216,.4)'; ctx.lineWidth = 1.3; ctx.stroke(); }
+        });
+        txt('내야 ' + innerCount(W, t), x + cw - 7, y0 + 26, '#f2e9d8', '700 11px ' + FONT, 'right');
+        ctx.restore();
+      }
+      // clock
+      const ot = W.ot, left = ot ? W.rt + OT_T - W.t : W.rt - W.t;
+      const lab = phase === 'count' ? st.rd + '판' : (ot ? '승부 ' : '') + fmt(phase === 'play' || phase === 'end' ? left : W.rt);
+      const tw = 62, tx = (w - tw) / 2, low = phase === 'play' && left < 10;
+      rr(ctx, tx, y0 + 4, tw, 28, 14); ctx.fillStyle = ot ? '#ee6a55' : 'rgba(23,19,31,.86)'; ctx.fill();
+      txt(lab, w / 2, y0 + 18.5, ot ? '#fff' : low && Math.floor(now / 300) % 2 ? '#ee6a55' : '#e3ae45', '700 13px ' + MONO);
+      // court name + wind
+      let sub = MAPS[st.mk].nm;
+      if (W.mp.wind) { const wv = flip ? -W.wind : W.wind; sub += '  ' + (wv > 0 ? '바람 →' : '← 바람') + (Math.abs(wv) > 2.2 ? '!' : ''); }
+      txt(sub, w / 2, y0 + ch + 7, W.mp.wind ? '#bfe3ff' : 'rgba(242,233,216,.6)', '700 10px ' + FONT, 'center', 3);
+    }
+    function smallBanner(t1, sub, col, y) { // 작은 반투명 알림 띠(글씨 20px)
+      ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '20px ' + DISP; let bw = ctx.measureText(t1).width;
+      if (sub) { ctx.font = '700 12px ' + FONT; bw = Math.max(bw, ctx.measureText(sub).width); }
+      bw = Math.min(cv.w - 16, bw + 28); const bh = sub ? 46 : 30;
+      rr(ctx, (cv.w - bw) / 2, y, bw, bh, 12); ctx.fillStyle = 'rgba(16,12,22,.5)'; ctx.fill();
+      ctx.font = '20px ' + DISP; ctx.fillStyle = col; ctx.fillText(t1, cv.w / 2, y + 15.5, bw - 12);
+      if (sub) { ctx.font = '700 12px ' + FONT; ctx.fillStyle = '#f2e9d8'; ctx.fillText(sub, cv.w / 2, y + 34, bw - 12); }
+      ctx.restore();
+    }
+    function centerText(t1, sub, col, scale, cy) {
+      ctx.save(); ctx.translate(cv.w / 2, cy); ctx.scale(scale, scale);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '46px ' + DISP; ctx.lineWidth = 7; ctx.strokeStyle = 'rgba(16,12,22,.85)'; ctx.lineJoin = 'round'; ctx.strokeText(t1, 0, 0);
+      ctx.fillStyle = col; ctx.fillText(t1, 0, 0);
+      if (sub) { ctx.font = '700 15px ' + FONT; ctx.lineWidth = 4.5; ctx.strokeText(sub, 0, 38); ctx.fillStyle = '#f2e9d8'; ctx.fillText(sub, 0, 38); }
+      ctx.restore();
+    }
+    function drawBanners() {
+      const cy = TOPH + (cv.h - TOPH - lay.bot) * 0.36;
+      const mt = myTeam();
+      if (phase === 'count') {
+        const n = Math.ceil(cd), mp = MAPS[st.mk];
+        if (n <= 3) centerText(String(n), tipT > 0 ? null : st.rd + '판 · ' + mp.nm + ' · ' + mp.d, '#f2e9d8', 1 + (cd % 1) * 0.3, cy);
+        else centerText(st.rd + '판 · ' + mp.nm, mp.d, '#ffd27a', 0.8, cy);
+      } else if (phase === 'play' && startT > 0) {
+        ctx.save(); ctx.globalAlpha = Math.min(0.92, startT * 2); smallBanner('피구 시작!', null, '#e3ae45', TOPH + 36); ctx.restore();
+      } else if (phase === 'end' && (st.ph === 'end' || st.ph === 'done')) {
+        const rw = st.rw, mine = ctrlOn() && rw === mt;
+        const why = st.why === 'time' ? '시간 끝 · 내야에 많이 남은 팀 승리' : st.why === 'sd' ? '한 명 승부에서 먼저 맞혔어요' : rw >= 0 ? '상대 내야를 모두 아웃!' : '';
+        if (st.ph === 'done') centerText('경기 끝!', null, '#e3ae45', 0.9, cy);
+        else centerText(rw >= 0 ? (ctrlOn() ? (mine ? '이번 판 승리!' : '이번 판 패배') : TEAM_NM[rw] + ' 승리') : '무승부', why, rw >= 0 ? TC[rw] : '#f2e9d8', 0.75, cy);
+      }
+      if (banner && phase === 'play') { ctx.save(); ctx.globalAlpha = Math.min(0.92, banner.life * 2); smallBanner(banner.t, banner.sub, banner.c, TOPH + 36); ctx.restore(); } // 알림은 위쪽에 작게(판을 가리지 않게)
+      if (tipT > 0 && ctrlOn()) {
+        const pc = !!window.LOUNGE_DESKTOP || (window.matchMedia && matchMedia('(pointer:fine)').matches);
+        const lines = ['왼쪽 엄지: 끌어서 달리기', '공을 들면 「던지기」 톡=빠르게 · 꾹=세게', '꾹 하면서 옆으로 밀면 커브', '꾹 누른 채 버튼 밖에서 떼면 속임', '고리가 작아질 때 「잡기」 → 바로 던지면 반격', '「피하기」: 높은 공은 숙이고 낮은 공은 폴짝', '「패스」 톡=낮고 빠르게 · 꾹=높게', '나를 톡 = 「공 줘」 · 외야에서 맞히면 부활'];
+        if (pc) lines.push('PC: 스페이스 던지기 · Shift 피하기/패스 · F 속임 · E 공 줘');
+        ctx.save(); ctx.globalAlpha = Math.min(1, tipT * 2);
+        ctx.font = '600 13px ' + FONT;
+        let mw = 0; for (const l of lines) mw = Math.max(mw, ctx.measureText(l).width);
+        const bw = Math.min(cv.w - 16, mw + 26), bh = lines.length * 21 + 14, bx = (cv.w - bw) / 2, by = Math.min(cv.h - lay.bot - bh - 4, cy + 58);
+        rr(ctx, bx, by, bw, bh, 14); ctx.fillStyle = 'rgba(20,16,30,.92)'; ctx.fill(); ctx.strokeStyle = 'rgba(227,174,69,.6)'; ctx.lineWidth = 1.2; ctx.stroke();
+        lines.forEach((l, k) => { ctx.font = '600 13px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = k === 0 ? '#ffd27a' : '#f2e9d8'; ctx.fillText(l, cv.w / 2, by + 17 + k * 21, bw - 12); });
+        ctx.restore();
+      }
+      // small hint for my state
+      const p = myP();
+      if (p && ctrlOn() && phase === 'play' && !tipT && !banner) {
+        let h = '';
+        const mateHas = !holding(W, p) && W.balls.some((b) => b.h >= 0 && b.h !== p.i && W.pl[b.h].t === p.t);
+        if (p.o) h = holding(W, p) ? '외야에서 맞히면 다시 내야로!' : mateHas ? '나를 톡 누르면 「공 줘」' : '외야: 공을 주워 상대를 맞혀요';
+        else if (holding(W, p) && p.hT >= HOLD_WARN) h = '8초 안에 던져요!';
+        if (h) { ctx.save(); ctx.font = '700 12px ' + FONT; const tw = ctx.measureText(h).width + 20, hx = cv.w / 2, hy = cv.h - lay.bot - 14; rr(ctx, hx - tw / 2, hy - 11, tw, 22, 11); ctx.fillStyle = 'rgba(20,16,30,.85)'; ctx.fill(); txt(h, hx, hy + 0.5, '#f2e9d8', '700 12px ' + FONT); ctx.restore(); }
+      }
+    }
+    let lastDraw = 0;
+    function draw(now) {
+      if (!lay || !W || !bgCv) return;
+      lastDraw = now;
+      cv.clear();
+      ctx.fillStyle = (FLOOR[W.mp.id] || FLOOR.gym).out; ctx.fillRect(0, 0, cv.w, cv.h);
+      const sx = shake > 0 ? (Math.random() - 0.5) * shake * 7 * L.fx() : 0, sy = shake > 0 ? (Math.random() - 0.5) * shake * 7 * L.fx() : 0;
+      ctx.save(); ctx.translate(sx, sy);
+      drawWorld(now);
+      ctx.restore();
+      drawHud(now);
+      drawStick();
+      drawBanners();
+      for (const c of conf) { ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.rot); ctx.globalAlpha = Math.min(1, (c.life - c.t) * 2); ctx.fillStyle = c.c; ctx.fillRect(-4, -2.2, 8, 4.4); ctx.restore(); }
+    }
+
+    const stopLoop = U.loop((rdt, now) => {
+      const n = Math.min(12, Math.max(1, Math.ceil(rdt * SPD() * 30)));
+      try { for (let i = 0; i < n; i++) frame(rdt / n, now); syncBtns(); } catch (e) { console.error(e); }
+      try { draw(now); } catch (e) { console.error(e); }
+    });
+
+    function celebrate(next) {
+      const rw = next.rw, mt = myTeam();
+      if (rw === 0 || rw === 1) {
+        const mine = ctrlOn() && rw === mt;
+        api.sfx(!ctrlOn() || mine ? 'win' : 'lose');
+        if (mine) api.buzz(50);
+        for (let i = 0; i < 60; i++) conf.push({ x: cv.w * (0.2 + Math.random() * 0.6), y: TOPH + 60, vx: (Math.random() - 0.5) * 380, vy: -100 - Math.random() * 300, rot: Math.random() * 7, vr: (Math.random() - 0.5) * 14, c: [TC[rw], '#ffffff', '#e3ae45'][i % 3], t: 0, life: 1.5 + Math.random() * 0.8 });
+      } else api.sfx('tick');
+    }
+
+    return {
+      update(next) {
+        if (!next) return;
+        const prev = st;
+        st = next;
+        if (curKey() !== key) { startRound(); return; }
+        if (prev && prev.ph !== next.ph) {
+          if (next.ph === 'play' && phase === 'count') { phase = 'play'; sfx('pop'); startT = 0.9; }
+          if (next.ph === 'end') { phase = 'end'; endT = END_T; charge = null; celebrate(next); }
+        }
+        if (W && next.ph === 'done') phase = 'end';
+      },
+      destroy() {
+        stopLoop();
+        if (offIn) offIn();
+        window.removeEventListener('blur', releaseAll); window.removeEventListener('lounge-ctl', onCtl);
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        for (const k in btn) btn[k].remove();
+        styleEl.remove();
+        cv.destroy();
+      },
+      _dbg: () => ({ W, st, lay, flip, charge, locIn, remIn, phase }),
+    };
+  }
+
+  /* ---------- small drawing helpers ---------- */
+  function rr(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+  function rrc(c, x, y, w, h, r) { rr(c, x, y, w, h, r); }
+  function hexA(hex, a) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return 'rgba(255,255,255,' + a + ')';
+    const n = parseInt(m[1], 16);
+    return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  }
+  function shade(hex, k) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    const f = (c) => Math.round(k >= 0 ? c + (255 - c) * k : c * (1 + k));
+    return 'rgb(' + f(n >> 16) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  L.register({
+    id: 'dodgeball', name: '피구 4:4', tag: '실시간 팀 피구', cat: '스포츠',
+    blurb: '공을 던져 상대 내야를 맞히면 아웃! 맞은 사람은 외야로 가고, 외야에서 맞히면 다시 들어와요. 타이밍 맞춰 「잡기」, 휙 「피하기」, 커브·속임·반격, 외야로 「패스」. 최대 8명 팀전(빈자리는 봇).',
+    tint: '#8a2f2a',
+    icon: '<rect x="6" y="5" width="44" height="46" rx="3" fill="none" stroke="currentColor" stroke-width="3"/><path d="M6 28h44" stroke="currentColor" stroke-width="3"/><circle cx="34" cy="17" r="7" fill="currentColor"/><path d="M28 15q6 3 12 0" fill="none" stroke="#8a2f2a" stroke-width="1.6"/><circle cx="18" cy="38" r="4" fill="currentColor"/><path d="M18 42v5M14 45h8" stroke="currentColor" stroke-width="2.5"/><path d="M24 34q4-6 6-11" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="2.5 2.5"/>',
+    minPlayers: 2, maxPlayers: 8, defaultPlayers: 8, hidden: false, realtime: true, aiDelay: 0,
+    maxPlayersIf: (o) => 2 * ([2, 3, 4].includes(+(o && o.ts)) ? +o.ts : 4),
+    options: [
+      { id: 'ts', label: '팀 인원', tip: '한 팀 인원. 빈자리는 AI.', choices: [{ v: 4, label: '4:4' }, { v: 3, label: '3:3' }, { v: 2, label: '2:2' }], def: 4 },
+      { id: 'map', label: '코트', tip: '코트 모양·바닥. 「공 두 개」는 공이 2개.', choices: [{ v: -1, label: '무작위' }].concat(MAPS.map((m, i) => ({ v: i, label: m.nm }))), def: -1 },
+      { id: 'need', label: '경기', choices: [{ v: 1, label: '1판' }, { v: 2, label: '3판 2선승' }, { v: 3, label: '5판 3선승' }], def: 2 },
+      { id: 'time', label: '한 판 시간', choices: [{ v: 90, label: '1분 30초' }, { v: 120, label: '2분' }, { v: 180, label: '3분' }], def: 120 },
+    ],
+    controls: [
+      { id: 'up', label: '위로 달리기', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '아래로 달리기', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'left', label: '왼쪽으로 달리기', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '오른쪽으로 달리기', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'main', label: '던지기(톡/꾹) · 잡기', keys: ['Space', 'KeyJ'], pad: ['a', 'rt'] },
+      { id: 'sub', label: '피하기 · 패스(톡=낮게, 꾹=높게)', keys: ['ShiftLeft', 'KeyK'], pad: ['b', 'lt'] },
+      { id: 'target', label: '노릴 상대 바꾸기', keys: ['KeyR', 'KeyU'], pad: ['y', 'rb'] },
+      { id: 'fake', label: '속임 동작(공 들었을 때)', keys: ['KeyF', 'KeyL'], pad: ['lb'] },
+      { id: 'call', label: '「공 줘」 부르기', keys: ['KeyE', 'KeyI'], pad: ['x'] },
+    ],
+    quick: [
+      '공을 던져 상대 내야 사람을 맞히면 아웃! 상대 내야를 모두 아웃시키면 그 판 승리.',
+      '공을 들면 「던지기」(톡=빠르게, 꾹=세게, 꾹 하며 옆으로 밀면 커브). 날아오는 공은 고리가 작아질 때 「잡기」, 아니면 「피하기」.',
+      '맞으면 외야로 나가요. 외야에서 상대를 맞히면 다시 내야로 들어와요!',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '두 팀이 가운데 선을 사이에 두고 하는 피구예요. 공으로 상대 내야(안쪽 코트)에 있는 사람을 맞혀요.',
+        '공이 땅에 닿기 전에 몸에 맞으면 「아웃」 → 외야로 나가요. 상대 내야를 모두 외야로 보내면 그 판 승리!',
+        '기본은 3판 2선승. 팀 인원(2:2·3:3·4:4)과 판 수는 설정에서 바꿔요.',
+      ] },
+      { h: '코트: 내야와 외야', p: [
+        '내야: 우리 팀 쪽 안쪽 코트(화면 아래쪽). 가운데 선은 넘어갈 수 없어요.',
+        '외야: 상대 코트를 둘러싼 바깥(상대 뒤쪽과 양옆). 외야에 있는 사람은 맞아도 아웃이 아니에요.',
+        '3:3·4:4는 처음에 팀마다 1명이 외야에서 시작해요(가능하면 봇). 2:2는 모두 내야에서 시작해요. 시작할 때 공은 한 팀이 갖고(판마다 번갈아), 「공 두 개」 코트는 두 팀이 하나씩 가져요.',
+      ] },
+      { h: '조작 (터치)', p: [
+        '왼쪽 엄지: 화면 왼쪽을 누르고 끌면 그 방향으로 달려요(누른 곳이 조이스틱 중심).',
+        '「던지기」(공을 들었을 때): 톡 누르면 가장 가까운 상대에게 빠른 공. 꾹 누르고 있으면 고리가 차면서 세지고, 떼면 던져요. 누르는 순간 이동 방향 쪽에 있는 상대를 노려요.',
+        '커브: 꾹 누르는 동안 이동(조이스틱)을 옆으로 밀면 공이 그쪽으로 휘어요. 점선이 공이 날아갈 길이에요. 앞을 막은 우리 편을 돌아서 맞힐 수 있고, 휘는 공은 조금 잡기 어려워요.',
+        '속임: 꾹 누른 채 손가락을 「던지기」 버튼 밖으로 빼서 떼면 던지지 않고 공을 그대로 들고 있어요. 코트를 눌러 꾹 했을 땐 손가락을 멀리 끌고 가서 떼요. 속는 상대는 헛손질하거나 괜히 피해요.',
+        '화면 오른쪽 코트를 누르면 그 근처 상대를 노려서 던져요(마우스도 같아요). 조금 끌면 노릴 상대가 바뀌어요. 공이 없을 땐 「잡기」와 같아요.',
+        '「잡기」(공이 없을 때): 날아오는 공이 보이면 내 주위에 흰 고리가 줄어들어요. 고리가 노란 원에 닿을 때 누르면 잡아요! 너무 일찍 누르면 헛손질(잠깐 못 잡음). 발밑으로 오는 낮은 공은 조금 더 어려워요.',
+        '「피하기」: 휙 옆으로 빠르게 움직여요(1초쯤 쉬었다 다시 써요). 높게 오는 공이면 저절로 몸을 숙이고, 낮게 오는 공이면 저절로 폴짝 뛰어요.',
+        '「패스」(공을 들었을 때 「피하기」 자리): 톡 = 낮고 빠른 패스(빨리 가지만 가는 길에 있는 상대가 가로챌 수 있어요), 꾹 = 높은 패스(느리지만 안전해요). 외야 친구에게 주면 뒤에서 공격!',
+        '「공 줘」: 공이 없을 때 내 캐릭터를 톡 누르면 머리 위에 「공 줘!」 말풍선이 떠요. 우리 팀(봇도)이 보고, 내가 맞히기 좋은 자리면 패스해 줘요.',
+        'PC: WASD·방향키 이동, 스페이스·J 던지기/잡기, 왼 Shift·K 피하기/패스, R·U 노릴 상대 바꾸기, F·L 속임, E·I 공 줘. 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '아웃과 부활', p: [
+        '맞은 사람은 바로 우리 팀 외야(상대 코트 뒤)로 나가요.',
+        '외야에서 던진 공으로 상대를 맞히면, 던진 사람이 다시 우리 내야로 들어와요(부활!).',
+        '세게 던진 공(꾹)은 빠르고 잡기 어려워요. 빠른 공(톡)은 잡기 쉬운 대신 금방 던질 수 있어요.',
+        '반격: 공을 잡고 0.6초 안에 던지면 공이 조금 더 빨라요(주황 고리와 「반격!」이 떠요).',
+        '공은 한 번에 한 명만 아웃시켜요. 땅·벽에 먼저 닿은 공, 같은 팀이 던진 공, 패스는 아웃이 아니에요.',
+      ] },
+      { h: '공 줍기 · 시간', p: [
+        '땅에 떨어진 공은 그 자리 주인이 주워요: 우리 내야에 떨어지면 우리 내야, 우리 외야에 떨어지면 우리 외야 사람이.',
+        '아무도 못 줍는 곳에 멈추면 심판이 그 자리 팀에게 공을 넘겨줘요.',
+        '공을 8초 넘게 들고 있으면 자동으로 던져요(5초부터 숫자가 떠요).',
+        '한 판은 2분(설정). 시간이 끝나면 내야에 더 많이 남은 팀이 이겨요. 같으면 「한 명 승부」 30초: 먼저 맞히는 팀이 이겨요(그래도 못 맞히면 무승부).',
+      ] },
+      { h: '코트 (기본은 판마다 무작위)', p: [
+        '체육관: 기본 코트. 모래사장: 공이 덜 튀고 발이 조금 무거워요. 눈밭: 미끄러워서 멈추기 어려워요.',
+        '지붕 옥상: 바람이 공을 옆으로 밀어요(위쪽에 바람 방향 표시). 공 두 개: 두 팀이 공을 하나씩 들고 시작해요. 좁은 강당: 코트가 작아 공이 금방 와요.',
+      ] },
+      { h: '예시', p: [
+        '상대가 공을 들고 가운데 선으로 다가와요 → 뒤로 물러나 거리를 벌리고, 공이 날아오면 고리를 보고 「잡기」! 자신 없으면 「피하기」.',
+        '내가 공을 들었는데 상대가 멀어요 → 「패스」로 상대 뒤의 외야 친구에게! 외야 친구가 등 뒤에서 맞히면 친구가 부활해요.',
+        '내가 아웃돼서 외야로 나갔어요 → 실망 말고 상대 뒤에 서서 나를 톡(「공 줘」). 한 명 맞히면 다시 들어가요.',
+        '상대가 공을 잡으려고 자꾸 일찍 손을 내밀어요 → 꾹 누르고 버튼 밖에서 떼서 속인 다음, 헛손질한 틈에 바로 던져요.',
+      ] },
+      { h: '함께 하기 · AI', p: [
+        '한 폰에는 한 명만: 혼자 하면 나머지는 AI예요. 친구와는 온라인·LAN 방에서 각자 폰으로(최대 8명). 사람은 1·3·5·7번 빨강 팀, 2·4·6·8번 파랑 팀이고, 빈자리는 봇(보통)이 채워요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요. 어려움 AI는 잘 피하고 잘 잡고, 외야 패스로 앞뒤에서 몰아붙이고, 한 사람을 같이 노려요. 하지만 가까이서 세게 던진 공이나 등 뒤 공엔 약해요.',
+        '봇마다 경기마다 버릇이 달라요(잘 잡으려는 봇, 세게 던지는 봇, 패스를 좋아하는 봇, 뒤에서 조심하는 봇…). 판이 지날수록 내가 어느 쪽으로 피하는지, 자주 잡으려 하는지 보고 따라 노려요(보통·어려움). 자주 속이면 덜 속아요.',
+      ] },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { init, newWorld, tickWorld, stepWorld, aiThink, roundOver, nextRound, result, MAPS, AI_DIFF, zoneOf, clampZone, innerCount, holding, threat, doEvent, planThrow, curveStep, habOf, hiOf, loOf },
+  });
+})();

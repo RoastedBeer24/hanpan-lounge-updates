@@ -1,0 +1,1235 @@
+/* 지렁이 대전 — realtime slither-style survival (2–6, one player per phone).
+   Host-authoritative: the host (or the local phone) simulates every worm, food and collision.
+   Guests publish their steering; the host sends compact snapshots (~15 Hz: head + quantised segment deltas,
+   food generations as one char per slot, drops packed in base36). Guests interpolate other worms and
+   predict their own worm locally, reconciled against the host's head position. Rounds via api.setState. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ======================= engine (pure, node-testable) ======================= */
+  const SP = 4;                 // trail point spacing (units)
+  const V0 = 100, VB = 185;     // speed, boost speed (units/s)
+  const LEN0 = 90, LMIN = 50;   // start length, min length to boost
+  const BCOST = 26;             // length burnt per second while boosting
+  const FOODV = 4;              // length per food pellet
+  const COUNT = 3, END_T = 2.6, ROUND_CAP = 150, TIME_LEN = 120, RESPAWN = 3, SHRINK_AT = 25, SHRINK_DUR = 70;
+  const NET_PTS = 40;           // max body samples per worm in a snapshot
+  const ALPH = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_';
+  const TEAMC = [['#e8574a', '#f29a5a', '#d6457e'], ['#4a8fe8', '#52c9e0', '#8a72ec']], TEAMN = ['빨강 팀', '파랑 팀'];
+  const ally = (W, a, b) => !!(W && W.tm && a >= 0 && b >= 0 && a !== b && W.tm[a] === W.tm[b]); // 팀전: same side
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const wrapA = (a) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
+
+  function hash32(a, b, c) {
+    let h = (Math.imul(a | 0, 0x9E3779B1) ^ Math.imul((b | 0) + 0x632BE5AB, 0x85EBCA77) ^ Math.imul((c | 0) + 0x27D4EB2F, 0xC2B2AE3D)) >>> 0;
+    h ^= h >>> 16; h = Math.imul(h, 0x7feb352d) >>> 0; h ^= h >>> 15; h = Math.imul(h, 0x846ca68b) >>> 0; h ^= h >>> 16;
+    return h >>> 0;
+  }
+  const arenaR0 = (n) => 300 + 60 * n;
+  const nFood = (n) => Math.min(160, 30 + 22 * n);
+  const radOf = (len) => 5.5 + Math.sqrt(Math.max(0, len)) * 0.22;
+  const turnOf = (len) => 3.4 - Math.min(1.1, len / 900);
+  function foodPos(seed, i, g, R0) {
+    const gg = g % 63;
+    const h1 = hash32(seed, i, gg), h2 = hash32(seed ^ 0x5bd1e995, i + 77, gg + 3);
+    const r = Math.sqrt(h1 / 4294967296) * R0 * 0.94, an = (h2 / 4294967296) * Math.PI * 2;
+    return { x: Math.cos(an) * r, y: Math.sin(an) * r };
+  }
+  function spawnPose(seed, n, s, R0) {
+    const off = (hash32(seed, 991, 5) / 4294967296) * Math.PI * 2;
+    const an = off + (s / n) * Math.PI * 2;
+    const rr = R0 * 0.6;
+    return { x: Math.cos(an) * rr, y: Math.sin(an) * rr, a: wrapA(an + Math.PI + 0.75) };
+  }
+  function makeWorm(seat, x, y, a, len) {
+    const w = { seat, alive: true, x, y, a, len, tr: [], st: 0, tgt: null, bo: false, boosting: false, bacc: 0, kills: 0, dt: 0, best: len };
+    const n = Math.ceil(len / SP);
+    for (let i = 1; i <= n; i++) w.tr.push(x - Math.cos(a) * SP * i, y - Math.sin(a) * SP * i);
+    return w;
+  }
+  /* opts: {m:'r'|'t', sh:0|1} */
+  function newWorld(seed, n, opts) {
+    const o = opts || {};
+    const R0 = arenaR0(n);
+    const W = { seed: seed >>> 0, n, R0, R: R0, t: 0, m: o.m === 't' ? 't' : 'r', sh: o.sh ? 1 : 0, foods: [], drops: [], worms: [], fchk: 0 };
+    for (let i = 0; i < nFood(n); i++) { const p = foodPos(W.seed, i, 0, R0); W.foods.push({ g: 0, x: p.x, y: p.y, on: true }); }
+    for (let s = 0; s < n; s++) { const p = spawnPose(W.seed, n, s, R0); W.worms.push(makeWorm(s, p.x, p.y, p.a, LEN0)); }
+    return W;
+  }
+  function arenaR(W) {
+    if (!W.sh) return W.R0;
+    if (W.m === 't') return W.R0 * (1 - 0.45 * clamp(W.t / TIME_LEN, 0, 1));
+    return W.R0 * Math.max(0.3, 1 - 0.7 * clamp((W.t - SHRINK_AT) / SHRINK_DUR, 0, 1));
+  }
+  function advanceTrail(w) {
+    const tr = w.tr;
+    let hx = tr.length ? tr[0] : w.x, hy = tr.length ? tr[1] : w.y;
+    let dx = w.x - hx, dy = w.y - hy, d = Math.hypot(dx, dy);
+    let guard = 0;
+    while (d >= SP && guard++ < 20) {
+      hx += (dx / d) * SP; hy += (dy / d) * SP;
+      tr.unshift(hx, hy);
+      dx = w.x - hx; dy = w.y - hy; d = Math.hypot(dx, dy);
+    }
+    const keep = Math.max(2, Math.ceil(w.len / SP)) * 2;
+    if (tr.length > keep) tr.length = keep;
+  }
+  function respawnFood(W, f, i) {
+    for (let k = 0; k < 6; k++) {
+      f.g = (f.g + 1) % 63;
+      const p = foodPos(W.seed, i, f.g, W.R0);
+      if (Math.hypot(p.x, p.y) < W.R * 0.93) { f.x = p.x; f.y = p.y; f.on = true; return; }
+    }
+    f.on = false;
+  }
+  function addDrop(W, x, y, v, c) {
+    W.drops.push({ x, y, v: clamp(Math.round(v), 1, 35), c });
+    if (W.drops.length > 96) W.drops.splice(0, W.drops.length - 96);
+  }
+  function killWorm(W, w, killer, hooks) {
+    if (!w.alive) return;
+    w.alive = false; w.dt = 0; w.bo = false; w.boosting = false;
+    const total = w.len * 0.6, n = clamp(Math.round(w.len / 16), 4, 30), v = Math.max(1, Math.min(35, Math.round(total / n)));
+    const pts = w.tr.length / 2;
+    for (let k = 0; k < n; k++) {
+      const i = Math.min(pts - 1, Math.floor((k / n) * pts));
+      const px = i >= 0 ? w.tr[i * 2] : w.x, py = i >= 0 ? w.tr[i * 2 + 1] : w.y;
+      const jx = (Math.random() - 0.5) * 8, jy = (Math.random() - 0.5) * 8;
+      if (Math.hypot(px + jx, py + jy) < W.R - 4) addDrop(W, px + jx, py + jy, v, w.seat);
+    }
+    if (killer) killer.kills++;
+    if (hooks && hooks.die) hooks.die(w, killer);
+  }
+  /* one simulation step of h seconds */
+  function stepWorld(W, h, hooks) {
+    W.t += h;
+    W.R = arenaR(W);
+    const live = W.worms.filter((w) => w.alive);
+    for (const w of live) {
+      const tr = turnOf(w.len);
+      if (fin(w.tgt)) { const d = wrapA(w.tgt - w.a); w.a = wrapA(w.a + clamp(d, -tr * h, tr * h)); }
+      else w.a = wrapA(w.a + clamp(w.st || 0, -1, 1) * tr * h);
+      w.boosting = !!w.bo && w.len > LMIN;
+      const v = w.boosting ? VB : V0;
+      w.x += Math.cos(w.a) * v * h; w.y += Math.sin(w.a) * v * h;
+      if (w.boosting) {
+        w.len -= BCOST * h; w.bacc += BCOST * h * 0.55;
+        if (w.bacc >= 4) { w.bacc -= 4; const n = w.tr.length; if (n >= 2) addDrop(W, w.tr[n - 2] + (Math.random() - 0.5) * 4, w.tr[n - 1] + (Math.random() - 0.5) * 4, 4, w.seat); }
+      }
+      advanceTrail(w);
+    }
+    // eating
+    for (const w of live) {
+      const er = radOf(w.len) + 7, er2 = er * er;
+      for (let i = 0; i < W.foods.length; i++) {
+        const f = W.foods[i];
+        if (!f.on) continue;
+        const dx = f.x - w.x, dy = f.y - w.y;
+        if (dx * dx + dy * dy < er2) { w.len += FOODV; respawnFood(W, f, i); if (hooks && hooks.eat) hooks.eat(w, FOODV); }
+      }
+      for (let i = W.drops.length - 1; i >= 0; i--) {
+        const f = W.drops[i], dx = f.x - w.x, dy = f.y - w.y, rr = er + 1 + Math.sqrt(f.v);
+        if (dx * dx + dy * dy < rr * rr) { w.len += f.v; W.drops.splice(i, 1); if (hooks && hooks.eat) hooks.eat(w, f.v); }
+      }
+      if (w.len > w.best) w.best = w.len;
+    }
+    // food outside a shrinking ring moves inside; dormant slots retry
+    W.fchk -= h;
+    if (W.fchk <= 0) {
+      W.fchk = 0.5;
+      W.foods.forEach((f, i) => { if (!f.on || Math.hypot(f.x, f.y) > W.R - 6) respawnFood(W, f, i); });
+      for (let i = W.drops.length - 1; i >= 0; i--) if (Math.hypot(W.drops[i].x, W.drops[i].y) > W.R) W.drops.splice(i, 1);
+    }
+    // collisions
+    const deaths = [];
+    for (const w of live) {
+      const rw = radOf(w.len);
+      if (Math.hypot(w.x, w.y) > W.R - rw * 0.6) { deaths.push([w, null]); continue; }
+      for (const o of live) {
+        if (o === w || ally(W, w.seat, o.seat)) continue; // 팀전: teammates slide over each other
+        const ro = radOf(o.len);
+        const hx = o.x - w.x, hy = o.y - w.y;
+        if (hx * hx + hy * hy < (rw + ro) * (rw + ro) * 0.72) { deaths.push([w, null]); break; } // head on: both go
+        const lim = rw * 0.7 + ro * 0.8, lim2 = lim * lim;
+        const tr = o.tr;
+        let hit = false;
+        // skip quickly when far from the whole body
+        if (hx * hx + hy * hy > (o.len + lim + 10) * (o.len + lim + 10)) continue;
+        for (let i = 0; i < tr.length; i += 2) {
+          const dx = tr[i] - w.x, dy = tr[i + 1] - w.y;
+          if (dx * dx + dy * dy < lim2) { hit = true; break; }
+        }
+        if (hit) { deaths.push([w, o]); break; }
+      }
+    }
+    for (const [w, k] of deaths) killWorm(W, w, k, hooks);
+    return deaths.length;
+  }
+
+  /* ----- AI ----- */
+  const AIC = {
+    1: { rate: 0.3, look: 50, noise: 0.55, blind: 0.35, cut: 0, boost: 0, wall: 50 },
+    2: { rate: 0.12, look: 65, noise: 0.16, blind: 0.1, cut: 0.15, boost: 0.25, wall: 80 },
+    3: { rate: 0.05, look: 150, noise: 0.02, blind: 0, cut: 0.05, boost: 0.5, wall: 110, safe: 1, arc: 1 },
+  };
+  const GC = 30;
+  const gk = (x, y) => (Math.floor(x / GC) + 128) * 512 + (Math.floor(y / GC) + 128);
+  function buildGrid(W) {
+    const g = new Map();
+    const put = (x, y, wi) => { const k = gk(x, y); let a = g.get(k); if (!a) g.set(k, (a = [])); a.push(x, y, wi); };
+    W.worms.forEach((w, wi) => {
+      if (!w.alive) return;
+      put(w.x, w.y, wi);
+      put(w.x + Math.cos(w.a) * 22, w.y + Math.sin(w.a) * 22, wi); // where that head is going
+      for (let i = 0; i < w.tr.length; i += 4) put(w.tr[i], w.tr[i + 1], wi);
+    });
+    return g;
+  }
+  function rayClear(W, w, a, look, grid, hon) {
+    const r = radOf(w.len), me = W.worms.indexOf(w);
+    const ca = Math.cos(a), sa = Math.sin(a);
+    for (let d = 12; d <= look; d += 10) {
+      const px = w.x + ca * d, py = w.y + sa * d;
+      if (Math.hypot(px, py) > W.R - r - 4) return d;
+      if (hon) for (const o of W.worms) { // 보통 이상: don't meet an enemy head where it's heading
+        if (o === w || !o.alive || ally(W, w.seat, o.seat)) continue;
+        const t = d / V0, ox = o.x + Math.cos(o.a) * V0 * t, oy = o.y + Math.sin(o.a) * V0 * t, lim = r + radOf(o.len) + 14;
+        if ((ox - px) * (ox - px) + (oy - py) * (oy - py) < lim * lim) return d;
+      }
+      for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+        const arr = grid.get(gk(px + ox * GC, py + oy * GC));
+        if (!arr) continue;
+        for (let i = 0; i < arr.length; i += 3) {
+          if (arr[i + 2] === me || ally(W, w.seat, W.worms[arr[i + 2]].seat)) continue;
+          const o = W.worms[arr[i + 2]], lim = r + radOf(o.len) + 4;
+          const dx = arr[i] - px, dy = arr[i + 1] - py;
+          if (dx * dx + dy * dy < lim * lim) return d;
+        }
+      }
+    }
+    return look + 30;
+  }
+  /* 어려움: follow the real turning arc toward heading a (not a straight ray) and see how far it gets before a body,
+     an enemy head's projected path or the (shrinking) arena edge — returns distance travelled, or look + 30 if safe */
+  function arcClear(W, w, a, look, grid, v) {
+    const r = radOf(w.len), me = W.worms.indexOf(w), tr = turnOf(w.len), h = 0.05;
+    const fut = { sh: W.sh, m: W.m, R0: W.R0, t: W.t };
+    let x = w.x, y = w.y, ang = w.a, d = 0, t = 0;
+    while (d < look) {
+      const da = wrapA(a - ang); ang = wrapA(ang + clamp(da, -tr * h, tr * h));
+      x += Math.cos(ang) * v * h; y += Math.sin(ang) * v * h; d += v * h; t += h; fut.t = W.t + t;
+      if (Math.hypot(x, y) > arenaR(fut) - r - 6) return d;
+      for (const o of W.worms) { // enemy head keeps going straight
+        if (o === w || !o.alive || ally(W, w.seat, o.seat)) continue;
+        const ox = o.x + Math.cos(o.a) * V0 * t, oy = o.y + Math.sin(o.a) * V0 * t, lim = r + radOf(o.len) + 22;
+        if ((ox - x) * (ox - x) + (oy - y) * (oy - y) < lim * lim) return d;
+      }
+      for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+        const arr = grid.get(gk(x + ox * GC, y + oy * GC));
+        if (!arr) continue;
+        for (let i = 0; i < arr.length; i += 3) {
+          if (arr[i + 2] === me || ally(W, w.seat, W.worms[arr[i + 2]].seat)) continue;
+          const lim = r + radOf(W.worms[arr[i + 2]].len) + 3, dx = arr[i] - x, dy = arr[i + 1] - y;
+          if (dx * dx + dy * dy < lim * lim) return d;
+        }
+      }
+    }
+    return look + 30;
+  }
+  function aiThink(W, w, mem, lv, dt, grid) {
+    if (!w.alive) return;
+    const C = AIC[lv] || AIC[2];
+    mem.t = (mem.t || 0) - dt;
+    if (mem.t > 0) return;
+    mem.t = C.rate * (0.7 + Math.random() * 0.6);
+    const r = radOf(w.len);
+    let goal = null, wantBoost = false;
+    // 어려움: cut across an opponent's path
+    let cutP = C.cut + (W.tm ? 0.15 : 0);
+    if (C.arc && W.m !== 't' && !W.tm) { // 어려움: late in the round, the shorter worm hunts and the longer one just stays alive
+      const top = Math.max(0, ...W.worms.filter((o) => o !== w && o.alive).map((o) => o.len));
+      if (W.t > ROUND_CAP - 45) cutP = w.len > top + 20 ? 0 : 0.9;
+    }
+    if (C.cut && w.len > 110 && Math.random() < cutP) {
+      let bestD = 1e9;
+      for (const o of W.worms) {
+        if (o === w || !o.alive || ally(W, w.seat, o.seat)) continue;
+        // 팀전 포위: an enemy a teammate is already shadowing looks closer (we close the net together)
+        const d = Math.hypot(o.x - w.x, o.y - w.y) - (W.tm && W.worms.some((q) => q !== w && q.alive && ally(W, w.seat, q.seat) && Math.hypot(q.x - o.x, q.y - o.y) < 120) ? 50 : 0);
+        if (d > 180 || d >= bestD) continue;
+        const par = Math.cos(o.a) * Math.cos(w.a) + Math.sin(o.a) * Math.sin(w.a);
+        if (par < 0.2) continue;
+        let ahead = 60 + Math.max(0, d) * 0.5;
+        if (C.icp) { // 어려움: intercept — the point just in front of their head that I reach first
+          ahead = -1;
+          for (let t = 0.2; t <= 2.0; t += 0.1) {
+            const px = o.x + Math.cos(o.a) * V0 * t, py = o.y + Math.sin(o.a) * V0 * t;
+            const m = radOf(o.len) + r + 30;
+            if (Math.hypot(px + Math.cos(o.a) * m - w.x, py + Math.sin(o.a) * m - w.y) < V0 * t * 0.95) { ahead = V0 * t + m; break; }
+          }
+          if (ahead < 0) continue;
+        }
+        const tx = o.x + Math.cos(o.a) * ahead, ty = o.y + Math.sin(o.a) * ahead;
+        if (Math.hypot(tx, ty) > W.R - 40) continue;
+        bestD = d; goal = Math.atan2(ty - w.y, tx - w.x);
+        wantBoost = d < (C.arc ? 90 : 130) && w.len > 150 && Math.random() < C.boost;
+      }
+    }
+    if (goal == null) {
+      let best = 0, bx = 0, by = 0, bv = 0;
+      const consider = (x, y, v) => {
+        const d = Math.hypot(x - w.x, y - w.y);
+        if (d > 280) return;
+        const fr = Math.cos(Math.atan2(y - w.y, x - w.x) - w.a); // prefer food ahead
+        let sc;
+        if (C.arc) { // 어려움: value per second to get there (turning included; food inside my turning circle is out of reach)
+          const da = Math.abs(wrapA(Math.atan2(y - w.y, x - w.x) - w.a)), tr = turnOf(w.len), rc = V0 / tr;
+          if (d < rc * 2 * Math.sin(da) * 0.95) return;
+          sc = v / (d / V0 + da / tr + 0.15);
+          if (mem.fx != null && Math.hypot(x - mem.fx, y - mem.fy) < 2) sc *= 1.25; // stick with the plan
+        } else sc = (v / (d + 30)) * (1.3 + fr * 0.7);
+        if (sc > best) { best = sc; bx = x; by = y; bv = v; }
+      };
+      for (const f of W.foods) if (f.on) consider(f.x, f.y, FOODV);
+      for (const f of W.drops) consider(f.x, f.y, f.v);
+      if (best > 0) {
+        goal = Math.atan2(by - w.y, bx - w.x); mem.fx = bx; mem.fy = by;
+        if (!C.arc && bv >= 8 && Math.hypot(bx - w.x, by - w.y) < 110 && w.len > 120 && Math.random() < C.boost * 0.5) wantBoost = true;
+      } else goal = Math.atan2(-w.y, -w.x) + (Math.random() - 0.5);
+    }
+    if (Math.hypot(w.x, w.y) > W.R - C.wall - r) goal = Math.atan2(-w.y, -w.x);
+    const blind = Math.random() < C.blind;
+    let bestA = w.a, bestS = -1e9, bestClear = 0;
+    const KM = C.arc ? 8 : 5;
+    for (let k = -KM; k <= KM; k++) {
+      const ca = w.a + k * 0.3;
+      const gr = typeof grid === 'function' ? grid() : grid;
+      const clear = blind ? C.look + 30 : C.arc ? Math.min(rayClear(W, w, ca, C.look, gr, 1), arcClear(W, w, ca, C.look, gr, wantBoost ? VB : V0)) : rayClear(W, w, ca, C.look, gr, lv >= 2);
+      let s = clear * (clear > C.look ? 1.6 : 1) - Math.abs(wrapA(ca - goal)) * 30 - Math.abs(k) * 0.5;
+      if (C.safe && clear <= C.look) s -= (C.look - clear) * 1.5 + 200; // 어려움: any safe way beats a risky one
+      if (s > bestS) { bestS = s; bestA = ca; bestClear = clear; }
+    }
+    w.tgt = wrapA(bestA + (Math.random() - 0.5) * 2 * C.noise);
+    w.bo = wantBoost && bestClear > C.look;
+  }
+
+  /* ----- snapshot codec ----- */
+  function b36(n, k) { let s = Math.max(0, Math.round(n)).toString(36); while (s.length < k) s = '0' + s; return s.slice(-k); }
+  function encodeWorm(w) {
+    const al = w.alive ? 1 : 0;
+    const sp = Math.max(12, Math.ceil(w.len / NET_PTS));
+    let str = '';
+    if (w.alive) {
+      const q = sp / 16;
+      let rx = w.x, ry = w.y, px = w.x, py = w.y, acc = 0, next = sp, made = 0;
+      const tr = w.tr;
+      for (let i = 0; i < tr.length && made < NET_PTS; i += 2) {
+        const x = tr[i], y = tr[i + 1], seg = Math.hypot(x - px, y - py);
+        while (seg > 0 && acc + seg >= next && made < NET_PTS) {
+          const k = (next - acc) / seg, sx = px + (x - px) * k, sy = py + (y - py) * k;
+          const vx = clamp(Math.round((sx - rx) / q), -16, 16), vy = clamp(Math.round((sy - ry) / q), -16, 16);
+          rx += vx * q; ry += vy * q;
+          str += ALPH[vx + 16] + ALPH[vy + 16];
+          made++; next += sp;
+        }
+        acc += seg; px = x; py = y;
+        if (next > w.len) break;
+      }
+    }
+    return [al, r1(w.x), r1(w.y), r2(w.a), Math.round(w.len), w.boosting ? 1 : 0, sp, str];
+  }
+  function decodeWorm(a) {
+    if (!Array.isArray(a) || a.length < 8) return null;
+    const w = { alive: a[0] === 1, x: +a[1] || 0, y: +a[2] || 0, a: +a[3] || 0, len: +a[4] || LEN0, boost: a[5] === 1, sp: +a[6] || 12, pts: [] };
+    const q = w.sp / 16, s = String(a[7] || '');
+    let x = w.x, y = w.y;
+    w.pts.push(x, y);
+    for (let i = 0; i + 1 < s.length; i += 2) {
+      const vx = ALPH.indexOf(s[i]) - 16, vy = ALPH.indexOf(s[i + 1]) - 16;
+      x += vx * q; y += vy * q; w.pts.push(x, y);
+    }
+    return w;
+  }
+  const encodeFoods = (W) => W.foods.map((f) => (f.on ? ALPH[f.g % 63] : ALPH[63])).join('');
+  const encodeDrops = (W) => W.drops.map((d) => b36((d.x + 1200) / 2, 2) + b36((d.y + 1200) / 2, 2) + b36(d.v, 1) + b36(d.c, 1)).join('');
+  function decodeDrops(s) {
+    const out = [];
+    s = String(s || '');
+    for (let i = 0; i + 5 < s.length + 0 && i + 6 <= s.length; i += 6) {
+      out.push({ x: parseInt(s.slice(i, i + 2), 36) * 2 - 1200, y: parseInt(s.slice(i + 2, i + 4), 36) * 2 - 1200, v: parseInt(s[i + 4], 36) || 1, c: parseInt(s[i + 5], 36) });
+    }
+    return out;
+  }
+
+  /* ======================= pure game interface ======================= */
+  function init(players, opts) {
+    const o = opts || {};
+    const np = players.length, tm = o.team === 1;
+    const n = tm && np % 2 ? np + 1 : np, nm = players.map((p) => String((p && p.name) || '').slice(0, 10));
+    if (n > np) nm.push('지원 AI'); // odd head count in 팀전: an AI worm evens the teams
+    return {
+      rid: 1 + U.rand(99999), n, np, nm, tm: tm ? Array.from({ length: n }, (_, i) => i % 2) : null, tw: [0, 0],
+      m: o.mode === 't' ? 't' : 'r', b: [1, 3, 5].includes(o.rounds) ? o.rounds : 3, sh: o.shrink === 0 ? 0 : 1,
+      rd: 1, sd: 1 + U.rand(2147483646), ph: 'count', out: [], rw: -1, wins: Array(n).fill(0), res: null,
+    };
+  }
+  /* host / local: round bookkeeping (pure) */
+  function roundOver(s, winner) {
+    const n = Object.assign({}, s, { wins: (s.wins || []).slice(), tw: (s.tw || [0, 0]).slice(), ph: 'end', rw: winner });
+    if (winner >= 0) { if (s.tm) n.tw[winner] = (n.tw[winner] | 0) + 1; else n.wins[winner] = (n.wins[winner] | 0) + 1; } // 팀전: winner = team
+    return n;
+  }
+  function nextRound(s) {
+    const need = Math.floor(s.b / 2) + 1;
+    const wv = s.tm ? s.tw : s.wins;
+    const mx = Math.max(...wv), lead = wv.map((v, i) => (v === mx ? i : -1)).filter((i) => i >= 0);
+    if (mx >= need || (s.rd >= s.b && lead.length === 1)) {
+      const order = wv.map((v, i) => [i, v]).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+      return Object.assign({}, s, { ph: 'done', res: order });
+    }
+    return Object.assign({}, s, { rd: s.rd + 1, sd: 1 + U.rand(2147483646), ph: 'count', out: [], rw: -1 });
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !Array.isArray(s.res) || !s.res.length) return null;
+    const nm = (i) => (s.nm && s.nm[i]) || (i + 1) + '번';
+    const w = s.res[0][0], np = s.np || s.n || s.res.length;
+    const tl = s.tl || {}, col = (a, f) => Array.from({ length: np }, (_, i) => f((Array.isArray(a) ? a[i] : 0) | 0));
+    const stats = [];
+    if (s.m !== 't' && !s.tm) stats.push({ label: '라운드 승', values: col(s.wins, (v) => v + '승') });
+    stats.push({ label: '처치', values: col(tl.k, (v) => v + '마리') }, { label: '최대 길이', values: col(tl.b, String) });
+    if (s.tm) { // res = teams [[team, wins | length sum, kills]]
+      const tie = s.res.length > 1 && s.res[0][1] === s.res[1][1] && (s.m !== 't' || s.res[0][2] === s.res[1][2]);
+      const mem = (t) => s.tm.map((m, i) => (m === t ? nm(i) : null)).filter(Boolean).join(', ');
+      const ln = s.res.map((r) => TEAMN[r[0]] + '  ' + (s.m === 't' ? '길이 합 ' + r[1] + ' · 처치 ' + r[2] : r[1] + '승') + '  (' + mem(r[0]) + ')');
+      stats.unshift({ label: '팀', values: Array.from({ length: np }, (_, i) => TEAMN[s.tm[i]]) });
+      const win = Array.from({ length: np }, (_, i) => i).filter((i) => tie || s.tm[i] === w);
+      return { winners: win, title: tie ? '무승부' : TEAMN[w] + ' 승리!', text: '팀전 · ' + (s.m === 't' ? '시간제 · 팀 길이 합\n' : '라운드 ' + s.rd + '판\n') + ln.join('\n'), stats };
+    }
+    const lines = s.res.map((r, k) => (k + 1) + '위  ' + nm(r[0]) + '  ' + (s.m === 't' ? '길이 ' + r[1] + (r[2] ? ' · 처치 ' + r[2] : '') : r[1] + '승'));
+    return { winners: [w], title: nm(w) + ' 승리!', text: (s.m === 't' ? '시간제 · 가장 긴 지렁이\n' : '라운드 ' + s.rd + '판\n') + lines.join('\n'), stats };
+  }
+  function addTally(s, W) { // result stats: kills summed and longest length over all rounds
+    const n = s.wins ? s.wins.length : W.worms.length, o = s.tl || {}, k = [], b = [];
+    for (let i = 0; i < n; i++) { const w = W.worms.find((x) => x.seat === i); k.push(((o.k && o.k[i]) | 0) + (w ? w.kills | 0 : 0)); b.push(Math.max((o.b && o.b[i]) | 0, w ? Math.round(w.best || 0) : 0)); }
+    return Object.assign({}, s, { tl: { k, b } });
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const FOODC = ['#e3ae45', '#ee6a55', '#5bb3e6', '#5fd3a0', '#b48cf0', '#f07fb8', '#f2e9d8'];
+  const CSS = `
+.wm-chip{position:absolute;left:10px;z-index:6;appearance:none;border:1px solid rgba(242,233,216,.2);background:rgba(23,19,31,.78);color:var(--ink,#f2e9d8);border-radius:12px;min-height:44px;padding:4px 12px;font:700 12px/1.2 "IBM Plex Sans KR",system-ui,sans-serif;display:flex;align-items:center;gap:6px;cursor:pointer;touch-action:manipulation;user-select:none;-webkit-user-select:none}
+.wm-chip b{color:var(--brass,#e3ae45)}
+.wm-chip:active{transform:scale(.96)}
+`;
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS });
+    root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    let st = null, key = null, W = null, phase = 'wait', cd = 0, endT = 0, hostT = 0, frameNo = 0;
+    let cfg = { ctl: 'hold' };
+    try { const c = JSON.parse(localStorage.getItem('lounge.worm.cfg') || 'null'); if (c && (c.ctl === 'hold' || c.ctl === 'drag')) cfg.ctl = c.ctl; } catch (e) {}
+    const pc = {};
+    const P = (s) => {
+      const b = api.players[s] || { name: (st && st.nm && st.nm[s]) || 'AI', color: '#888', ai: true, lv: 2 };
+      if (!st || !st.tm || st.tm[s] == null) return b;
+      const k = st.rid + ':' + s; if (pc[k]) return pc[k];
+      let j = 0; for (let i = 0; i < s; i++) if (st.tm[i] === st.tm[s]) j++;
+      return (pc[k] = Object.assign({}, b, { color: TEAMC[st.tm[s]][j % 3] }));
+    };
+    const name = (s) => (st && st.nm && st.nm[s]) || P(s).name || (s + 1) + '번';
+    const simHere = (s) => { const p = api.players[s]; if (!p) return !!(st && st.tm && s < st.n) && (!api.online || api.isHost); if (!api.online) return true; if (api.isHost) return !!p.ai || !!p.local; return !p.ai && !!p.local; };
+    const host = () => !api.online || api.isHost;
+    const mySeat = () => { const m = api.mySeats(); return m.length ? m[0] : -1; };
+    const input = { s: 0, a: null, b: false };
+    let aiMem = [], parts = [], floats = [], shake = 0, lastSfx = 0, hintT = 0;
+    const cam = { x: 0, y: 0, s: 1, ok: false };
+    // network
+    let pubT = 0, hsQ = 0, inQ = 0, lastInSig = '', inT = 0;
+    const sendT = {};
+    let rtt = 0.15, snaps = [], lastSnapQ = -1, gFoods = [], gFoodStr = '', gDrops = [], gR = 0, gT = 0, gAlive = [], respT = [];
+    let me = null, hist = [], bestDone = false;
+    const iqOf = {};
+
+    /* ----- round lifecycle ----- */
+    function curKey() { return st ? st.rid + '.' + st.rd : null; }
+    function startRound() {
+      W = newWorld(st.sd, st.n, { m: st.m, sh: st.sh }); W.tm = st.tm || null;
+      aiMem = W.worms.map(() => ({}));
+      respT = W.worms.map(() => 0);
+      parts = []; floats = []; pops = []; snaps = []; bestDone = false; lastSnapQ = -1; hist = [];
+      gFoods = W.foods.map((f) => ({ x: f.x, y: f.y, on: true, hide: 0 })); gFoodStr = ''; gDrops = []; gR = W.R0; gT = 0;
+      gAlive = W.worms.map(() => true);
+      const ms = mySeat();
+      me = ms >= 0 ? { x: W.worms[ms].x, y: W.worms[ms].y, a: W.worms[ms].a, len: LEN0, tr: W.worms[ms].tr.slice(), alive: true } : null;
+      phase = st.ph === 'count' ? 'count' : st.ph === 'play' ? 'play' : st.ph;
+      cd = COUNT; endT = END_T;
+      input.a = null;
+      cam.ok = false;
+      hintT = mySeat() >= 0 && st.rd === 1 ? 5 : 0;
+      syncChip();
+    }
+
+    /* ----- input ----- */
+    const inp = api.input || null;
+    const ptrs = new Map(); // id -> {zone:'L'|'R'|'B'|'D', x0, y0, x, y}
+    let lastTap = { L: 0, R: 0 };
+    function boostBtn() { const r = Math.max(30, Math.min(38, cv.w * 0.09)); return { x: cv.w / 2, y: cv.h - r - 18, r }; }
+    function refreshInput() {
+      let l = false, r = false, b = false, drag = null;
+      for (const p of ptrs.values()) {
+        if (p.zone === 'L') l = true; else if (p.zone === 'R') r = true;
+        if (p.zone === 'B' || p.boost) b = true;
+        if (p.zone === 'D') drag = p;
+      }
+      if (cfg.ctl === 'hold') {
+        if (l && r) { input.s = 0; b = true; } else input.s = (r ? 1 : 0) - (l ? 1 : 0);
+        input.a = null;
+      } else {
+        input.s = 0;
+        if (drag && Math.hypot(drag.x - drag.x0, drag.y - drag.y0) > 10) input.a = r2(Math.atan2(drag.y - drag.y0, drag.x - drag.x0));
+      }
+      // keyboard / gamepad (api.input, rebindable in 「⌨ 조작 설정」): keys turn fully, a stick turns in proportion
+      const ks = inp ? Math.round(inp.axis('L', 'R') * 10) / 10 : 0;
+      input.b = b || (!!inp && inp.held('boost'));
+      if (ks) { input.s = ks; input.a = null; }
+    }
+    function onDown(e) {
+      if (mySeat() < 0) return;
+      const p = cv.local(e), bb = boostBtn();
+      let zone;
+      if (Math.hypot(p.x - bb.x, p.y - bb.y) < bb.r + 10) zone = 'B';
+      else if (cfg.ctl === 'drag') zone = 'D';
+      else zone = p.x < cv.w / 2 ? 'L' : 'R';
+      const rec = { zone, x0: p.x, y0: p.y, x: p.x, y: p.y, boost: false };
+      if ((zone === 'L' || zone === 'R') && performance.now() - lastTap[zone] < 280) rec.boost = true; // double tap & hold = boost
+      if (zone === 'D') for (const [id, q] of ptrs) if (q.zone === 'D') ptrs.delete(id); // newest finger steers
+      ptrs.set(e.pointerId, rec);
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      e.preventDefault();
+      refreshInput();
+      if (zone === 'B' || rec.boost) api.buzz(10);
+      hintT = Math.min(hintT, 1.2);
+    }
+    function onMove(e) {
+      const rec = ptrs.get(e.pointerId);
+      if (!rec) return;
+      const p = cv.local(e);
+      rec.x = p.x; rec.y = p.y;
+      if (cfg.ctl === 'hold' && (rec.zone === 'L' || rec.zone === 'R')) { // sliding across the middle switches sides
+        const z = p.x < cv.w / 2 ? 'L' : 'R';
+        if (z !== rec.zone) rec.zone = z;
+      }
+      if (rec.zone === 'D' && Math.hypot(rec.x - rec.x0, rec.y - rec.y0) > 70) { // anchor follows a long drag
+        const a = Math.atan2(rec.y - rec.y0, rec.x - rec.x0);
+        rec.x0 = rec.x - Math.cos(a) * 70; rec.y0 = rec.y - Math.sin(a) * 70;
+      }
+      refreshInput();
+    }
+    function onUp(e) {
+      const rec = ptrs.get(e.pointerId);
+      if (!rec) return;
+      ptrs.delete(e.pointerId);
+      if (rec.zone === 'L' || rec.zone === 'R') lastTap[rec.zone] = performance.now();
+      refreshInput();
+    }
+    const offIn = inp ? inp.on(() => { refreshInput(); hintT = Math.min(hintT, 1.2); }) : () => {};
+    const releaseAll = () => { ptrs.clear(); refreshInput(); };
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    cv.cv.addEventListener('lostpointercapture', onUp);
+    cv.cv.addEventListener('contextmenu', noCtx);
+    window.addEventListener('blur', releaseAll);
+
+    /* control-scheme chip (per phone) */
+    const chip = L.h('button', { class: 'wm-chip', type: 'button', 'aria-label': '조작 방식 바꾸기', onclick() {
+      cfg.ctl = cfg.ctl === 'hold' ? 'drag' : 'hold';
+      try { localStorage.setItem('lounge.worm.cfg', JSON.stringify(cfg)); } catch (e) {}
+      releaseAll(); input.a = null; api.sfx('click'); syncChip(); hintT = 3.5;
+    } });
+    chip.addEventListener('pointerdown', (e) => e.stopPropagation());
+    root.appendChild(chip);
+    function syncChip() {
+      chip.innerHTML = '';
+      chip.append('조작 ', L.h('b', { text: cfg.ctl === 'hold' ? '좌우 누르기' : '끌어서 방향' }), ' ⇄');
+      chip.hidden = mySeat() < 0 || !st || st.ph === 'done';
+      chip.style.top = '62px';
+    }
+
+    /* ----- feedback ----- */
+    function sfx(n, gap) { const t = performance.now(); if (t - lastSfx < (gap || 50)) return; lastSfx = t; api.sfx(n); }
+    function burstBody(pts, col) {
+      for (let i = 0; i < pts.length; i += 8) {
+        for (let k = 0; k < 2; k++) {
+          const a = Math.random() * 7, v = 20 + Math.random() * 60;
+          parts.push({ x: pts[i], y: pts[i + 1], vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: 0.6 + Math.random() * 0.4, c: col });
+        }
+      }
+      if (parts.length > 500) parts.splice(0, parts.length - 500);
+    }
+    function onDeathFx(seat, pts, killer) {
+      const col = P(seat).color;
+      burstBody(pts, col);
+      const mine = seat === mySeat();
+      if (mine) { shake = 1; api.buzz(120); api.sfx('lose'); }
+      else if (killer === mySeat() && killer >= 0) { api.buzz(30); api.sfx('chip'); shake = Math.max(shake, 0.35); floats.push({ text: name(seat) + ' 처치!', col: P(killer).color, t: 1.6 }); if (pts.length >= 2) addPop(pts[0], pts[1], '처치!', '#ffd98a'); }
+      else sfx('thud', 90);
+    }
+    let pops = []; // world-space score popups {x,y,text,col,t}
+    function sparkle(x, y, col, n) {
+      for (let k = 0; k < n; k++) { const a = Math.random() * 7, v = 15 + Math.random() * 35; parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: 0.25 + Math.random() * 0.2, c: col }); }
+      if (parts.length > 500) parts.splice(0, parts.length - 500);
+    }
+    function addPop(x, y, text, col) { pops.push({ x, y, text, col, t: 0.9 }); if (pops.length > 12) pops.shift(); }
+    const hooks = {
+      eat(w, v) {
+        const mine = w.seat === mySeat();
+        if (mine || cam.ok) sparkle(w.x, w.y, v >= 8 ? P(w.seat).color : '#f2e9d8', v >= 8 ? 5 : 2);
+        if (mine) { sfx(v >= 8 ? 'pop' : 'tick', 70); if (v >= 8) addPop(w.x, w.y, '+' + Math.round(v), '#ffd98a'); }
+      },
+      die(w, k) { onDeathFx(w.seat, [w.x, w.y].concat(w.tr), k ? k.seat : -1); },
+    };
+
+    /* ----- host: round flow ----- */
+    function hostFlow(dt) {
+      if (!host() || !st || !W) return;
+      if (st.ph === 'count' && phase === 'play') { api.setState(Object.assign({}, st, { ph: 'play' })); return; }
+      if (st.ph === 'play') {
+        const alive = W.worms.filter((w) => w.alive);
+        if (st.m === 't') {
+          if (W.t >= TIME_LEN) {
+            let order = W.worms.map((w) => [w.seat, w.alive ? Math.round(w.len) : 0, w.kills]).sort((a, b) => b[1] - a[1] || b[2] - a[2] || a[0] - b[0]);
+            if (st.tm) { // 팀전: total length of each team's living worms
+              const t = [[0, 0, 0], [1, 0, 0]]; order.forEach((r) => { const q = t[st.tm[r[0]]]; q[1] += r[1]; q[2] += r[2]; });
+              order = t.sort((a, b) => b[1] - a[1] || b[2] - a[2]);
+            }
+            api.setState(Object.assign({}, addTally(st, W), { ph: 'end', rw: order[0][0], res: order }));
+          }
+          return;
+        }
+        if (st.tm) { // 팀전: last team with a worm alive takes the round
+          const at = [0, 1].filter((t) => alive.some((w) => st.tm[w.seat] === t));
+          if (at.length <= 1 || W.t >= ROUND_CAP) {
+            let win = at.length === 1 ? at[0] : -1;
+            if (at.length > 1) { const sum = [0, 0]; alive.forEach((w) => { sum[st.tm[w.seat]] += w.len; }); win = sum[0] > sum[1] ? 0 : sum[1] > sum[0] ? 1 : -1; }
+            else if (!at.length) { const last = W.worms.filter((w) => w.lastDie === W.t); if (last.length) { last.sort((a, b) => b.len - a.len); if (last.length === 1 || last[0].len > last[1].len + 0.5) win = st.tm[last[0].seat]; } }
+            api.setState(roundOver(addTally(st, W), win));
+          }
+          return;
+        }
+        if (alive.length <= 1 || W.t >= ROUND_CAP) {
+          let win = -1;
+          if (alive.length === 1) win = alive[0].seat;
+          else if (alive.length > 1) win = alive.slice().sort((a, b) => b.len - a.len)[0].seat; // time cap: longest
+          else { // everyone left died together: the longest of them takes it
+            const last = W.worms.filter((w) => w.lastDie === W.t);
+            if (last.length) { last.sort((a, b) => b.len - a.len); if (last.length === 1 || last[0].len > last[1].len + 0.5) win = last[0].seat; }
+          }
+          api.setState(roundOver(addTally(st, W), win));
+        }
+      } else if (st.ph === 'end') {
+        endT -= dt;
+        if (endT <= 0) {
+          endT = 1e9;
+          if (st.m === 't') api.setState(Object.assign({}, st, { ph: 'done' }));
+          else api.setState(nextRound(st));
+        }
+      }
+    }
+    function noteDeaths(before) {
+      if (!st || st.m === 't') return;
+      const out = (st.out || []).slice();
+      let ch = false;
+      W.worms.forEach((w, i) => { if (before[i] && !w.alive && !out.includes(i)) { out.push(i); ch = true; } });
+      if (ch && host() && st.ph === 'play') api.setState(Object.assign({}, st, { out }));
+    }
+
+    /* ----- online ----- */
+    function pollHost(now) {
+      if (!api.online || !api.isHost || !W) return;
+      let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+      if (!rem || typeof rem !== 'object') return;
+      for (const k in rem) {
+        const s = +k, o = rem[k];
+        if (!(s >= 0 && s < W.worms.length) || simHere(s) || !o || o.k !== key) continue;
+        const w = W.worms[s];
+        w.st = clamp(+o.s || 0, -1, 1); w.tgt = fin(o.a) ? o.a : null; w.bo = !!o.b;
+        if (fin(o.q)) iqOf[s] = o.q;
+      }
+      void now;
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !W) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || typeof hs !== 'object' || hs.k !== key || hs.q === lastSnapQ) return;
+      lastSnapQ = hs.q;
+      const ws = Array.isArray(hs.w) ? hs.w.map(decodeWorm) : [];
+      const snap = { at: now, t: +hs.t || 0, R: +hs.R || W.R0, w: ws };
+      snaps.push(snap); if (snaps.length > 4) snaps.shift();
+      gR = snap.R; gT = snap.t;
+      if (typeof hs.f === 'string' && hs.f !== gFoodStr) {
+        for (let i = 0; i < gFoods.length && i < hs.f.length; i++) {
+          if (hs.f[i] === gFoodStr[i]) continue;
+          const g = ALPH.indexOf(hs.f[i]);
+          if (g === 63 || g < 0) gFoods[i].on = false;
+          else { const p = foodPos(W.seed, i, g, W.R0); gFoods[i].x = p.x; gFoods[i].y = p.y; gFoods[i].on = true; gFoods[i].hide = 0; }
+        }
+        gFoodStr = hs.f;
+      }
+      gDrops = decodeDrops(hs.d);
+      // deaths / respawns seen by this guest
+      ws.forEach((w, i) => {
+        if (!w) return;
+        if (gAlive[i] && !w.alive) {
+          const prev = snaps.length > 1 ? snaps[snaps.length - 2].w[i] : null;
+          onDeathFx(i, i === mySeat() && me ? [me.x, me.y].concat(me.tr) : prev ? prev.pts : [w.x, w.y], -1);
+        }
+        gAlive[i] = w.alive;
+      });
+      // rtt from the echoed input sequence
+      const ms = mySeat();
+      if (ms >= 0 && hs.iq && fin(hs.iq[ms]) && sendT[hs.iq[ms]]) {
+        const sample = (now - sendT[hs.iq[ms]]) / 1000;
+        if (sample > 0 && sample < 2) rtt = rtt * 0.85 + sample * 0.15;
+      }
+      if (ms >= 0 && me) reconcile(ws[ms], now);
+    }
+    function reconcile(sw, now) {
+      if (!sw) return;
+      me.len = sw.len;
+      if (!sw.alive) { me.alive = false; return; }
+      if (!me.alive || Math.hypot(sw.x - me.x, sw.y - me.y) > 150) { // (re)spawn or far off: take the host's worm
+        me.alive = true; me.x = sw.x; me.y = sw.y; me.a = sw.a;
+        me.tr = []; const p = sw.pts; for (let i = 2; i < p.length; i += 2) { me.tr.push(p[i], p[i + 1]); }
+        resampleTrail(me);
+        hist = [];
+        return;
+      }
+      // compare with where I predicted myself one round trip ago
+      const tt = now - rtt * 1000;
+      let h = null;
+      for (let i = hist.length - 1; i >= 0; i--) if (hist[i].t <= tt) { h = hist[i]; break; }
+      if (!h) return;
+      const ex = sw.x - h.x, ey = sw.y - h.y, ea = wrapA(sw.a - h.a);
+      const e = Math.hypot(ex, ey);
+      if (e > 70) { me.x += ex * 0.5; me.y += ey * 0.5; }
+      else { me.x += ex * 0.18; me.y += ey * 0.18; }
+      me.a = wrapA(me.a + ea * 0.12);
+      for (const q of hist) { q.x += ex * 0.18; q.y += ey * 0.18; }
+    }
+    function resampleTrail(w) { // a coarse trail (from a snapshot) → SP spacing
+      const src = [w.x, w.y].concat(w.tr), out = [];
+      let px = w.x, py = w.y, acc = 0, next = SP;
+      for (let i = 2; i < src.length; i += 2) {
+        const x = src[i], y = src[i + 1], seg = Math.hypot(x - px, y - py);
+        while (seg > 0 && acc + seg >= next) { const k = (next - acc) / seg; out.push(px + (x - px) * k, py + (y - py) * k); next += SP; }
+        acc += seg; px = x; py = y;
+      }
+      w.tr = out;
+    }
+    function predictMe(dt, now) {
+      if (!me || !me.alive) return;
+      const tr = turnOf(me.len);
+      if (fin(input.a)) { const d = wrapA(input.a - me.a); me.a = wrapA(me.a + clamp(d, -tr * dt, tr * dt)); }
+      else me.a = wrapA(me.a + input.s * tr * dt);
+      const v = input.b && me.len > LMIN ? VB : V0;
+      me.x += Math.cos(me.a) * v * dt; me.y += Math.sin(me.a) * v * dt;
+      advanceTrail(me);
+      hist.push({ t: now, x: me.x, y: me.y, a: me.a });
+      while (hist.length && hist[0].t < now - 2000) hist.shift();
+      // hide pellets I am obviously eating until the host confirms
+      const er = radOf(me.len) + 7;
+      for (const f of gFoods) if (f.on && Math.abs(f.x - me.x) < er && Math.abs(f.y - me.y) < er && Math.hypot(f.x - me.x, f.y - me.y) < er) { if (!f.hide) sfx('tick', 70); f.hide = now + 600; }
+    }
+    function publish(rdt, now) {
+      if (!api.online || !W) return;
+      pubT -= rdt; inT -= rdt;
+      try {
+        if (api.isHost) {
+          if (pubT > 0) return;
+          pubT = 1 / 15;
+          hsQ = (hsQ + 1) % 100000;
+          api.net.hostSend({ k: key, q: hsQ, t: r1(W.t), R: r1(W.R), f: encodeFoods(W), d: encodeDrops(W), w: W.worms.map(encodeWorm), iq: Object.assign({}, iqOf) });
+        } else {
+          const s = mySeat();
+          if (s < 0) return;
+          const sig = input.s + '|' + input.a + '|' + (input.b ? 1 : 0);
+          if (sig === lastInSig && inT > 0) return;
+          lastInSig = sig; inT = 0.12;
+          inQ = (inQ + 1) % 100000;
+          sendT[inQ] = now; delete sendT[(inQ + 99900) % 100000];
+          api.net.publish({ k: key, q: inQ, s: input.s, a: input.a, b: input.b ? 1 : 0 });
+        }
+      } catch (e) {}
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      if (!st || !W) return;
+      frameNo++;
+      if (inp) refreshInput(); // analog sticks change without events
+      const dt = rdt * SPD();
+      if (phase === 'count') {
+        const prevN = Math.ceil(cd);
+        cd -= dt;
+        const nowN = Math.ceil(cd);
+        if (nowN !== prevN && nowN > 0) { api.sfx('tick'); }
+        if (cd <= 0) { phase = 'play'; api.sfx('pop'); api.buzz(20); }
+      }
+      if (hintT > 0) hintT -= rdt;
+      if (host()) {
+        pollHost(now);
+        const ms = mySeat();
+        if (phase === 'play' && st.ph !== 'done' && st.ph !== 'end') {
+          let gridC = null; const grid = () => gridC || (gridC = buildGrid(W));
+          W.worms.forEach((w, i) => {
+            const p = api.players[i] || (st.tm && i < st.n ? { ai: true, lv: 2 } : null);
+            if (!p || !simHere(i)) return;
+            if (p.ai || (L.debug && L.debug.autoplay)) aiThink(W, w, aiMem[i], p.ai ? (p.lv || 2) : 2, dt, grid);
+            else if (i === ms) { w.st = input.s; w.tgt = fin(input.a) ? input.a : null; w.bo = input.b; }
+          });
+          const before = W.worms.map((w) => w.alive);
+          const tBefore = W.t;
+          stepWorld(W, Math.min(dt, 1 / 20), hooks);
+          W.worms.forEach((w, i) => { if (before[i] && !w.alive) w.lastDie = W.t; });
+          void tBefore;
+          noteDeaths(before);
+          if (st.m === 't') { // respawn after a short wait
+            W.worms.forEach((w, i) => {
+              if (w.alive) return;
+              respT[i] += dt;
+              if (respT[i] >= RESPAWN) {
+                respT[i] = 0;
+                let best = null, bd = -1;
+                for (let k = 0; k < 12; k++) {
+                  const an = Math.random() * 7, rr = Math.sqrt(Math.random()) * W.R * 0.7, x = Math.cos(an) * rr, y = Math.sin(an) * rr;
+                  let md = 1e9; for (const o of W.worms) if (o.alive) md = Math.min(md, Math.hypot(o.x - x, o.y - y));
+                  if (md > bd) { bd = md; best = { x, y, a: Math.atan2(-y, -x) + (Math.random() - 0.5) }; }
+                }
+                const nw = makeWorm(i, best.x, best.y, best.a, LEN0);
+                nw.kills = w.kills; nw.best = w.best;
+                W.worms[i] = nw; aiMem[i] = {};
+                if (i === ms) { api.toast('다시 출발!'); api.sfx('pop'); }
+              }
+            });
+          }
+        }
+        hostFlow(dt);
+      } else {
+        pollGuest(now);
+        if (phase === 'play' && st.ph === 'play') predictMe(Math.min(dt, 1 / 20), now);
+      }
+      for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.t -= rdt; p.x += p.vx * rdt; p.y += p.vy * rdt; p.vx *= 0.94; p.vy *= 0.94; if (p.t <= 0) parts.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t -= rdt; if (floats[i].t <= 0) floats.splice(i, 1); }
+      for (let i = pops.length - 1; i >= 0; i--) { pops[i].t -= rdt; pops[i].y -= 30 * rdt; if (pops[i].t <= 0) pops.splice(i, 1); }
+      shake = Math.max(0, shake - rdt * 3);
+      publish(rdt, now);
+    }
+
+    /* ----- what to draw (host: the world; guest: interpolated snapshots + my predicted worm) ----- */
+    function scene(now) {
+      if (host()) {
+        return {
+          R: W.R, t: W.t, foods: W.foods, drops: W.drops,
+          worms: W.worms.map((w) => ({ seat: w.seat, alive: w.alive, x: w.x, y: w.y, a: w.a, len: w.len, pts: [w.x, w.y].concat(w.tr), boost: w.boosting })),
+        };
+      }
+      const worms = [];
+      const ms = mySeat();
+      let A = null, B = null, k = 1;
+      if (snaps.length) {
+        const rt = now - 110;
+        B = snaps[snaps.length - 1];
+        for (let i = snaps.length - 1; i > 0; i--) if (snaps[i - 1].at <= rt) { A = snaps[i - 1]; B = snaps[i]; break; }
+        if (A) k = clamp((rt - A.at) / Math.max(1, B.at - A.at), 0, 1.3);
+      }
+      for (let s = 0; s < (st ? st.n : 0); s++) {
+        if (s === ms && me) {
+          worms.push({ seat: s, alive: me.alive, x: me.x, y: me.y, a: me.a, len: me.len, pts: [me.x, me.y].concat(me.tr), boost: input.b && me.len > LMIN });
+          continue;
+        }
+        const wb = B && B.w[s];
+        if (!wb) {
+          if (W && W.worms[s] && !snaps.length) { const w = W.worms[s]; worms.push({ seat: s, alive: true, x: w.x, y: w.y, a: w.a, len: w.len, pts: [w.x, w.y].concat(w.tr), boost: false }); }
+          continue;
+        }
+        const wa = A && A.w[s];
+        if (!wa || !wa.alive || !wb.alive || wa.sp !== wb.sp) { worms.push(Object.assign({ seat: s }, wb)); continue; }
+        const n = Math.min(wa.pts.length, wb.pts.length), pts = new Array(wb.pts.length);
+        for (let i = 0; i < wb.pts.length; i++) pts[i] = i < n ? wa.pts[i] + (wb.pts[i] - wa.pts[i]) * k : wb.pts[i];
+        worms.push({ seat: s, alive: true, x: pts[0], y: pts[1], a: wa.a + wrapA(wb.a - wa.a) * k, len: wa.len + (wb.len - wa.len) * k, pts, boost: wb.boost });
+      }
+      return { R: gR || (W ? W.R0 : 400), t: gT, foods: gFoods.filter((f) => !(f.hide > now)), drops: gDrops, worms };
+    }
+
+    /* ----- drawing ----- */
+    function camTarget(sc) {
+      const ms = mySeat();
+      const mine = ms >= 0 ? sc.worms.find((w) => w.seat === ms) : null;
+      if (mine && mine.alive) return mine;
+      let best = null;
+      for (const w of sc.worms) if (w.alive && (!best || w.len > best.len)) best = w;
+      return best;
+    }
+    function draw(now) {
+      if (!W || !st) { cv.clear(); return; }
+      const sc = scene(now);
+      const w = cv.w, h = cv.h;
+      const tgt = camTarget(sc);
+      const base = Math.min(w, h * 0.75);
+      const wantS = tgt ? base / (330 + Math.min(380, tgt.len * 0.25)) : base / (sc.R * 2.1);
+      const tx = tgt ? tgt.x : 0, ty = tgt ? tgt.y : 0;
+      if (!cam.ok) { cam.x = tx; cam.y = ty; cam.s = wantS; cam.ok = true; }
+      else { const kk = Math.min(1, 0.18 * 60 / 60); cam.x += (tx - cam.x) * kk; cam.y += (ty - cam.y) * kk; cam.s += (wantS - cam.s) * 0.05; }
+      const s = cam.s;
+      const fxk = L.fx ? L.fx() : 1, sx = shake > 0 ? (Math.random() - 0.5) * shake * 8 * fxk : 0, sy = shake > 0 ? (Math.random() - 0.5) * shake * 8 * fxk : 0;
+      const ox = w / 2 - cam.x * s + sx, oy = h / 2 - cam.y * s + sy;
+      const X = (x) => ox + x * s, Y = (y) => oy + y * s;
+      // outside: dark warm hatch
+      ctx.fillStyle = '#140c12'; ctx.fillRect(0, 0, w, h);
+      // arena floor
+      ctx.save();
+      ctx.beginPath(); ctx.arc(X(0), Y(0), sc.R * s, 0, Math.PI * 2);
+      const fg = ctx.createRadialGradient(X(0), Y(0), 0, X(0), Y(0), sc.R * s);
+      fg.addColorStop(0, '#262036'); fg.addColorStop(0.75, '#1e1a2c'); fg.addColorStop(1, '#191425');
+      ctx.fillStyle = fg; ctx.fill();
+      ctx.clip();
+      // hex-ish dot grid
+      const gs = 48, x0 = Math.floor((cam.x - w / 2 / s) / gs) - 1, x1 = Math.ceil((cam.x + w / 2 / s) / gs) + 1;
+      const y0 = Math.floor((cam.y - h / 2 / s) / gs) - 1, y1 = Math.ceil((cam.y + h / 2 / s) / gs) + 1;
+      ctx.fillStyle = 'rgba(171,159,184,.14)';
+      for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+        const px = X(gx * gs + (gy & 1 ? gs / 2 : 0)), py = Y(gy * gs * 0.87);
+        ctx.fillRect(px - 1, py - 1, 2, 2);
+      }
+      ctx.restore();
+      // shrinking ring: original edge faint, danger band
+      if (sc.R < W.R0 - 1) {
+        ctx.beginPath(); ctx.arc(X(0), Y(0), W.R0 * s, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(238,106,85,.14)'; ctx.lineWidth = 1; ctx.setLineDash([6, 8]); ctx.stroke(); ctx.setLineDash([]);
+      }
+      const pulse = sc.R < W.R0 - 1 ? 0.55 + 0.45 * Math.sin(now / 160) : 1;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(X(0), Y(0), sc.R * s, 0, Math.PI * 2);
+      ctx.shadowColor = sc.R < W.R0 - 1 ? 'rgba(238,106,85,.9)' : 'rgba(227,174,69,.8)'; ctx.shadowBlur = 14;
+      ctx.strokeStyle = sc.R < W.R0 - 1 ? 'rgba(238,106,85,' + (0.6 + 0.4 * pulse) + ')' : 'rgba(227,174,69,.85)';
+      ctx.lineWidth = Math.max(3, 6 * s); ctx.stroke();
+      ctx.restore();
+      const inView = (x, y, m) => { const px = X(x), py = Y(y); return px > -m && px < w + m && py > -m && py < h + m; };
+      // food
+      sc.foods.forEach((f, i) => {
+        if (!f.on || !inView(f.x, f.y, 10)) return;
+        const c = FOODC[i % FOODC.length], px = X(f.x), py = Y(f.y), r = Math.max(1.6, 2.6 * s), tw = 0.75 + 0.25 * Math.sin(now / 300 + i);
+        ctx.globalAlpha = 0.22 * tw; ctx.fillStyle = c; ctx.beginPath(); ctx.arc(px, py, r * 2.4, 0, 7); ctx.fill();
+        ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(px, py, r, 0, 7); ctx.fill();
+      });
+      for (const d of sc.drops) {
+        if (!inView(d.x, d.y, 14)) continue;
+        const c = d.c >= 0 && d.c < 6 ? P(d.c).color : '#f2e9d8', px = X(d.x), py = Y(d.y), r = Math.max(2, (2 + Math.sqrt(d.v) * 1.1) * s);
+        ctx.globalAlpha = 0.3; ctx.fillStyle = c; ctx.beginPath(); ctx.arc(px, py, r * 2, 0, 7); ctx.fill();
+        ctx.globalAlpha = 1; ctx.beginPath(); ctx.arc(px, py, r, 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.beginPath(); ctx.arc(px - r * 0.3, py - r * 0.3, r * 0.35, 0, 7); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      // worms (mine on top)
+      const ms = mySeat();
+      const order = sc.worms.filter((q) => q.alive).sort((a, b) => (a.seat === ms) - (b.seat === ms));
+      for (const q of order) drawWorm(q, X, Y, s, now);
+      // particles
+      for (const p of parts) { ctx.globalAlpha = Math.min(1, p.t * 1.6); ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), Math.max(1.5, 3 * s), 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+      if (pops.length) {
+        ctx.font = '15px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(10,8,16,.8)';
+        for (const p of pops) { ctx.globalAlpha = Math.min(1, p.t * 2); const px = X(p.x), py = Y(p.y) - 18; ctx.strokeText(p.text, px, py); ctx.fillStyle = p.col; ctx.fillText(p.text, px, py); }
+        ctx.globalAlpha = 1;
+      }
+      drawHud(sc, now);
+    }
+    function drawWorm(q, X, Y, s, now) {
+      const col = P(q.seat).color || '#ccc', r = radOf(q.len) * s, p = q.pts;
+      if (p.length < 4) return;
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      const path = () => { ctx.beginPath(); ctx.moveTo(X(p[p.length - 2]), Y(p[p.length - 1])); for (let i = p.length - 4; i >= 0; i -= 2) ctx.lineTo(X(p[i]), Y(p[i + 1])); };
+      if (q.boost) { ctx.save(); ctx.globalAlpha = 0.35 + 0.15 * Math.sin(now / 60); path(); ctx.strokeStyle = col; ctx.lineWidth = r * 2 + 10; ctx.stroke(); ctx.restore(); }
+      path(); ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = r * 2 + 3; ctx.save(); ctx.translate(0, 2); ctx.stroke(); ctx.restore();
+      path(); ctx.strokeStyle = shade(col, -0.35); ctx.lineWidth = r * 2 + 2; ctx.stroke();
+      path(); ctx.strokeStyle = col; ctx.lineWidth = r * 2; ctx.stroke();
+      path(); ctx.strokeStyle = shade(col, 0.3); ctx.lineWidth = r * 1.1; ctx.setLineDash([Math.max(2, r * 0.8), Math.max(3, r * 1.5)]); ctx.stroke(); ctx.setLineDash([]);
+      path(); ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = r * 0.5; ctx.save(); ctx.translate(-r * 0.25, -r * 0.3); ctx.stroke(); ctx.restore();
+      // head
+      const hx = X(q.x), hy = Y(q.y), ca = Math.cos(q.a), sa = Math.sin(q.a);
+      ctx.beginPath(); ctx.arc(hx, hy, r * 1.12, 0, 7); ctx.fillStyle = col; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = shade(col, -0.35); ctx.stroke();
+      for (const sd of [-1, 1]) {
+        const ex = hx + ca * r * 0.35 - sa * r * 0.5 * sd, ey = hy + sa * r * 0.35 + ca * r * 0.5 * sd;
+        ctx.beginPath(); ctx.arc(ex, ey, r * 0.42, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+        ctx.beginPath(); ctx.arc(ex + ca * r * 0.16, ey + sa * r * 0.16, r * 0.22, 0, 7); ctx.fillStyle = '#17131f'; ctx.fill();
+      }
+      // name tag for others
+      if (q.seat !== mySeat()) {
+        ctx.font = '700 11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(15,10,20,.75)'; ctx.strokeText(name(q.seat), hx, hy - r * 1.3 - 4);
+        ctx.fillStyle = col; ctx.fillText(name(q.seat), hx, hy - r * 1.3 - 4);
+      }
+    }
+    function drawHud(sc, now) {
+      const w = cv.w, h = cv.h, ms = mySeat();
+      // top-left: round / time + per-player chips
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      let title;
+      if (st.m === 't') { const left = Math.max(0, TIME_LEN - sc.t); title = '남은 시간 ' + Math.floor(left / 60) + ':' + String(Math.floor(left % 60)).padStart(2, '0'); }
+      else title = '라운드 ' + st.rd + (st.rd <= st.b ? ' / ' + st.b : ' · 결승');
+      const aliveN = sc.worms.filter((q) => q.alive).length;
+      const mine = ms >= 0 ? sc.worms.find((q) => q.seat === ms) : null;
+      ctx.font = '700 13px ' + FONT;
+      let sub = st.m === 't' ? '' : ' · 생존 ' + aliveN;
+      if (st.tm) {
+        if (st.m === 't') { const L2 = [0, 0]; sc.worms.forEach((q) => { if (q.alive && st.tm[q.seat] != null) L2[st.tm[q.seat]] += Math.round(q.len); }); sub = ' · 빨강 ' + L2[0] + ' : ' + L2[1] + ' 파랑'; }
+        else sub = ' · 빨강 ' + (st.tw[0] | 0) + ' : ' + (st.tw[1] | 0) + ' 파랑';
+      }
+      const bw = Math.min(w - 120, Math.max(150, ctx.measureText(title + sub).width + 24, st.n * 34 + 16));
+      rrect(ctx, 8, 8, bw, 48, 12); ctx.fillStyle = 'rgba(23,19,31,.72)'; ctx.fill();
+      ctx.fillStyle = '#f2e9d8'; ctx.fillText(title, 18, 21);
+      ctx.fillStyle = '#ab9fb8'; ctx.fillText(sub, 18 + ctx.measureText(title).width, 21);
+      // dots row: wins (rounds) or current length (time mode)
+      let x = 18;
+      ctx.font = '700 11px ' + MONO;
+      for (let s2 = 0; s2 < st.n; s2++) {
+        const q = sc.worms.find((o) => o.seat === s2);
+        const alive = q && q.alive;
+        ctx.globalAlpha = alive ? 1 : 0.35;
+        ctx.beginPath(); ctx.arc(x + 5, 42, 5, 0, 7); ctx.fillStyle = P(s2).color; ctx.fill();
+        if (s2 === ms) { ctx.lineWidth = 2; ctx.strokeStyle = '#f2e9d8'; ctx.stroke(); }
+        const val = st.m === 't' || st.tm ? (q && q.alive ? Math.round(q.len) : '-') : (st.wins[s2] | 0);
+        ctx.fillStyle = '#f2e9d8'; ctx.fillText(String(val), x + 13, 42.5);
+        x += 13 + ctx.measureText(String(val)).width + 9;
+      }
+      ctx.globalAlpha = 1;
+      // top-right minimap
+      const mr = Math.min(46, w * 0.12), mx = w - mr - 10, my = mr + 10;
+      ctx.beginPath(); ctx.arc(mx, my, mr + 3, 0, 7); ctx.fillStyle = 'rgba(23,19,31,.75)'; ctx.fill();
+      const k = mr / W.R0;
+      ctx.beginPath(); ctx.arc(mx, my, sc.R * k, 0, 7); ctx.strokeStyle = sc.R < W.R0 - 1 ? 'rgba(238,106,85,.9)' : 'rgba(227,174,69,.7)'; ctx.lineWidth = 1.5; ctx.stroke();
+      for (const q of sc.worms) {
+        if (!q.alive) continue;
+        ctx.beginPath(); ctx.arc(mx + q.x * k, my + q.y * k, q.seat === ms ? 3.6 : 2.6, 0, 7); ctx.fillStyle = P(q.seat).color; ctx.fill();
+        if (q.seat === ms) { ctx.lineWidth = 1.5; ctx.strokeStyle = '#fff'; ctx.stroke(); }
+      }
+      // boost button + steering cues for the local player
+      if (ms >= 0 && st.ph !== 'done') {
+        const bb = boostBtn(), on = input.b;
+        const dead = !mine || !mine.alive;
+        ctx.globalAlpha = dead ? 0.35 : 1;
+        ctx.beginPath(); ctx.arc(bb.x, bb.y, bb.r, 0, 7);
+        ctx.fillStyle = on ? 'rgba(227,174,69,.9)' : 'rgba(23,19,31,.7)'; ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = on ? '#fff3cf' : 'rgba(227,174,69,.8)'; ctx.stroke();
+        ctx.fillStyle = on ? '#17131f' : '#e3ae45';
+        ctx.beginPath(); const z = bb.r / 30; ctx.moveTo(bb.x + 3 * z, bb.y - 15 * z); ctx.lineTo(bb.x - 9 * z, bb.y + 2 * z); ctx.lineTo(bb.x - 1 * z, bb.y + 2 * z); ctx.lineTo(bb.x - 4 * z, bb.y + 15 * z); ctx.lineTo(bb.x + 9 * z, bb.y - 3 * z); ctx.lineTo(bb.x + 1 * z, bb.y - 3 * z); ctx.closePath(); ctx.fill();
+        ctx.font = '700 10px ' + FONT; ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(242,233,216,.7)'; ctx.fillText('부스트', bb.x, bb.y + bb.r + 9);
+        L.ui.drawKeyBadge(ctx, bb.x + bb.r + 6, bb.y + bb.r + 4, L.ui.keyLabel('worm', 'boost'));
+        if (mine && mine.alive) { ctx.font = '700 13px ' + MONO; ctx.fillStyle = '#f2e9d8'; ctx.fillText('길이 ' + Math.round(mine.len), bb.x, bb.y - bb.r - 14); }
+        ctx.globalAlpha = 1;
+        if (cfg.ctl === 'hold' && !dead) {
+          for (const side of [-1, 1]) {
+            const act = input.s === side;
+            const ax = side < 0 ? 26 : w - 26, ay = h - 70;
+            ctx.globalAlpha = act ? 0.95 : 0.28;
+            ctx.beginPath(); ctx.moveTo(ax - 6 * side, ay - 14); ctx.lineTo(ax + 8 * side, ay); ctx.lineTo(ax - 6 * side, ay + 14);
+            ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#f2e9d8'; ctx.stroke();
+            { const ga = ctx.globalAlpha; ctx.globalAlpha = 0.85; L.ui.drawKeyBadge(ctx, side < 0 ? ax + 18 : ax + 8, ay + 34, L.ui.keyLabel('worm', side < 0 ? 'L' : 'R')); ctx.globalAlpha = ga; }
+            if (act) { const g = ctx.createLinearGradient(side < 0 ? 0 : w, 0, side < 0 ? 60 : w - 60, 0); g.addColorStop(0, 'rgba(227,174,69,.25)'); g.addColorStop(1, 'rgba(227,174,69,0)'); ctx.fillStyle = g; ctx.fillRect(side < 0 ? 0 : w - 60, 70, 60, h - 70); }
+          }
+          ctx.globalAlpha = 1;
+        }
+        if (cfg.ctl === 'drag') for (const p of ptrs.values()) if (p.zone === 'D') {
+          ctx.beginPath(); ctx.arc(p.x0, p.y0, 40, 0, 7); ctx.strokeStyle = 'rgba(242,233,216,.3)'; ctx.lineWidth = 2; ctx.stroke();
+          const d = Math.min(40, Math.hypot(p.x - p.x0, p.y - p.y0)), a = Math.atan2(p.y - p.y0, p.x - p.x0);
+          ctx.beginPath(); ctx.arc(p.x0 + Math.cos(a) * d, p.y0 + Math.sin(a) * d, 16, 0, 7); ctx.fillStyle = 'rgba(227,174,69,.55)'; ctx.fill();
+        }
+        if (dead && st.ph === 'play' && phase === 'play') banner(st.m === 't' ? '잠시 후 다시 출발' : '탈락 · 관전 중', '#ee6a55', h * 0.3, 18);
+      }
+      // floats
+      floats.forEach((f, i) => { ctx.globalAlpha = Math.min(1, f.t * 2); banner(f.text, f.col, h * 0.24 + i * 30, 17); });
+      ctx.globalAlpha = 1;
+      // countdown / round end
+      if (phase === 'count' && st.ph === 'count') {
+        const n = Math.max(1, Math.ceil(cd));
+        const kk = 1 + (cd % 1) * 0.3;
+        ctx.save(); ctx.translate(w / 2, h * 0.42); ctx.scale(kk, kk);
+        ctx.font = '64px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(10,8,16,.8)'; ctx.strokeText(String(n), 0, 0); ctx.fillStyle = '#f2e9d8'; ctx.fillText(String(n), 0, 0);
+        ctx.restore();
+        banner(st.m === 't' ? (st.tm ? '2분 동안 팀 길이 합을 길게!' : '2분 동안 가장 길게!') : '라운드 ' + st.rd + (st.rd > st.b ? ' · 결승 라운드' : ''), '#e3ae45', h * 0.3, 18);
+        if (st.tm && ms >= 0 && st.tm[ms] != null) banner('나는 ' + TEAMN[st.tm[ms]] + ' · 아군 몸은 통과해요', TEAMC[st.tm[ms]][0], h * 0.3 + 30, 14);
+      }
+      if (st.ph === 'end') {
+        const rw = st.rw;
+        if (st.tm) banner(st.m === 't' ? (rw >= 0 ? '시간 종료! ' + TEAMN[rw] + ' 우세' : '시간 종료!') : rw >= 0 ? TEAMN[rw] + ' 라운드 승리!' : '무승부 라운드', rw >= 0 ? TEAMC[rw][0] : '#f2e9d8', h * 0.4, 24);
+        else banner(st.m === 't' ? '시간 종료!' : rw >= 0 ? name(rw) + ' 라운드 승리!' : '무승부 라운드', rw >= 0 ? P(rw).color : '#f2e9d8', h * 0.4, 24);
+      }
+      // hint
+      if (hintT > 0 && ms >= 0) {
+        ctx.globalAlpha = Math.min(1, hintT);
+        const t = cfg.ctl === 'hold' ? '왼쪽·오른쪽을 누르고 있으면 그쪽으로 돌아요' : '누른 채 끄는 방향으로 머리가 향해요';
+        const t2 = '⚡ 부스트: 빨라지지만 몸이 줄어요';
+        ctx.font = '600 13px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        const ww = Math.min(w - 24, Math.max(ctx.measureText(t).width, ctx.measureText(t2).width) + 24);
+        rrect(ctx, (w - ww) / 2, h * 0.58, ww, 50, 14); ctx.fillStyle = 'rgba(23,19,31,.82)'; ctx.fill();
+        ctx.fillStyle = '#f2e9d8'; ctx.fillText(t, w / 2, h * 0.58 + 16);
+        ctx.fillStyle = '#e3ae45'; ctx.fillText(t2, w / 2, h * 0.58 + 35);
+        ctx.globalAlpha = 1;
+      }
+    }
+    function banner(text, col, y, size) {
+      ctx.font = (size || 18) + 'px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(10,8,16,.8)'; ctx.strokeText(text, cv.w / 2, y);
+      ctx.fillStyle = col || '#f2e9d8'; ctx.fillText(text, cv.w / 2, y);
+    }
+
+    const stopLoop = U.loop((rdt, now) => {
+      const n = Math.min(12, Math.max(1, Math.ceil(rdt * SPD() * 30)));
+      try { for (let i = 0; i < n; i++) frame(rdt / n, now); } catch (e) { console.error(e); }
+      try { draw(now); } catch (e) { console.error(e); }
+    });
+
+    return {
+      update(next) {
+        if (!next) return;
+        const prev = st;
+        st = next;
+        const k = curKey();
+        if (k !== key) { key = k; startRound(); }
+        if (st.ph === 'play' && phase === 'count' && !host()) { phase = 'play'; cd = 0; }
+        if (st.ph === 'end' && (!prev || prev.ph !== 'end')) {
+          endT = END_T;
+          const ms = mySeat();
+          if (st.rw >= 0 && st.rw === ms) { api.sfx('win'); api.buzz(60); } else api.sfx('chip');
+          if (ms >= 0 && !bestDone && api.best && !(L.debug && L.debug.autoplay)) {
+            bestDone = true;
+            const bl = host() && W && W.worms[ms] ? W.worms[ms].best : me ? me.len : 0;
+            try { if (bl > LEN0 && api.best(st.m === 't' ? 'lenT' : 'lenR', Math.round(bl), { label: (st.m === 't' ? '시간제' : '최후 생존') + ' · 가장 길었던 길이', unit: '' })) floats.push({ text: '새 최고 길이 ' + Math.round(bl) + '!', col: '#8affc8', t: 2 }); } catch (e) {}
+          }
+        }
+        if (prev && st.out && prev.out && st.out.length > prev.out.length && prev.rd === st.rd) {
+          const s = st.out[st.out.length - 1];
+          const ms = mySeat();
+          if (s === ms) api.toast('탈락! ' + (st.n - st.out.length + 1) + '위');
+          else api.toast(name(s) + ' 탈락');
+        }
+        syncChip();
+      },
+      destroy() {
+        stopLoop();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('lostpointercapture', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        offIn();
+        window.removeEventListener('blur', releaseAll);
+        chip.remove(); styleEl.remove();
+        cv.destroy();
+      },
+      _dbg: () => ({ W, st, phase, input, me, snaps, rtt, cfg, cam }),
+    };
+  }
+
+  /* ---------- helpers ---------- */
+  function rrect(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+  function shade(hex, k) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    const f = (c) => Math.round(k >= 0 ? c + (255 - c) * k : c * (1 + k));
+    return 'rgb(' + f(n >> 16) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  L.register({
+    id: 'worm', name: '지렁이 대전', tag: '실시간 생존', cat: '아케이드',
+    blurb: '먹이를 먹고 길어지며, 머리를 남의 몸에 박으면 탈락! 마지막까지 살아남으면 라운드 승리. 한 기기에 한 명씩.',
+    tint: '#2f5a24',
+    icon: '<path d="M10 40c6-14 16-14 20-4s14 10 18-8" fill="none" stroke="currentColor" stroke-width="7" stroke-linecap="round"/><circle cx="48" cy="28" r="6" fill="currentColor"/><circle cx="50" cy="26" r="2" fill="#2f5a24"/><circle cx="14" cy="16" r="3" fill="currentColor"/><circle cx="28" cy="12" r="2.5" fill="currentColor"/><circle cx="40" cy="48" r="2.5" fill="currentColor"/>',
+    minPlayers: 2, maxPlayers: 6, defaultPlayers: 4, hidden: false, realtime: true, aiDelay: 0,
+    controls: [
+      { id: 'L', label: '왼쪽으로', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'R', label: '오른쪽으로', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'boost', label: '부스트', keys: ['Space', 'ShiftLeft'], pad: ['a', 'rb'] },
+    ],
+    options: [
+      { id: 'mode', label: '승리 방식', tip: '이기는 방법.', choices: [{ v: 'r', label: '최후 생존 (라운드)', tip: '마지막까지 살아남으면 라운드 승리.' }, { v: 't', label: '시간제 · 가장 긴 지렁이', tip: '시간 끝에 가장 긴 지렁이 승리.' }], def: 'r' },
+      { id: 'team', label: '모드', tip: '혼자 싸울지, 두 팀으로 싸울지.', choices: [{ v: 0, label: '개인전', tip: '모두가 적.' }, { v: 1, label: '팀전 (2팀)', tip: '두 팀으로 나눠 같은 편 몸통엔 부딪혀도 괜찮아요.' }], def: 0 },
+      { id: 'rounds', label: '라운드 (최후 생존)', choices: [{ v: 1, label: '1판' }, { v: 3, label: '3판 2선승' }, { v: 5, label: '5판 3선승' }], def: 3 },
+      { id: 'shrink', label: '경기장 줄어들기', tip: '시간이 지나면 경기장 가장자리가 좁혀져요.', choices: [{ v: 1, label: '켜기' }, { v: 0, label: '끄기' }], def: 1 },
+    ],
+    quick: [
+      '지렁이는 멈추지 않고 앞으로 기어가요. 먹이를 먹으면 길어져요.',
+      '화면 왼쪽을 누르고 있으면 왼쪽, 오른쪽을 누르면 오른쪽으로 돌아요. ⚡ 버튼은 부스트.',
+      '내 머리가 남의 몸이나 벽에 닿으면 탈락! 마지막까지 살아남으면 라운드 승리.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '지렁이는 계속 앞으로 기어가요. 먹이 알갱이를 먹으면 길어져요.',
+        '내 머리가 다른 지렁이의 몸(머리 포함)이나 경기장 벽에 닿으면 탈락. 내 몸에는 부딪혀도 괜찮아요.',
+        '남을 내 몸에 부딪히게 만들어 탈락시키고, 마지막까지 살아남으면 라운드 승리예요.',
+      ] },
+      { h: '조작 (터치)', p: [
+        '좌우 누르기(기본): 화면 왼쪽 절반을 누르고 있으면 왼쪽으로, 오른쪽 절반은 오른쪽으로 돌아요. 떼면 똑바로 가요. 누른 채 가운데를 넘어 미끄러뜨리면 방향이 바뀌어요.',
+        '끌어서 방향: 아무 데나 누른 채 끌면 끈 방향으로 머리가 향해요. 떼어도 그 방향을 유지해요.',
+        '왼쪽 위 「조작」 칩으로 두 방식을 바꿔요. 이 폰에 기억돼요.',
+        '부스트: 아래 가운데 ⚡ 버튼을 누르고 있거나, 한쪽을 두 번 톡 누른 채 유지하거나, 양쪽을 동시에 누르면 빨라져요. 대신 몸이 조금씩 줄고 뒤에 먹이가 떨어져요.',
+        'PC 키보드·게임패드: ←→(A·D)·왼스틱으로 돌기(스틱은 기운 만큼), 스페이스·Shift·Ⓐ·RB 부스트(누르는 동안). 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '승리 방식', p: [
+        '최후 생존(기본): 한 라운드에서 마지막까지 살아남은 지렁이가 라운드 승리. 1판 / 3판 2선승 / 5판 3선승 중에서 골라요. 정한 판 수가 끝났는데 선두가 동점이면 결승 라운드를 더 해요.',
+        '여러 명이 동시에 마지막으로 탈락하면 그중 가장 긴 지렁이가 이겨요(길이도 같으면 무승부 라운드).',
+        '한 라운드는 최대 2분 30초. 넘기면 살아 있는 지렁이 중 가장 긴 쪽이 이겨요.',
+        '시간제: 2분 동안 진행하고, 탈락하면 3초 뒤 처음 길이로 다시 출발해요. 끝났을 때 가장 긴(살아 있는) 지렁이가 우승.',
+      ] },
+      { h: '팀전', p: [
+        '옵션 「모드」에서 팀전을 고르면 빨강 팀과 파랑 팀으로 나뉘어요. 인원이 홀수면 AI 지렁이(보통) 하나가 모자란 팀에 들어와요.',
+        '지렁이 색이 팀 색이에요(빨강 계열·파랑 계열). 같은 팀끼리는 부딪혀도 죽지 않고 겹쳐 지나가요.',
+        '최후 생존: 한 팀만 살아남으면 그 팀이 라운드 승리. 시간 끝(2분 30초)이면 살아 있는 지렁이 길이 합이 긴 팀이 이겨요.',
+        '시간제: 끝났을 때 팀의 살아 있는 지렁이 길이 합이 긴 팀이 우승(같으면 처치 합).',
+        'AI는 아군과 부딪힐 걱정 없이 다니고, 아군이 쫓는 적의 앞을 함께 가로막아 포위해요.',
+      ] },
+      { h: '특수 규칙', p: [
+        '머리끼리 정면으로 부딪히면 둘 다 탈락해요.',
+        '탈락한 지렁이의 몸은 큰 먹이 알갱이로 바뀌어요.',
+        '긴 지렁이는 조금 굵어지고 아주 약간 덜 꺾여요.',
+        '경기장 줄어들기(켜기): 최후 생존은 25초 뒤부터 약 70초에 걸쳐, 시간제는 2분 동안 천천히 경기장 벽이 안쪽으로 다가와요. 벽 밖의 먹이는 안쪽으로 옮겨져요.',
+      ] },
+      { h: '팁', p: [
+        '상대 머리 바로 앞을 가로질러 지나가면 상대가 내 몸에 부딪혀요. 부스트로 앞질러 막아 보세요.',
+        '부스트는 길이를 깎아요. 꼭 필요할 때만 짧게!',
+        '탈락한 지렁이 자리의 큰 먹이를 먹으면 빨리 길어져요. 하지만 그곳엔 다들 몰려드니 조심.',
+        '경기장이 줄어들기 시작하면 벽에서 멀리, 가운데 쪽으로 가요.',
+      ] },
+      { h: 'AI', p: [
+        'AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요.',
+        '쉬움: 앞을 잘 안 보고 자주 부딪혀요. 보통: 먹이를 찾고 장애물을 피해요. 어려움: 실제로 꺾이는 궤적과 상대 머리가 향하는 곳까지 내다보며 위험을 먼저 피하고, 돌아서 닿는 시간까지 따져 먹이를 고르며, 라운드 막판에 짧으면 상대 앞을 가로막고 길면 안전하게 버텨요.',
+      ] },
+      { h: '함께 하기', p: [
+        '실시간 게임이라 한 기기에 한 명씩이에요. 혼자 하면 나머지는 AI 지렁이예요.',
+        '친구와 하려면 온라인 방이나 LAN 방을 쓰세요. 지렁이와 먹이는 호스트 폰이 계산해요.',
+        '라운드마다 내 지렁이가 가장 길었던 길이가 「🏆 내 최고 기록」에 남아요(방식별로 따로).',
+      ] },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { ally, init, newWorld, stepWorld, aiThink, buildGrid, rayClear, encodeWorm, decodeWorm, encodeFoods, encodeDrops, decodeDrops, foodPos, killWorm, roundOver, nextRound, radOf, arenaR, SP, LEN0, TIME_LEN, ROUND_CAP },
+  });
+})();

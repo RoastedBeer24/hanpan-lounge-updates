@@ -1,0 +1,1717 @@
+/* 안개 어장 — 낮에 낚아 화물칸에 맞춰 싣고, 밤이 오기 전에 돌아오는 1인 항해 낚시 로그라이크.
+   구조: 순수 로직(init/apply/ai/result, 시드 난수 · 고정 걸음) + 뷰(캔버스 바다 · DOM 항구/화물칸).
+   시간은 배가 움직이거나 일을 할 때만 흐른다 — 뷰는 누른 방향을 걸음 단위 행동({t:'go'})으로 보낸다.
+   물고기 · 장비 · 해역 · 사건 수치는 모두 아래 표에 있고 도감은 표에서 만든다. 그림은 전부 코드(SVG)로 그린다. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge, U = L.util || {};
+  const ID = 'fogfish';
+  const N = 64, HX = 32.5, HY = 32.5;          // 지도 크기(칸), 본항 자리
+  const STEP_MIN = 0.6, BASE_V = 0.15;         // 한 걸음 = 0.5분, 기본 속력(칸/걸음)
+  const DAY_VIS = 9.5, DUSK = 780, DAWN0 = 1380;   // t = 06:00부터 흐른 분. 19:00 땅거미, 05:00 동틀 녘
+  const FR1 = 540, FR2 = 1320;                 // 신선도 경계(분): 싱싱 → 물감 → 상함
+  const COIN = '닢';
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const r3 = (v) => Math.round(v * 1000) / 1000;
+
+  const KIND = { shore: '연안', marsh: '여울', reef: '암초', deep: '심해', ruin: '폐허', ice: '빙해', abyss: '먼바다', wreck: '잔해' };
+  /* 해역: fear 밤 공포 배율 · rock 암초 밀도 · chart 해도 값 · th 밤의 것 */
+  const ZONES = [
+    { id: 'bay', n: '안쪽 만', k: 'shore', fear: 0.7, rock: 0.05, chart: 0, th: [], col: '#3d6b74', d: '항구를 감싼 얕은 물. 밤에도 비교적 조용함.' },
+    { id: 'reed', n: '갈대 여울', k: 'marsh', fear: 1.0, rock: 0.05, chart: 70, th: ['sw'], col: '#4a6a55', d: '갈대가 배를 붙잡는 얕은 물길. 갈대 속의 밤은 유난히 길다.' },
+    { id: 'saw', n: '톱니 암초', k: 'reef', fear: 1.1, rock: 0.17, chart: 150, th: ['bc'], col: '#476278', d: '물 위아래로 바위가 촘촘한 곳. 밤에는 없는 등대가 켜진다.' },
+    { id: 'trench', n: '검은 해구', k: 'deep', fear: 1.3, rock: 0.03, chart: 260, th: ['wh', 'mw'], col: '#2c4662', d: '바닥이 보이지 않는 물. 밤이면 물이 돌고, 아래에서 무엇인가 올라온다.' },
+    { id: 'belfry', n: '잠긴 종탑', k: 'ruin', fear: 1.5, rock: 0.11, chart: 420, th: ['bl', 'sw'], col: '#4d4a66', d: '가라앉은 마을 위. 밤마다 물 밑에서 종이 울린다.' },
+    { id: 'frost', n: '서리 물목', k: 'ice', fear: 1.4, rock: 0.07, chart: 600, th: ['fl', 'bc'], col: '#5b7f8f', d: '유빙이 떠다니는 찬 물목. 얼음은 낮에도 배를 긁는다.' },
+    { id: 'outer', n: '바깥 물', k: 'abyss', fear: 1.8, rock: 0.02, chart: 850, th: ['wh', 'mw'], col: '#232f4f', d: '해도의 끝. 가장 값진 것과 가장 큰 것이 함께 있다.' },
+  ];
+  /* 화물 조각 모양(칸 좌표) */
+  const SH = {
+    a1: [[0, 0]], i2: [[0, 0], [1, 0]], i3: [[0, 0], [1, 0], [2, 0]], l3: [[0, 0], [1, 0], [0, 1]],
+    i4: [[0, 0], [1, 0], [2, 0], [3, 0]], o4: [[0, 0], [1, 0], [0, 1], [1, 1]], l4: [[0, 0], [1, 0], [2, 0], [0, 1]], t4: [[0, 0], [1, 0], [2, 0], [1, 1]], s4: [[0, 0], [1, 0], [1, 1], [2, 1]],
+    i5: [[0, 0], [1, 0], [2, 0], [3, 0], [4, 0]], l5: [[0, 0], [1, 0], [2, 0], [3, 0], [0, 1]], p5: [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1]], x5: [[1, 0], [0, 1], [1, 1], [2, 1], [1, 2]],
+    r6: [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1]],
+  };
+  const ROT = {};
+  function cellsOf(sh, r) {
+    const key = sh + (r & 3); if (ROT[key]) return ROT[key];
+    let c = SH[sh].map((p) => p.slice());
+    for (let i = 0; i < (r & 3); i++) c = c.map(([x, y]) => [-y, x]);
+    const mx = Math.min(...c.map((p) => p[0])), my = Math.min(...c.map((p) => p[1]));
+    c = c.map(([x, y]) => [x - mx, y - my]);
+    return (ROT[key] = c);
+  }
+  const TIERS = [   // 화물칸 단계: 칸 · 선체 · 넓히는 값(닢 + 재료)
+    { w: 5, h: 5, hp: 100, n: '작은 거룻배' },
+    { w: 6, h: 6, hp: 120, n: '덧댄 어선', p: 160, need: { wood: 2 } },
+    { w: 7, h: 6, hp: 140, n: '넓은 어선', p: 380, need: { wood: 2, iron: 2 } },
+    { w: 8, h: 7, hp: 165, n: '원양 어선', p: 760, need: { wood: 3, iron: 3, cloth: 2 } },
+  ];
+
+  /* 물고기: [id, 이름, 해역, 값, 모양, 낚는 시간(분), 낚기 방식, 난도, 표시(n 밤 · t 그물 · p 통발), 그림[몸, 색1, 색2, 무늬], 변이종 이름]
+     낚기 방식: tm 띠 맞추기 · hd 당겼다 풀기 · rg 고리 맞추기 · dp 깊이 맞추기 */
+  const FISH_RAW = [
+    ['jeoneo', '전어', 0, 7, 'a1', 12, 'tm', 1, 't', ['f', '#9fb3bd', '#e8eef0', 3], '뼈 비치는 전어'],
+    ['mangduk', '망둑어', 0, 6, 'a1', 12, 'tm', 1, 't', ['f', '#8a7a5c', '#cdbf9a', 2], '눈 많은 망둑어'],
+    ['sungeo', '숭어', 0, 15, 'i2', 18, 'rg', 1, '', ['f', '#7d8f99', '#dfe6e8', 3], ''],
+    ['hak', '학꽁치', 0, 13, 'i2', 15, 'tm', 2, 't', ['l', '#8fb0c4', '#e6eef2', 0], ''],
+    ['dodari', '도다리', 0, 24, 'o4', 22, 'hd', 2, '', ['p', '#7a6a4e', '#b7a885', 2], '뒤집힌 도다리'],
+    ['nongeo', '농어', 0, 34, 'i3', 28, 'hd', 2, '', ['f', '#6f7f86', '#d9dfe0', 0], ''],
+    ['bungjang', '붕장어', 0, 40, 'i3', 25, 'hd', 2, 'n', ['l', '#5d5142', '#b9ab8e', 0], '매듭 붕장어'],
+    ['gaetga', '갯가재', 0, 22, 'a1', 14, 'rg', 2, 'n', ['m', '#b08a6a', '#e3c9a8', 4], ''],
+    ['kkotge', '꽃게', 0, 22, 'o4', 0, '', 0, 'p', ['c', '#6d7f9a', '#c9b08a', 2], '집게 셋 꽃게'],
+
+    ['baengeo', '뱅어', 1, 10, 'a1', 12, 'tm', 1, 't', ['f', '#d9dccf', '#f2f2ea', 0], ''],
+    ['ungeo', '웅어', 1, 19, 'i2', 16, 'tm', 2, 't', ['f', '#b9bcae', '#ecece0', 3], ''],
+    ['jjang', '짱뚱어', 1, 17, 'a1', 14, 'rg', 2, '', ['f', '#6a6f5a', '#b5c2d0', 2], '걸어 나온 짱뚱어'],
+    ['megi', '메기', 1, 36, 'l3', 24, 'hd', 2, '', ['f', '#4a4538', '#9a927a', 0], ''],
+    ['gamul', '가물치', 1, 34, 'i3', 24, 'hd', 3, '', ['l', '#4f5a3c', '#a9a37a', 2], '이 돋은 가물치'],
+    ['baem', '뱀장어', 1, 48, 'i4', 28, 'hd', 3, '', ['l', '#3f4a3a', '#c8c39a', 0], ''],
+    ['deungbul', '갈대 등불치', 1, 56, 'i2', 20, 'rg', 3, 'n', ['f', '#3c5a50', '#9be0c0', 2], '속 비치는 등불치'],
+    ['deureong', '드렁허리', 1, 44, 'i3', 22, 'tm', 3, 'n', ['l', '#7a5a3a', '#d0b080', 2], ''],
+    ['chamge', '참게', 1, 27, 'l3', 0, '', 0, 'p', ['c', '#4f5a4a', '#8a8f6a', 0], ''],
+
+    ['bollak', '볼락', 2, 21, 'i2', 16, 'tm', 2, '', ['f', '#8a5a4a', '#d9b8a0', 4], '겹눈 볼락'],
+    ['noraemi', '노래미', 2, 18, 'i2', 15, 'tm', 2, 't', ['f', '#7a6a3a', '#cfc08a', 2], ''],
+    ['jwichi', '쥐치', 2, 24, 'l3', 18, 'rg', 2, '', ['r', '#9a8f6a', '#d9d0a8', 2], ''],
+    ['ureok', '우럭', 2, 30, 'o4', 22, 'hd', 2, '', ['f', '#3f4448', '#8a9096', 2], ''],
+    ['gamseong', '감성돔', 2, 48, 'o4', 26, 'hd', 3, '', ['f', '#5a6068', '#c9cfd6', 1], '이 고른 감성돔'],
+    ['muneo', '돌문어', 2, 42, 't4', 24, 'hd', 3, '', ['s', '#8a4f4a', '#d9a898', 2], '손가락 문어'],
+    ['ssom', '쏨뱅이', 2, 60, 'l3', 22, 'rg', 3, 'n', ['f', '#9a3f3a', '#e0a090', 2], ''],
+    ['galchi', '갈치', 2, 68, 'i4', 24, 'tm', 4, 'n', ['l', '#c9d2da', '#f2f6f8', 0], '고리 이빨 갈치'],
+    ['daksaeu', '가시 닭새우', 2, 38, 'i2', 0, '', 0, 'p', ['m', '#b0503a', '#e8b090', 4], ''],
+
+    ['kkomchi', '꼼치', 3, 28, 'i2', 20, 'dp', 2, 't', ['l', '#9a8a80', '#d0c4bc', 0], ''],
+    ['imyeonsu', '임연수어', 3, 32, 'i3', 20, 'tm', 3, 't', ['f', '#6a6a4a', '#c9c9a0', 1], ''],
+    ['daegu', '대구', 3, 46, 'l4', 28, 'hd', 3, '', ['f', '#8a8470', '#d9d4c0', 2], '속 빈 대구'],
+    ['eundaegu', '은대구', 3, 50, 'i3', 26, 'dp', 3, '', ['f', '#3a3f48', '#8a909a', 0], ''],
+    ['agwi', '아귀', 3, 58, 'o4', 30, 'dp', 3, '', ['a', '#5a4a3a', '#a08a6a', 2], '유리 아귀'],
+    ['hongeo', '홍어', 3, 66, 'x5', 32, 'hd', 4, '', ['y', '#7a5a4a', '#c9a898', 2], '눈꺼풀 홍어'],
+    ['chorong', '초롱아귀', 3, 100, 'o4', 30, 'dp', 4, 'n', ['a', '#2a2630', '#7ad0c0', 0], ''],
+    ['sangalchi', '산갈치', 3, 128, 'i5', 34, 'hd', 4, 'n', ['l', '#c9d0d8', '#d05a4a', 0], '끝없는 산갈치'],
+    ['daege', '대게', 3, 62, 'x5', 0, '', 0, 'p', ['c', '#b0603a', '#e0b090', 0], ''],
+
+    ['haema', '해마', 4, 32, 'a1', 16, 'tm', 3, 't', ['m', '#b09a5a', '#e0d0a0', 4], ''],
+    ['jogi', '참조기', 4, 40, 'i2', 18, 'tm', 3, '', ['f', '#c9b06a', '#f0e0a0', 0], '우는 조기'],
+    ['gabo', '갑오징어', 4, 50, 'o4', 22, 'rg', 3, '', ['s', '#6a7a6a', '#c0d0b0', 1], '종 삼킨 갑오징어'],
+    ['gomchi', '곰치', 4, 56, 'i4', 28, 'hd', 4, '', ['l', '#5a4f2a', '#b0a060', 2], '두 머리 곰치'],
+    ['ssolbae', '쏠배감펭', 4, 70, 't4', 24, 'rg', 4, '', ['f', '#a04a3a', '#f0d0c0', 1], ''],
+    ['neungseong', '능성어', 4, 80, 'r6', 32, 'hd', 4, '', ['f', '#6a4a3a', '#c0a080', 4], ''],
+    ['jongjigi', '종지기 물고기', 4, 118, 'l4', 26, 'rg', 4, 'n', ['f', '#b0b8b0', '#e8f0e8', 0], ''],
+    ['meokjang', '먹장어', 4, 76, 'i3', 24, 'hd', 4, 'n', ['l', '#6a5a60', '#a09098', 0], '매듭 먹장어'],
+    ['ppulsora', '뿔소라', 4, 44, 'i2', 0, '', 0, 'p', ['h', '#8a7a6a', '#d0c0a8', 4], ''],
+
+    ['bingeo', '빙어', 5, 15, 'a1', 12, 'tm', 2, 't', ['f', '#c0d0d8', '#f0f6f8', 3], ''],
+    ['cheongeo', '청어', 5, 26, 'i2', 14, 'tm', 3, 't', ['f', '#6a8aa0', '#e0e8f0', 0], ''],
+    ['dorumuk', '도루묵', 5, 24, 'i2', 16, 'rg', 3, 't', ['f', '#a09070', '#f0e8d0', 2], ''],
+    ['myeongtae', '명태', 5, 44, 'i3', 20, 'tm', 3, '', ['f', '#7a7460', '#d0ccb8', 2], '얼음 눈 명태'],
+    ['yeoneo', '연어', 5, 76, 'l4', 28, 'hd', 4, '', ['f', '#8a9aa8', '#e09080', 2], '붉은 속 연어'],
+    ['gwangeo', '광어', 5, 88, 'r6', 32, 'hd', 4, '', ['p', '#5a5a48', '#a0a088', 2], '거울 광어'],
+    ['ippal', '이빨고기', 5, 140, 'l5', 34, 'dp', 5, 'n', ['f', '#4a4a52', '#9a9aa4', 0], ''],
+    ['chilseong', '서리 칠성장어', 5, 92, 'i3', 24, 'rg', 4, 'n', ['l', '#8090a0', '#c0d0e0', 2], '입만 남은 칠성장어'],
+    ['teolge', '털게', 5, 74, 'o4', 0, '', 0, 'p', ['c', '#a06a3a', '#d8b080', 2], ''],
+
+    ['saetbi', '샛비늘치', 6, 48, 'a1', 14, 'tm', 3, 't', ['f', '#5a6a80', '#a0c0e0', 2], ''],
+    ['tongan', '통안어', 6, 100, 'i2', 24, 'dp', 4, '', ['f', '#3a3a3a', '#80c0a0', 0], '눈 넷 통안어'],
+    ['pungseon', '풍선장어', 6, 118, 'l4', 28, 'dp', 4, '', ['l', '#2a2a30', '#5a5a66', 0], '입 속의 입'],
+    ['heuphyeol', '흡혈오징어', 6, 132, 't4', 26, 'rg', 5, '', ['s', '#6a2a2a', '#a04a4a', 0], ''],
+    ['gaebok', '개복치', 6, 150, 'r6', 36, 'hd', 4, '', ['r', '#8a9098', '#c0c8d0', 0], '반쪽 개복치'],
+    ['dombal', '돔발상어', 6, 165, 'i5', 36, 'hd', 5, '', ['f', '#4a4a50', '#8a8a94', 0], '아가미 없는 상어'],
+    ['silla', '실러캔스', 6, 280, 'r6', 40, 'hd', 5, 'n', ['f', '#3a4a6a', '#8090b0', 2], ''],
+    ['ginpal', '긴팔 오징어', 6, 190, 'l5', 30, 'rg', 5, 'n', ['s', '#7a6a80', '#c0b0c8', 0], '팔이 너무 많은 것'],
+    ['wangge', '심해 왕게', 6, 135, 'x5', 0, '', 0, 'p', ['c', '#8a2a2a', '#c87060', 0], ''],
+  ];
+  const FISH = FISH_RAW.map((a, i) => ({ i, id: a[0], n: a[1], z: a[2], k: ZONES[a[2]].k, v: a[3], sh: a[4], tm: Math.round(a[5] * 2.2), mg: a[6], dif: a[7], nt: a[8].includes('n'), net: a[8].includes('t'), pot: a[8].includes('p'), look: a[9], ab: a[10] || '' }));
+  const AB_MUL = 3;   // 변이종 값 배율
+  const FI = {}; FISH.forEach((f) => { FI[f.id] = f.i; });
+  /* 재료 · 건진 물건 */
+  const MATS = [
+    { id: 'wood', n: '젖은 목재', sh: 'i3', v: 12, mat: 1, buy: 45, d: '화물칸을 넓히는 데 씀.' },
+    { id: 'iron', n: '고철', sh: 'o4', v: 18, mat: 1, buy: 70, d: '화물칸을 넓히는 데 씀.' },
+    { id: 'cloth', n: '낡은 돛천', sh: 'i2', v: 10, mat: 1, buy: 55, d: '화물칸을 넓히는 데 씀.' },
+    { id: 'spoon', n: '은수저', sh: 'a1', v: 45, d: '누군가의 식탁에 있던 것.' },
+    { id: 'lens', n: '금 간 렌즈', sh: 'a1', v: 60, d: '등대에서 떨어져 나온 조각.' },
+    { id: 'clock', n: '멈춘 회중시계', sh: 'a1', v: 75, d: '바늘이 새벽 세 시에 멈춰 있음.' },
+    { id: 'chain', n: '닻사슬', sh: 'i3', v: 40, d: '끊어진 자리가 매끈함.' },
+    { id: 'bone', n: '고래 뼈', sh: 'l3', v: 80, d: '약재상이 값을 쳐줌.' },
+    { id: 'idol', n: '물 먹은 목상', sh: 'i2', v: 120, fear: 1, d: '값은 좋음. 싣고 있는 동안 공포가 조금씩 오름.' },
+    { id: 'bell', n: '놋쇠 종', sh: 'o4', v: 130, d: '추가 없는데 가끔 울림.' },
+    { id: 'box', n: '봉인된 상자', sh: 'o4', v: 170, d: '조합이 열어 보지 않고 사 감.' },
+  ];
+  const MI = {}; MATS.forEach((m, i) => { m.i = i; MI[m.id] = i; });
+  const WRECK_LOOT = [['wood', 26], ['iron', 20], ['cloth', 18], ['spoon', 8], ['chain', 8], ['lens', 6], ['clock', 5], ['bone', 4], ['idol', 2], ['bell', 2], ['box', 1]];
+
+  /* 장비: t 종류(rod 낚싯대 · net 그물 · pot 통발 · eng 기관 · lamp 등 · misc) */
+  const EQ = [
+    { id: 'bamboo', n: '대나무 낚싯대', t: 'rod', sh: 'i2', p: 30, kinds: ['shore', 'marsh'], sp: 1 },
+    { id: 'pole', n: '여울 장대', t: 'rod', sh: 'i3', p: 90, kinds: ['marsh', 'reef'], sp: 1.2 },
+    { id: 'reel', n: '강철 릴대', t: 'rod', sh: 'i3', p: 110, kinds: ['shore', 'reef'], sp: 1.35 },
+    { id: 'spool', n: '깊은 줄 감개', t: 'rod', sh: 'o4', p: 170, kinds: ['deep'], sp: 1 },
+    { id: 'hook', n: '갈고리 줄', t: 'rod', sh: 'i3', p: 230, kinds: ['ruin'], sp: 1 },
+    { id: 'winch', n: '무쇠 권양기', t: 'rod', sh: 'r6', p: 380, kinds: ['deep', 'ruin'], sp: 1.3 },
+    { id: 'auger', n: '얼음 끌 낚싯대', t: 'rod', sh: 'i3', p: 300, kinds: ['ice'], sp: 1 },
+    { id: 'frostw', n: '서리 감개', t: 'rod', sh: 'o4', p: 460, kinds: ['ice', 'deep'], sp: 1.3 },
+    { id: 'longline', n: '긴 주낙', t: 'rod', sh: 'r6', p: 480, kinds: ['abyss', 'deep'], sp: 1 },
+    { id: 'blackline', n: '검은 줄', t: 'rod', sh: 'l5', p: 640, kinds: ['abyss', 'ruin', 'ice'], sp: 1.25 },
+    { id: 'grapnel', n: '인양 갈고리', t: 'rod', sh: 'o4', p: 120, kinds: ['wreck'], sp: 1 },
+    { id: 'net1', n: '작은 끌그물', t: 'net', sh: 'o4', p: 80, kinds: ['shore', 'marsh'], per: 11, cap: 4 },
+    { id: 'net2', n: '넓은 끌그물', t: 'net', sh: 'r6', p: 240, kinds: ['shore', 'marsh', 'reef'], per: 8, cap: 7 },
+    { id: 'net3', n: '깊은 끌그물', t: 'net', sh: 'r6', p: 420, kinds: ['deep', 'ice', 'abyss'], per: 9, cap: 6 },
+    { id: 'pot1', n: '통발', t: 'pot', sh: 'i2', p: 45, kinds: ['shore', 'marsh', 'reef'], cap: 3 },
+    { id: 'pot2', n: '큰 통발', t: 'pot', sh: 'o4', p: 130, kinds: ['shore', 'marsh', 'reef', 'ruin'], cap: 6 },
+    { id: 'pot3', n: '깊은 통발', t: 'pot', sh: 'o4', p: 260, kinds: ['deep', 'ice', 'abyss', 'ruin'], cap: 4 },
+    { id: 'eng0', n: '낡은 발동기', t: 'eng', sh: 'o4', p: 60, sp: 1 },
+    { id: 'eng1', n: '쌍기통 발동기', t: 'eng', sh: 'o4', p: 240, sp: 1.25 },
+    { id: 'eng2', n: '무쇠 심장 기관', t: 'eng', sh: 'r6', p: 560, sp: 1.5 },
+    { id: 'eng3', n: '조용한 터빈', t: 'eng', sh: 'r6', p: 620, sp: 1.4, quiet: 1 },
+    { id: 'lamp0', n: '등유등', t: 'lamp', sh: 'a1', p: 25, vis: 4.2, calm: 0.62, att: 1 },
+    { id: 'lamp1', n: '반사경 등', t: 'lamp', sh: 'i2', p: 140, vis: 5.2, calm: 0.52, att: 1.3 },
+    { id: 'lamp2', n: '탐조등', t: 'lamp', sh: 'o4', p: 360, vis: 6.6, calm: 0.45, att: 1.9 },
+    { id: 'lamp3', n: '푸른 유리등', t: 'lamp', sh: 'i2', p: 210, vis: 4.4, calm: 0.68, att: 0 },
+    { id: 'ice', n: '얼음 상자', t: 'misc', sh: 'o4', p: 150, keep: 1.6 },
+    { id: 'salt', n: '소금 통', t: 'misc', sh: 'i2', p: 60, keep: 1.25 },
+    { id: 'rib', n: '보강 늑재', t: 'misc', sh: 'i3', p: 130, hp: 30 },
+    { id: 'horn', n: '안개 나팔', t: 'misc', sh: 'i2', p: 110 },
+    { id: 'compass', n: '놋쇠 나침반', t: 'misc', sh: 'a1', p: 90 },
+    { id: 'lead', n: '측심 추', t: 'misc', sh: 'a1', p: 70 },
+    { id: 'bait', n: '미끼통', t: 'misc', sh: 'a1', p: 85 },
+    { id: 'kit', n: '수선 도구함', t: 'misc', sh: 'i2', p: 100 },
+  ];
+  const EI = {}; EQ.forEach((e, i) => { e.i = i; EI[e.id] = i; });
+  const ETYPE = { rod: '낚싯대', net: '그물', pot: '통발', eng: '기관', lamp: '등', misc: '선구' };
+  const kindsText = (ks) => ks.map((k) => KIND[k]).join(' · ');
+  function eqDesc(e) {   // 「키워드: 수치」 표기 — 도감 · 선구점 · 화물칸이 같은 글을 씀
+    const a = [];
+    if (e.t === 'rod') { a.push('어장: ' + kindsText(e.kinds)); if (e.sp !== 1) a.push('낚는 속도: ×' + e.sp); if (e.id === 'grapnel') a.push('가라앉은 잔해에서 재료와 물건을 건짐'); }
+    if (e.t === 'net') a.push('어장: ' + kindsText(e.kinds), '끌기: ' + e.per + '칸마다 1마리', '자루: ' + e.cap + '마리', '지나가기만 해도 잔고기가 듦');
+    if (e.t === 'pot') a.push('어장: ' + kindsText(e.kinds), '담김: 5시간마다 1마리', '최대: ' + e.cap + '마리', '바다에 내려 두고 나중에 걷음');
+    if (e.t === 'eng') { a.push('속력: ×' + e.sp); if (e.quiet) a.push('뒤따르는 것 속력: ×0.75'); }
+    if (e.t === 'lamp') a.push('밤 시야: ' + e.vis + '칸', '공포 오름: ×' + e.calm, e.att ? '빛 끌림: ×' + e.att : '빛 끌림: 없음');
+    if (e.keep) a.push('신선도 유지: ×' + e.keep);
+    if (e.hp) a.push('선체: +' + e.hp);
+    if (e.id === 'horn') a.push('뒤따르는 것 · 빛 먹는 떼를 쫓음', '공포: −10', '다시 쓰기: 180분');
+    if (e.id === 'compass') a.push('공포 오름: ×0.9', '공포가 높아도 나침반이 돌지 않음');
+    if (e.id === 'lead') a.push('해도에 모든 어군과 어종이 보임');
+    if (e.id === 'bait') a.push('변이종 확률: +4%', '큰 놈 확률: +12%');
+    if (e.id === 'kit') a.push('바다에서 선체 +20', '걸리는 시간: 60분', '하루 한 번');
+    return a.join(' · ');
+  }
+  /* 날씨(그날의 바다) */
+  const WX = [
+    { id: 'clear', n: '맑음', w: 5, d: '별일 없는 날.' },
+    { id: 'fog', n: '짙은 안개', w: 2, d: '땅거미: 60분 일찍 · 밤 어군: +1' },
+    { id: 'tide', n: '큰 물때', w: 2, d: '어군 재고: +1' },
+    { id: 'wind', n: '찬 바람', w: 2, d: '공포 오름: ×1.25' },
+    { id: 'fair', n: '장날', w: 2, d: '모든 어종 값: ×1.15' },
+    { id: 'poor', n: '흉어', w: 1, d: '낮 어군: −1' },
+    { id: 'calm', n: '잔잔한 물', w: 2, d: '속력: ×1.1' },
+    { id: 'red', n: '붉은 달', w: 1, d: '변이종 확률: ×2 · 공포 오름: ×1.2' },
+  ];
+  /* 바다의 사건(표류물). o: 고를 것, r: [가중치, 결과 글, 효과]. 효과: m 닢 · h 선체 · p 공포 · t 분 · it 물건 · fz 그 해역 물고기 n마리 · sh 어군 · bf 버프 · rw 귀항 사례금 */
+  const EVENTS = [
+    { id: 'crate', n: '떠다니는 상자', tx: '못이 반쯤 빠진 나무 상자가 물결에 흔들린다.', o: [
+      { l: '건져 올린다', t: 20, r: [[4, '안에 든 것은 아직 쓸 만했다.', { it: ['wood', 'cloth', 'iron'] }], [2, '바닥에 은붙이가 깔려 있었다.', { it: ['spoon', 'lens'] }], [2, '뚜껑을 열자 썩은 내가 올라왔다. 한참 손을 씻었다.', { p: 6 }]] },
+      { l: '지나친다', r: [[1, '상자는 안개 쪽으로 떠내려갔다.', {}]] }] },
+    { id: 'skiff', n: '뒤집힌 거룻배', tx: '배 한 척이 바닥을 하늘로 향한 채 떠 있다. 주인은 보이지 않는다.', o: [
+      { l: '뒤집어 살핀다', t: 30, r: [[3, '뱃전 틈에 끼어 있던 돈주머니를 찾았다.', { m: [40, 90] }], [3, '쓸 만한 널빤지를 뜯어냈다.', { it: ['wood'] }], [2, '배 밑에 무엇인가 붙어 있었다. 떨어져 나가며 이쪽을 보았다.', { p: 12 }]] },
+      { l: '지나친다', r: [[1, '돌아보지 않았다.', {}]] }] },
+    { id: 'tangle', n: '버려진 그물', tx: '끊어진 그물이 떠 있고, 그 안에서 무엇인가 퍼덕인다.', o: [
+      { l: '끌어 올린다', t: 25, r: [[5, '아직 싱싱한 것이 몇 마리 걸려 있었다.', { fz: 2 }], [2, '그물이 스크루에 감겼다. 풀어내느라 선체가 긁혔다.', { h: -6 }]] },
+      { l: '지나친다', r: [[1, '퍼덕임은 곧 멎었다.', {}]] }] },
+    { id: 'mute', n: '말 없는 배', tx: '낯선 어선이 닻도 없이 서 있다. 뱃사람은 고개만 끄덕인다.', o: [
+      { l: '어디가 잘 무는지 묻는다', t: 15, r: [[4, '뱃사람이 손가락으로 한쪽을 가리켰다. 그쪽 물빛이 달랐다.', { sh: 1 }], [1, '뱃사람은 끝내 입을 열지 않았다.', {}]] },
+      { l: '기름을 조금 얻는다', t: 10, r: [[3, '등에 기름을 채웠다. 오늘 밤은 불이 고르게 탈 것이다.', { bf: 'oil' }], [1, '통은 비어 있었다.', {}]] },
+      { l: '지나친다', r: [[1, '멀어질 때까지 그는 이쪽을 보고 있었다.', {}]] }] },
+    { id: 'whale', n: '죽은 고래', tx: '커다란 몸이 옆으로 누워 떠 있다. 갈매기도 앉지 않는다.', o: [
+      { l: '살을 베어 미끼로 쓴다', t: 40, r: [[4, '냄새는 지독하지만 고기는 이런 것을 좋아한다.', { bf: 'chum', p: 5 }]] },
+      { l: '뼈를 건진다', t: 60, r: [[3, '갈비뼈 하나를 잘라 실었다.', { it: ['bone'] }], [1, '속이 비어 있었다. 뼈가 있어야 할 자리에 아무것도 없었다.', { p: 10 }]] },
+      { l: '지나친다', r: [[1, '물빛이 한동안 붉었다.', {}]] }] },
+    { id: 'birds', n: '새 떼', tx: '새들이 한곳을 맴돌며 물로 내리꽂힌다.', o: [
+      { l: '새를 따라간다', t: 10, r: [[5, '새 떼 아래로 물이 끓고 있었다.', { sh: 1 }], [1, '도착했을 때 새들은 이미 흩어진 뒤였다.', {}]] },
+      { l: '지나친다', r: [[1, '갈 길이 멀다.', {}]] }] },
+    { id: 'buoy', n: '부서진 부표', tx: '조합의 부표가 기울어 반쯤 잠겨 있다.', o: [
+      { l: '바로 세운다', t: 25, r: [[1, '조합 장부에 수고비가 적힐 것이다.', { rw: 35 }]] },
+      { l: '쇠붙이를 떼어 간다', t: 15, r: [[1, '부표는 가라앉았고, 쇠는 남았다.', { it: ['iron'] }]] },
+      { l: '지나친다', r: [[1, '누군가 고치겠지.', {}]] }] },
+    { id: 'pot', n: '낯선 통발', tx: '주인 모를 통발의 부표가 떠 있다. 줄이 팽팽하다.', o: [
+      { l: '걷어 올린다', t: 20, r: [[4, '속이 꽉 차 있었다. 주인이 알면 좋아하지 않을 것이다.', { fz: 2 }], [2, '통발 안에는 통발 주인의 장화가 한 짝 들어 있었다.', { p: 9 }]] },
+      { l: '그대로 둔다', r: [[1, '남의 것이다.', {}]] }] },
+    { id: 'still', n: '잔잔한 물', tx: '바람이 닿지 않는 고요한 물목. 물이 거울 같다.', o: [
+      { l: '닻을 내리고 쉰다', t: 60, r: [[1, '한 시간쯤 아무 일도 일어나지 않았다. 그것으로 충분했다.', { p: -22 }]] },
+      { l: '지나친다', r: [[1, '쉴 틈이 없다.', {}]] }] },
+    { id: 'cargo', n: '가라앉는 화물', tx: '묶인 궤짝들이 천천히 잠기고 있다. 손으로는 닿지 않는다.', o: [
+      { l: '갈고리로 끌어 올린다', need: 'grapnel', t: 30, r: [[3, '젖은 궤짝 속에서 값나가는 것을 골라냈다.', { it: ['box', 'bell', 'clock'] }], [2, '건진 것은 쇳덩이뿐이었다.', { it: ['iron'] }]] },
+      { l: '지나친다', r: [[1, '궤짝은 물 아래로 사라졌다.', {}]] }] },
+    { id: 'bellev', n: '안개 속 종소리', nt: 1, tx: '가까운 곳에서 종이 울린다. 이 근처에 종이 있을 리 없다.', o: [
+      { l: '소리를 따라간다', t: 20, r: [[2, '물에 반쯤 잠긴 종루 끝에 무엇인가 걸려 있었다.', { it: ['bell', 'clock', 'spoon'] }], [2, '소리는 가까워지지도 멀어지지도 않았다. 배가 제자리를 돌고 있었다.', { p: 15 }]] },
+      { l: '귀를 막는다', r: [[1, '손바닥 너머로도 종은 울렸다.', { p: 3 }]] }] },
+    { id: 'light', n: '물 위의 등불', nt: 1, tx: '작은 불빛이 물 위에서 흔들린다. 누군가 손을 흔드는 것도 같다.', o: [
+      { l: '다가간다', t: 20, r: [[3, '뗏목 위의 사람을 태웠다. 항구에 닿자 그는 말없이 돈을 쥐여 주었다.', { rw: 120 }], [2, '불빛 아래에는 아무도 없었다. 불빛을 들고 있는 것도 없었다.', { p: 18, h: -8 }]] },
+      { l: '등을 끄고 지나친다', r: [[1, '불빛은 한참을 따라오다 멈췄다.', { p: 4 }]] }] },
+    { id: 'frozen', n: '얼음에 갇힌 것', z: 5, tx: '유빙 속에 커다란 그림자가 박혀 있다.', o: [
+      { l: '얼음을 깬다', t: 45, r: [[3, '얼음 속 고기는 방금 잡은 것처럼 단단했다.', { fz: 2 }], [1, '깨진 얼음 안은 비어 있었다. 그림자만 물속으로 미끄러져 내려갔다.', { p: 16 }]] },
+      { l: '지나친다', r: [[1, '얼음은 천천히 돌며 멀어졌다.', {}]] }] },
+    { id: 'steeple', n: '물 위로 솟은 첨탑', z: 4, tx: '종탑 꼭대기가 물 위로 손바닥만큼 나와 있다. 창 안쪽이 어둡다.', o: [
+      { l: '창 안으로 손을 넣는다', t: 20, r: [[3, '손에 차가운 쇠붙이가 잡혔다.', { it: ['clock', 'spoon', 'lens'] }], [2, '안에서 무엇인가 손을 마주 잡았다.', { p: 20 }]] },
+      { l: '지나친다', r: [[1, '창은 계속 이쪽을 향해 있었다.', { p: 2 }]] }] },
+    { id: 'slick', n: '기름띠', tx: '물 위에 무지갯빛 띠가 길게 늘어져 있다. 어디선가 배가 깨진 것이다.', o: [
+      { l: '띠를 거슬러 올라간다', t: 35, r: [[3, '부서진 선체 조각들이 떠 있었다. 쓸 것을 추렸다.', { it: ['wood', 'iron', 'chain'] }], [1, '띠의 끝에는 아무것도 없었다. 기름만 물 밑에서 계속 올라왔다.', { p: 8 }]] },
+      { l: '지나친다', r: [[1, '남의 불행이다.', {}]] }] },
+    { id: 'spout', n: '검은 물기둥', z: 3, tx: '멀지 않은 곳에서 물이 조용히 솟았다가 가라앉는다. 숨을 쉬는 것 같다.', o: [
+      { l: '가라앉은 자리에 줄을 내린다', t: 30, r: [[3, '깊은 데 것이 줄줄이 올라왔다.', { fz: 3 }], [2, '줄이 끌려갔다. 배가 한 뼘쯤 기울었다가 돌아왔다.', { h: -10, p: 8 }]] },
+      { l: '지나친다', r: [[1, '물기둥은 배가 멀어질 때까지 솟지 않았다.', {}]] }] },
+  ];
+  /* 밤의 것(도감 · 규칙용 설명. 수치는 로직 상수와 같은 곳에서 가져옴) */
+  const TH = {
+    rk: { n: '떠오른 암초', d: '공포: 30부터. 뱃머리 앞에 없던 바위가 나타남. 절반은 진짜(선체 −6), 절반은 헛것(닿으면 사라짐 · 공포 +3).' },
+    st: { n: '뒤따르는 것', d: '공포: 50부터. 고물 쪽에서 나타나 배를 쫓음. 닿으면 선체 −15 · 화물 하나를 잃음 · 공포 +10. 등을 켜면 느려짐(×0.7). 서 있는 동안에도 다가옴.' },
+    sw: { n: '빛 먹는 떼', d: '갈대 여울 · 잠긴 종탑. 켜 둔 등에 끌려옴. 닿으면 등이 90분 동안 꺼짐 · 공포 +12. 등을 끄면 흩어짐. 푸른 유리등에는 끌리지 않음.' },
+    wh: { n: '도는 물', d: '검은 해구 · 바깥 물. 밤마다 자리가 바뀌는 소용돌이. 2.4칸 안에서 배를 끌어당기고, 한가운데에 닿으면 선체 −12 · 공포 +8.' },
+    mw: { n: '큰 입', d: '검은 해구 · 바깥 물. 물 아래를 도는 커다란 그림자. 가까이 오래 머물면 올라옴. 닿으면 선체 −25 · 공포 +15.' },
+    bc: { n: '없는 등대', d: '톱니 암초 · 서리 물목. 항구의 등대와 닮은 불빛. 다가가면 꺼짐 · 공포 +8. 공포가 높으면 나침반이 돌아 가려내기 어려움.' },
+    bl: { n: '물 밑의 종', d: '잠긴 종탑. 밤에 그 물 위에 있으면 150분마다 울림. 공포 +8(등을 켜면 +4).' },
+    fl: { n: '유빙', d: '서리 물목. 낮에도 떠다님. 부딪히면 선체 −5.' },
+  };
+  const LENS = { S: { days: 6, inst: [170, 440, 860], n: '짧게' }, M: { days: 10, inst: [150, 360, 660, 1000, 1420], n: '보통' }, L: { days: 16, inst: [140, 280, 440, 620, 820, 1040, 1260, 1480], n: '길게' } };
+  const PER = 2;   // 납부 주기(일)
+
+  /* ---------- 난수 · 지도 ---------- */
+  function mul32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function rnd(s) { s.r = (s.r + 0x6D2B79F5) | 0; let t = Math.imul(s.r ^ (s.r >>> 15), 1 | s.r); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+  const hash2 = (x, y, k) => { let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263) ^ Math.imul(k | 0, 1274126177); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+  function noise(x, y, k) {
+    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const a = hash2(ix, iy, k), b = hash2(ix + 1, iy, k), c = hash2(ix, iy + 1, k), d = hash2(ix + 1, iy + 1, k);
+    return a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy;
+  }
+  const TAU = Math.PI * 2;
+  let MAPC = null;
+  function mapOf(seed) {
+    if (MAPC && MAPC.seed === seed) return MAPC;
+    const R = mul32(seed ^ 0x51ed27), t = new Uint8Array(N * N), z = new Uint8Array(N * N), k = seed & 0xffff;
+    const off = R() * TAU, sh3 = (a) => { for (let i = 2; i > 0; i--) { const j = Math.floor(R() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+    const p1 = sh3([1, 2, 3]), p2 = sh3([4, 5, 6]);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const dx = x + 0.5 - HX, dy = y + 0.5 - HY, d = Math.hypot(dx, dy) + (noise(x * 0.18, y * 0.18, k + 1) - 0.5) * 3;
+      let a = Math.atan2(dy, dx) + off + (noise(x * 0.12, y * 0.12, k + 2) - 0.5) * 0.5; a = ((a % TAU) + TAU) % TAU;
+      let zn = d < 9 ? 0 : d < 20 ? p1[Math.floor(a / (TAU / 3)) % 3] : d < 30.5 ? p2[Math.floor(((a + TAU / 6) % TAU) / (TAU / 3)) % 3] : 255;
+      if (x < 1 || y < 1 || x > N - 2 || y > N - 2) zn = 255;
+      z[y * N + x] = zn;
+      if (zn === 255) { t[y * N + x] = 1; continue; }
+      const Z = ZONES[zn], n = noise(x * 0.42, y * 0.42, k + 3) * 0.65 + noise(x * 0.9, y * 0.9, k + 4) * 0.35;
+      if (n > 0.8 - Z.rock * 1.1 && Math.hypot(dx, dy) > 3.4) t[y * N + x] = 1;
+      else if (zn === 1 && noise(x * 0.3, y * 0.3, k + 5) > 0.52 && Math.hypot(dx, dy) > 3.4) t[y * N + x] = 2;
+    }
+    for (const [x, y] of [[31, 30], [32, 30], [33, 30], [32, 29], [31, 29]]) t[y * N + x] = 1;   // 본항이 선 섬
+    // 닿을 수 없는 물은 바위로 메움
+    const seen = new Uint8Array(N * N), q = [32 * N + 32]; seen[q[0]] = 1;
+    for (let h = 0; h < q.length; h++) { const c = q[h], cx = c % N, cy = (c / N) | 0; for (const [ax, ay] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const nx = cx + ax, ny = cy + ay; if (nx < 0 || ny < 0 || nx >= N || ny >= N) continue; const ni = ny * N + nx; if (seen[ni] || t[ni] === 1) continue; seen[ni] = 1; q.push(ni); } }
+    const tz = ZONES.map(() => []);
+    for (let i = 0; i < N * N; i++) { if (t[i] !== 1 && !seen[i]) t[i] = 1; if (t[i] !== 1 && z[i] !== 255 && Math.hypot((i % N) + 0.5 - HX, ((i / N) | 0) + 0.5 - HY) > 3.2) tz[z[i]].push(i); }
+    const near = (tx, ty) => { let b = -1, bd = 1e9; for (let i = 0; i < N * N; i++) { if (t[i] !== 0 || z[i] === 255) continue; const d = Math.hypot((i % N) + 0.5 - tx, ((i / N) | 0) + 0.5 - ty); if (d < bd) { bd = d; b = i; } } return b; };
+    const docks = [0, 1].map((j) => { const a = (j * 1.5 + 0.75) * (TAU / 3) - off, i = near(HX + Math.cos(a) * 19.5, HY + Math.sin(a) * 19.5); return { x: (i % N) + 0.5, y: ((i / N) | 0) + 0.5, n: j ? '말뚝 부두' : '등대 부두' }; });
+    const wrecks = ZONES.map((Z, zi) => { const a = tz[zi]; let i = a[Math.floor(R() * a.length)]; for (let n = 0; n < 20 && Math.hypot((i % N) + 0.5 - HX, ((i / N) | 0) + 0.5 - HY) < 5; n++) i = a[Math.floor(R() * a.length)]; return { x: (i % N) + 0.5, y: ((i / N) | 0) + 0.5, z: zi }; });
+    return (MAPC = { seed, t, z, tz, docks, wrecks, p1, p2, off });
+  }
+  const zoneAt = (M, x, y) => { const v = M.z[(y | 0) * N + (x | 0)]; return v === undefined ? 255 : v; };
+  /* 길 찾기용 거리장(목표 칸에서 퍼짐). 해도 없는 물 · 바위는 막힘 */
+  const FC = new Map();
+  function fieldTo(M, s, ti) {
+    let ck = 0; s.ch.forEach((c, i) => { if (c) ck |= 1 << i; });
+    const rk = s.rk.length ? s.rk.map((r) => (r[1] | 0) * N + (r[0] | 0)) : null;
+    const key = M.seed + '|' + ck + '|' + ti + (rk ? '|' + rk.join(',') : '');
+    let f = FC.get(key); if (f) return f;
+    f = new Int16Array(N * N).fill(-1);
+    const ok = (i) => M.t[i] !== 1 && M.z[i] !== 255 && s.ch[M.z[i]] && !(rk && rk.includes(i));
+    const q = [ti]; f[ti] = 0;
+    for (let h = 0; h < q.length; h++) {
+      const c = q[h], cx = c % N, cy = (c / N) | 0, d = f[c] + 1;
+      for (let ay = -1; ay <= 1; ay++) for (let ax = -1; ax <= 1; ax++) {
+        if (!ax && !ay) continue; const nx = cx + ax, ny = cy + ay; if (nx < 0 || ny < 0 || nx >= N || ny >= N) continue;
+        const ni = ny * N + nx; if (f[ni] >= 0 || !ok(ni)) continue;
+        if (ax && ay && (!ok(cy * N + nx) || !ok(ny * N + cx))) continue;
+        f[ni] = d; q.push(ni);
+      }
+    }
+    if (FC.size > 60) FC.delete(FC.keys().next().value);
+    FC.set(key, f); return f;
+  }
+
+  /* ---------- 상태 도우미 ---------- */
+  function nf(s) {   // 밤의 깊이 0~1 (시간에 대한 부드러운 함수)
+    const ds = DUSK - (s.wx === 1 ? 60 : 0), t = s.t, sm = (v) => { v = clamp(v, 0, 1); return v * v * (3 - 2 * v); };
+    return t < DAWN0 ? sm((t - ds) / 90) : sm((1440 - t) / 60);
+  }
+  function eqInfo(s) {
+    const E = { sp: 0.6, quiet: 0, lamp: null, rods: {}, net: null, keep: 1, hp: 0, horn: 0, compass: 0, lead: 0, bait: 0, kit: 0, idol: 0, pots: [] };
+    s.cargo.forEach((it, i) => {
+      if (it.k === 'm') { if (MATS[it.m].fear) E.idol++; return; }
+      if (it.k !== 'e') return;
+      const e = EQ[it.e];
+      if (e.t === 'eng' && e.sp > E.sp) { E.sp = e.sp; E.quiet = e.quiet || 0; }
+      if (e.t === 'lamp' && (!E.lamp || e.vis > E.lamp.vis)) E.lamp = e;
+      if (e.t === 'rod') e.kinds.forEach((k) => { if (!(E.rods[k] >= e.sp)) E.rods[k] = e.sp; });
+      if (e.t === 'net' && (!E.net || e.cap > E.net.cap)) E.net = e;
+      if (e.t === 'pot') E.pots.push(i);
+      if (e.keep) E.keep = Math.max(E.keep, 1) * (E['k' + e.id] ? 1 : e.keep), E['k' + e.id] = 1;
+      if (e.hp) E.hp = e.hp;
+      if (e.id === 'horn') E.horn = 1; if (e.id === 'compass') E.compass = 1; if (e.id === 'lead') E.lead = 1; if (e.id === 'bait') E.bait = 1; if (e.id === 'kit') E.kit = 1;
+    });
+    return E;
+  }
+  const mhp = (s, E) => TIERS[s.tier].hp + (E || eqInfo(s)).hp;
+  const itShape = (it) => (it.k === 'f' ? FISH[it.f].sh : it.k === 'e' ? EQ[it.e].sh : MATS[it.m].sh);
+  const itName = (it) => (it.k === 'f' ? (it.ab ? FISH[it.f].ab : FISH[it.f].n) + (it.big ? ' (큰 놈)' : '') : it.k === 'e' ? EQ[it.e].n : MATS[it.m].n);
+  function fresh(s, it, E) {   // 0 싱싱 · 1 물감 · 2 상함
+    if (it.k !== 'f') return 0; if (it.rot) return 2;
+    const age = (s.m - it.m) / ((E || eqInfo(s)).keep * (it.ab ? 2 : 1));
+    return age < FR1 ? 0 : age < FR2 ? 1 : 2;
+  }
+  const FRN = ['싱싱', '물감', '상함'], FRV = [1, 0.6, 0.2];
+  function price(s, it, E) {
+    if (it.k === 'm') return MATS[it.m].v;
+    if (it.k === 'e') return it.nw ? it.pp : Math.floor(EQ[it.e].p * 0.5);
+    const F = FISH[it.f];
+    let v = F.v * (it.ab ? AB_MUL : 1) * (it.big ? 1.5 : 1) * FRV[fresh(s, it, E)];
+    if (s.hot.includes(it.f)) v *= 1.5;
+    v *= Math.max(0.6, 1 - 0.05 * (s.sold[it.f] || 0));
+    if (s.wx === 4) v *= 1.15;
+    return Math.max(1, Math.round(v));
+  }
+  const eqPrice = (s, ei) => Math.round(EQ[ei].p * (s.disc.includes(ei) ? 0.75 : 1));
+  function fx(s, k, o) { s.fid++; s.fx.push(Object.assign({ id: s.fid, k }, o)); if (s.fx.length > 8) s.fx.shift(); }
+  function gridOf(s) { const T = TIERS[s.tier], g = new Int8Array(T.w * T.h).fill(-1); s.cargo.forEach((it, i) => cellsOf(itShape(it), it.r).forEach(([cx, cy]) => { g[(it.y + cy) * T.w + it.x + cx] = i; })); return g; }
+  function fitAt(g, T, sh, r, x, y) { for (const [cx, cy] of cellsOf(sh, r)) { const X = x + cx, Y = y + cy; if (X < 0 || Y < 0 || X >= T.w || Y >= T.h || g[Y * T.w + X] >= 0) return false; } return true; }
+  function findFit(g, T, sh) { for (let r = 0; r < 4; r++) for (let y = 0; y < T.h; y++) for (let x = 0; x < T.w; x++) if (fitAt(g, T, sh, r, x, y)) return [x, y, r]; return null; }
+  const freeCells = (s) => { const T = TIERS[s.tier]; return T.w * T.h - s.cargo.reduce((n, it) => n + SH[itShape(it)].length, 0); };
+  const due = (s) => { const i = Math.ceil(s.day / PER) - 1; return { amt: s.inst[i] || 0, left: PER - ((s.day - 1) % PER), i }; };
+  const dayNight = (s) => (nf(s) > 0.5 ? 1 : 0);
+  const shoalOn = (s, sh) => (sh.nt ? nf(s) > 0.5 : nf(s) < 0.75);
+
+  /* ---------- 하루 준비 ---------- */
+  function pickTile(s, M, z, avoid, minD) {   // 지금 해도로 닿을 수 있는 칸만(해도 없는 물 너머의 외딴 물은 뺌)
+    const a = M.tz[z], f = fieldTo(M, { ch: s.ch, rk: [] }, 33 * N + 32); let best = -1;
+    for (let n = 0; n < 24; n++) { const i = a[Math.floor(rnd(s) * a.length)], x = (i % N) + 0.5, y = ((i / N) | 0) + 0.5; if (f[i] < 0 && s.ch[z]) continue; best = i; if (M.t[i] === 0 && !avoid.some((p) => Math.hypot(p.x - x, p.y - y) < minD)) break; }
+    if (best < 0) best = a.find((i) => f[i] >= 0); if (best == null || best < 0) best = a[0];
+    return { x: (best % N) + 0.5, y: ((best / N) | 0) + 0.5 };
+  }
+  function pickFish(s, z, night, f) {
+    const c = FISH.filter((F) => F.z === z && !F.pot && F.nt === !!night && (!f || f(F))); if (!c.length) return null;
+    let tot = 0; const w = c.map((F) => { const v = 1 / Math.sqrt(F.v) + 0.04; tot += v; return v; }); let r = rnd(s) * tot;
+    for (let i = 0; i < c.length; i++) { r -= w[i]; if (r <= 0) return c[i]; } return c[c.length - 1];
+  }
+  function spawnZone(s, M, z) {
+    s.sh = s.sh.filter((h) => h.z !== z);
+    const nd = 6 - (s.wx === 5 ? 1 : 0) + (z === 0 ? 1 : 0), nn = 3 + (s.wx === 1 ? 1 : 0), own = [];
+    let abDone = rnd(s) > 0.4;   // 변이 어군은 해역마다 하루에 많아야 하나, 열에 넷
+    for (let i = 0; i < nd + nn; i++) {
+      const night = i >= nd, F = pickFish(s, z, night), p = pickTile(s, M, z, own.concat(M.docks), 2.6), cells = SH[F.sh].length;
+      let n = 2 + Math.floor(rnd(s) * 3) + (s.wx === 2 ? 1 : 0); if (cells >= 5) n = Math.min(n, 3);
+      const h = { x: p.x, y: p.y, z, f: F.i, n, nt: night ? 1 : 0, ab: 0, sn: 0 };
+      if (!abDone && F.ab && rnd(s) < 0.4) { h.ab = 1; h.n = 2; abDone = true; }
+      own.push(h); s.sh.push(h);
+    }
+  }
+  function genReq(s) {
+    const zs = s.ch.map((c, i) => (c ? i : -1)).filter((i) => i >= 0), z = zs[Math.floor(rnd(s) * zs.length)], r = rnd(s), dl = s.day + 2 + Math.floor(rnd(s) * 2);
+    if (r < 0.14) return { k: 'ab', n: 1, rw: 90 + 25 * zs.length, dl };
+    if (r < 0.28) { const m = ['wood', 'iron', 'cloth'][Math.floor(rnd(s) * 3)]; return { k: 'm', m: MI[m], n: 2, rw: 60 + MATS[MI[m]].v * 2, dl }; }
+    const F = pickFish(s, z, r > 0.82), n = F.nt ? 1 + Math.floor(rnd(s) * 2) : SH[F.sh].length >= 4 ? 2 : 2 + Math.floor(rnd(s) * 2);
+    return { k: 'f', f: F.i, n, rw: Math.round(F.v * n * (F.nt ? 1.7 : 1.5) + 10), dl };
+  }
+  function newDay(s, M) {
+    // 납부
+    if (s.day > 0 && s.day % PER === 0) {
+      const amt = s.inst[s.day / PER - 1];
+      if (s.money >= amt) { s.money -= amt; s.paid++; fx(s, 'paid', { v: amt }); } else { s.end = 'debt'; s.endv = amt; return; }
+    }
+    if (s.day >= s.days) { s.end = 'win'; return; }
+    s.day++; s.t = 0; s.st.yinc = s.st.dinc; s.st.dinc = 0;
+    let tot = 0; WX.forEach((w) => { tot += w.w; }); let r = rnd(s) * tot; s.wx = 0;
+    for (let i = 0; i < WX.length; i++) { r -= WX[i].w; if (r <= 0) { s.wx = i; break; } }
+    const zs = s.ch.map((c, i) => (c ? i : -1)).filter((i) => i >= 0);
+    zs.forEach((z) => spawnZone(s, M, z));
+    const pool = FISH.filter((F) => s.ch[F.z]); s.hot = [0, 1].map(() => pool[Math.floor(rnd(s) * pool.length)].i); s.sold = {};
+    s.disc = [0, 1].map(() => Math.floor(rnd(s) * EQ.length));
+    s.em = [];
+    for (let i = 0, n = 2 + Math.min(4, zs.length); i < n; i++) {
+      const z = zs[Math.floor(rnd(s) * zs.length)], ok = EVENTS.map((e, j) => j).filter((j) => EVENTS[j].z == null || EVENTS[j].z === z);
+      const e = ok[Math.floor(rnd(s) * ok.length)], p = pickTile(s, M, z, s.sh.concat(M.docks, s.em), 2.2);
+      s.em.push({ x: p.x, y: p.y, e, nt: EVENTS[e].nt ? 1 : 0 });
+    }
+    s.rq = s.rq.filter((q) => q.dl >= s.day); while (s.rq.length < 3) s.rq.push(genReq(s));
+    s.wk = s.wk.map((n) => Math.min(3, n + (s.day % 2 === 0 ? 1 : 0)));
+    s.th = s.th.filter((o) => o.k === 'fl'); s.rk = []; s.ns = 0;
+    if (s.ch[5] && !s.th.some((o) => o.k === 'fl')) for (let i = 0; i < 9; i++) { const p = pickTile(s, M, 5, [], 0); s.th.push({ k: 'fl', x: p.x, y: p.y, a: r3(rnd(s) * TAU) }); }
+    fx(s, 'day', { d: s.day });
+  }
+
+  /* ---------- 걸음 ---------- */
+  function blocked(s, M, x, y) {   // 0 없음 · 1 바위 · 2 해도 밖 · 3 떠오른 암초
+    for (const [ox, oy] of [[0, 0], [0.3, 0], [-0.3, 0], [0, 0.3], [0, -0.3]]) {
+      const tx = Math.floor(x + ox), ty = Math.floor(y + oy); if (tx < 0 || ty < 0 || tx >= N || ty >= N) return 2;
+      const i = ty * N + tx; if (M.z[i] === 255) return 2; if (M.t[i] === 1) return 1; if (!s.ch[M.z[i]]) return 2;
+    }
+    for (const r of s.rk) if (r[2] && Math.hypot(r[0] - x, r[1] - y) < 0.62) return 3;
+    return 0;
+  }
+  function hurt(s, d, why) { s.hp = Math.max(0, s.hp - d); s.st.dmg += d; fx(s, 'hit', { d, why }); if (s.hp <= 0) { s.end = 'sunk'; s.endv = why; } }
+  function loseFish(s) { const c = s.cargo.map((it, i) => (it.k === 'f' ? i : -1)).filter((i) => i >= 0); if (!c.length) return null; const i = c[Math.floor(rnd(s) * c.length)], it = s.cargo[i]; s.cargo.splice(i, 1); return itName(it); }
+  function step(s, E, M, dir) {
+    const nfv = nf(s), ti = (s.y | 0) * N + (s.x | 0), z = M.z[ti] === 255 ? 0 : M.z[ti], Z = ZONES[z], lampOn = s.lamp && E.lamp && s.m >= s.lampOut;
+    if (dir >= 0) {
+      s.hd = dir;
+      let v = BASE_V * E.sp * (s.wx === 6 ? 1.1 : 1); if (M.t[ti] === 2) v *= 0.6;
+      const a = dir * Math.PI / 16, dx = Math.cos(a) * v, dy = Math.sin(a) * v, ox = s.x, oy = s.y; let hit = 0;
+      const mv = (nx, ny) => { const b = blocked(s, M, nx, ny); if (b) { hit = hit || b; return false; } s.x = nx; s.y = ny; return true; };
+      if (!mv(s.x + dx, s.y + dy)) { if (!(Math.abs(dx) > 1e-4 && mv(s.x + dx, s.y))) if (Math.abs(dy) > 1e-4) mv(s.x, s.y + dy); }
+      if (hit && s.cd <= 0) {
+        if (hit === 2) { fx(s, 'edge', {}); s.cd = 40; }
+        else if (Math.hypot(s.x - ox, s.y - oy) < v * 0.55) { hurt(s, nfv > 0.5 ? 6 : 4, hit === 3 ? 'rk' : 'rock'); s.cd = 30; }
+      }
+      if (E.net && s.net.length < E.net.cap && E.net.kinds.includes(Z.k)) {
+        s.nd += Math.hypot(s.x - ox, s.y - oy);
+        if (s.nd >= E.net.per) { s.nd = 0; const F = pickFish(s, z, nfv > 0.5, (f) => f.net) || pickFish(s, z, 0, (f) => f.net); if (F) { s.net.push({ k: 'f', f: F.i, m: s.m }); if (s.net.length >= E.net.cap) fx(s, 'netfull', {}); } }
+      }
+    }
+    s.t = Math.round((s.t + STEP_MIN) * 10) / 10; s.m = Math.round((s.m + STEP_MIN) * 10) / 10; if (s.cd > 0) s.cd--; if (s.stc > 0) s.stc--;
+    // 공포
+    let g = 0.11 * nfv * Z.fear * (lampOn ? E.lamp.calm * (s.bf.oil === s.day ? 0.8 : 1) : 1.5) * (s.wx === 3 ? 1.25 : s.wx === 7 ? 1.2 : 1) * (M.t[ti] === 2 ? 1.6 : 1) * (E.compass ? 0.9 : 1);
+    g += E.idol * 0.012; if (nfv < 0.05) g -= 0.05;
+    s.pan = clamp(s.pan + g * STEP_MIN, 0, 100);
+    if (s.pan >= 100 && (s.m % 30) < STEP_MIN - 1e-6) hurt(s, 1, 'pan');
+    if (s.pan >= 75 && nfv > 0.5 && (s.m % 60) < STEP_MIN - 1e-6 && rnd(s) < 0.5) { const c = s.cargo.filter((it) => it.k === 'f' && !it.rot && !it.ab); if (c.length) { const it = c[Math.floor(rnd(s) * c.length)]; it.rot = 1; fx(s, 'rot', { n: itName(it) }); } }
+    // 밤 채비
+    if (nfv > 0.5 && !s.ns) {
+      s.ns = 1; s.st.nights++;
+      ZONES.forEach((ZZ, zi) => {
+        if (!s.ch[zi]) return;
+        if (ZZ.th.includes('wh')) for (let i = 0; i < 3; i++) { const p = pickTile(s, M, zi, s.th.concat(M.docks, [{ x: s.x, y: s.y }]), 5); s.th.push({ k: 'wh', x: p.x, y: p.y }); }
+        if (ZZ.th.includes('mw')) { const p = pickTile(s, M, zi, [{ x: s.x, y: s.y }], 8), w = pickTile(s, M, zi, [], 0); s.th.push({ k: 'mw', x: p.x, y: p.y, z: zi, wx: w.x, wy: w.y }); }
+        if (ZZ.th.includes('bc')) for (let i = 0; i < 2; i++) { const p = pickTile(s, M, zi, s.th.concat(M.docks, [{ x: s.x, y: s.y }]), 6); s.th.push({ k: 'bc', x: p.x, y: p.y }); }
+      });
+    } else if (nfv < 0.2 && s.ns) { s.ns = 0; s.th = s.th.filter((o) => o.k === 'fl'); s.rk = []; }
+    if (nfv > 0.5) {
+      // 떠오른 암초
+      if (dir >= 0 && s.pan >= 30 && --s.rkc <= 0) {
+        s.rkc = 24;
+        if (s.rk.length < 8 && rnd(s) < (s.pan - 20) / 90) {
+          const a = s.hd * Math.PI / 16, f = 3 + rnd(s) * 2, sd = rnd(s) * 3 - 1.5, x = s.x + Math.cos(a) * f - Math.sin(a) * sd, y = s.y + Math.sin(a) * f + Math.cos(a) * sd;
+          if (!blocked(s, M, x, y) && Math.hypot(x - HX, y - HY) > 4) s.rk.push([r3(x), r3(y), rnd(s) < 0.5 ? 1 : 0, 500]);
+        }
+      }
+      for (let i = s.rk.length - 1; i >= 0; i--) { const r = s.rk[i]; if (--r[3] <= 0) { s.rk.splice(i, 1); continue; } if (!r[2] && Math.hypot(r[0] - s.x, r[1] - s.y) < 1) { s.rk.splice(i, 1); s.pan = clamp(s.pan + 3, 0, 100); fx(s, 'mirage', {}); } }
+      // 뒤따르는 것
+      if (s.pan >= 50 && s.stc <= 0 && nfv > 0.6 && !s.th.some((o) => o.k === 'st') && Math.hypot(s.x - HX, s.y - HY) > 5) {
+        const a = s.hd * Math.PI / 16; s.th.push({ k: 'st', x: s.x - Math.cos(a) * 7, y: s.y - Math.sin(a) * 7 }); fx(s, 'stalk', {});
+      }
+      // 빛 먹는 떼
+      if (lampOn && E.lamp.att > 0 && Z.th.includes('sw') && nfv > 0.6 && !s.th.some((o) => o.k === 'sw') && rnd(s) < 0.004 * E.lamp.att) {
+        const a = rnd(s) * TAU; s.th.push({ k: 'sw', x: s.x + Math.cos(a) * 6.5, y: s.y + Math.sin(a) * 6.5 }); fx(s, 'swarm', {});
+      }
+      // 물 밑의 종
+      if (Z.th.includes('bl') && s.m >= s.bellT) { s.bellT = s.m + 150; s.pan = clamp(s.pan + (lampOn ? 4 : 8), 0, 100); fx(s, 'bell', {}); }
+    }
+    for (let i = s.th.length - 1; i >= 0; i--) {
+      const o = s.th[i], dx = s.x - o.x, dy = s.y - o.y, d = Math.hypot(dx, dy) || 1e-6;
+      if (o.k === 'st') {
+        if (nfv < 0.3 || s.pan < 35) { s.th.splice(i, 1); continue; }
+        const v = 0.115 * (lampOn ? 0.7 : 1) * (E.quiet ? 0.75 : 1); o.x += dx / d * v; o.y += dy / d * v;
+        if (d < 0.75) { const lost = loseFish(s); s.pan = clamp(s.pan + 10, 0, 100); s.th.splice(i, 1); s.stc = 400; fx(s, 'bite', { n: lost }); hurt(s, 15, 'st'); }
+      } else if (o.k === 'sw') {
+        if (d > 13) { s.th.splice(i, 1); continue; }
+        const v = lampOn ? 0.075 : -0.05; o.x += dx / d * v; o.y += dy / d * v;
+        if (lampOn && d < 0.85) { s.lampOut = s.m + 90; s.lamp = 0; s.pan = clamp(s.pan + 12, 0, 100); s.th.splice(i, 1); fx(s, 'dark', {}); }
+      } else if (o.k === 'wh') {
+        if (d < 2.4) {
+          const p = 0.012 + 0.05 * (1 - d / 2.4), nx = s.x - dx / d * p, ny = s.y - dy / d * p; if (!blocked(s, M, nx, ny)) { s.x = nx; s.y = ny; }
+          if (d < 0.5 && s.cd <= 0) { s.pan = clamp(s.pan + 8, 0, 100); s.cd = 30; const a = s.hd * Math.PI / 16; for (const k of [2.7, 2.2, 1.6]) { const ex = o.x + Math.cos(a) * k, ey = o.y + Math.sin(a) * k; if (!blocked(s, M, ex, ey)) { s.x = ex; s.y = ey; break; } } hurt(s, 12, 'wh'); }
+        }
+      } else if (o.k === 'mw') {
+        const hunt = d < 4.5 && z === o.z, tx = hunt ? s.x : o.wx, ty = hunt ? s.y : o.wy, ex = tx - o.x, ey = ty - o.y, ed = Math.hypot(ex, ey) || 1e-6, v = hunt ? 0.08 : 0.05;
+        o.x += ex / ed * v; o.y += ey / ed * v;
+        if (!hunt && ed < 1) { const w = pickTile(s, M, o.z, [], 0); o.wx = w.x; o.wy = w.y; }
+        if (d < 1.1) { s.pan = clamp(s.pan + 15, 0, 100); const w = pickTile(s, M, o.z, [{ x: s.x, y: s.y }], 9); o.x = w.x; o.y = w.y; fx(s, 'maw', {}); hurt(s, 25, 'mw'); }
+      } else if (o.k === 'bc') {
+        if (d < 2.2) { s.th.splice(i, 1); s.pan = clamp(s.pan + 8, 0, 100); fx(s, 'beacon', {}); }
+      } else if (o.k === 'fl') {
+        const nx = o.x + Math.cos(o.a) * 0.02, ny = o.y + Math.sin(o.a) * 0.02, tI = (ny | 0) * N + (nx | 0);
+        if (M.t[tI] === 1 || M.z[tI] !== 5) o.a = r3((o.a + 2.2 + (i % 3) * 0.7) % TAU); else { o.x = nx; o.y = ny; }
+        if (d < 0.8 && s.cd <= 0) { s.cd = 30; const px = s.x + dx / d * 0.35, py = s.y + dy / d * 0.35; if (!blocked(s, M, px, py)) { s.x = px; s.y = py; } hurt(s, 5, 'fl'); }
+      }
+    }
+    // 본 어군 표시
+    if ((s.m % 3) < STEP_MIN - 1e-6) { const vr = vision(s, E, nfv) + 1; for (const h of s.sh) if (!h.sn && Math.hypot(h.x - s.x, h.y - s.y) < vr) h.sn = 1; }
+    // 표류물
+    if (dir >= 0 && !s.end) for (let i = 0; i < s.em.length; i++) { const e = s.em[i]; if ((e.nt ? nfv > 0.5 : true) && Math.hypot(e.x - s.x, e.y - s.y) < 0.9) { s.ev = { i: e.e }; s.em.splice(i, 1); s.ph = 'ev'; s.st.ev++; break; } }
+    if (s.t >= 1440 && !s.end) newDay(s, M);
+    return !!s.end || s.ph !== 'sea';
+  }
+  function vision(s, E, nfv) {
+    const lampOn = s.lamp && E.lamp && s.m >= s.lampOut, nv = (lampOn ? E.lamp.vis : 2.7) - Math.max(0, s.pan - 30) * 0.012;
+    return DAY_VIS + (nv - DAY_VIS) * nfv;
+  }
+  function pass(s, E, M, mins) { for (let i = 0, n = Math.round(mins / STEP_MIN); i < n && !s.end; i++) step(s, E, M, -1); }
+
+  /* ---------- 판 시작 ---------- */
+  function init(players, opts) {
+    const len = LENS[opts && opts.len] ? opts.len : 'M', LN = LENS[len], seed = (Math.random() * 0x7fffffff) | 0;
+    const s = { v: 1, seed, r: seed ^ 0x2f6e2b1, len, days: LN.days, inst: LN.inst.slice(), paid: 0, day: 0, t: 0, m: 0, x: HX, y: HY + 0.9, hd: 8, hp: 100, pan: 0, money: 30, lamp: 0, lampOut: 0,
+      tier: 0, cargo: [{ k: 'e', e: EI.eng0, x: 0, y: 0, r: 0 }, { k: 'e', e: EI.bamboo, x: 2, y: 0, r: 0 }, { k: 'e', e: EI.lamp0, x: 4, y: 0, r: 0 }], pend: [],
+      ch: [1, 0, 0, 0, 0, 0, 0], sh: [], pots: [], th: [], rk: [], em: [], ev: null, ph: 'port', port: 0, rq: [], hot: [], sold: {}, disc: [], wx: 0, wk: ZONES.map(() => 3), net: [], nd: 0,
+      cd: 0, stc: 0, rkc: 0, ns: 0, bellT: 0, hornT: 0, kitD: 0, bf: {}, rw: 0, fid: 0, fx: [], end: null, endv: null,
+      st: { c: 0, inc: 0, dinc: 0, yinc: 0, ab: 0, big: 0, dmg: 0, ev: 0, nights: 0, nc: 0, best: 0, bestN: '' }, lv: (players && players[0] && players[0].lv) || 0 };
+    newDay(s, mapOf(seed));   // day 0 → 1
+    s.wx = 0; s.fx = [];   // 첫날은 맑음
+    return s;
+  }
+  const actor = (s) => (s.end ? null : 0);
+
+  /* ---------- 행동 ---------- */
+  function nearShoal(s) { let b = -1, bd = 1.5; s.sh.forEach((h, i) => { const d = Math.hypot(h.x - s.x, h.y - s.y); if (d < bd && h.n > 0 && shoalOn(s, h)) { bd = d; b = i; } }); return b; }
+  function dockAt(s, M) { if (Math.hypot(s.x - HX, s.y - HY) < 2.3) return 0; for (let i = 0; i < M.docks.length; i++) if (Math.hypot(s.x - M.docks[i].x, s.y - M.docks[i].y) < 2) return i + 1; return -1; }
+  function givePend(s, it) { s.pend.push(it); }
+  function lootMat(s) { let tot = 0; WRECK_LOOT.forEach((w) => { tot += w[1]; }); let r = rnd(s) * tot; for (const w of WRECK_LOOT) { r -= w[1]; if (r <= 0) return MI[w[0]]; } return 0; }
+  function apply(s, seat, a) {
+    if (s.end) throw new Error('끝난 판');
+    const M = mapOf(s.seed), E = eqInfo(s), T = TIERS[s.tier];
+    const need = (c, m) => { if (!c) throw new Error(m || '할 수 없음'); };
+    switch (a.t) {
+      case 'go': {
+        need(s.ph === 'sea' && !s.pend.length && Array.isArray(a.d));
+        let tot = 0;
+        out: for (const [dir, n] of a.d) { need(dir >= 0 && dir < 32 && n > 0); for (let i = 0; i < n && tot < 40; i++, tot++) if (step(s, E, M, dir | 0)) break out; }
+        break;
+      }
+      case 'lamp': need(s.ph === 'sea' && E.lamp && s.m >= s.lampOut, '등을 켤 수 없음'); s.lamp = s.lamp ? 0 : 1; break;
+      case 'fish': {
+        need(s.ph === 'sea' && !s.pend.length);
+        const i = a.i, h = s.sh[i]; need(h && h.n > 0 && shoalOn(s, h) && Math.hypot(h.x - s.x, h.y - s.y) < 1.6, '어군이 멀다');
+        const F = FISH[h.f], sp = E.rods[F.k]; need(sp, '맞는 낚싯대 없음');
+        const q = clamp(+a.q || 0, 0, 1), mins = Math.round(F.tm / sp * (1.5 - 0.8 * q));
+        h.n--;
+        if (q < 0.3) { fx(s, 'miss', { n: F.n, t: Math.round(mins * 0.6) }); pass(s, E, M, mins * 0.6); break; }
+        const abP = F.ab ? (0.04 + s.pan / 400 + (E.bait ? 0.04 : 0)) * (s.wx === 7 ? 2 : 1) : 0;
+        const it = { k: 'f', f: F.i, m: s.m };
+        if (F.ab && (h.ab || rnd(s) < abP)) { it.ab = 1; s.st.ab++; }
+        if (rnd(s) < (q - 0.6) * 0.5 + (E.bait ? 0.12 : 0) + (s.bf.chum === s.day ? 0.25 : 0)) { it.big = 1; s.st.big++; }
+        s.st.c++; if (nf(s) > 0.5) s.st.nc++;
+        fx(s, 'catch', { n: itName(it), ab: it.ab || 0, big: it.big || 0, t: mins, f: F.i });
+        givePend(s, it); pass(s, E, M, mins);
+        break;
+      }
+      case 'salv': {
+        need(s.ph === 'sea' && !s.pend.length && E.rods.wreck, '인양 갈고리 없음');
+        const i = M.wrecks.findIndex((w, j) => s.ch[w.z] && s.wk[j] > 0 && Math.hypot(w.x - s.x, w.y - s.y) < 1.6); need(i >= 0, '잔해가 멀다');
+        const q = clamp(+a.q || 0, 0, 1), mins = Math.round(70 * (1.5 - 0.8 * q)); s.wk[i]--;
+        const m = lootMat(s); fx(s, 'catch', { n: MATS[m].n, t: mins, mat: 1 }); givePend(s, { k: 'm', m }); pass(s, E, M, mins);
+        break;
+      }
+      case 'haul': need(s.ph === 'sea' && s.net.length && !s.pend.length); fx(s, 'haul', { n: s.net.length }); s.net.forEach((it) => givePend(s, it)); s.st.c += s.net.length; s.net = []; pass(s, E, M, 30); break;
+      case 'pot': {
+        need(s.ph === 'sea' && !s.pend.length);
+        const it = s.cargo[a.c]; need(it && it.k === 'e' && EQ[it.e].t === 'pot');
+        const z = zoneAt(M, s.x, s.y), e = EQ[it.e]; need(e.kinds.includes(ZONES[z].k), '이 통발로는 여기서 잡히지 않음');
+        need(!s.pots.some((p) => Math.hypot(p.x - s.x, p.y - s.y) < 1.5) && dockAt(s, M) < 0, '자리가 좋지 않음');
+        s.cargo.splice(a.c, 1); s.pots.push({ x: r3(s.x), y: r3(s.y), e: it.e, m: s.m, z }); fx(s, 'potset', {}); pass(s, E, M, 20);
+        break;
+      }
+      case 'potup': {
+        need(s.ph === 'sea' && !s.pend.length);
+        const i = s.pots.findIndex((p) => Math.hypot(p.x - s.x, p.y - s.y) < 1.6); need(i >= 0, '통발이 멀다');
+        const p = s.pots[i], e = EQ[p.e], n = Math.min(e.cap, Math.floor((s.m - p.m) / 300)), F = FISH.find((f) => f.z === p.z && f.pot);
+        s.pots.splice(i, 1);
+        for (let j = 0; j < n; j++) { const it = { k: 'f', f: F.i, m: s.m }; if (F.ab && rnd(s) < 0.06) { it.ab = 1; s.st.ab++; } givePend(s, it); }
+        s.st.c += n; givePend(s, { k: 'e', e: p.e }); fx(s, 'potup', { n, f: F.n }); pass(s, E, M, 20);
+        break;
+      }
+      case 'horn': need(s.ph === 'sea' && E.horn && s.m >= s.hornT, '아직 불 수 없음'); s.th = s.th.filter((o) => o.k !== 'st' && o.k !== 'sw'); s.stc = 600; s.pan = clamp(s.pan - 10, 0, 100); s.hornT = s.m + 180; fx(s, 'horn', {}); break;
+      case 'kit': need(s.ph === 'sea' && E.kit && s.kitD !== s.day && s.hp < mhp(s, E), '쓸 수 없음'); s.kitD = s.day; s.hp = Math.min(mhp(s, E), s.hp + 20); fx(s, 'fix', { v: 20 }); pass(s, E, M, 60); break;
+      case 'pack': {
+        const all = s.cargo.concat(s.pend); need(Array.isArray(a.p) && a.p.length === all.length);
+        const g = new Int8Array(T.w * T.h).fill(-1), keep = []; let got = 0;
+        all.forEach((it, i) => {
+          const p = a.p[i];
+          if (!p) { if (s.ph === 'port' && s.port === 0) { const v = price(s, it, E); got += v; if (it.k === 'f') { s.sold[it.f] = (s.sold[it.f] || 0) + 1; s.st.inc += v; s.st.dinc += v; } } return; }
+          const x = p[0] | 0, y = p[1] | 0, r = p[2] & 3; need(fitAt(g, T, itShape(it), r, x, y), '겹치거나 벗어남');
+          cellsOf(itShape(it), r).forEach(([cx, cy]) => { g[(y + cy) * T.w + x + cx] = 1; });
+          it.x = x; it.y = y; it.r = r; keep.push(it);
+        });
+        s.cargo = keep; s.pend = []; if (got) { s.money += got; fx(s, 'sold', { v: got }); }
+        const E2 = eqInfo(s); s.hp = Math.min(s.hp, mhp(s, E2)); if (!E2.lamp) s.lamp = 0;
+        break;
+      }
+      case 'dock': {
+        need(s.ph === 'sea' && !s.pend.length); const d = dockAt(s, M); need(d >= 0, '부두가 멀다');
+        s.ph = 'port'; s.port = d; s.th = s.th.filter((o) => o.k !== 'st' && o.k !== 'sw'); s.lamp = 0;
+        if (s.net.length) { s.net.forEach((it) => givePend(s, it)); s.st.c += s.net.length; s.net = []; }
+        if (d === 0 && s.rw) { s.money += s.rw; fx(s, 'reward', { v: s.rw }); s.rw = 0; }
+        break;
+      }
+      case 'leave': need(s.ph === 'port' && !s.pend.length, '못 실은 것이 있음'); s.ph = 'sea'; s.cargo.forEach((it) => { delete it.nw; delete it.pp; }); break;
+      case 'sell': {
+        need(s.ph === 'port' && s.port === 0); const it = s.cargo[a.i]; need(it && it.k !== 'e');
+        const v = price(s, it, E); s.money += v; s.cargo.splice(a.i, 1);
+        if (it.k === 'f') { s.sold[it.f] = (s.sold[it.f] || 0) + 1; s.st.inc += v; s.st.dinc += v; if (v > s.st.best) { s.st.best = v; s.st.bestN = itName(it); } }
+        fx(s, 'sold', { v });
+        break;
+      }
+      case 'sellall': {
+        need(s.ph === 'port' && s.port === 0); let got = 0;
+        for (let i = 0; i < s.cargo.length;) { const it = s.cargo[i]; if (it.k !== 'f') { i++; continue; } const v = price(s, it, E); got += v; s.sold[it.f] = (s.sold[it.f] || 0) + 1; if (v > s.st.best) { s.st.best = v; s.st.bestN = itName(it); } s.cargo.splice(i, 1); }
+        need(got > 0, '팔 물고기 없음'); s.money += got; s.st.inc += got; s.st.dinc += got; fx(s, 'sold', { v: got });
+        break;
+      }
+      case 'buy': { need(s.ph === 'port' && s.port === 0 && EQ[a.e]); const p = eqPrice(s, a.e); need(s.money >= p, '돈이 모자람'); s.money -= p; givePend(s, { k: 'e', e: a.e, nw: 1, pp: p }); break; }
+      case 'mat': { need(s.ph === 'port' && s.port === 0 && MATS[a.m] && MATS[a.m].buy); const p = MATS[a.m].buy; need(s.money >= p, '돈이 모자람'); s.money -= p; givePend(s, { k: 'm', m: a.m }); break; }
+      case 'chart': { need(s.ph === 'port' && s.port === 0 && ZONES[a.z] && !s.ch[a.z]); const p = ZONES[a.z].chart; need(s.money >= p, '돈이 모자람'); s.money -= p; s.ch[a.z] = 1; spawnZone(s, M, a.z); fx(s, 'chart', { z: a.z }); break; }
+      case 'hull': {
+        need(s.ph === 'port' && s.port === 0 && TIERS[s.tier + 1]); const NT = TIERS[s.tier + 1]; need(s.money >= NT.p, '돈이 모자람');
+        const idx = []; for (const k in NT.need) { const c = s.cargo.map((it, i) => (it.k === 'm' && it.m === MI[k] ? i : -1)).filter((i) => i >= 0); need(c.length >= NT.need[k], '재료가 모자람'); idx.push(...c.slice(0, NT.need[k])); }
+        s.money -= NT.p; s.cargo = s.cargo.filter((it, i) => !idx.includes(i)); s.hp += NT.hp - T.hp; s.tier++; fx(s, 'hull', {});
+        break;
+      }
+      case 'repair': {
+        need(s.ph === 'port'); const rate = s.port === 0 ? 1.2 : 2, miss = mhp(s, E) - s.hp; need(miss > 0 && s.money >= 1, '고칠 곳이 없거나 돈이 없음');
+        const n = Math.min(miss, Math.floor(s.money / rate)); need(n > 0); s.money -= Math.ceil(n * rate); s.hp += n; fx(s, 'fix', { v: n });
+        break;
+      }
+      case 'req': {
+        need(s.ph === 'port' && s.port === 0); const q = s.rq[a.i]; need(q);
+        const idx = s.cargo.map((it, i) => (reqMatch(s, q, it, E) ? i : -1)).filter((i) => i >= 0); need(idx.length >= q.n, '아직 모자람');
+        const use = idx.slice(0, q.n); s.cargo = s.cargo.filter((it, i) => !use.includes(i)); s.money += q.rw; s.st.inc += q.rw; s.st.dinc += q.rw; s.rq.splice(a.i, 1); fx(s, 'reward', { v: q.rw });
+        break;
+      }
+      case 'sleep': {
+        need(s.ph === 'port' && !s.pend.length, '못 실은 것이 있음');
+        s.m += 1440 - s.t; s.t = 1440; s.pan = s.port === 0 ? 0 : Math.max(0, s.pan - 60); s.lamp = 0; newDay(s, M);
+        break;
+      }
+      case 'ev': {
+        need(s.ph === 'ev' && s.ev && s.ev.out == null); const ev = EVENTS[s.ev.i], o = ev.o[a.c]; need(o && (!o.need || eqHas(s, o.need)), '장비가 없음');
+        if (o.t) pass(s, E, M, o.t);
+        let tot = 0; o.r.forEach((r) => { tot += r[0]; }); let x = rnd(s) * tot, res = o.r[0]; for (const r of o.r) { x -= r[0]; if (x <= 0) { res = r; break; } }
+        const e = res[2], got = [];
+        if (e.m) { const v = Math.round(e.m[0] + rnd(s) * (e.m[1] - e.m[0])); s.money += v; got.push(v + COIN); }
+        if (e.rw) { s.rw += e.rw; got.push('귀항 사례 ' + e.rw + COIN); }
+        if (e.p) { s.pan = clamp(s.pan + e.p, 0, 100); got.push('공포 ' + (e.p > 0 ? '+' : '−') + Math.abs(e.p)); }
+        if (e.it) { const m = MI[e.it[Math.floor(rnd(s) * e.it.length)]]; givePend(s, { k: 'm', m }); got.push(MATS[m].n); }
+        if (e.fz) { const z = zoneAt(M, s.x, s.y); for (let i = 0; i < e.fz; i++) { const F = pickFish(s, z === 255 ? 0 : z, 0); givePend(s, { k: 'f', f: F.i, m: s.m }); got.push(F.n); } s.st.c += e.fz; }
+        if (e.sh) { const z = zoneAt(M, s.x, s.y), zz = z === 255 ? 0 : z, c = FISH.filter((F) => F.z === zz && !F.pot && !F.nt && E.rods[F.k]).sort((p, q) => q.v - p.v)[0] || pickFish(s, zz, 0), p = pickTile(s, M, zz, [{ x: s.x - 40, y: s.y }], 0); let bx = p.x, by = p.y; for (let n = 0; n < 30; n++) { const a2 = rnd(s) * TAU, tx = s.x + Math.cos(a2) * 3.5, ty = s.y + Math.sin(a2) * 3.5; if (!blocked(s, M, tx, ty)) { bx = Math.floor(tx) + 0.5; by = Math.floor(ty) + 0.5; break; } } s.sh.push({ x: bx, y: by, z: zz, f: c.i, n: 5, nt: 0, ab: 0, sn: 1, rich: 1 }); got.push('어군: ' + c.n); }
+        if (e.bf) { s.bf[e.bf] = s.day; got.push(e.bf === 'oil' ? '오늘 등 공포 오름 ×0.8' : '오늘 큰 놈 확률 +25%'); }
+        if (o.t) got.push(o.t + '분');
+        s.ev.out = res[1]; s.ev.got = got.join(' · ');
+        if (e.h && !s.end) { got.push('선체 ' + e.h); s.ev.got = got.join(' · '); hurt(s, -e.h, 'ev'); }
+        break;
+      }
+      case 'evok': need(s.ph === 'ev' && s.ev && s.ev.out != null); s.ev = null; s.ph = 'sea'; break;
+      default: need(false, '모르는 행동');
+    }
+    s.x = r3(s.x); s.y = r3(s.y); s.pan = r3(s.pan); s.th.forEach((o) => { o.x = r3(o.x); o.y = r3(o.y); });
+    return s;
+  }
+  const eqHas = (s, id) => s.cargo.some((it) => it.k === 'e' && it.e === EI[id]);
+  function reqMatch(s, q, it, E) {
+    if (q.k === 'm') return it.k === 'm' && it.m === q.m;
+    if (it.k !== 'f' || fresh(s, it, E) === 2) return false;
+    return q.k === 'ab' ? !!it.ab : it.f === q.f;
+  }
+  const reqText = (q) => (q.k === 'ab' ? '변이종 아무것이나 ' + q.n + '마리' : q.k === 'm' ? MATS[q.m].n + ' ' + q.n + '개' : FISH[q.f].n + ' ' + q.n + '마리');
+  const clockText = (t) => { const m = Math.floor(t + 360) % 1440; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(Math.floor(m % 60 / 10) * 10).padStart(2, '0'); };
+
+  function result(s) {
+    if (!s.end) return null;
+    const win = s.end === 'win', why = { rock: '암초', rk: '떠오른 암초', st: '뒤따르는 것', wh: '도는 물', mw: '큰 입', fl: '유빙', pan: '공포', ev: '바다의 사건' };
+    const text = win ? s.days + '일 동안 조합의 납부금 ' + s.inst.reduce((a, b) => a + b, 0) + COIN + '을 모두 치렀어요. 배는 이제 온전히 당신 것이에요.'
+      : s.end === 'debt' ? s.day + '일째 밤, 납부금 ' + s.endv + COIN + '을 채우지 못했어요. 조합이 배를 거두어 갔어요.'
+      : s.day + '일째 ' + clockText(s.t) + ', ' + (why[s.endv] || '바다') + ' 탓에 선체가 버티지 못했어요. 배는 안개 속으로 가라앉았어요.';
+    const hl = []; if (s.st.bestN) hl.push('가장 비싸게 판 것: ' + s.st.bestN + ' ' + s.st.best + COIN); if (s.st.ab) hl.push('변이종 ' + s.st.ab + '마리를 건져 올림'); if (s.st.nc) hl.push('밤바다에서 ' + s.st.nc + '마리를 낚음');
+    return { winners: win ? [0] : [], title: win ? '빚을 다 갚았어요' : s.end === 'debt' ? '배를 압류당했어요' : '배를 잃었어요', text, highlights: hl,
+      stats: [{ label: '버틴 날', value: s.day + ' / ' + s.days + '일' }, { label: '낸 납부금', value: s.paid + ' / ' + s.inst.length + '회' }, { label: '낚은 수', value: s.st.c + '마리' }, { label: '번 돈', value: s.st.inc + COIN }, { label: '연 해역', value: s.ch.filter(Boolean).length + ' / ' + ZONES.length }, { label: '바다에서 맞은 밤', value: s.st.nights + '번' }, { label: '입은 피해', value: String(s.st.dmg) }] };
+  }
+
+  /* ---------- AI: 상황 점수 + 판 시드 버릇(밤 욕심 · 씀씀이 · 해역 취향) ---------- */
+  function habit(s, lv) {
+    const R = mul32((s.seed ^ 0x77aa) + lv * 131), night = R(), thrift = R(), taste = R();
+    return {
+      night, thrift, taste,
+      curfew: lv === 3 ? 790 + night * 330 : lv === 2 ? 800 + night * 260 : 860 + night * 300,   // 이 시각까지는 항구에 닿으려 함(분)
+      panMax: lv === 3 ? 42 + night * 26 : lv === 2 ? 55 + night * 20 : 85,
+    };
+  }
+  function aiPack(s, lv, E) {
+    const T = TIERS[s.tier], all = s.cargo.concat(s.pend), nC = s.cargo.length, atHome = s.ph === 'port' && s.port === 0;
+    const val = (it) => (it.k === 'e' ? 1e6 : atHome ? (it.k === 'f' ? 0 : 1e3) : price(s, it, E) / SH[itShape(it)].length);
+    const tryAll = (skip) => {   // 큰 것부터 다시 싣기
+      const g = new Int8Array(T.w * T.h).fill(-1), res = all.map(() => 0);
+      const ord = all.map((it, i) => i).filter((i) => !skip.includes(i)).sort((a, b) => (all[b].k === 'e') - (all[a].k === 'e') || SH[itShape(all[b])].length - SH[itShape(all[a])].length);
+      for (const i of ord) { const p = findFit(g, T, itShape(all[i])); if (!p) return null; cellsOf(itShape(all[i]), p[2]).forEach(([cx, cy]) => { g[(p[1] + cy) * T.w + p[0] + cx] = 1; }); res[i] = p; }
+      return res;
+    };
+    // 1) 지금 자리 그대로 두고 새것만 끼움
+    const g = gridOf(s), res = s.cargo.map((it) => [it.x, it.y, it.r]); let ok = true;
+    for (let i = nC; i < all.length; i++) { const p = findFit(g, T, itShape(all[i])); if (!p) { ok = false; break; } cellsOf(itShape(all[i]), p[2]).forEach(([cx, cy]) => { g[(p[1] + cy) * T.w + p[0] + cx] = 1; }); res[i] = p; }
+    if (ok) return res;
+    // 2) 전부 다시 싣기, 안 되면 값싼 것부터 내림
+    const skip = [];
+    for (let n = 0; n < all.length; n++) {
+      const r = lv >= 2 || all.slice(nC).some((it) => it.k === 'e') ? tryAll(skip) : null; if (r) return r;
+      let cand = all.map((it, i) => i).filter((i) => !skip.includes(i) && (lv >= 2 ? all[i].k !== 'e' || (atHome && all[i].nw) : i >= nC));
+      if (!cand.length) cand = all.map((it, i) => i).filter((i) => !skip.includes(i) && i >= nC);
+      if (!cand.length) break;
+      cand.sort((a, b) => val(all[a]) - val(all[b])); skip.push(cand[0]);
+      if (lv < 2) { const keep = s.cargo.map((it) => [it.x, it.y, it.r]), g2 = gridOf(s); let fine = true; for (let i = nC; i < all.length; i++) { if (skip.includes(i)) { keep[i] = 0; continue; } const p = findFit(g2, T, itShape(all[i])); if (!p) { fine = false; break; } cellsOf(itShape(all[i]), p[2]).forEach(([cx, cy]) => { g2[(p[1] + cy) * T.w + p[0] + cx] = 1; }); keep[i] = p; } if (fine) return keep; }
+    }
+    return s.cargo.map((it) => [it.x, it.y, it.r]).concat(s.pend.map(() => 0));
+  }
+  function canHold(s, sh) { return !!findFit(gridOf(s), TIERS[s.tier], sh); }
+  function homeReason(s, H, lv, E, etaHome) {
+    if (freeCells(s) <= (lv === 1 ? 0 : 1)) return 'full';
+    if (s.hp < mhp(s, E) * 0.35 && s.money >= 20) return 'hull';
+    if (s.pan > H.panMax && nf(s) > 0.3) return 'fear';
+    if (s.t + etaHome >= H.curfew && s.t < DAWN0) return 'late';
+    return '';
+  }
+  const tilesMin = (s, E, d) => d * 1.25 / (BASE_V * E.sp) * STEP_MIN;
+  function bestTarget(s, H, lv, E, M) {
+    const nfv = nf(s), free = freeCells(s), g = gridOf(s), T = TIERS[s.tier]; let best = null;
+    const fb = fieldTo(M, s, (s.y | 0) * N + (s.x | 0));
+    const haz = lv >= 2 ? s.th.filter((o) => o.k === 'wh' || o.k === 'mw') : [];
+    const consider = (kind, i, x, y, val, cnt, ft) => {
+      if (haz.some((o) => Math.hypot(o.x - x, o.y - y) < 3.4)) return;
+      const fd = fb[(y | 0) * N + (x | 0)]; if (fd < 0) return;   // 해도 없는 물 너머라 닿을 수 없는 곳
+      const d0 = Math.hypot(x - s.x, y - s.y), d = Math.max(d0, fd * 0.9), tr = tilesMin(s, E, d), back = tilesMin(s, E, Math.hypot(x - HX, y - HY));
+      if (s.t + tr + ft + back >= H.curfew && s.t < DAWN0) return;
+      let sc = val * cnt / (tr + ft * cnt + 6);
+      if (lv === 1) sc = 1 / (d + 1); else if (lv === 2) sc *= 0.75 + hash2(i, s.day, s.seed & 255) * 0.5;
+      if (!best || sc > best.sc) best = { kind, i, x, y, sc, d: d0 };
+    };
+    s.sh.forEach((h, i) => {
+      if (h.n <= 0 || !shoalOn(s, h) || !s.ch[h.z]) return; const F = FISH[h.f], sp = E.rods[F.k]; if (!sp) return;
+      const cells = SH[F.sh].length; if (!findFit(g, T, F.sh)) return;
+      consider('sh', i, h.x, h.y, F.v * (h.ab ? AB_MUL : 1) * (s.hot.includes(F.i) ? 1.5 : 1), Math.max(1, Math.min(h.n, Math.floor(free / cells))), F.tm / sp * 0.85);
+    });
+    if (E.rods.wreck && lv >= 2) M.wrecks.forEach((w, i) => { if (s.ch[w.z] && s.wk[i] > 0 && free >= 4) consider('wk', i, w.x, w.y, 30 + (TIERS[s.tier + 1] ? 25 : 0), Math.min(s.wk[i], 2), 70); });
+    s.pots.forEach((p, i) => { const e = EQ[p.e], n = Math.min(e.cap, Math.floor((s.m - p.m) / 300)), F = FISH.find((f) => f.z === p.z && f.pot); if (n >= Math.min(e.cap, 2) && free >= SH[F.sh].length + SH[e.sh].length) consider('pt', i, p.x, p.y, F.v * n, 1, 20); });
+    if (lv >= 2 && free >= 4) s.em.forEach((e, i) => { if (!e.nt || nfv > 0.5) consider('em', i, e.x, e.y, 45, 1, 25); });
+    return best;
+  }
+  function goTo(s, E, M, tx, ty, stopD) {
+    const v = BASE_V * E.sp, d0 = Math.hypot(tx - s.x, ty - s.y), q = (a) => ((Math.round(a / (Math.PI / 16)) % 32) + 32) % 32;
+    // 밤의 것에서 떨어지기
+    let rx = 0, ry = 0; for (const o of s.th) { const r = o.k === 'wh' ? 3.3 : o.k === 'mw' ? 3.8 : o.k === 'st' ? 3 : o.k === 'fl' ? 1.3 : 0; if (!r) continue; const dx = s.x - o.x, dy = s.y - o.y, d = Math.hypot(dx, dy) || 1e-6; if (d < r) { rx += dx / d * (r - d); ry += dy / d * (r - d); } }
+    const f = fieldTo(M, s, (ty | 0) * N + (tx | 0)); let cx = s.x | 0, cy = s.y | 0, px = s.x, py = s.y; const out = []; let tot = 0;
+    let clear = d0 < 1.6; if (clear) for (let u = 0.15; u < d0; u += 0.15) if (blocked(s, M, s.x + (tx - s.x) / d0 * u, s.y + (ty - s.y) / d0 * u)) { clear = false; break; }
+    if (f[cy * N + cx] < 0 || clear) { const dirA = Math.atan2(ty - s.y + ry, tx - s.x + rx); return { t: 'go', d: [[q(dirA), clamp(Math.ceil((d0 - (stopD || 0.2)) / v), 1, 14)]] }; }
+    { const ox = cx + 0.5 - px, oy = cy + 0.5 - py, od = Math.hypot(ox, oy); if (od > 0.22 && !rx && !ry) { const n = clamp(Math.round(od / v), 1, 4); out.push([q(Math.atan2(oy, ox)), n]); tot += n; px = cx + 0.5; py = cy + 0.5; } }   // 칸 한가운데를 거쳐 가야 모서리에 걸리지 않음
+    for (let w = 0; w < 5 && tot < 14; w++) {
+      let bi = -1, bd = f[cy * N + cx];
+      for (let ay = -1; ay <= 1; ay++) for (let ax = -1; ax <= 1; ax++) { if (!ax && !ay) continue; const nx = cx + ax, ny = cy + ay, ni = ny * N + nx; if (nx < 0 || ny < 0 || nx >= N || ny >= N || f[ni] < 0) continue; if (ax && ay && (f[cy * N + nx] < 0 || f[ny * N + cx] < 0)) continue; if (f[ni] < bd || (bi >= 0 && f[ni] === bd && !(ax && ay))) { bd = f[ni]; bi = ni; } }
+      if (bi < 0) break;
+      const wx = (bi % N) + 0.5, wy = ((bi / N) | 0) + 0.5; let ax = wx - px, ay = wy - py; if (w === 0) { ax += rx * 1.5; ay += ry * 1.5; }
+      const dd = Math.hypot(wx - px, wy - py), n = clamp(Math.round(dd / v), 1, 10), dir = q(Math.atan2(ay, ax));
+      if (out.length && out[out.length - 1][0] === dir) out[out.length - 1][1] += n; else out.push([dir, n]);
+      tot += n; px += Math.cos(dir * Math.PI / 16) * v * n; py += Math.sin(dir * Math.PI / 16) * v * n; cx = bi % N; cy = (bi / N) | 0; if (Math.hypot(wx - px, wy - py) > 0.2) break;   // 어긋나면 다음 행동에서 다시 잡음
+      if (f[bi] === 0) break; if (rx || ry) break;
+    }
+    return { t: 'go', d: out.length ? out : [[q(Math.atan2(ty - s.y, tx - s.x)), 4]] };
+  }
+  function aiSea(s, H, lv, E, M) {
+    const nfv = nf(s), z = zoneAt(M, s.x, s.y), Z = ZONES[z === 255 ? 0 : z];
+    const sw = s.th.find((o) => o.k === 'sw'), st = s.th.find((o) => o.k === 'st');
+    if (E.lamp && s.m >= s.lampOut) { const want = nfv > 0.25 && !(lv === 3 && sw && E.lamp.att > 0 && Math.hypot(sw.x - s.x, sw.y - s.y) < 5); if (!!s.lamp !== want && (lv >= 2 || want)) return { t: 'lamp' }; }
+    if (st && E.horn && s.m >= s.hornT && Math.hypot(st.x - s.x, st.y - s.y) < 3.5) return { t: 'horn' };
+    if (E.kit && s.kitD !== s.day && s.hp < mhp(s, E) * 0.45 && !st) return { t: 'kit' };
+    if (E.net && s.net.length >= E.net.cap && freeCells(s) >= s.net.length) return { t: 'haul' };
+    const dHome = Math.hypot(s.x - HX, s.y - HY), why = homeReason(s, H, lv, E, tilesMin(s, E, dHome));
+    const tg = why ? null : bestTarget(s, H, lv, E, M);
+    if (!tg) { if (dockAt(s, M) === 0) return { t: 'dock' }; return goTo(s, E, M, HX, HY + 0.9, 0.3); }
+    if (tg.d < 1.3) {
+      if (tg.kind === 'sh') {
+        if (lv >= 2 && E.pots.length && dockAt(s, M) < 0) { const c = E.pots.find((i) => EQ[s.cargo[i].e].kinds.includes(Z.k)); if (c != null && FISH.some((f) => f.z === z && f.pot) && !s.pots.some((p) => Math.hypot(p.x - s.x, p.y - s.y) < 1.5)) return { t: 'pot', c }; }
+        return { t: 'fish', i: tg.i, q: lv === 3 ? 0.78 + Math.random() * 0.22 : lv === 2 ? 0.5 + Math.random() * 0.4 : 0.22 + Math.random() * 0.5 };
+      }
+      if (tg.kind === 'wk') return { t: 'salv', q: 0.5 + lv * 0.12 };
+      if (tg.kind === 'pt') return { t: 'potup' };
+    }
+    return goTo(s, E, M, tg.x, tg.y, tg.kind === 'em' ? -0.5 : 0.6);
+  }
+  function aiPort(s, H, lv, E, M) {
+    if (s.port !== 0) { return s.t > 600 || nf(s) > 0.2 ? { t: 'sleep' } : { t: 'leave' }; }
+    const NT = TIERS[s.tier + 1], needMat = {}; if (NT && lv >= 2) for (const k in NT.need) needMat[MI[k]] = NT.need[k];
+    for (let i = 0; i < s.rq.length; i++) { const q = s.rq[i]; if (s.cargo.filter((it) => reqMatch(s, q, it, E)).length >= q.n && (q.k !== 'm' || !needMat[q.m])) return { t: 'req', i }; }
+    const have = {}; let sellI = -1;
+    s.cargo.forEach((it, i) => { if (sellI >= 0) return; if (it.k === 'f') { sellI = i; return; } if (it.k === 'm') { have[it.m] = (have[it.m] || 0) + 1; if (!MATS[it.m].mat || have[it.m] > (needMat[it.m] || 0)) sellI = i; } });
+    if (sellI >= 0) return { t: 'sell', i: sellI };
+    const D = due(s), exp = Math.max(60, s.st.yinc || s.st.dinc), reserve = D.left <= 1 ? Math.max(0, D.amt - exp * (lv === 3 ? 0.5 : 0.7) * Math.max(0, 1 - s.t / 800)) : D.amt * (lv === 3 ? 0.3 : 0.2) + H.thrift * 30;
+    let budget = s.money - reserve;
+    const miss = mhp(s, E) - s.hp; if (miss > mhp(s, E) * 0.25 && s.money >= 6) return { t: 'repair' };
+    if (lv === 1 && hash2(s.day, 3, s.seed & 255) < 0.5) budget -= 80;
+    const free = freeCells(s), afford = (p) => budget >= p * (lv === 3 ? 1 : 1.3), nz = s.ch.filter(Boolean).length;
+    const rodFor = (k) => EQ.filter((e) => e.t === 'rod' && e.kinds.includes(k)).sort((a, b) => a.p - b.p)[0];
+    // 해도는 있는데 낚싯대가 없는 해역 → 낚싯대부터
+    for (let zi = 1; zi < ZONES.length; zi++) if (s.ch[zi] && !E.rods[ZONES[zi].k]) { const r = rodFor(ZONES[zi].k); if (s.money >= eqPrice(s, r.i) && canHold(s, r.sh)) return { t: 'buy', e: r.i }; }
+    // 화물칸 넓히기: 재료 값까지 한꺼번에 낼 수 있을 때 재료를 사고 바로 넓힘
+    if (NT && lv >= 2 && nz >= [0, 2, 3, 5][s.tier + 1]) {
+      let mc = 0, miss1 = -1; for (const k in NT.need) { const n = NT.need[k] - (have[MI[k]] || 0); if (n > 0) { mc += n * MATS[MI[k]].buy; if (miss1 < 0) miss1 = MI[k]; } }
+      if (afford(NT.p + mc)) { if (miss1 < 0) return { t: 'hull' }; if (canHold(s, MATS[miss1].sh)) return { t: 'mat', m: miss1 }; }
+    }
+    // 다음 해역: 해도 + 낚싯대 값을 한꺼번에 낼 수 있을 때
+    const nextZ = ZONES.map((Z, zi) => zi).filter((zi) => !s.ch[zi] && (zi <= 3 || s.ch.slice(1, 4).some(Boolean))).map((zi) => { const r = E.rods[ZONES[zi].k] ? null : rodFor(ZONES[zi].k); return { zi, r, cost: ZONES[zi].chart + (r ? eqPrice(s, r.i) : 0) }; }).sort((a, b) => a.cost * (1 + hash2(a.zi, 7, s.seed & 255) * H.taste * 0.5) - b.cost * (1 + hash2(b.zi, 7, s.seed & 255) * H.taste * 0.5))[0];
+    if (nextZ && afford(nextZ.cost) && (!nextZ.r || canHold(s, nextZ.r.sh)) && (lv > 1 || s.day > 2) && s.days - s.day >= 1) return { t: 'chart', z: nextZ.zi };
+    if (lv >= 2) {
+      const want = [];
+      if (E.sp < 1.25 && nz >= 2) want.push(EI.eng1); else if (E.sp < 1.5 && nz >= 4) want.push(EI.eng2);
+      if (E.keep === 1 && nz >= 3) want.push(EI.ice);
+      if (!E.net && s.day >= 2) want.push(EI.net1);
+      if (H.night > 0.5 && E.lamp && E.lamp.vis < 5 && nz >= 3) want.push(EI.lamp1);
+      if (!E.pots.length && !s.pots.length && s.day >= 2) want.push(EI.pot1);
+      for (const ei of want) if (afford(eqPrice(s, ei) * 1.5) && (EQ[ei].t === 'eng' || free - SH[EQ[ei].sh].length >= 12) && canHold(s, EQ[ei].sh)) return { t: 'buy', e: ei };
+    } else if (hash2(s.day, 9, s.seed & 255) < 0.3 && budget > 150 && free > 12) { const ei = [EI.net1, EI.salt, EI.pot1, EI.lamp1][s.day % 4]; if (!eqHas(s, EQ[ei].id) && canHold(s, EQ[ei].sh)) return { t: 'buy', e: ei }; }
+    // 겹치는 헌 기관은 판다(화물칸을 비움)
+    const engs = s.cargo.map((it, i) => (it.k === 'e' && EQ[it.e].t === 'eng' ? i : -1)).filter((i) => i >= 0);
+    if (engs.length > 1) { engs.sort((a, b) => EQ[s.cargo[a].e].sp - EQ[s.cargo[b].e].sp); return { t: 'pack', p: s.cargo.map((it, i) => (i === engs[0] ? 0 : [it.x, it.y, it.r])) }; }
+    const why = homeReason(s, H, lv, E, 0), tg = why ? null : bestTarget(s, H, lv, E, M);
+    return tg ? { t: 'leave' } : { t: 'sleep' };
+  }
+  function ai(s, seat, lv) {
+    lv = lv || 2; const M = mapOf(s.seed), E = eqInfo(s), H = habit(s, lv);
+    if (s.ph === 'ev') {
+      if (s.ev.out != null) return { t: 'evok' };
+      const ev = EVENTS[s.ev.i], ok = ev.o.map((o, i) => i).filter((i) => !ev.o[i].need || eqHas(s, ev.o[i].need));
+      if (lv === 1) return { t: 'ev', c: ok[Math.floor(Math.random() * ok.length)] };
+      // 시간이 넉넉하고 화물칸에 자리가 있으면 손을 댐. 공포가 높으면 지나침
+      const first = ok[0], o = ev.o[first], risky = s.pan > H.panMax - 12 || freeCells(s) < 4 || s.t + (o.t || 0) > H.curfew - 60;
+      if (ev.id === 'still') return { t: 'ev', c: s.pan > 25 ? 0 : 1 };
+      return { t: 'ev', c: risky || ok.length < 2 ? ok[ok.length - 1] : first };
+    }
+    if (s.pend.length) return { t: 'pack', p: aiPack(s, lv, E) };
+    return s.ph === 'port' ? aiPort(s, H, lv, E, M) : aiSea(s, H, lv, E, M);
+  }
+
+  /* ---------- 그림(전부 코드로 그린 SVG) ---------- */
+  const mixHex = (a, b, t) => { const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16), c = (s) => Math.round(((pa >> s) & 255) + (((pb >> s) & 255) - ((pa >> s) & 255)) * t); return '#' + ((1 << 24) | (c(16) << 16) | (c(8) << 8) | c(0)).toString(16).slice(1); };
+  function fishSVG(F, ab, size) {
+    let [b, c1, c2, pat] = F.look; const id = 'ff' + F.i + (ab ? 'a' : ''), o = [], ink = '#14181d';
+    if (ab) { c1 = mixHex(c1, '#8d7a9c', 0.55); c2 = mixHex(c2, '#d8d0de', 0.5); }
+    const eye = (x, y, r) => '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + (ab ? '#e9e2c0' : '#f4f1e6') + '"/><circle cx="' + x + '" cy="' + y + '" r="' + (r * 0.5) + '" fill="' + ink + '"/>';
+    let body = '', extra = '', eyes = '';
+    if (b === 'f') {
+      body = 'M8,30 Q30,6 62,14 Q80,20 85,30 Q80,40 62,46 Q30,54 8,30 Z';
+      extra = '<path d="M84,30 L98,15 L93,30 L98,45 Z" fill="' + c1 + '"/><path d="M36,13 Q50,1 62,14 Z" fill="' + mixHex(c1, '#000000', 0.25) + '"/><path d="M40,44 Q46,54 54,45 Z" fill="' + mixHex(c1, '#000000', 0.2) + '"/>';
+      eyes = eye(21, 26, 3.6);
+    } else if (b === 'l') {
+      extra = '<path d="M9,32 C24,16 38,46 56,30 S84,22 95,31" fill="none" stroke="' + c1 + '" stroke-width="12" stroke-linecap="round"/><path d="M10,34 C24,19 38,49 56,33 S84,25 94,33" fill="none" stroke="' + c2 + '" stroke-width="3.5" stroke-linecap="round" opacity=".7"/>';
+      eyes = eye(12, 28, 2.6);
+    } else if (b === 'p') {
+      body = 'M12,30 Q16,8 48,8 Q78,8 82,30 Q78,52 48,52 Q16,52 12,30 Z';
+      extra = '<path d="M81,30 L96,20 L96,40 Z" fill="' + c1 + '"/><path d="M12,30 Q16,8 48,8 Q78,8 82,30 Q78,52 48,52 Q16,52 12,30 Z" fill="none" stroke="' + c2 + '" stroke-width="3" stroke-dasharray="2 3" opacity=".8"/>';
+      eyes = eye(27, 23, 3) + eye(36, 19, 3);
+    } else if (b === 'r') {
+      body = 'M14,30 Q14,6 44,6 Q74,6 74,30 Q74,54 44,54 Q14,54 14,30 Z';
+      extra = '<path d="M72,30 L92,18 L88,30 L92,42 Z" fill="' + c1 + '"/><path d="M40,6 L50,0 L54,8 Z M40,54 L50,60 L54,52 Z" fill="' + mixHex(c1, '#000000', 0.25) + '"/>';
+      eyes = eye(27, 24, 4);
+    } else if (b === 'c') {
+      body = 'M26,32 Q26,16 50,16 Q74,16 74,32 Q74,48 50,48 Q26,48 26,32 Z';
+      extra = '<g stroke="' + c1 + '" stroke-width="4" stroke-linecap="round" fill="none"><path d="M28,36 L10,42 M30,42 L14,52 M34,46 L24,58 M72,36 L90,42 M70,42 L86,52 M66,46 L76,58 M30,24 L16,14 M70,24 L84,14"/></g><circle cx="14" cy="11" r="7" fill="' + c1 + '"/><circle cx="86" cy="11" r="7" fill="' + c1 + '"/><path d="M9,8 L18,4 M82,4 L91,8" stroke="' + ink + '" stroke-width="2"/>' + (ab ? '<circle cx="50" cy="6" r="6" fill="' + c1 + '"/><path d="M50,14 L50,10" stroke="' + c1 + '" stroke-width="4"/>' : '');
+      eyes = eye(43, 20, 2.4) + eye(57, 20, 2.4);
+    } else if (b === 's') {
+      body = 'M8,30 Q10,12 34,12 Q54,14 56,30 Q54,46 34,48 Q10,48 8,30 Z';
+      extra = '<g stroke="' + c1 + '" stroke-width="5" stroke-linecap="round" fill="none"><path d="M54,22 Q70,10 92,16 M56,27 Q74,22 96,28 M56,33 Q74,38 96,34 M54,38 Q70,50 92,46' + (ab ? ' M50,18 Q64,2 84,4 M50,42 Q64,58 84,56' : '') + '"/></g>';
+      eyes = eye(44, 25, 3.4);
+    } else if (b === 'y') {
+      body = 'M10,30 L46,6 L72,30 L46,54 Z';
+      extra = '<path d="M70,30 Q84,28 98,34" fill="none" stroke="' + c1 + '" stroke-width="3.5" stroke-linecap="round"/>';
+      eyes = eye(30, 26, 2.6) + eye(30, 34, 2.6);
+    } else if (b === 'a') {
+      body = 'M10,34 Q10,12 40,12 Q66,14 70,34 Q66,54 40,54 Q10,54 10,34 Z';
+      extra = '<path d="M68,34 L90,24 L86,34 L90,46 Z" fill="' + c1 + '"/><path d="M12,38 Q26,50 44,40" fill="none" stroke="' + ink + '" stroke-width="3"/><path d="M16,40 L19,45 L22,41 L26,47 L30,42 L34,46 L38,41" fill="none" stroke="#efe9d6" stroke-width="1.6"/><path d="M34,13 Q30,0 16,6" fill="none" stroke="' + c1 + '" stroke-width="2.4"/><circle cx="15" cy="7" r="4.5" fill="' + c2 + '"/>';
+      eyes = eye(26, 27, 3.2);
+    } else if (b === 'm') {
+      extra = '<g fill="' + c1 + '" stroke="' + mixHex(c1, '#000000', 0.3) + '" stroke-width="1.2"><ellipse cx="78" cy="38" rx="12" ry="7"/><ellipse cx="64" cy="30" rx="12" ry="9"/><ellipse cx="50" cy="25" rx="12" ry="10"/><ellipse cx="36" cy="25" rx="12" ry="10"/><ellipse cx="24" cy="29" rx="11" ry="9"/></g><path d="M88,40 L98,34 L98,46 Z" fill="' + c2 + '"/><path d="M16,26 Q6,14 2,6 M16,30 Q4,24 0,18" fill="none" stroke="' + c1 + '" stroke-width="1.8"/><path d="M30,37 L26,46 M40,36 L38,46 M50,36 L50,46 M60,38 L62,47" stroke="' + c2 + '" stroke-width="2"/>';
+      eyes = eye(18, 25, 2.4);
+    } else {   // h: 소라
+      body = 'M14,44 Q12,30 30,22 L70,6 Q86,20 84,44 Q50,56 14,44 Z';
+      extra = '<path d="M30,22 Q40,36 34,49 M46,16 Q58,34 52,51 M60,10 Q74,30 70,50" fill="none" stroke="' + c2 + '" stroke-width="3" opacity=".8"/><path d="M70,6 L78,0 M80,14 L90,10 M84,26 L94,26" stroke="' + c1 + '" stroke-width="4" stroke-linecap="round"/>';
+    }
+    o.push('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 60"' + (size ? ' width="' + size + '" height="' + Math.round(size * 0.6) + '"' : '') + '>');
+    if (body) {
+      o.push('<defs><clipPath id="' + id + '"><path d="' + body + '"/></clipPath></defs><path d="' + body + '" fill="' + c1 + '"/><g clip-path="url(#' + id + ')">');
+      o.push('<rect x="0" y="34" width="100" height="30" fill="' + c2 + '" opacity=".55"/>');
+      if (pat === 1) o.push('<g stroke="' + mixHex(c1, '#000000', 0.4) + '" stroke-width="4" opacity=".6"><path d="M30,0 V60 M42,0 V60 M54,0 V60 M66,0 V60"/></g>');
+      if (pat === 2) o.push('<g fill="' + mixHex(c1, '#000000', 0.4) + '" opacity=".6"><circle cx="34" cy="22" r="3"/><circle cx="46" cy="18" r="2.4"/><circle cx="56" cy="24" r="3"/><circle cx="44" cy="28" r="2"/><circle cx="66" cy="26" r="2.4"/><circle cx="28" cy="30" r="2"/></g>');
+      if (pat === 3) o.push('<path d="M22,29 Q50,22 82,29" fill="none" stroke="' + mixHex(c1, '#ffffff', 0.5) + '" stroke-width="2.2" opacity=".8"/>');
+      if (pat === 4) o.push('<g stroke="' + mixHex(c1, '#ffffff', 0.45) + '" stroke-width="5" opacity=".5"><path d="M34,0 V60 M56,0 V60"/></g>');
+      o.push('</g>');
+    }
+    o.push(extra, eyes);
+    if (ab) {   // 변이종: 어긋난 눈 · 핏줄 · 혹
+      const hx = (n) => hash2(F.i, n, 77);
+      for (let i = 0; i < 3; i++) o.push(eye(Math.round(26 + hx(i) * 40), Math.round(18 + hx(i + 9) * 22), 1.8 + hx(i + 20) * 1.6));
+      o.push('<path d="M24,36 Q40,30 52,38 T78,34" fill="none" stroke="#7a2f3a" stroke-width="1.4" opacity=".8"/><circle cx="' + Math.round(40 + hx(40) * 30) + '" cy="' + Math.round(40 + hx(41) * 8) + '" r="4.5" fill="' + mixHex(c1, '#7a2f3a', 0.5) + '"/>');
+    }
+    o.push('</svg>'); return o.join('');
+  }
+  const S_ = (inner, size) => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60"' + (size ? ' width="' + size + '" height="' + size + '"' : '') + ' fill="none" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+  function eqSVG(e, size) {
+    const m = '#c9d2da', br = '#e3ae45', wd = '#a9824f', dk = '#2a323c';
+    const G = {
+      rod: '<path d="M8,52 L50,8" stroke="' + wd + '" stroke-width="4"/><circle cx="20" cy="40" r="6" fill="' + dk + '" stroke="' + m + '" stroke-width="2.5"/><path d="M50,8 Q54,30 46,44 q-2,6 3,6" stroke="' + m + '" stroke-width="1.8"/>',
+      grapnel: '<path d="M30,6 V34" stroke="' + m + '" stroke-width="3"/><circle cx="30" cy="8" r="4" stroke="' + m + '" stroke-width="2.5"/><path d="M12,30 Q12,50 30,50 Q48,50 48,30 M12,30 L8,38 M12,30 L18,36 M48,30 L52,38 M48,30 L42,36 M30,34 V50" stroke="' + m + '" stroke-width="4"/>',
+      net: '<path d="M8,14 H52 Q50,44 30,52 Q10,44 8,14 Z" fill="' + dk + '" stroke="' + m + '" stroke-width="2.5"/><path d="M18,14 Q20,36 30,50 M30,14 V52 M42,14 Q40,36 30,50 M10,26 H50 M14,38 H46" stroke="' + m + '" stroke-width="1.4"/>',
+      pot: '<path d="M14,18 H46 L52,48 H8 Z" fill="' + dk + '" stroke="' + wd + '" stroke-width="3"/><path d="M12,28 H48 M10,38 H50 M24,18 L20,48 M36,18 L40,48" stroke="' + wd + '" stroke-width="1.6"/><path d="M30,18 V8" stroke="' + m + '" stroke-width="2"/><circle cx="30" cy="7" r="3.5" fill="' + br + '"/>',
+      eng: '<rect x="10" y="20" width="30" height="24" rx="3" fill="' + dk + '" stroke="' + m + '" stroke-width="2.5"/><path d="M16,20 V12 H24 V20 M28,20 V14 H34 V20 M40,32 H50" stroke="' + m + '" stroke-width="2.5"/><path d="M50,22 Q56,32 50,42 Q46,32 50,22 Z" fill="' + br + '"/>',
+      lamp: '<path d="M22,16 Q30,2 38,16" stroke="' + m + '" stroke-width="2.5"/><rect x="18" y="16" width="24" height="6" rx="2" fill="' + m + '"/><path d="M20,22 L18,46 H42 L40,22 Z" fill="' + (e.id === 'lamp3' ? '#6aa0d8' : '#f0c060') + '" opacity=".9"/><rect x="16" y="46" width="28" height="6" rx="2" fill="' + m + '"/>',
+      ice: '<rect x="10" y="16" width="40" height="32" rx="4" fill="' + dk + '" stroke="#9cc8e0" stroke-width="2.5"/><path d="M30,22 V42 M21,27 L39,37 M39,27 L21,37" stroke="#cfe8f4" stroke-width="2.2"/>',
+      salt: '<path d="M18,12 H42 Q48,30 42,50 H18 Q12,30 18,12 Z" fill="' + dk + '" stroke="' + wd + '" stroke-width="2.5"/><path d="M15,24 H45 M15,38 H45" stroke="' + wd + '" stroke-width="2"/>',
+      rib: '<path d="M8,46 Q30,6 52,46 M16,48 Q30,22 44,48 M8,46 H52" stroke="' + wd + '" stroke-width="4"/>',
+      horn: '<path d="M10,26 L30,22 Q44,20 52,10 V50 Q44,40 30,38 L10,34 Z" fill="' + br + '" stroke="' + dk + '" stroke-width="1.5"/>',
+      compass: '<circle cx="30" cy="30" r="20" fill="' + dk + '" stroke="' + br + '" stroke-width="3"/><path d="M30,14 L35,30 L30,46 L25,30 Z" fill="' + m + '"/><path d="M30,14 L35,30 H25 Z" fill="#d05a4a"/>',
+      lead: '<path d="M30,4 V26" stroke="' + m + '" stroke-width="2"/><path d="M24,26 H36 L40,50 Q30,58 20,50 Z" fill="#6a7480" stroke="' + m + '" stroke-width="2"/>',
+      bait: '<rect x="16" y="18" width="28" height="32" rx="4" fill="' + dk + '" stroke="' + m + '" stroke-width="2.5"/><path d="M16,26 H44" stroke="' + m + '" stroke-width="2"/><path d="M24,38 q4,-6 8,0 t8,0" stroke="#d08a7a" stroke-width="2.5"/>',
+      kit: '<rect x="8" y="22" width="44" height="26" rx="3" fill="' + dk + '" stroke="' + br + '" stroke-width="2.5"/><path d="M22,22 V14 H38 V22 M8,32 H52" stroke="' + br + '" stroke-width="2.5"/>',
+    };
+    return S_(G[e.id] || G[e.t] || G.kit, size);
+  }
+  function matSVG(m, size) {
+    const wd = '#a9824f', mt = '#aab4be', dk = '#2a323c', br = '#e3ae45';
+    const G = {
+      wood: '<path d="M6,20 H54 V30 H6 Z M10,32 H50 V42 H10 Z" fill="' + wd + '" stroke="#5a4226" stroke-width="2"/><path d="M14,25 H40 M18,37 H44" stroke="#5a4226" stroke-width="1.4"/>',
+      iron: '<path d="M10,40 L18,16 L34,22 L50,12 L46,44 L28,48 Z" fill="#6a7480" stroke="' + mt + '" stroke-width="2"/><circle cx="26" cy="32" r="4" fill="' + dk + '"/><path d="M36,26 L42,38" stroke="#9a5a3a" stroke-width="3"/>',
+      cloth: '<path d="M10,16 H50 V44 Q40,38 30,44 T10,44 Z" fill="#b9ad94" stroke="#6a624e" stroke-width="2"/><path d="M10,26 H50 M24,16 V42" stroke="#6a624e" stroke-width="1.4"/>',
+      spoon: '<ellipse cx="30" cy="16" rx="8" ry="11" fill="' + mt + '"/><path d="M30,27 V54" stroke="' + mt + '" stroke-width="4"/>',
+      lens: '<circle cx="30" cy="30" r="19" fill="#5a7890" stroke="' + mt + '" stroke-width="3"/><path d="M22,14 L30,30 L24,44 M30,30 L44,36" stroke="#dfe8ee" stroke-width="1.6"/>',
+      clock: '<circle cx="30" cy="34" r="18" fill="#e8e0c8" stroke="' + br + '" stroke-width="3"/><path d="M30,34 V22 M30,34 L22,34 M30,16 V8" stroke="' + dk + '" stroke-width="2.4"/><circle cx="30" cy="7" r="4" stroke="' + br + '" stroke-width="2.4"/>',
+      chain: '<g stroke="' + mt + '" stroke-width="4"><ellipse cx="14" cy="30" rx="9" ry="6"/><ellipse cx="30" cy="30" rx="9" ry="6"/><ellipse cx="46" cy="30" rx="9" ry="6"/></g>',
+      bone: '<path d="M12,46 Q20,20 48,14" stroke="#e8e2d0" stroke-width="7"/><circle cx="10" cy="48" r="5" fill="#e8e2d0"/><circle cx="50" cy="12" r="5" fill="#e8e2d0"/>',
+      idol: '<path d="M22,54 V30 Q20,10 30,8 Q40,10 38,30 V54 Z" fill="#5a4a3a" stroke="#2a2018" stroke-width="2"/><circle cx="26" cy="20" r="2.2" fill="#d8d0b0"/><circle cx="34" cy="20" r="2.2" fill="#d8d0b0"/><path d="M26,30 H34" stroke="#2a2018" stroke-width="2"/>',
+      bell: '<path d="M14,44 Q16,14 30,12 Q44,14 46,44 Z" fill="' + br + '" stroke="#7a5a1a" stroke-width="2"/><path d="M10,44 H50 M30,12 V6" stroke="#7a5a1a" stroke-width="3"/>',
+      box: '<rect x="8" y="18" width="44" height="30" rx="3" fill="#4a3a2a" stroke="' + br + '" stroke-width="2.5"/><path d="M8,28 H52 M30,24 V34" stroke="' + br + '" stroke-width="2.5"/><circle cx="30" cy="30" r="4" fill="' + dk + '" stroke="' + br + '" stroke-width="2"/>',
+    };
+    return S_(G[m.id], size);
+  }
+  const itSVG = (it, size) => (it.k === 'f' ? fishSVG(FISH[it.f], it.ab, size) : it.k === 'e' ? eqSVG(EQ[it.e], size) : matSVG(MATS[it.m], size));
+  const IMG = {};
+  function itImg(it) {   // 캔버스용 그림(한 번 만들어 둠)
+    if (typeof Image === 'undefined') return null;
+    const key = it.k + (it.k === 'f' ? it.f + (it.ab ? 'a' : '') : it.k === 'e' ? it.e : it.m); let im = IMG[key];
+    if (!im) { im = IMG[key] = new Image(); im.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(itSVG(it, it.k === 'f' ? 200 : 120)); }
+    return im.complete && im.naturalWidth ? im : null;
+  }
+  const ICON = '<path d="M6 36h44l-6 10H12z" fill="currentColor"/><path d="M27 34V10" stroke="currentColor" stroke-width="3"/><path d="M27 10l14 9-14 5z" fill="currentColor" opacity=".7"/><circle cx="27" cy="8" r="3" fill="currentColor"/><path d="M4 52q6-4 12 0t12 0 12 0 12 0" fill="none" stroke="currentColor" stroke-width="2.5" opacity=".6"/><path d="M38 24q8 2 12 8" fill="none" stroke="currentColor" stroke-width="2" opacity=".5"/>';
+  const CSS = `
+.ff-root{position:absolute;inset:0;overflow:hidden;background:#0b1220;color:#e9e4d6;font-family:var(--f-body,"IBM Plex Sans KR",sans-serif);user-select:none;-webkit-user-select:none}
+.ff-root canvas.gcanvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.ff-hud{position:absolute;left:8px;top:6px;right:56px;display:flex;flex-direction:column;gap:5px;pointer-events:none;z-index:5}
+.ff-row{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.ff-chip{background:rgba(10,14,22,.72);border:1px solid rgba(233,228,214,.16);border-radius:9px;padding:3px 8px;font-size:13px;line-height:1.35;white-space:nowrap;font-variant-numeric:tabular-nums}
+.ff-chip b{color:#f1d38c;font-weight:600}.ff-chip.warn{border-color:#d8794f;color:#ffd9c4}
+.ff-bar{flex:1;min-width:0;background:rgba(10,14,22,.72);border:1px solid rgba(233,228,214,.16);border-radius:9px;padding:3px 8px;font-size:12px;display:flex;align-items:center;gap:6px}
+.ff-bar i{flex:1;height:7px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden;display:block}.ff-bar i u{display:block;height:100%;border-radius:4px;text-decoration:none}
+.ff-bar span{font-family:var(--f-mono,monospace);min-width:26px;text-align:right}
+.ff-hint{position:absolute;left:10px;right:10px;text-align:center;font-size:13px;line-height:1.4;color:#efe9d8;text-shadow:0 1px 3px #000,0 0 6px #000;pointer-events:none;z-index:5;word-break:keep-all}
+.ff-ctl{position:absolute;left:8px;right:8px;bottom:max(8px,env(safe-area-inset-bottom));display:flex;gap:6px;align-items:flex-end;justify-content:center;z-index:6;pointer-events:none}
+.ff-ctl>*{pointer-events:auto}
+.ff-btn{min-width:52px;min-height:52px;border-radius:14px;border:1px solid rgba(233,228,214,.28);background:rgba(18,24,34,.82);color:#efe9d8;font:600 13px var(--f-body,sans-serif);padding:4px 8px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;line-height:1.2;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.ff-btn small{font-size:12px;font-weight:400;color:#b9c2c8}.ff-btn:active{transform:translateY(1px);background:rgba(40,50,66,.9)}
+.ff-btn.on{border-color:#f0c060;color:#ffe2a0;box-shadow:0 0 12px rgba(240,192,96,.35) inset}
+.ff-btn.main{flex:1;max-width:300px;min-height:56px;font-size:16px;background:rgba(227,174,69,.92);color:#221a0c;border-color:#f3d48f}.ff-btn.main small{color:#4a3a18}
+.ff-btn.main.off{background:rgba(18,24,34,.82);color:#9aa3aa;border-color:rgba(233,228,214,.2)}.ff-btn.main.off small{color:#8a9299}
+.ff-side{position:absolute;right:8px;display:flex;flex-direction:column;gap:6px;z-index:6;align-items:flex-end}
+.ff-side .ff-btn{min-height:44px;min-width:44px;flex-direction:row;gap:6px;padding:4px 12px}
+.ff-toast{position:absolute;left:50%;transform:translateX(-50%);max-width:86%;background:rgba(10,14,22,.78);border:1px solid rgba(233,228,214,.18);border-radius:10px;padding:5px 12px;font-size:13px;line-height:1.4;text-align:center;pointer-events:none;z-index:25;opacity:0;transition:opacity .25s;word-break:keep-all}
+.ff-toast.show{opacity:1}.ff-toast.low{top:auto!important;bottom:126px}.ff-toast.bad{border-color:#c8644a;color:#ffd9c4}.ff-toast.good{border-color:#8fc0a0}
+.ff-ov{position:absolute;inset:0;z-index:18;display:flex;flex-direction:column;background:rgba(6,9,15,.86)}
+.ff-ov.lite{background:rgba(6,9,15,.35)}
+.ff-sheet{margin:auto 0 0;background:#141b27;border-top:1px solid rgba(233,228,214,.2);border-radius:16px 16px 0 0;padding:12px 12px max(12px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:8px;max-height:100%;min-height:0;width:100%;max-width:560px;align-self:center;box-sizing:border-box}
+.ff-sheet.full{margin:0 auto;height:100%;border-radius:0;border-top:0}
+.ff-h{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}.ff-sheet.full>.ff-h{padding-right:48px;min-height:40px;align-items:center}.ff-h h3{margin:0;font:400 20px var(--f-display,"Black Han Sans",sans-serif);color:#f1e7cf}.ff-h span{font-size:13px;color:#b9c2c8}
+.ff-p{margin:0;font-size:14px;line-height:1.6;color:#d9d3c2;word-break:keep-all}
+.ff-got{font-size:13px;color:#f1d38c}
+.ff-tabs{display:flex;gap:6px;overflow-x:auto;flex:none;padding-bottom:2px}.ff-tabs button{flex:none;min-height:44px;padding:0 13px;border-radius:12px;border:1px solid rgba(233,228,214,.2);background:#1c2533;color:#cfd6da;font:600 14px var(--f-body,sans-serif)}
+.ff-tabs button.on{background:#e3ae45;color:#221a0c;border-color:#f3d48f}
+.ff-list{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch}
+.ff-it{display:flex;gap:8px;align-items:center;background:#1c2533;border-radius:12px;padding:6px 8px}
+.ff-it .ic{flex:none;width:52px;height:34px;display:grid;place-items:center;background:#0f151f;border-radius:8px}.ff-it .ic svg{max-width:48px;max-height:30px}
+.ff-it .tx{flex:1;min-width:0}.ff-it .tx b{font-size:14px;font-weight:600;color:#efe9d8}.ff-it .tx div{font-size:12px;line-height:1.45;color:#aab4ba;word-break:keep-all}
+.ff-it .tx em{font-style:normal;color:#f1d38c}
+.ff-it button,.ff-act button{flex:none;min-width:64px;min-height:44px;border-radius:11px;border:1px solid rgba(233,228,214,.25);background:#2a3546;color:#efe9d8;font:600 13px var(--f-body,sans-serif);padding:2px 10px;line-height:1.25;white-space:pre-line}
+.ff-it button.go,.ff-act button.go{background:#e3ae45;color:#221a0c;border-color:#f3d48f}.ff-it button:disabled,.ff-act button:disabled,.ff-it button.dim{opacity:.45}
+.ff-act{display:flex;gap:6px;flex:none}.ff-act button{flex:1;min-height:48px;font-size:14px}
+.ff-note{font-size:12px;line-height:1.5;color:#aab4ba;margin:0;word-break:keep-all}
+.ff-kw{color:#f1d38c;font-weight:600}
+.ff-cg{position:relative;flex:1;min-height:0}.ff-cg canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+`;
+
+  /* ---------- 상황 안내(뷰 · core 도움말 공용) ---------- */
+  function hintOf(s) {
+    if (s.end) return '';
+    const D = due(s), E = eqInfo(s), nfv = nf(s), dueTx = (D.left <= 1 ? '오늘 밤' : D.left + '일 뒤 밤') + ' 납부 ' + D.amt + COIN;
+    if (s.ph === 'port') return s.port === 0 ? (D.left <= 1 && s.money < D.amt ? dueTx + ' — ' + (D.amt - s.money) + COIN + ' 모자라요' : '팔고, 고치고, 채비한 뒤 출항해요. ' + dueTx) : '간이 부두예요. 쉬거나 고칠 수 있어요. 파는 것은 본항에서만.';
+    if (s.ph === 'ev') return '어떻게 할지 골라요.';
+    if (s.pend.length) return '잡은 것을 화물칸에 실어요.';
+    if (s.hp < mhp(s, E) * 0.35) return '선체가 위태로워요. 항구에서 고쳐요.';
+    if (s.pan >= 50 && nfv > 0.4) return '공포가 높아요. 항구에서 쉬면 가라앉아요.';
+    if (freeCells(s) <= 1) return '화물칸이 찼어요. 나침반 화살표를 따라 항구로.';
+    if (nfv > 0.6) return s.lamp ? '밤이에요. 밤 어군(푸른 빛)은 값지지만 공포가 올라요.' : '밤이에요. 등을 켜면 공포가 덜 올라요.';
+    if (nfv > 0.05) return '해가 져요. 곧 안개가 끼고 공포가 오르기 시작해요.';
+    if (D.left <= 1 && s.money < D.amt) return dueTx + ' — 지금 ' + s.money + COIN;
+    return '물결 고리(어군)로 가서 낚아요. ' + dueTx;
+  }
+
+  /* ---------- 뷰 ---------- */
+  function mount(root, api) {
+    const h = L.h, doc = document;
+    if (!doc.getElementById('ff-css')) doc.head.append(h('style', { id: 'ff-css', text: CSS }));
+    const box = h('div', { class: 'ff-root' }); root.append(box);
+    const C = U.canvas(box), ctx = C.ctx;
+    let S = null, M = null, E = null, dead = false, mg = null, cg = null, ov = null, ovKind = '', portTab = 'mk', sleepArm = 0;
+    const V = { x: HX, y: HY, ang: Math.PI / 2, nfv: 0, vis: DAY_VIS, wc: [61, 107, 116], seen: 0, wake: [], acc: 0, flash: 0, first: true, stick: null, lastDir: null, tsz: 36 };
+    const human = () => api.canAct(0);
+    const store = (k, v) => { try { if (v === undefined) return localStorage.getItem('lounge.fogfish.' + k); localStorage.setItem('lounge.fogfish.' + k, v); } catch (e) {} return null; };
+    let autoPack = store('auto') !== '0';
+    const later = (fn) => setTimeout(() => { if (!dead) fn(); }, 0);
+    const act = (a) => { if (!dead && human()) api.act(a); };
+
+    /* HUD */
+    const elDay = h('span', { class: 'ff-chip' }), elMoney = h('span', { class: 'ff-chip' }), elDue = h('span', { class: 'ff-chip' });
+    const mkBar = (label, col) => { const u = h('u', { style: { background: col } }), n = h('span', { text: '0' }), el = h('div', { class: 'ff-bar' }, label, h('i', null, u), n); return { el, u, n }; };
+    const bHp = mkBar('선체', '#8fc0a0'), bPan = mkBar('공포', '#b98ad0');
+    const hud = h('div', { class: 'ff-hud' }, h('div', { class: 'ff-row' }, elDay, elMoney, elDue), h('div', { class: 'ff-row', style: { flexWrap: 'nowrap' } }, bHp.el, bPan.el));
+    const hint = h('div', { class: 'ff-hint' }), toastEl = h('div', { class: 'ff-toast' });
+    const btnLamp = h('button', { class: 'ff-btn', type: 'button', 'data-action': 'lamp', onclick: () => doLamp() }, '등', h('small', { text: '꺼짐' }));
+    const btnChart = h('button', { class: 'ff-btn', type: 'button', 'data-action': 'chart', onclick: () => openChart() }, '해도');
+    const btnMain = h('button', { class: 'ff-btn main', type: 'button', 'data-action': 'act', onclick: () => doMain() });
+    const btnCargo = h('button', { class: 'ff-btn', type: 'button', 'data-action': 'cargo', onclick: () => openCargo() }, '화물칸', h('small', { text: '' }));
+    const ctl = h('div', { class: 'ff-ctl' }, btnLamp, btnChart, btnMain, btnCargo), side = h('div', { class: 'ff-side' });
+    btnMain.addEventListener('pointerdown', () => { if (mg && mg.type === 'hd') mg.hold = true; }); ['pointerup', 'pointercancel', 'pointerleave'].forEach((n) => btnMain.addEventListener(n, () => { if (mg) mg.hold = false; }));
+    box.append(hud, hint, toastEl, side, ctl);
+    const place = () => { const ch = ctl.offsetHeight || 60; hint.style.bottom = (ch + 18) + 'px'; side.style.bottom = (ch + 46) + 'px'; toastEl.style.top = ((hud.offsetHeight || 60) + 14) + 'px'; };
+
+    /* 알림: 작고 반투명, 1.5초, 누르기를 막지 않음 */
+    const tq = []; let tBusy = 0;
+    function toast(text, cls) { if (tq.length > 2) tq.shift(); tq.push([text, cls || '']); if (!tBusy) nextToast(); }
+    function nextToast() { const t = tq.shift(); if (!t || dead) { tBusy = 0; toastEl.classList.remove('show'); return; } tBusy = 1; toastEl.textContent = t[0]; toastEl.className = 'ff-toast show ' + t[1] + (ov ? ' low' : ''); setTimeout(() => { toastEl.classList.remove('show'); setTimeout(nextToast, tq.length ? 120 : 260); }, tq.length ? 900 : 1500); }
+    const WHY = { rock: '암초', rk: '떠오른 암초', st: '뒤따르는 것', wh: '도는 물', mw: '큰 입', fl: '유빙', pan: '공포', ev: '사건' };
+    function onFx(f) {
+      const k = f.k;
+      if (k === 'catch') { toast((f.ab ? '변이종 · ' : '') + f.n + ' — ' + f.t + '분', 'good'); api.sfx('pop'); api.buzz(12, 'ui'); if (f.f != null) V.pop = { it: { k: 'f', f: f.f, ab: f.ab }, t0: performance.now() }; }
+      else if (k === 'miss') { toast(f.n + ' — 놓쳤어요 · ' + f.t + '분', 'bad'); api.sfx('whoosh'); }
+      else if (k === 'hit') { toast('선체 −' + f.d + ' · ' + (WHY[f.why] || ''), 'bad'); api.sfx('thud'); api.buzz(40, 'hit'); V.flash = 1; }
+      else if (k === 'edge') toast('해도가 없는 물이에요. 선구점에서 해도를 사면 열려요.');
+      else if (k === 'sold') { toast('+' + f.v + COIN, 'good'); api.sfx('chip'); }
+      else if (k === 'reward') { toast('사례금 +' + f.v + COIN, 'good'); api.sfx('chip'); }
+      else if (k === 'paid') { toast('조합 납부 −' + f.v + COIN); api.sfx('card'); }
+      else if (k === 'day') { api.banner(f.d + '일째', { sub: WX[S.wx].n + (S.wx ? ' · ' + WX[S.wx].d : ''), small: true, ms: 1500 }); }
+      else if (k === 'netfull') toast('그물 자루가 찼어요.');
+      else if (k === 'mirage') toast('헛것이었어요 · 공포 +3');
+      else if (k === 'stalk') { toast('무엇인가 뒤를 따라와요.', 'bad'); api.sfx('warn'); }
+      else if (k === 'swarm') toast('빛을 보고 무엇인가 모여들어요.', 'bad');
+      else if (k === 'dark') { toast('등이 꺼졌어요 · 90분 동안 켤 수 없음 · 공포 +12', 'bad'); api.sfx('lose'); }
+      else if (k === 'bell') toast('물 밑에서 종이 울려요 · 공포가 올라요', 'bad');
+      else if (k === 'beacon') toast('등대가 아니었어요 · 공포 +8', 'bad');
+      else if (k === 'maw') toast('아래에서 올라온 것이 배를 물었어요 · 공포 +15', 'bad');
+      else if (k === 'bite') toast(f.n ? '잃은 화물: ' + f.n + ' · 공포 +10' : '공포 +10', 'bad');
+      else if (k === 'rot') toast(f.n + ' — 상했어요', 'bad');
+      else if (k === 'chart') { toast(ZONES[f.z].n + ' 해도를 샀어요.', 'good'); api.sfx('card'); }
+      else if (k === 'hull') { toast('화물칸을 넓혔어요.', 'good'); api.sfx('win'); }
+      else if (k === 'fix') { toast('선체 +' + f.v, 'good'); api.sfx('click'); }
+      else if (k === 'potset') toast('통발을 내렸어요. 5시간마다 한 마리씩 들어요.');
+      else if (k === 'potup') toast('통발: ' + f.f + ' ' + f.n + '마리', f.n ? 'good' : '');
+      else if (k === 'haul') toast('그물을 올렸어요 · ' + f.n + '마리', 'good');
+      else if (k === 'horn') { toast('나팔 소리에 물이 조용해졌어요 · 공포 −10', 'good'); api.sfx('go'); }
+    }
+
+    /* ----- 주 행동 ----- */
+    function ctxAction() {
+      if (!S || S.ph !== 'sea') return { k: 'none', label: '', sub: '', ok: false };
+      if (S.pend.length) return { k: 'cargo', label: '싣기', sub: S.pend.length + '개', ok: true };
+      const d = dockAt(S, M); if (d >= 0) return { k: 'dock', label: '입항', sub: d ? M.docks[d - 1].n : '본항', ok: true };
+      const pi = S.pots.findIndex((p) => Math.hypot(p.x - S.x, p.y - S.y) < 1.6);
+      if (pi >= 0) { const p = S.pots[pi], n = Math.min(EQ[p.e].cap, Math.floor((S.m - p.m) / 300)); return { k: 'potup', label: '통발 걷기', sub: n + '마리 들었음', ok: true }; }
+      let bi = -1, bd = 1.6; S.sh.forEach((o, i) => { const dd = Math.hypot(o.x - S.x, o.y - S.y); if (dd < bd && o.n > 0) { bd = dd; bi = i; } });
+      if (bi >= 0) {
+        const o = S.sh[bi], F = FISH[o.f], nm = (o.ab ? F.ab : F.n) + ' ×' + o.n;
+        if (!shoalOn(S, o)) return { k: 'no', label: '낚기', sub: nm, ok: false, why: o.nt ? '이 어군은 밤에만 모여요.' : '낮 어군은 밤에 흩어져요.' };
+        if (!E.rods[F.k]) return { k: 'no', label: '낚기', sub: KIND[F.k] + ' 낚싯대 필요', ok: false, why: '어장: ' + KIND[F.k] + ' — 맞는 낚싯대가 없어요. 선구점에서 살 수 있어요.' };
+        return { k: 'fish', i: bi, label: '낚기', sub: nm, ok: true };
+      }
+      const wi = M.wrecks.findIndex((w, j) => S.ch[w.z] && Math.hypot(w.x - S.x, w.y - S.y) < 1.6);
+      if (wi >= 0) {
+        if (S.wk[wi] <= 0) return { k: 'no', label: '인양', sub: '건질 것 없음', ok: false, why: '이 잔해는 다 건졌어요. 이틀마다 조금씩 다시 드러나요.' };
+        if (!E.rods.wreck) return { k: 'no', label: '인양', sub: '인양 갈고리 필요', ok: false, why: '잔해를 건지려면 인양 갈고리가 있어야 해요.' };
+        return { k: 'salv', label: '인양', sub: '잔해 · ' + S.wk[wi] + '번 남음', ok: true };
+      }
+      return { k: 'no', label: '낚을 곳 없음', sub: '물결 고리 위로', ok: false, why: '물결 고리(어군) 위에 배를 대면 낚을 수 있어요.' };
+    }
+    function doMain() {
+      if (!S || S.end || !human()) return;
+      if (mg) { mgTap(); return; }
+      const a = ctxAction();
+      if (a.k === 'cargo') openCargo();
+      else if (a.k === 'dock') act({ t: 'dock' });
+      else if (a.k === 'potup') act({ t: 'potup' });
+      else if (a.k === 'fish') startMg(S.sh[a.i], a.i);
+      else if (a.k === 'salv') startMg(null, -1);
+      else if (a.why) toast(a.why);
+    }
+    function doLamp() {
+      if (!S || S.ph !== 'sea' || !human()) return;
+      if (!E.lamp) { toast('등이 없어요.'); return; }
+      if (S.m < S.lampOut) { toast('등이 젖었어요. ' + Math.ceil(S.lampOut - S.m) + '분 뒤에 켤 수 있어요.'); return; }
+      act({ t: 'lamp' }); api.sfx('click');
+    }
+    function refreshUI() {
+      if (!S) return;
+      const D = due(S), mh = mhp(S, E), nfv = nf(S);
+      elDay.innerHTML = '<b>' + S.day + '</b>/' + S.days + '일 ' + clockText(S.t) + (nfv > 0.5 ? ' 밤' : nfv > 0.05 ? ' 땅거미' : '');
+      elMoney.innerHTML = '<b>' + S.money + '</b>' + COIN;
+      elDue.innerHTML = '납부 ' + (D.left <= 1 ? '오늘 밤' : D.left + '일 뒤') + ' <b>' + D.amt + '</b>' + COIN; elDue.classList.toggle('warn', D.left <= 1 && S.money < D.amt);
+      bHp.u.style.width = clamp(S.hp / mh * 100, 0, 100) + '%'; bHp.n.textContent = S.hp; bHp.u.style.background = S.hp < mh * 0.35 ? '#d8794f' : '#8fc0a0';
+      bPan.u.style.width = S.pan + '%'; bPan.n.textContent = Math.round(S.pan);
+      const sea = S.ph === 'sea' && !S.end, hm = human();
+      ctl.style.display = sea && hm ? '' : 'none'; side.style.display = sea && hm ? '' : 'none';
+      hint.textContent = hm ? hintOf(S) : S.ph === 'port' ? '항구에 머무는 중' : '';
+      const lampOk = E.lamp && S.m >= S.lampOut;
+      btnLamp.classList.toggle('on', !!S.lamp && lampOk); btnLamp.lastChild.textContent = !E.lamp ? '없음' : !lampOk ? '젖음' : S.lamp ? '켜짐' : '꺼짐';
+      btnCargo.lastChild.textContent = '빈 칸 ' + freeCells(S);
+      const a = ctxAction(); btnMain.innerHTML = ''; btnMain.append(a.label, h('small', { text: a.sub })); btnMain.classList.toggle('off', !a.ok);
+      // 곁 행동: 쓸 수 있을 때만 보임
+      side.innerHTML = '';
+      const chip = (label, fn, id) => side.append(h('button', { class: 'ff-btn', type: 'button', 'data-action': id || null, onclick: fn }, label));
+      if (sea && hm && !S.pend.length) {
+        if (E.net && S.net.length) chip('그물 올리기 ' + S.net.length + '/' + E.net.cap, () => act({ t: 'haul' }), 'haul');
+        const z = zoneAt(M, S.x, S.y), pc = E.pots.find((i) => EQ[S.cargo[i].e].kinds.includes((ZONES[z] || ZONES[0]).k));
+        if (pc != null && dockAt(S, M) < 0 && !S.pots.some((p) => Math.hypot(p.x - S.x, p.y - S.y) < 1.5)) chip('통발 내리기', () => act({ t: 'pot', c: pc }));
+        if (E.horn && S.m >= S.hornT && nfv > 0.4) chip('나팔 불기', () => act({ t: 'horn' }), 'horn');
+        if (E.kit && S.kitD !== S.day && S.hp < mh - 5) chip('수선 +20 · 60분', () => act({ t: 'kit' }));
+      }
+      const amb = nfv > 0.5 ? 'wind' : 'harbor'; if (hm && amb !== V.amb && !S.end) { V.amb = amb; try { if (L.ambient && L.ambient.playing && L.ambient.playing() && L.ambient.playing() !== amb) L.ambient.play(amb); } catch (e) {} }
+      place();
+    }
+
+    /* ----- 낚기(짧은 조작) ----- */
+    function startMg(sh, i) {
+      const F = sh ? FISH[sh.f] : null, type = F ? F.mg : 'hd', dif = F ? F.dif : 2, now = performance.now();
+      mg = { type, dif, i, F, name: F ? (sh.ab ? F.ab : F.n) : '잔해', t0: now, hits: 0, miss: 0, need: type === 'tm' || type === 'rg' ? (dif >= 3 ? 3 : 2) : type === 'dp' ? (dif >= 4 ? 2 : 1) : 1, zone: 0.2 + Math.random() * 0.6, prog: 0, ten: 0, over: 0, last: now, done: 0, msg: '', hold: false };
+      api.sfx('whoosh'); refreshUI();
+    }
+    const mgPos = (now) => {   // 0~1 사이를 오가는 바늘(시간의 삼각파)
+      const per = mg.type === 'tm' ? 1500 - mg.dif * 150 : mg.type === 'dp' ? 2100 - mg.dif * 200 : 1300 - mg.dif * 90, u = ((now - mg.t0) % per) / per;
+      return mg.type === 'rg' ? 1 - u : u < 0.5 ? u * 2 : 2 - u * 2;
+    };
+    const mgTol = () => (mg.type === 'tm' ? 0.15 - mg.dif * 0.014 : mg.type === 'dp' ? 0.12 - mg.dif * 0.012 : 0.17 - mg.dif * 0.016);
+    function mgTap() {
+      if (!mg || mg.done) return; const now = performance.now();
+      if (mg.type === 'hd') return;
+      const p = mgPos(now), target = mg.type === 'rg' ? 0.3 : mg.zone, ok = Math.abs(p - target) <= mgTol();
+      if (ok) { mg.hits++; api.sfx('tick'); api.buzz(8, 'ui'); mg.zone = 0.2 + Math.random() * 0.6; mg.msg = '걸렸어요'; } else { mg.miss++; api.sfx('click'); mg.msg = '빗나갔어요'; }
+      if (mg.type === 'rg') mg.t0 = now;
+      if (mg.hits >= mg.need || mg.miss >= 3) endMg(clamp(mg.hits / mg.need - mg.miss * 0.18 + (mg.miss ? 0 : 0.0), 0, 1));
+    }
+    function endMg(q) { if (!mg || mg.done) return; mg.done = performance.now(); mg.q = q; const m = mg; setTimeout(() => { if (dead || mg !== m) return; mg = null; act(m.F ? { t: 'fish', i: m.i, q } : { t: 'salv', q }); refreshUI(); }, 260); }
+    function mgFrame(dt, now) {
+      if (!mg || mg.done || mg.type !== 'hd') return;
+      const hold = mg.hold || api.input.held('act'), per = 1500 - mg.dif * 110, u = ((now - mg.t0) % per) / per, pull = u > 0.62 - mg.dif * 0.04;   // 주기의 끝자락에 고기가 버팀
+      mg.pull = pull; mg.pullIn = pull ? 0 : (0.62 - mg.dif * 0.04 - u) * per;
+      if (hold) { if (pull) { mg.ten += dt * 1.7; mg.over += dt; } else { mg.prog += dt * 0.5; mg.ten = Math.max(0, mg.ten - dt * 0.5); } } else mg.ten = Math.max(0, mg.ten - dt * 1.4);
+      if (mg.ten >= 1) { mg.msg = '줄이 터졌어요'; endMg(0.2); } else if (mg.prog >= 1) endMg(clamp(1 - mg.over * 0.7, 0.35, 1));
+    }
+    function drawMg(now) {
+      const W = C.w, H = C.h, w = Math.min(320, W - 24), hh = 132, x = (W - w) / 2, y = H * 0.47 + V.tsz * 1.3;
+      ctx.save(); ctx.fillStyle = 'rgba(10,14,22,.88)'; ctx.strokeStyle = 'rgba(233,228,214,.25)'; ctx.lineWidth = 1; rr(x, y, w, hh, 14); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#f1e7cf'; ctx.font = '600 15px "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(mg.name, x + 14, y + 20);
+      ctx.textAlign = 'right'; ctx.font = '13px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#b9c2c8';
+      const HOW = { tm: '바늘이 밝은 띠에 올 때 누르기', rg: '고리가 겹칠 때 누르기', dp: '추가 밝은 띠에 닿을 때 누르기', hd: '누르고 있기 · 붉어지면 떼기' };
+      ctx.fillText(mg.type === 'hd' ? '' : mg.hits + ' / ' + mg.need, x + w - 14, y + 20);
+      ctx.textAlign = 'center'; ctx.fillText(mg.done ? (mg.q < 0.3 ? '놓쳤어요' : '올라와요') : mg.msg || HOW[mg.type], x + w / 2, y + hh - 16);
+      const bx = x + 20, bw = w - 40, by = y + 62, p = mg.done ? null : mgPos(now), tol = mgTol();
+      if (mg.type === 'tm' || mg.type === 'dp') {
+        ctx.fillStyle = 'rgba(255,255,255,.1)'; rr(bx, by - 9, bw, 18, 9); ctx.fill();
+        ctx.fillStyle = mg.type === 'dp' ? '#6fb0c8' : '#e3ae45'; rr(bx + (mg.zone - tol) * bw, by - 9, tol * 2 * bw, 18, 6); ctx.fill();
+        if (p != null) { ctx.fillStyle = '#fff'; rr(bx + p * bw - 2.5, by - 15, 5, 30, 2.5); ctx.fill(); if (mg.type === 'dp') { ctx.beginPath(); ctx.arc(bx + p * bw, by + 20, 5, 0, TAU); ctx.fillStyle = '#9aa4ae'; ctx.fill(); } }
+      } else if (mg.type === 'rg') {
+        const cx = x + w / 2, R = 38;
+        ctx.lineWidth = Math.max(5, tol * 2 * R); ctx.strokeStyle = 'rgba(227,174,69,.75)'; ctx.beginPath(); ctx.arc(cx, by + 4, R * 0.3 + 6, 0, TAU); ctx.stroke();
+        if (p != null) { ctx.lineWidth = 3; ctx.strokeStyle = '#fff'; ctx.beginPath(); ctx.arc(cx, by + 4, R * p + 6, 0, TAU); ctx.stroke(); }
+      } else {
+        const col = mg.pull ? '#d8644a' : mg.pullIn < 260 ? mixHex('#8fc0a0', '#d8644a', 1 - mg.pullIn / 260) : '#8fc0a0';
+        ctx.fillStyle = 'rgba(255,255,255,.1)'; rr(bx, by - 9, bw, 18, 9); ctx.fill();
+        ctx.fillStyle = col; rr(bx, by - 9, Math.max(8, bw * clamp(mg.prog, 0, 1)), 18, 9); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.1)'; rr(bx, by + 18, bw, 8, 4); ctx.fill(); ctx.fillStyle = '#d8644a'; rr(bx, by + 18, Math.max(4, bw * clamp(mg.ten, 0, 1)), 8, 4); ctx.fill();
+        ctx.fillStyle = '#b9c2c8'; ctx.font = '12px "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'left'; ctx.fillText(mg.pull ? '버텨요 — 떼기' : '당기기', bx, by - 22); ctx.textAlign = 'right'; ctx.fillText('줄 당김', bx + bw, by + 38);
+      }
+      ctx.restore();
+    }
+    function rr(x, y, w, hh, r) { r = Math.min(r, w / 2, hh / 2); ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + hh, r); ctx.arcTo(x + w, y + hh, x, y + hh, r); ctx.arcTo(x, y + hh, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+
+    /* ----- 겹침 창(항구 · 사건 · 화물칸 · 해도) ----- */
+    function closeOv() { if (ov) { ov.remove(); ov = null; ovKind = ''; toastEl.classList.remove('low'); } if (cg) { cg.destroy(); cg = null; } }
+    function showOv(kind, el) { closeOv(); ov = h('div', { class: 'ff-ov' + (kind === 'ev' ? ' lite' : '') }, el); ovKind = kind; box.append(ov); toastEl.classList.add('low'); return ov; }
+    const itRow = (svg, name, desc, btn) => { const ic = h('span', { class: 'ic' }); ic.innerHTML = svg; const d = h('div'); d.innerHTML = desc; return h('div', { class: 'ff-it' }, ic, h('div', { class: 'tx' }, h('b', { text: name }), d), btn || null); };
+    const kw = (t) => t.replace(/([가-힣A-Za-z ]+): /g, '<span class="ff-kw">$1:</span> ');
+    function frText(it) { if (it.k !== 'f') return ''; const f = fresh(S, it, E); return '<em style="color:' + ['#8fc0a0', '#d8c070', '#d8794f'][f] + '">' + FRN[f] + '</em> · '; }
+    function buildPort() {
+      const keep = ov && ovKind === 'port' ? ov.querySelector('.ff-list') : null, sc = keep ? keep.scrollTop : 0;
+      const home = S.port === 0, D = due(S), mh = mhp(S, E), list = h('div', { class: 'ff-list' });
+      const head = h('div', { class: 'ff-h' }, h('h3', { text: home ? '본항' : M.docks[S.port - 1].n }), h('span', { text: S.day + '일째 ' + clockText(S.t) + ' · ' + S.money + COIN + ' · 선체 ' + S.hp + '/' + mh + ' · 공포 ' + Math.round(S.pan) }));
+      const B = (label, fn, o) => { o = Object.assign({}, o || {}); const why = o.why; delete o.why; if (why) { o.class = (o.class || '') + ' dim'; } return h('button', Object.assign({ type: 'button', text: label, onclick: why ? () => toast(why) : fn }, o)); };
+      const poor = (p) => (S.money < p ? '돈이 모자라요. ' + p + COIN + ' 가운데 ' + S.money + COIN + '뿐이에요.' : null);
+      const tabs = h('div', { class: 'ff-tabs' });
+      const miss = mh - S.hp, rate = home ? 1.2 : 2, rcost = Math.ceil(Math.min(miss, Math.floor(S.money / rate)) * rate);
+      const repairRow = () => itRow(S_('<path d="M14,46 L34,26 M30,14 a10,10 0 1 0 14,14 l-6,-2 l-4,-6 Z" stroke="#c9d2da" stroke-width="4"/>', 30), '선체 수리', miss > 0 ? '선체 <em>' + S.hp + '/' + mh + '</em> · ' + rate + COIN + '에 1' : '손볼 곳이 없어요.', B(miss > 0 ? '고치기\n' + rcost + COIN : '멀쩡함', () => act({ t: 'repair' }), { why: miss <= 0 ? '손볼 곳이 없어요.' : S.money < rate ? '돈이 모자라요.' : null, class: miss > 0 ? 'go' : '' }));
+      if (home) {
+        [['mk', '어시장'], ['shop', '선구점'], ['yard', '조선소'], ['rq', '의뢰'], ['guild', '조합']].forEach(([k, n]) => tabs.append(B(n, () => { portTab = k; buildPort(); }, { class: portTab === k ? 'on' : '' })));
+        if (portTab === 'mk') {
+          const fishN = S.cargo.filter((it) => it.k === 'f'), tot = fishN.reduce((a, it) => a + price(S, it, E), 0);
+          list.append(h('p', { class: 'ff-note', text: '오늘 찾는 어종(값 ×1.5): ' + [...new Set(S.hot)].map((f) => FISH[f].n).join(' · ') + '. 같은 어종은 팔수록 값이 5%씩 내려요(60%까지).' }));
+          if (fishN.length) list.append(h('div', { class: 'ff-act' }, B('물고기 모두 팔기 +' + tot + COIN, () => act({ t: 'sellall' }), { class: 'go' })));
+          let any = false;
+          S.cargo.forEach((it, i) => { if (it.k === 'e') return; any = true; list.append(itRow(itSVG(it), itName(it), frText(it) + (it.k === 'm' && MATS[it.m].mat ? '재료 · ' : '') + '값 <em>' + price(S, it, E) + COIN + '</em>' + (it.k === 'f' && S.hot.includes(it.f) ? ' · 찾는 어종' : ''), B('팔기', () => act({ t: 'sell', i })))); });
+          if (!any) list.append(h('p', { class: 'ff-note', text: '팔 것이 없어요. 장비는 화물칸에서 내려놓고 닫으면 반값에 되팔려요.' }));
+        } else if (portTab === 'shop') {
+          list.append(h('p', { class: 'ff-note', text: '해도를 사면 새 해역이 열려요. 그 해역의 어장에 맞는 낚싯대가 있어야 낚을 수 있어요. 장비는 화물칸 칸을 차지해요.' }));
+          ZONES.forEach((Z, zi) => { if (zi && !S.ch[zi]) list.append(itRow(S_('<path d="M10,14 L24,10 L36,16 L50,12 V46 L36,50 L24,44 L10,48 Z" fill="' + Z.col + '" stroke="#e3ae45" stroke-width="2.5"/><path d="M24,10 V44 M36,16 V50" stroke="#e3ae45" stroke-width="1.5"/>', 30), '해도: ' + Z.n, kw('어장: ' + KIND[Z.k] + ' · 밤 공포: ×' + Z.fear) + '<br>' + Z.d, B('사기\n' + Z.chart + COIN, () => act({ t: 'chart', z: zi }), { why: poor(Z.chart), class: 'go' }))); });
+          let lastT = '';
+          EQ.forEach((e) => {
+            if (e.t !== lastT) { lastT = e.t; list.append(h('p', { class: 'ff-note', style: { margin: '6px 0 0', color: '#f1d38c' }, text: ETYPE[e.t] })); }
+            const p = eqPrice(S, e.i), own = S.cargo.filter((it) => it.k === 'e' && it.e === e.i).length + S.pots.filter((q) => q.e === e.i).length;
+            list.append(itRow(eqSVG(e), e.n + (own ? ' · 보유 ' + own : ''), kw(eqDesc(e)) + ' · ' + SH[e.sh].length + '칸', B((p < e.p ? '할인\n' : '사기\n') + p + COIN, () => act({ t: 'buy', e: e.i }), { why: poor(p) })));
+          });
+        } else if (portTab === 'yard') {
+          list.append(repairRow());
+          const NT = TIERS[S.tier + 1], T = TIERS[S.tier];
+          if (NT) {
+            const cnt = (k) => S.cargo.filter((it) => it.k === 'm' && it.m === MI[k]).length; let ok = S.money >= NT.p; const nd = Object.keys(NT.need).map((k) => { const c = cnt(k); if (c < NT.need[k]) ok = false; return MATS[MI[k]].n + ' ' + c + '/' + NT.need[k]; });
+            list.append(itRow(S_('<path d="M6,24 H54 L46,46 H14 Z" fill="#2a323c" stroke="#a9824f" stroke-width="3"/><path d="M30,24 V46 M18,24 L20,46 M42,24 L40,46" stroke="#a9824f" stroke-width="1.6"/>', 30), '화물칸 넓히기 → ' + NT.n, '칸 <em>' + T.w + '×' + T.h + ' → ' + NT.w + '×' + NT.h + '</em> · 선체 +' + (NT.hp - T.hp) + '<br>재료(화물칸에 싣고 있어야 함): ' + nd.join(' · '), B('넓히기\n' + NT.p + COIN, () => act({ t: 'hull' }), { why: ok ? null : S.money < NT.p ? poor(NT.p) : '재료가 모자라요. 화물칸에 싣고 와야 해요: ' + nd.join(' · '), class: 'go' })));
+          } else list.append(h('p', { class: 'ff-note', text: '화물칸은 더 넓힐 수 없어요.' }));
+          list.append(h('p', { class: 'ff-note', text: '재료는 잔해에서 인양 갈고리로 건지거나 여기서 사요.' }));
+          MATS.filter((m) => m.buy).forEach((m) => list.append(itRow(matSVG(m), m.n, m.d + ' · ' + SH[m.sh].length + '칸', B('사기\n' + m.buy + COIN, () => act({ t: 'mat', m: m.i }), { why: poor(m.buy) }))));
+        } else if (portTab === 'rq') {
+          list.append(h('p', { class: 'ff-note', text: '적힌 것을 화물칸에 싣고 와서 건네면 시세보다 넉넉히 쳐줘요. 상한 것은 받지 않아요.' }));
+          S.rq.forEach((q, i) => { const hv = S.cargo.filter((it) => reqMatch(S, q, it, E)).length; list.append(itRow(q.k === 'f' ? fishSVG(FISH[q.f]) : q.k === 'm' ? matSVG(MATS[q.m]) : fishSVG(FISH[FI.mangduk], 1), reqText(q), '사례 <em>' + q.rw + COIN + '</em> · ' + (q.dl - S.day <= 0 ? '오늘까지' : (q.dl - S.day) + '일 남음') + ' · 가진 것 ' + hv + '/' + q.n + (q.k === 'f' ? ' · ' + ZONES[FISH[q.f].z].n + (FISH[q.f].nt ? ' · 밤' : '') : ''), B('건네기', () => act({ t: 'req', i }), { why: hv >= q.n ? null : '아직 모자라요. ' + reqText(q) + ' 가운데 ' + hv + '만 있어요.', class: 'go' }))); });
+        } else {
+          list.append(h('p', { class: 'ff-p', text: '배는 조합의 빚으로 산 것이에요. 이틀마다 밤이 지날 때 납부금이 장부에서 빠져나가요. 그때 돈이 모자라면 조합이 배를 거두어 가요.' }));
+          S.inst.forEach((v, i) => list.append(itRow(S_('<circle cx="30" cy="30" r="18" fill="' + (i < S.paid ? '#3a5a48' : '#3a3222') + '" stroke="#e3ae45" stroke-width="3"/><path d="' + (i < S.paid ? 'M21,30 L28,37 L40,23' : 'M30,20 V32 L38,36') + '" stroke="#f1d38c" stroke-width="3.5"/>', 30), (i + 1) + '번째 납부 · ' + ((i + 1) * PER) + '일째 밤', i < S.paid ? '냈어요.' : '금액 <em>' + v + COIN + '</em>' + (i === D.i ? ' · 지금 ' + S.money + COIN : ''))));
+          list.append(h('p', { class: 'ff-note', text: '오늘의 바다: ' + WX[S.wx].n + ' — ' + WX[S.wx].d }));
+        }
+      } else {
+        list.append(h('p', { class: 'ff-p', text: '사람이 떠난 간이 부두예요. 밤을 넘기고 배를 손볼 수 있어요. 여기서 쉬면 공포가 60 내려가요. 물고기는 본항에서만 팔 수 있어요.' }), repairRow());
+      }
+      const late = S.t >= 600 || nf(S) > 0.05, lack = D.left <= 1 && S.money < D.amt;
+      const sleepB = B(sleepArm ? (lack ? '납부금이 모자라요 · 그래도 쉬기' : '아직 낮이에요 · 그래도 쉬기') : '쉬기 · 다음 날 06:00', () => { if ((!late || lack) && !sleepArm) { sleepArm = 1; buildPort(); return; } sleepArm = 0; act({ t: 'sleep' }); }, { class: late && !lack ? 'go' : '' });
+      const acts = h('div', { class: 'ff-act' }, B('화물칸 · 빈 칸 ' + freeCells(S), () => openCargo()), sleepB, B('출항', () => { sleepArm = 0; act({ t: 'leave' }); }, { class: late ? '' : 'go' }));
+      showOv('port', h('div', { class: 'ff-sheet full' }, head, home ? tabs : null, list, h('p', { class: 'ff-note', text: hintOf(S) }), acts));
+      const nl = ov.querySelector('.ff-list'); if (nl) nl.scrollTop = sc;
+    }
+    function buildEvent() {
+      const ev = EVENTS[S.ev.i], sheet = h('div', { class: 'ff-sheet' }, h('div', { class: 'ff-h' }, h('h3', { text: ev.n }), h('span', { text: clockText(S.t) })));
+      if (S.ev.out != null) {
+        sheet.append(h('p', { class: 'ff-p', text: S.ev.out }), S.ev.got ? h('p', { class: 'ff-got', text: S.ev.got }) : null, h('div', { class: 'ff-act' }, h('button', { type: 'button', class: 'go', text: '확인', 'data-action': 'act', onclick: () => act({ t: 'evok' }) })));
+      } else {
+        sheet.append(h('p', { class: 'ff-p', text: ev.tx }));
+        ev.o.forEach((o, c) => { const lock = o.need && !eqHas(S, o.need); sheet.append(h('div', { class: 'ff-act' }, h('button', { type: 'button', disabled: lock ? '' : null, text: o.l + (o.t ? ' · ' + o.t + '분' : '') + (lock ? ' · ' + EQ[EI[o.need]].n + ' 필요' : ''), onclick: () => act({ t: 'ev', c }) }))); });
+      }
+      showOv('ev', sheet);
+    }
+    /* 해도 */
+    function openChart() {
+      if (!S) return;
+      const cv = h('canvas'), wrap = h('div', { class: 'ff-cg' }, cv);
+      const legend = h('p', { class: 'ff-note', text: '어두운 곳: 해도 없는 해역 · 금색: 본항 · 흰 점: 간이 부두 · 물색 점: 낮 어군 · 푸른 점: 밤 어군 · 보라: 변이 어군 · ×: 잔해 · ○: 내 통발' + (E.lead ? '' : ' — 어군은 직접 본 것만 표시돼요(측심 추가 있으면 전부).') });
+      showOv('chart', h('div', { class: 'ff-sheet full' }, h('div', { class: 'ff-h' }, h('h3', { text: '해도' }), h('span', { text: '오늘의 바다: ' + WX[S.wx].n })), wrap, legend, h('div', { class: 'ff-act' }, h('button', { type: 'button', class: 'go', text: '닫기', onclick: () => { closeOv(); syncOv(); } }))));
+      requestAnimationFrame(() => {
+        if (dead || ovKind !== 'chart') return;
+        const r = wrap.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 3), sz = Math.max(60, Math.min(r.width, r.height)), c = cv.getContext('2d');
+        cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const u = sz / N, ox = (r.width - sz) / 2, oy = (r.height - sz) / 2;
+        c.fillStyle = '#0d131d'; c.fillRect(0, 0, r.width, r.height);
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { const i = y * N + x, z = M.z[i]; if (z === 255) continue; c.fillStyle = !S.ch[z] ? mixHex('#39414b', ZONES[z].col, 0.22) : M.t[i] === 1 ? '#15191f' : M.t[i] === 2 ? '#5d7a4a' : ZONES[z].col; c.fillRect(ox + x * u, oy + y * u, u + 0.5, u + 0.5); }
+        const dot = (x, y, col, rad) => { c.beginPath(); c.arc(ox + x * u, oy + y * u, rad, 0, TAU); c.fillStyle = col; c.fill(); };
+        S.sh.forEach((o) => { if (S.ch[o.z] && o.n > 0 && (o.sn || E.lead)) dot(o.x, o.y, o.ab ? '#c08ae0' : o.nt ? '#6fd0e0' : '#cfe6e0', 2.6); });
+        c.strokeStyle = '#d8c8a0'; c.lineWidth = 1.5; M.wrecks.forEach((w, j) => { if (!S.ch[w.z]) return; const X = ox + w.x * u, Y = oy + w.y * u; c.beginPath(); c.moveTo(X - 3, Y - 3); c.lineTo(X + 3, Y + 3); c.moveTo(X + 3, Y - 3); c.lineTo(X - 3, Y + 3); c.stroke(); });
+        S.pots.forEach((p) => { c.beginPath(); c.arc(ox + p.x * u, oy + p.y * u, 4, 0, TAU); c.strokeStyle = '#f1d38c'; c.stroke(); });
+        M.docks.forEach((d) => dot(d.x, d.y, '#fff', 3.2)); dot(HX, HY, '#e3ae45', 4.5);
+        c.font = '600 12px "IBM Plex Sans KR", sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        ZONES.forEach((Z, zi) => { const a = M.tz[zi]; let sx = 0, sy = 0; a.forEach((i) => { sx += i % N; sy += (i / N) | 0; }); const X = ox + (sx / a.length + 0.5) * u, Y = oy + (sy / a.length + 0.5) * u + (zi ? 0 : 14); c.lineWidth = 3; c.strokeStyle = 'rgba(8,12,18,.8)'; const t = Z.n; c.strokeText(t, X, Y); c.fillStyle = S.ch[zi] ? '#f3ecd8' : '#aab2b8'; c.fillText(t, X, Y); });
+        const a = S.hd * Math.PI / 16, X = ox + S.x * u, Y = oy + S.y * u; c.save(); c.translate(X, Y); c.rotate(a); c.beginPath(); c.moveTo(8, 0); c.lineTo(-5, -5); c.lineTo(-2, 0); c.lineTo(-5, 5); c.closePath(); c.fillStyle = '#fff'; c.strokeStyle = '#d8644a'; c.lineWidth = 2; c.fill(); c.stroke(); c.restore();
+      });
+    }
+    /* 화물칸: 끌어서 옮기고, 돌리고, 못 실은 것은 닫을 때 내림 */
+    function openCargo() {
+      if (!S || S.end || !human() || mg) return;
+      const T = TIERS[S.tier], atHome = S.ph === 'port' && S.port === 0, all = S.cargo.concat(S.pend), nC = S.cargo.length;
+      const its = all.map((it, i) => ({ it, x: it.x || 0, y: it.y || 0, r: it.r || 0, g: i < nC }));
+      const grid = () => { const g = new Int8Array(T.w * T.h).fill(-1); its.forEach((o, i) => { if (o.g) cellsOf(itShape(o.it), o.r).forEach(([cx, cy]) => { g[(o.y + cy) * T.w + o.x + cx] = i; }); }); return g; };
+      for (let i = nC; i < its.length; i++) { const p = findFit(grid(), T, itShape(its[i].it)); if (p) { its[i].x = p[0]; its[i].y = p[1]; its[i].r = p[2]; its[i].g = true; its[i].fresh = 1; } }   // 맞는 자리에 미리 놓아 둠
+      let sel = its.length > nC ? its.length - 1 : -1, drag = null, arm = 0, lay = null;
+      const cv = h('canvas'), wrap = h('div', { class: 'ff-cg' }, cv), info = h('p', { class: 'ff-note', style: { minHeight: '36px' } }), c = cv.getContext('2d');
+      const title = h('span');
+      const bRot = h('button', { type: 'button', text: '돌리기', 'data-action': 'rot', onclick: () => rotate() }), bOut = h('button', { type: 'button', text: '내려놓기', onclick: () => { if (sel >= 0) { its[sel].g = false; arm = 0; draw(); } } });
+      const bAuto = h('button', { type: 'button', text: '자동 정리', onclick: () => { arrange(); draw(); } }), bOk = h('button', { type: 'button', class: 'go', 'data-action': 'act', onclick: () => done() });
+      const bSet = h('button', { type: 'button', style: { flex: 'none', minHeight: '44px', padding: '0 10px', borderRadius: '11px', border: '1px solid rgba(233,228,214,.25)', background: 'transparent', color: '#cfd6da', font: '13px var(--f-body,sans-serif)' }, onclick: () => { autoPack = !autoPack; store('auto', autoPack ? '1' : '0'); draw(); } });
+      showOv('cargo', h('div', { class: 'ff-sheet full' }, h('div', { class: 'ff-h' }, h('h3', { text: '화물칸' }), title, bSet), wrap, info, h('div', { class: 'ff-act' }, bRot, bOut, bAuto), h('div', { class: 'ff-act' }, bOk)));
+      function arrange() {
+        const ord = its.map((o, i) => i).sort((a, b) => (its[b].it.k === 'e') - (its[a].it.k === 'e') || SH[itShape(its[b].it)].length - SH[itShape(its[a].it)].length);
+        its.forEach((o) => { o.g = false; }); ord.forEach((i) => { const p = findFit(grid(), T, itShape(its[i].it)); if (p) { its[i].x = p[0]; its[i].y = p[1]; its[i].r = p[2]; its[i].g = true; } }); arm = 0;
+      }
+      function rotate() {
+        const i = drag ? drag.i : sel; if (i < 0) return; const o = its[i]; api.sfx('click');
+        if (drag || !o.g) { o.r = (o.r + 1) & 3; draw(); return; }
+        o.g = false; const g = grid(), nr = (o.r + 1) & 3; let ok = false;
+        for (const [ax, ay] of [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, 1], [-2, 0], [0, -2]]) if (fitAt(g, T, itShape(o.it), nr, o.x + ax, o.y + ay)) { o.x += ax; o.y += ay; ok = true; break; }
+        o.r = nr; o.g = ok; if (!ok) toast('돌리면 자리가 없어 내려놓았어요.'); draw();
+      }
+      function done() {
+        const out = its.filter((o) => !o.g);
+        if (out.length && !arm) { arm = 1; draw(); return; }
+        const p = its.map((o) => (o.g ? [o.x, o.y, o.r] : 0)); closeOv(); act({ t: 'pack', p }); later(syncOv);
+      }
+      function layout() {
+        const r = wrap.getBoundingClientRect(), W = r.width, H = r.height, trayH = Math.max(70, Math.min(120, H * 0.26)), cs = Math.floor(Math.min(52, (W - 8) / T.w, (H - trayH - 14) / T.h));
+        const gx = Math.round((W - cs * T.w) / 2), gy = 4, ty = gy + cs * T.h + 10, tcs = Math.max(14, Math.min(cs * 0.6, 24)), rects = {}; let tx = 8, rowH = 0, yy = ty + 20;
+        its.forEach((o, i) => { if (o.g || (drag && drag.i === i)) return; const cl = cellsOf(itShape(o.it), o.r), bw = (Math.max(...cl.map((q) => q[0])) + 1) * tcs, bh = (Math.max(...cl.map((q) => q[1])) + 1) * tcs; if (tx + bw > W - 8) { tx = 8; yy += rowH + 8; rowH = 0; } rects[i] = { x: tx, y: yy, w: bw, h: bh }; tx += bw + 12; rowH = Math.max(rowH, bh); });
+        return (lay = { W, H, cs, gx, gy, ty, tcs, rects });
+      }
+      const COLS = { f: ['#2c5d64', '#6d6536', '#5c3636'], e: '#39424f', m: '#5a4632' };
+      function piece(o, px, py, cs, alpha, hl) {
+        const it = o.it, cl = cellsOf(itShape(it), o.r), col = it.k === 'f' ? COLS.f[fresh(S, it, E)] : COLS[it.k];
+        c.globalAlpha = alpha; c.fillStyle = col;
+        cl.forEach(([cx, cy]) => { c.beginPath(); c.rect(px + cx * cs + 1, py + cy * cs + 1, cs - 2, cs - 2); c.fill(); });
+        // 이웃 칸 사이는 이어 붙여 한 덩어리로
+        cl.forEach(([cx, cy]) => { if (cl.some((q) => q[0] === cx + 1 && q[1] === cy)) c.fillRect(px + cx * cs + cs - 2, py + cy * cs + 1, 4, cs - 2); if (cl.some((q) => q[0] === cx && q[1] === cy + 1)) c.fillRect(px + cx * cs + 1, py + cy * cs + cs - 2, cs - 2, 4); });
+        c.strokeStyle = hl ? '#f1d38c' : it.ab ? '#c08ae0' : 'rgba(255,255,255,.22)'; c.lineWidth = hl ? 2.5 : it.ab ? 2 : 1;
+        cl.forEach(([cx, cy]) => { const X = px + cx * cs, Y = py + cy * cs, has = (ax, ay) => cl.some((q) => q[0] === cx + ax && q[1] === cy + ay); c.beginPath(); if (!has(0, -1)) { c.moveTo(X + 1, Y + 1); c.lineTo(X + cs - 1, Y + 1); } if (!has(0, 1)) { c.moveTo(X + 1, Y + cs - 1); c.lineTo(X + cs - 1, Y + cs - 1); } if (!has(-1, 0)) { c.moveTo(X + 1, Y + 1); c.lineTo(X + 1, Y + cs - 1); } if (!has(1, 0)) { c.moveTo(X + cs - 1, Y + 1); c.lineTo(X + cs - 1, Y + cs - 1); } c.stroke(); });
+        const im = itImg(it), bw = (Math.max(...cl.map((q) => q[0])) + 1) * cs, bh = (Math.max(...cl.map((q) => q[1])) + 1) * cs;
+        if (im) { const vert = bh > bw, ar = im.naturalWidth / im.naturalHeight, L1 = vert ? bh : bw, L2 = vert ? bw : bh; let w = L1 - 6, hh = w / ar; if (hh > L2 - 6) { hh = L2 - 6; w = hh * ar; } w = Math.min(w, cs * 2.6); hh = w / ar; c.save(); c.translate(px + bw / 2, py + bh / 2); if (vert) c.rotate(Math.PI / 2); c.drawImage(im, -w / 2, -hh / 2, w, hh); c.restore(); }
+        if (it.big && cs > 20) { c.fillStyle = '#f1d38c'; c.font = '600 12px "IBM Plex Sans KR", sans-serif'; c.textAlign = 'left'; c.textBaseline = 'top'; c.fillText('큰', px + cl[0][0] * cs + 4, py + cl[0][1] * cs + 3); }
+        c.globalAlpha = 1;
+      }
+      function draw() {
+        if (dead || ovKind !== 'cargo') return;
+        const r = wrap.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 3); if (cv.width !== Math.round(r.width * dpr) || cv.height !== Math.round(r.height * dpr)) { cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr); }
+        c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, r.width, r.height);
+        const Y = layout(), g = grid(), used = its.reduce((n, o) => n + (o.g ? SH[itShape(o.it)].length : 0), 0), out = its.filter((o, i) => !o.g && !(drag && drag.i === i));
+        for (let y = 0; y < T.h; y++) for (let x = 0; x < T.w; x++) { c.fillStyle = (x + y) % 2 ? '#1a222e' : '#1e2733'; c.fillRect(Y.gx + x * Y.cs, Y.gy + y * Y.cs, Y.cs, Y.cs); }
+        c.strokeStyle = '#a9824f'; c.lineWidth = 2; c.strokeRect(Y.gx - 1, Y.gy - 1, Y.cs * T.w + 2, Y.cs * T.h + 2);
+        its.forEach((o, i) => { if (o.g && !(drag && drag.i === i)) piece(o, Y.gx + o.x * Y.cs, Y.gy + o.y * Y.cs, Y.cs, 1, i === sel); });
+        c.fillStyle = '#aab4ba'; c.font = '12px "IBM Plex Sans KR", sans-serif'; c.textAlign = 'left'; c.textBaseline = 'top';
+        c.fillText(out.length ? '아직 못 실은 것 — 끌어서 칸에 놓아요' : '칸의 조각을 끌어 옮기거나, 눌러 고른 뒤 돌려요', 8, Y.ty);
+        its.forEach((o, i) => { const q = Y.rects[i]; if (q) piece(o, q.x, q.y, Y.tcs, 1, i === sel); });
+        if (drag && drag.moved) {
+          const o = its[drag.i], gxp = drag.px - drag.ox * Y.cs, gyp = drag.py - drag.oy * Y.cs - drag.lift, cx = Math.round((gxp - Y.gx) / Y.cs), cy = Math.round((gyp - Y.gy) / Y.cs), ok = fitAt(g, T, itShape(o.it), o.r, cx, cy);
+          drag.cx = cx; drag.cy = cy; drag.ok = ok;
+          if (ok) { c.fillStyle = 'rgba(143,192,160,.35)'; cellsOf(itShape(o.it), o.r).forEach(([ax, ay]) => c.fillRect(Y.gx + (cx + ax) * Y.cs, Y.gy + (cy + ay) * Y.cs, Y.cs, Y.cs)); }
+          piece(o, gxp, gyp, Y.cs, 0.9, true);
+        }
+        title.textContent = used + '/' + (T.w * T.h) + '칸';
+        const o = sel >= 0 ? its[sel] : null;
+        info.innerHTML = o ? '<b style="color:#efe9d8">' + itName(o.it) + '</b> · ' + SH[itShape(o.it)].length + '칸 · ' + (o.it.k === 'e' ? kw(eqDesc(EQ[o.it.e])) + ' · 되팔기 ' + price(S, o.it, E) + COIN : frText(o.it) + '값 ' + price(S, o.it, E) + COIN + (o.it.k === 'm' ? ' · ' + MATS[o.it.m].d : '')) : '조각을 누르면 값과 신선도가 보여요. 싱싱 → 물감(값 60%) → 상함(값 20%).';
+        const outV = out.reduce((n, q) => n + price(S, q.it, E), 0), eqOut = out.some((q) => q.it.k === 'e');
+        bOk.textContent = !out.length ? (its.length > nC ? '싣기' : '닫기') : atHome ? (arm ? '정말 팔기 +' + outV + COIN : '남은 ' + out.length + '개는 팔고 닫기 +' + outV + COIN) : (arm ? '정말 버리기' + (eqOut ? ' (장비 포함)' : '') : '남은 ' + out.length + '개는 바다에 버리고 닫기');
+        bOk.style.background = out.length && !atHome ? '#c8644a' : ''; bOk.style.color = out.length && !atHome ? '#fff' : '';
+        bSet.textContent = '바로 싣기: ' + (autoPack ? '켬' : '끔'); bOut.disabled = !(o && o.g); bRot.disabled = !o && !drag;
+      }
+      const loc = (e) => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+      function down(e) {
+        if (e.button === 2) { rotate(); return; }
+        const [x, y] = loc(e), Y = lay || layout(); let hit = -1, ox = 0, oy = 0;
+        const cx = Math.floor((x - Y.gx) / Y.cs), cy = Math.floor((y - Y.gy) / Y.cs);
+        if (cx >= 0 && cy >= 0 && cx < T.w && cy < T.h) { hit = grid()[cy * T.w + cx]; if (hit >= 0) { ox = (x - Y.gx) / Y.cs - its[hit].x; oy = (y - Y.gy) / Y.cs - its[hit].y; } }
+        if (hit < 0) for (const k in Y.rects) { const q = Y.rects[k]; if (x >= q.x - 6 && x <= q.x + q.w + 6 && y >= q.y - 6 && y <= q.y + q.h + 6) { hit = +k; ox = clamp((x - q.x) / Y.tcs, 0, q.w / Y.tcs); oy = clamp((y - q.y) / Y.tcs, 0, q.h / Y.tcs); } }
+        if (hit < 0) { sel = -1; draw(); return; }
+        try { cv.setPointerCapture(e.pointerId); } catch (er) {}
+        drag = { i: hit, ox, oy, px: x, py: y, sx: x, sy: y, moved: false, was: { x: its[hit].x, y: its[hit].y, r: its[hit].r, g: its[hit].g }, lift: e.pointerType === 'touch' ? Y.cs * 0.9 : 0 };
+        sel = hit; arm = 0; draw();
+      }
+      function move(e) { if (!drag) return; const [x, y] = loc(e); drag.px = x; drag.py = y; if (!drag.moved && Math.hypot(x - drag.sx, y - drag.sy) > 7) { drag.moved = true; its[drag.i].g = false; } draw(); }
+      function up() {
+        if (!drag) return; const d = drag, o = its[d.i]; drag = null;
+        if (d.moved) {
+          if (d.ok) { o.x = d.cx; o.y = d.cy; o.g = true; api.sfx('card'); }
+          else if (d.py - d.lift > lay.gy + lay.cs * T.h + 4) o.g = false;                       // 칸 아래로 끌어내림
+          else if (d.was.g) { o.x = d.was.x; o.y = d.was.y; o.r = d.was.r; o.g = true; }          // 안 맞으면 제자리로
+        }
+        draw();
+      }
+      cv.addEventListener('pointerdown', down); cv.addEventListener('pointermove', move); cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up); cv.addEventListener('contextmenu', (e) => e.preventDefault());
+      const ro = new ResizeObserver(() => draw()); ro.observe(wrap);
+      const iv = setInterval(draw, 400);   // 그림이 늦게 뜨는 경우
+      cg = { rotate, done, destroy() { ro.disconnect(); clearInterval(iv); } };
+      requestAnimationFrame(draw);
+    }
+    /* 상태에 맞는 창을 띄움 */
+    function syncOv() {
+      if (dead || !S) return;
+      if (S.end) { closeOv(); return; }
+      if (!human()) { closeOv(); return; }
+      if (ovKind === 'cargo') return;
+      if (S.ph === 'ev') { buildEvent(); return; }   // 사건 결과를 먼저 읽고, 얻은 것은 그 뒤에 실음
+      if (S.pend.length) {
+        if (autoPack && S.ph === 'sea') { const g = gridOf(S), T = TIERS[S.tier], p = S.cargo.map((it) => [it.x, it.y, it.r]); let ok = true; for (const it of S.pend) { const f = findFit(g, T, itShape(it)); if (!f) { ok = false; break; } cellsOf(itShape(it), f[2]).forEach(([cx, cy]) => { g[(f[1] + cy) * T.w + f[0] + cx] = 1; }); p.push(f); } if (ok) { closeOv(); act({ t: 'pack', p }); return; } toast('자리가 모자라요. 화물칸을 정리해요.'); }
+        openCargo(); return;
+      }
+      if (S.ph === 'port') { if (V.wasSea) { portTab = 'mk'; V.wasSea = false; } buildPort(); return; }
+      V.wasSea = true;
+      if (ovKind !== 'chart') closeOv();
+    }
+
+    /* ----- 입력 ----- */
+    const cvs = C.cv;
+    function pd(e) { if (!S || S.ph !== 'sea' || !human() || ov) return; if (mg) { if (mg.type === 'hd') mg.hold = true; else mgTap(); return; } const p = C.local(e); V.stick = { id: e.pointerId, ox: p.x, oy: p.y, x: p.x, y: p.y, touch: e.pointerType === 'touch' }; try { cvs.setPointerCapture(e.pointerId); } catch (er) {} }
+    function pm(e) { if (V.stick && V.stick.id === e.pointerId) { const p = C.local(e); V.stick.x = p.x; V.stick.y = p.y; } }
+    function pu(e) { if (mg) mg.hold = false; if (V.stick && V.stick.id === e.pointerId) V.stick = null; }
+    cvs.addEventListener('pointerdown', pd); cvs.addEventListener('pointermove', pm); cvs.addEventListener('pointerup', pu); cvs.addEventListener('pointercancel', pu);
+    const offIn = api.input.on((type, id) => {
+      if (type !== 'down' || !S || dead) return;
+      if (id === 'act') { if (ovKind === 'cargo' && cg) cg.done(); else if (ovKind === 'ev' && S.ev && S.ev.out != null) act({ t: 'evok' }); else if (!ov) doMain(); }
+      else if (id === 'cargo') { if (ovKind === 'cargo') { if (cg) cg.done(); } else if (!mg && (!ov || ovKind === 'port')) openCargo(); }
+      else if (id === 'rot') { if (cg) cg.rotate(); }
+      else if (id === 'lamp') { if (!ov) doLamp(); }
+      else if (id === 'chart') { if (ovKind === 'chart') { closeOv(); syncOv(); } else if (!ov && !mg) openChart(); }
+      else if (id === 'haul') { if (!ov && !mg && S.ph === 'sea' && S.net.length && !S.pend.length) act({ t: 'haul' }); }
+      else if (id === 'horn') { if (!ov && !mg && S.ph === 'sea' && E.horn && S.m >= S.hornT) act({ t: 'horn' }); }
+    });
+    const onCancel = (e) => { if (mg) { mg = null; refreshUI(); e.preventDefault(); } else if (ovKind === 'chart') { closeOv(); syncOv(); e.preventDefault(); } };
+    window.addEventListener('lounge-cancel', onCancel);
+    function steerDir() {
+      let ax = api.input.axis('left', 'right'), ay = api.input.axis('up', 'down');
+      if (Math.hypot(ax, ay) > 0.3) return Math.atan2(ay, ax);
+      const st = V.stick; if (!st) return null;
+      const dx = st.x - st.ox, dy = st.y - st.oy;
+      if (st.touch && Math.hypot(dx, dy) > 14) return Math.atan2(dy, dx);          // 끌면 가상 막대
+      const bx = st.x - C.w / 2, by = st.y - C.h * 0.47; return Math.hypot(bx, by) > 18 ? Math.atan2(by, bx) : null;   // 누른 쪽으로
+    }
+
+    /* ----- 그리기 ----- */
+    const w2s = (x, y) => [(x - V.x) * V.tsz + C.w / 2, (y - V.y) * V.tsz + C.h * 0.47];
+    function glow(x, y, r, col, a) { const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, 'rgba(' + col + ',' + a + ')'); g.addColorStop(1, 'rgba(' + col + ',0)'); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+    function label(text, x, y, col) { ctx.font = '600 12px "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; const w = ctx.measureText(text).width + 12; ctx.fillStyle = 'rgba(10,14,22,.72)'; rr(x - w / 2, y - 10, w, 20, 8); ctx.fill(); ctx.fillStyle = col || '#efe9d8'; ctx.fillText(text, x, y + 0.5); }
+    function frame(dt, now) {
+      if (dead || !S) return;
+      const W = C.w, H = C.h, sp = L.debug && L.debug.speed || 1;
+      // 조타: 고정 걸음(초당 20)을 행동으로 보냄
+      if (human() && S.ph === 'sea' && !ov && !mg && !S.pend.length && !S.end) {
+        const a = steerDir();
+        if (a != null) { V.acc += dt; let n = 0; while (V.acc >= 0.05 && n < 3) { V.acc -= 0.05; n++; } if (n) act({ t: 'go', d: [[((Math.round(a / (Math.PI / 16)) % 32) + 32) % 32, n]] }); } else V.acc = 0;
+      }
+      mgFrame(dt, now);
+      // 화면 값은 상태를 부드럽게 따라감(걸음 사이 보간)
+      const k = 1 - Math.exp(-dt * sp / 0.075), far = Math.hypot(S.x - V.x, S.y - V.y) > 4;
+      if (V.first || far) { V.x = S.x; V.y = S.y; V.first = false; } else { V.x += (S.x - V.x) * k; V.y += (S.y - V.y) * k; }
+      const ta = S.hd * Math.PI / 16; let da = ((ta - V.ang + Math.PI * 3) % TAU) - Math.PI; V.ang += da * (1 - Math.exp(-dt * sp / 0.12));
+      const nfT = nf(S); V.nfv += (nfT - V.nfv) * (1 - Math.exp(-dt * sp / 0.6));
+      const visT = Math.min(vision(S, E, nfT), S.wx === 1 ? 6.2 + (1 - nfT) : 99); V.vis += (visT - V.vis) * (1 - Math.exp(-dt * sp / 0.5));
+      const nfv = V.nfv, ts = V.tsz = clamp(Math.min(W, H) / 10, 28, 56), cx = W / 2, cy = H * 0.47, tt = now / 1000;
+      const zb = zoneAt(M, S.x, S.y), zc = ZONES[zb === 255 ? 0 : zb].col, pz = parseInt(zc.slice(1), 16), tw = [pz >> 16, (pz >> 8) & 255, pz & 255], kc = 1 - Math.exp(-dt / 0.8);
+      for (let i = 0; i < 3; i++) V.wc[i] += (tw[i] - V.wc[i]) * kc;
+      const dn = 1 - nfv * 0.74, dusk = Math.max(0, 1 - Math.abs(S.t - (DUSK + 30)) / 110);
+      ctx.fillStyle = 'rgb(' + Math.round(V.wc[0] * dn + 6 * nfv) + ',' + Math.round(V.wc[1] * dn + 10 * nfv) + ',' + Math.round(V.wc[2] * dn + 18 * nfv) + ')'; ctx.fillRect(0, 0, W, H);
+      const x0 = Math.floor(V.x - cx / ts) - 1, x1 = Math.ceil(V.x + (W - cx) / ts) + 1, y0 = Math.floor(V.y - cy / ts) - 1, y1 = Math.ceil(V.y + (H - cy) / ts) + 1;
+      // 물결
+      ctx.lineWidth = 1.4; ctx.lineCap = 'round';
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const hv = hash2(x, y, 11); if (hv > 0.2) continue; const [sx, sy] = w2s(x + 0.5 + Math.sin(tt * 0.35 + hv * 40) * 0.25, y + 0.5), a = 0.1 + 0.05 * Math.sin(tt * 0.5 + hv * 90); ctx.strokeStyle = 'rgba(235,245,245,' + (a * (1 - nfv * 0.5)).toFixed(3) + ')'; ctx.beginPath(); ctx.moveTo(sx - ts * 0.3, sy); ctx.quadraticCurveTo(sx - ts * 0.15, sy - 4, sx, sy); ctx.quadraticCurveTo(sx + ts * 0.15, sy + 4, sx + ts * 0.3, sy); ctx.stroke(); }
+      // 바위 · 갈대 · 해도 밖
+      const rockC = mixHex('#43484f', '#101318', nfv * 0.8), rockT = mixHex('#6a7078', '#1a1f26', nfv * 0.8), fogC = mixHex('#aab6ba', '#121b28', nfv);
+      const far2 = [];
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        if (x < 0 || y < 0 || x >= N || y >= N) { far2.push(x, y, 1); continue; }
+        const i = y * N + x, z = M.z[i]; if (z === 255) { far2.push(x, y, 1); continue; } if (!S.ch[z]) { far2.push(x, y, 0); continue; }
+        if (M.t[i] === 1) {
+          const [sx, sy] = w2s(x + 0.5, y + 0.5); ctx.beginPath();
+          for (let k2 = 0; k2 < 7; k2++) { const a = k2 / 7 * TAU, r = ts * (0.5 + hash2(i, k2, 5) * 0.22); if (k2) ctx.lineTo(sx + Math.cos(a) * r, sy + Math.sin(a) * r); else ctx.moveTo(sx + r, sy); }
+          ctx.closePath(); ctx.fillStyle = rockC; ctx.fill();
+          ctx.beginPath(); for (let k2 = 0; k2 < 5; k2++) { const a = k2 / 5 * TAU + 0.4, r = ts * (0.22 + hash2(i, k2, 6) * 0.12); const X = sx - ts * 0.08 + Math.cos(a) * r, Y = sy - ts * 0.1 + Math.sin(a) * r; if (k2) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); } ctx.closePath(); ctx.fillStyle = rockT; ctx.fill();
+        } else if (M.t[i] === 2) {
+          const [sx, sy] = w2s(x + 0.5, y + 0.5); ctx.strokeStyle = mixHex('#8aa468', '#1c2a1c', nfv * 0.8); ctx.lineWidth = 2;
+          for (let k2 = 0; k2 < 4; k2++) { const bx = sx + (hash2(i, k2, 8) - 0.5) * ts * 0.8, by = sy + (hash2(i, k2, 9) - 0.2) * ts * 0.5, sw = Math.sin(tt * 0.6 + hash2(i, k2, 3) * 6) * 3; ctx.beginPath(); ctx.moveTo(bx, by); ctx.quadraticCurveTo(bx + sw * 0.4, by - ts * 0.3, bx + sw, by - ts * 0.55); ctx.stroke(); }
+        }
+      }
+      // 본항 · 부두
+      { const [px, py] = w2s(HX, HY - 1.55); ctx.fillStyle = '#7a5c3a'; ctx.fillRect(px - ts * 0.12, py, ts * 0.24, ts * 1.4); ctx.fillRect(px - ts * 0.5, py + ts * 1.3, ts, ts * 0.14);
+        const [hx, hy] = w2s(32.5, 30.4); ctx.fillStyle = mixHex('#c9bfa8', '#3a3a40', nfv * 0.7); ctx.fillRect(hx - ts * 0.9, hy - ts * 0.2, ts * 0.5, ts * 0.4); ctx.fillRect(hx + ts * 0.3, hy - ts * 0.1, ts * 0.6, ts * 0.36); ctx.fillStyle = mixHex('#8a4a3a', '#2a2024', nfv * 0.7); ctx.fillRect(hx - ts * 0.95, hy - ts * 0.3, ts * 0.6, ts * 0.14); ctx.fillRect(hx + ts * 0.25, hy - ts * 0.2, ts * 0.7, ts * 0.14);
+        ctx.fillStyle = mixHex('#e8e2d0', '#5a5a60', nfv * 0.6); ctx.fillRect(hx - ts * 0.1, hy - ts * 0.75, ts * 0.2, ts * 0.8); ctx.fillStyle = '#c8644a'; ctx.fillRect(hx - ts * 0.13, hy - ts * 0.5, ts * 0.26, ts * 0.12); }
+      M.docks.forEach((d) => { const [sx, sy] = w2s(d.x, d.y); if (sx < -60 || sy < -60 || sx > W + 60 || sy > H + 60) return; ctx.fillStyle = '#7a5c3a'; ctx.fillRect(sx - ts * 0.45, sy - ts * 0.1, ts * 0.9, ts * 0.2); ctx.fillRect(sx - ts * 0.08, sy - ts * 0.5, ts * 0.16, ts * 0.5); ctx.fillStyle = '#e8e2d0'; ctx.beginPath(); ctx.arc(sx, sy - ts * 0.55, ts * 0.09, 0, TAU); ctx.fill(); });
+      // 큰 입(물 아래 그림자) · 도는 물
+      S.th.forEach((o) => {
+        const [sx, sy] = w2s(o.x, o.y); if (sx < -200 || sy < -200 || sx > W + 200 || sy > H + 200) return;
+        if (o.k === 'mw') { const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, ts * 1.7); g.addColorStop(0, 'rgba(0,0,0,.6)'); g.addColorStop(0.6, 'rgba(0,0,0,.35)'); g.addColorStop(1, 'rgba(0,0,0,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(sx, sy, ts * 1.7, ts * 1.2, tt * 0.2, 0, TAU); ctx.fill(); }
+        else if (o.k === 'wh') { ctx.strokeStyle = 'rgba(210,230,240,.3)'; ctx.lineWidth = 2; for (let k2 = 0; k2 < 3; k2++) { ctx.beginPath(); for (let u = 0; u <= 1.001; u += 0.05) { const a = tt * 0.9 + k2 * TAU / 3 + u * 5, r = ts * 2.3 * (1 - u * 0.92); const X = sx + Math.cos(a) * r, Y = sy + Math.sin(a) * r; if (u) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); } ctx.stroke(); } ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.beginPath(); ctx.arc(sx, sy, ts * 0.4, 0, TAU); ctx.fill(); }
+      });
+      // 어군 · 잔해 · 통발 · 표류물
+      const labels = [];
+      S.sh.forEach((o) => {
+        if (o.n <= 0 || !S.ch[o.z]) return; const on = shoalOn(S, o); if (!on && o.nt) return;
+        const [sx, sy] = w2s(o.x, o.y); if (sx < -50 || sy < -50 || sx > W + 50 || sy > H + 50) return;
+        const col = o.ab ? '200,150,235' : o.nt ? '120,225,235' : '235,245,240', al = on ? 1 : 0.35;
+        if (o.nt || o.ab) glow(sx, sy, ts * 1.1, col, 0.22 * al);
+        ctx.lineWidth = 1.6;
+        for (let k2 = 0; k2 < 3; k2++) { const u = (tt * 0.28 + k2 / 3 + hash2(o.x | 0, o.y | 0, 2)) % 1; ctx.strokeStyle = 'rgba(' + col + ',' + ((1 - u) * 0.55 * al).toFixed(3) + ')'; ctx.beginPath(); ctx.ellipse(sx, sy, ts * (0.2 + u * 0.55), ts * (0.14 + u * 0.38), 0, 0, TAU); ctx.stroke(); }
+        ctx.fillStyle = 'rgba(20,30,36,' + (0.5 * al) + ')'; for (let k2 = 0; k2 < Math.min(3, o.n); k2++) { const a = tt * 0.7 + k2 * 2.1, X = sx + Math.cos(a) * ts * 0.24, Y = sy + Math.sin(a) * ts * 0.15; ctx.beginPath(); ctx.ellipse(X, Y, ts * 0.11, ts * 0.045, a + Math.PI / 2, 0, TAU); ctx.fill(); }
+        const d = Math.hypot(o.x - S.x, o.y - S.y); if (d < Math.min(V.vis, 5.5)) { const F = FISH[o.f]; labels.push([(o.ab ? F.ab : F.n) + ' ×' + o.n, sx, sy - ts * 0.62, !on ? '#8a949a' : E.rods[F.k] ? (o.ab ? '#dcb8f0' : o.nt ? '#a8ecf4' : '#efe9d8') : '#e09a80']); }
+      });
+      M.wrecks.forEach((w, j) => { if (!S.ch[w.z]) return; const [sx, sy] = w2s(w.x, w.y); if (sx < -50 || sy < -50 || sx > W + 50 || sy > H + 50) return; ctx.strokeStyle = mixHex('#6a5038', '#22201e', nfv * 0.7); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(sx - ts * 0.3, sy + ts * 0.15); ctx.lineTo(sx + ts * 0.1, sy - ts * 0.5); ctx.moveTo(sx - ts * 0.1, sy - ts * 0.15); ctx.lineTo(sx + ts * 0.25, sy - ts * 0.3); ctx.moveTo(sx + ts * 0.3, sy + ts * 0.2); ctx.lineTo(sx + ts * 0.42, sy - ts * 0.18); ctx.stroke(); if (Math.hypot(w.x - S.x, w.y - S.y) < Math.min(V.vis, 5)) labels.push(['잔해 ' + S.wk[j] + '/3', sx, sy - ts * 0.75, E.rods.wreck ? '#d8c8a0' : '#e09a80']); });
+      S.pots.forEach((p) => { const [sx, sy] = w2s(p.x, p.y), bob = Math.sin(tt * 1.1 + p.x) * 2; ctx.fillStyle = '#c8644a'; ctx.beginPath(); ctx.arc(sx, sy + bob, ts * 0.13, 0, TAU); ctx.fill(); ctx.fillStyle = '#efe9d8'; ctx.fillRect(sx - 1, sy + bob - ts * 0.4, 2, ts * 0.3); if (Math.hypot(p.x - S.x, p.y - S.y) < 5) labels.push(['통발 ' + Math.min(EQ[p.e].cap, Math.floor((S.m - p.m) / 300)) + '/' + EQ[p.e].cap, sx, sy - ts * 0.7, '#f1d38c']); });
+      S.em.forEach((e) => { if (e.nt && nfv < 0.5) return; const [sx, sy] = w2s(e.x, e.y); if (sx < -50 || sy < -50 || sx > W + 50 || sy > H + 50) return; const bob = Math.sin(tt * 0.9 + e.x * 3) * 2.5; if (e.nt) glow(sx, sy + bob, ts * 0.9, '255,214,150', 0.3); ctx.fillStyle = mixHex('#a9824f', '#3a3026', nfv * 0.6); ctx.fillRect(sx - ts * 0.18, sy - ts * 0.13 + bob, ts * 0.36, ts * 0.26); ctx.strokeStyle = 'rgba(20,16,10,.6)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx - ts * 0.18, sy - ts * 0.13 + bob, ts * 0.36, ts * 0.26); if (Math.hypot(e.x - S.x, e.y - S.y) < Math.min(V.vis, 5)) labels.push(['표류물', sx, sy - ts * 0.55, '#d8c8a0']); });
+      // 떠오른 암초 · 유빙
+      S.rk.forEach((r) => { const [sx, sy] = w2s(r[0], r[1]), i = Math.round(r[0] * 31 + r[1] * 17); ctx.beginPath(); for (let k2 = 0; k2 < 7; k2++) { const a = k2 / 7 * TAU, rad = ts * (0.42 + hash2(i, k2, 5) * 0.2); if (k2) ctx.lineTo(sx + Math.cos(a) * rad, sy + Math.sin(a) * rad); else ctx.moveTo(sx + rad, sy); } ctx.closePath(); ctx.fillStyle = rockC; ctx.fill(); });
+      S.th.forEach((o, i) => { if (o.k !== 'fl') return; const [sx, sy] = w2s(o.x, o.y); if (sx < -50 || sy < -50 || sx > W + 50 || sy > H + 50) return; ctx.beginPath(); for (let k2 = 0; k2 < 6; k2++) { const a = k2 / 6 * TAU + i, rad = ts * (0.4 + hash2(i, k2, 4) * 0.2); if (k2) ctx.lineTo(sx + Math.cos(a) * rad, sy + Math.sin(a) * rad); else ctx.moveTo(sx + Math.cos(a) * rad, sy + Math.sin(a) * rad); } ctx.closePath(); ctx.fillStyle = mixHex('#dcecf2', '#4a5a68', nfv * 0.7); ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 1; ctx.stroke(); });
+      // 항적
+      const lw = V.wake[V.wake.length - 1]; if (!lw || Math.hypot(lw[0] - V.x, lw[1] - V.y) > 0.3) { V.wake.push([V.x, V.y, tt]); if (V.wake.length > 14) V.wake.shift(); }
+      ctx.lineCap = 'butt'; for (let i = 1; i < V.wake.length; i++) { const p = V.wake[i], q = V.wake[i - 1], age = tt - p[2]; if (age > 2.2 || Math.hypot(p[0] - q[0], p[1] - q[1]) > 1.5) continue; const [sx, sy] = w2s(p[0], p[1]), [qx, qy] = w2s(q[0], q[1]); ctx.strokeStyle = 'rgba(235,245,245,' + ((1 - age / 2.2) * 0.22).toFixed(3) + ')'; ctx.lineWidth = ts * (0.1 + age * 0.12); ctx.beginPath(); ctx.moveTo(qx, qy); ctx.lineTo(sx, sy); ctx.stroke(); }
+      // 뒤따르는 것 · 빛 먹는 떼
+      S.th.forEach((o, i) => {
+        const [sx, sy] = w2s(o.x, o.y);
+        if (o.k === 'st') { const a = Math.atan2(S.y - o.y, S.x - o.x); ctx.save(); ctx.translate(sx, sy); ctx.rotate(a); ctx.fillStyle = 'rgba(4,6,10,.9)'; ctx.beginPath(); ctx.ellipse(-ts * 0.5, 0, ts * 1.2, ts * 0.3, 0, 0, TAU); ctx.fill(); ctx.beginPath(); ctx.ellipse(ts * 0.5, 0, ts * 0.42, ts * 0.34, 0, 0, TAU); ctx.fill(); ctx.fillStyle = 'rgba(230,225,190,.85)'; ctx.beginPath(); ctx.arc(ts * 0.62, -ts * 0.13, 2.2, 0, TAU); ctx.arc(ts * 0.62, ts * 0.13, 2.2, 0, TAU); ctx.fill(); ctx.restore(); }
+        else if (o.k === 'sw') { for (let k2 = 0; k2 < 14; k2++) { const a = tt * (0.5 + hash2(k2, 1, 9)) + k2 * 1.7, r = ts * (0.2 + hash2(k2, 2, 9) * 0.6), X = sx + Math.cos(a) * r, Y = sy + Math.sin(a * 1.3) * r * 0.7; ctx.fillStyle = 'rgba(190,230,210,.75)'; ctx.beginPath(); ctx.arc(X, Y, 1.8, 0, TAU); ctx.fill(); } glow(sx, sy, ts, '150,220,200', 0.15); }
+      });
+      // 해도 밖 안개 벽
+      for (let pass2 = 0; pass2 < 2; pass2++) { ctx.beginPath(); for (let i = 0; i < far2.length; i += 3) { if (far2[i + 2] !== pass2) continue; const [sx, sy] = w2s(far2[i] + 0.5, far2[i + 1] + 0.5), X = sx + Math.sin(tt * 0.2 + far2[i] * 1.3) * 3, R = ts * (0.78 + hash2(far2[i], far2[i + 1], 13) * 0.3); ctx.moveTo(X + R, sy); ctx.arc(X, sy, R, 0, TAU); } ctx.fillStyle = fogC; ctx.globalAlpha = pass2 ? 0.95 : 0.72; ctx.fill('nonzero'); } ctx.globalAlpha = 1;
+      // 배
+      const lampOn = S.lamp && E.lamp && S.m >= S.lampOut;
+      if (lampOn && nfv > 0.02) { ctx.globalCompositeOperation = 'lighter'; glow(cx + (V.x - V.x), cy, E.lamp.vis * ts * 0.95, E.lamp.id === 'lamp3' ? '110,160,230' : '255,190,110', 0.2 * nfv * (1 + 0.03 * Math.sin(tt * 0.8))); ctx.globalCompositeOperation = 'source-over'; }
+      { const [bx, by] = w2s(V.x, V.y); ctx.save(); ctx.translate(bx, by); ctx.rotate(V.ang); const l = ts * 0.5, wd = ts * 0.21;
+        ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.ellipse(-2, 3, l, wd, 0, 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(l, 0); ctx.quadraticCurveTo(l * 0.4, -wd * 1.1, -l * 0.8, -wd); ctx.lineTo(-l, -wd * 0.6); ctx.lineTo(-l, wd * 0.6); ctx.lineTo(-l * 0.8, wd); ctx.quadraticCurveTo(l * 0.4, wd * 1.1, l, 0); ctx.closePath(); ctx.fillStyle = '#7a4f34'; ctx.fill(); ctx.strokeStyle = '#e8dcc0'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = '#d8d0b8'; ctx.fillRect(-l * 0.55, -wd * 0.5, l * 0.55, wd); ctx.fillStyle = '#3a4350'; ctx.fillRect(-l * 0.45, -wd * 0.3, l * 0.3, wd * 0.6);
+        if (lampOn) { ctx.fillStyle = '#ffe2a0'; ctx.beginPath(); ctx.arc(l * 0.55, 0, 2.6, 0, TAU); ctx.fill(); }
+        ctx.restore(); }
+      // 해 질 녘 빛
+      if (dusk > 0.01) { ctx.fillStyle = 'rgba(225,120,60,' + (dusk * 0.16).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H); }
+      // 안개(시야 밖을 덮음)
+      const fogA = Math.max(nfv * 0.93, S.wx === 1 ? 0.62 : 0);
+      if (fogA > 0.01) {
+        const vr = Math.max(ts * 1.5, V.vis * ts), g = ctx.createRadialGradient(cx, cy, vr * 0.5, cx, cy, vr * 1.1), fc = parseInt(fogC.slice(1), 16), rgb = (fc >> 16) + ',' + ((fc >> 8) & 255) + ',' + (fc & 255);
+        g.addColorStop(0, 'rgba(' + rgb + ',0)'); g.addColorStop(0.6, 'rgba(' + rgb + ',' + (fogA * 0.55).toFixed(3) + ')'); g.addColorStop(1, 'rgba(' + rgb + ',' + fogA.toFixed(3) + ')'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+        // 흘러가는 안개 자락(시간에 대한 느린 함수)
+        for (let k2 = 0; k2 < 6; k2++) { const X = ((hash2(k2, 1, 21) * 1.4 - 0.2 + tt * 0.012 * (0.5 + hash2(k2, 2, 21))) % 1.4 - 0.2) * W, Y = (hash2(k2, 3, 21) * 0.9 + 0.05) * H + Math.sin(tt * 0.1 + k2) * 14; glow(X, Y, Math.max(W, H) * 0.34, nfv > 0.5 ? '120,140,160' : '225,232,235', 0.07 * fogA); }
+        // 안개 너머로 비치는 불빛: 본항 등대 · 부두 · 없는 등대
+        const light = (x, y, r, a) => { const [sx, sy] = w2s(x, y); if (sx < -40 || sy < -40 || sx > W + 40 || sy > H + 40) return; glow(sx, sy, r, '255,205,130', a * nfv); ctx.fillStyle = 'rgba(255,236,190,' + (0.95 * nfv).toFixed(3) + ')'; ctx.beginPath(); ctx.arc(sx, sy, 2.6, 0, TAU); ctx.fill(); };
+        if (nfv > 0.5) S.sh.forEach((o) => { if (!o.nt || o.n <= 0 || !S.ch[o.z]) return; const [sx, sy] = w2s(o.x, o.y); if (sx < -40 || sy < -40 || sx > W + 40 || sy > H + 40) return; glow(sx, sy, ts * 0.9, o.ab ? '200,150,235' : '120,225,235', 0.2 * nfv); });   // 밤 어군의 빛은 안개 너머로도 희미하게
+        light(32.5, 29.7, ts * 1.6, 0.55); M.docks.forEach((d) => light(d.x, d.y - 0.55, ts * 0.9, 0.4)); S.th.forEach((o) => { if (o.k === 'bc') light(o.x, o.y, ts * 1.6, 0.55); });
+      }
+      labels.forEach((l) => label(l[0], l[1], l[2], l[3]));
+      // 공포: 가장자리가 어두워지고, 안개 가장자리에서 눈이 뜬다(느리게)
+      if (S.pan > 20) { const a = (S.pan - 20) / 80 * 0.55, g = ctx.createRadialGradient(cx, cy, Math.min(W, H) * 0.3, cx, cy, Math.max(W, H) * 0.75); g.addColorStop(0, 'rgba(20,0,30,0)'); g.addColorStop(1, 'rgba(14,0,22,' + a.toFixed(3) + ')'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); }
+      if (S.pan >= 45 && nfv > 0.4) { const n = Math.min(6, Math.floor((S.pan - 34) / 11)), vr = Math.max(ts * 2, V.vis * ts) * 1.04; for (let i = 0; i < n; i++) { const a = i * 2.4 + 0.7 + Math.floor(tt / 23 + i * 0.37) * 1.3, open = Math.max(0, Math.sin(tt * 0.45 + i * 2.1)), X = cx + Math.cos(a) * vr, Y = cy + Math.sin(a) * vr * 0.9; if (open < 0.05) continue; ctx.fillStyle = 'rgba(232,226,190,' + (open * 0.75).toFixed(3) + ')'; ctx.beginPath(); ctx.ellipse(X - 6, Y, 4.5, 2.4 * open, 0, 0, TAU); ctx.ellipse(X + 6, Y, 4.5, 2.4 * open, 0, 0, TAU); ctx.fill(); ctx.fillStyle = 'rgba(10,8,14,' + open.toFixed(3) + ')'; ctx.beginPath(); ctx.arc(X - 6, Y, 1.4, 0, TAU); ctx.arc(X + 6, Y, 1.4, 0, TAU); ctx.fill(); } }
+      if (V.flash > 0.01) { ctx.fillStyle = 'rgba(200,60,40,' + (V.flash * 0.22 * (L.fx ? L.fx() : 1)).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H); V.flash *= Math.exp(-dt / 0.25); }
+      // 나침반: 본항이 화면 밖이면 가장자리에 화살표
+      if (S.ph === 'sea') {
+        const dx = HX - V.x, dy = HY - V.y, dist = Math.hypot(dx, dy), [hx, hy] = w2s(HX, HY);
+        if (hx < 30 || hy < 80 || hx > W - 30 || hy > H - 150) {
+          let a = Math.atan2(dy, dx); if (S.pan >= 60 && !E.compass && nfv > 0.3) a += Math.sin(tt * 0.9) * 1.1 * (S.pan - 60) / 40 + Math.sin(tt * 0.37) * 0.5 * (S.pan - 60) / 40;
+          const rx = W / 2 - 34, ry = Math.min(cy - 96, H * 0.5 - 150), ry2 = H - cy - 150, c2 = Math.cos(a), s2 = Math.sin(a), sc = Math.min(rx / Math.abs(c2 || 1e-6), (s2 < 0 ? ry : ry2) / Math.abs(s2 || 1e-6)), X = cx + c2 * sc, Y = cy + s2 * sc;
+          ctx.save(); ctx.translate(X, Y); ctx.rotate(a); ctx.fillStyle = 'rgba(10,14,22,.7)'; ctx.beginPath(); ctx.arc(0, 0, 17, 0, TAU); ctx.fill(); ctx.fillStyle = '#e3ae45'; ctx.beginPath(); ctx.moveTo(11, 0); ctx.lineTo(-6, -7); ctx.lineTo(-2, 0); ctx.lineTo(-6, 7); ctx.closePath(); ctx.fill(); ctx.restore();
+          label('본항 ' + Math.round(dist) + '칸', clamp(X - c2 * 44, 50, W - 50), Y - s2 * 30, '#f1d38c');
+        }
+      }
+      // 조타 표시
+      if (V.stick && !mg) { const st = V.stick; ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(st.touch ? st.ox : st.x, st.touch ? st.oy : st.y, st.touch ? 26 : 9, 0, TAU); ctx.stroke(); if (st.touch) { const dx = st.x - st.ox, dy = st.y - st.oy, d = Math.hypot(dx, dy) || 1, m = Math.min(d, 26); ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.arc(st.ox + dx / d * m, st.oy + dy / d * m, 11, 0, TAU); ctx.fill(); } }
+      if (V.pop) { const u = (now - V.pop.t0) / 1500, im = itImg(V.pop.it); if (u >= 1) V.pop = null; else if (im) { const a = Math.min(1, u * 6, (1 - u) * 3), w = ts * 1.9, hh = w * 0.6; ctx.globalAlpha = a; ctx.drawImage(im, cx - w / 2, cy - ts * 1.1 - hh - u * ts * 0.5, w, hh); ctx.globalAlpha = 1; } }
+      if (mg) drawMg(now);
+    }
+    const stop = U.loop(frame);
+    C.onresize = place;
+
+    return {
+      update(st) {
+        if (dead) return;
+        S = st; M = mapOf(S.seed); E = eqInfo(S);
+        if (V.first) V.seen = Math.max(0, S.fid - 1);
+        S.fx.forEach((f) => { if (f.id > V.seen) { V.seen = f.id; onFx(f); } });
+        if (mg && (S.ph !== 'sea' || S.end)) mg = null;
+        if (S.ph !== 'port') sleepArm = 0;
+        refreshUI(); later(syncOv);
+        if (S.end && human() && S.end === 'win') { try { api.best('money', S.money, { label: '빚을 갚고 남긴 돈', unit: COIN }); } catch (e) {} }
+      },
+      _dbg: () => ({ mg, ovKind, pos: mg ? mgPos(performance.now()) : 0, tol: mg ? mgTol() : 0 }),
+      destroy() { dead = true; stop(); offIn(); window.removeEventListener('lounge-cancel', onCancel); closeOv(); C.destroy(); box.remove(); },
+    };
+  }
+
+  /* ---------- 도감(수치는 위 표에서 자동) ---------- */
+  const MGN = { tm: '띠 맞추기', hd: '당겼다 풀기', rg: '고리 맞추기', dp: '깊이 맞추기' };
+  const fishDesc = (F) => '값: ' + F.v + COIN + ' · 칸: ' + SH[F.sh].length + (F.pot ? ' · 통발에만 듦(5시간마다 1마리)' : ' · 낚는 시간: ' + F.tm + '분 · 방식: ' + MGN[F.mg] + '(난도 ' + F.dif + ')') + ' · 어장: ' + KIND[F.k] + (F.nt ? ' · 밤에만' : '') + (F.net ? ' · 그물에 듦' : '') + (F.ab ? ' · 변이종: ' + F.ab : '');
+  function codexData() {
+    const fr = (F) => ({ icon: fishSVG(F, 0, 34), name: F.n, tag: ZONES[F.z].n + (F.nt ? ' · 밤' : F.pot ? ' · 통발' : ''), desc: fishDesc(F) });
+    return [
+      { h: '해역', p: ['본항을 감싼 안쪽 만에서 시작해요. 해도를 사면 새 해역이 열리고, 그 어장에 맞는 낚싯대가 있어야 낚을 수 있어요. 해역의 자리는 판마다 달라요.'],
+        rows: ZONES.map((Z, i) => ({ icon: S_('<path d="M10,14 L24,10 L36,16 L50,12 V46 L36,50 L24,44 L10,48 Z" fill="' + Z.col + '" stroke="#e3ae45" stroke-width="2.5"/>', 30), name: Z.n, tag: KIND[Z.k], desc: '해도: ' + (Z.chart ? Z.chart + COIN : '처음부터') + ' · 밤 공포: ×' + Z.fear + ' · 어종: ' + FISH.filter((F) => F.z === i).length + '종' + (Z.th.length ? ' · 밤의 것: ' + Z.th.map((k) => TH[k].n).join(', ') : '') + ' — ' + Z.d })) },
+      { h: '낮 물고기', p: ['낮 어군(흰 물결 고리)에서 낚아요. 값은 싱싱할 때의 값이에요. 물감은 60%, 상함은 20%.'], rows: FISH.filter((F) => !F.nt && !F.pot).map(fr) },
+      { h: '밤 · 통발', p: ['밤 어군(푸른 빛)은 해가 진 뒤에만 모여요. 통발 고기는 통발을 내려 두어야 잡혀요.'], rows: FISH.filter((F) => F.nt || F.pot).map(fr) },
+      { h: '변이종', p: ['보랏빛 어군에서, 또는 공포가 높을 때 드물게 올라와요. 기본 확률 4%에 공포 100당 +25%p. 값은 바탕 어종의 ' + AB_MUL + '배이고 절반 속도로 상해요.'],
+        rows: FISH.filter((F) => F.ab).map((F) => ({ icon: fishSVG(F, 1, 34), name: F.ab, tag: ZONES[F.z].n, desc: '바탕: ' + F.n + ' · 값: ' + F.v * AB_MUL + COIN + ' · 칸: ' + SH[F.sh].length + ' · 변이종' })) },
+      { h: '장비', p: ['장비는 화물칸에 실려 있어야 쓸 수 있고, 그만큼 칸을 차지해요. 기관 · 등 · 그물은 가장 좋은 것 하나만 쓰여요. 되팔면 반값이에요.'],
+        rows: EQ.map((e) => ({ icon: eqSVG(e, 30), name: e.n, tag: ETYPE[e.t], desc: '값: ' + e.p + COIN + ' · 칸: ' + SH[e.sh].length + ' · ' + eqDesc(e) })) },
+      { h: '건진 것', p: ['잔해와 표류물에서 나와요. 상하지 않아요. 재료는 조선소에서 화물칸을 넓히는 데 써요.'],
+        rows: MATS.map((m) => ({ icon: matSVG(m, 30), name: m.n, tag: m.mat ? '재료' : '물건', desc: '값: ' + m.v + COIN + ' · 칸: ' + SH[m.sh].length + (m.buy ? ' · 조선소 값: ' + m.buy + COIN : '') + ' — ' + m.d })) },
+      { h: '화물칸', p: ['조선소에서 재료와 돈을 내고 넓혀요. 재료는 화물칸에 싣고 있어야 해요.'],
+        rows: TIERS.map((T) => ({ icon: S_('<path d="M6,24 H54 L46,46 H14 Z" fill="#2a323c" stroke="#a9824f" stroke-width="3"/>', 30), name: T.n, tag: T.w + '×' + T.h, desc: '칸: ' + T.w * T.h + ' · 선체: ' + T.hp + (T.p ? ' · 값: ' + T.p + COIN + ' · 재료: ' + Object.keys(T.need).map((k) => MATS[MI[k]].n + ' ' + T.need[k]).join(', ') : ' · 처음 배') })) },
+      { h: '밤의 것', p: ['해가 지면 안개가 끼고 공포가 올라요. 공포: 30 떠오른 암초 · 50 뒤따르는 것 · 60 나침반이 돎 · 75 화물이 상함 · 100 선체가 조금씩 깎임. 본항에서 쉬면 0이 돼요.'],
+        rows: Object.keys(TH).map((k) => ({ icon: S_('<path d="M6,30 Q30,8 54,30 Q30,52 6,30 Z" fill="#141a24" stroke="#b98ad0" stroke-width="2.5"/><circle cx="30" cy="30" r="8" fill="#e8e2be"/><circle cx="30" cy="30" r="3.5" fill="#14181d"/>', 30), name: TH[k].n, tag: '밤', desc: TH[k].d })) },
+      { h: '사건', p: ['바다에 떠 있는 표류물에 닿으면 일어나요. 고른 일에는 시간이 들고, 결과는 그때그때 달라요.'],
+        rows: EVENTS.map((e) => ({ icon: S_('<rect x="14" y="20" width="32" height="24" rx="2" fill="#a9824f" stroke="#5a4226" stroke-width="2.5"/><path d="M14,30 H46" stroke="#5a4226" stroke-width="2"/>', 30), name: e.n, tag: e.nt ? '밤' : e.z != null ? ZONES[e.z].n : '어디서나', desc: e.tx + ' — ' + e.o.map((o) => o.l + (o.t ? '(' + o.t + '분)' : '') + (o.need ? '[' + EQ[EI[o.need]].n + ']' : '')).join(' / ') })) },
+      { h: '날씨', p: ['아침마다 그날의 바다가 정해져요. 조합 탭과 해도에서 볼 수 있어요.'],
+        rows: WX.map((w) => ({ icon: S_('<path d="M8,26 q8,-8 16,0 t16,0 t12,0 M8,38 q8,-8 16,0 t16,0 t12,0" stroke="#9cc8e0" stroke-width="3"/>', 30), name: w.n, tag: '날씨', desc: w.d })) },
+    ];
+  }
+  function preview(cv) {
+    const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+    const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#0b1420'); g.addColorStop(1, '#16283a'); c.fillStyle = g; c.fillRect(0, 0, W, H);
+    c.strokeStyle = 'rgba(200,220,230,.12)'; c.lineWidth = 2; for (let i = 0; i < 26; i++) { const x = hash2(i, 1, 5) * W, y = 60 + hash2(i, 2, 5) * (H - 80); c.beginPath(); c.moveTo(x - 16, y); c.quadraticCurveTo(x - 8, y - 5, x, y); c.quadraticCurveTo(x + 8, y + 5, x + 16, y); c.stroke(); }
+    const gl = (x, y, r, col, a) => { const q = c.createRadialGradient(x, y, 0, x, y, r); q.addColorStop(0, 'rgba(' + col + ',' + a + ')'); q.addColorStop(1, 'rgba(' + col + ',0)'); c.fillStyle = q; c.fillRect(x - r, y - r, r * 2, r * 2); };
+    gl(430, 215, 150, '255,190,110', 0.35);
+    c.save(); c.translate(430, 215); c.rotate(-0.5); c.beginPath(); c.moveTo(34, 0); c.quadraticCurveTo(14, -16, -28, -14); c.lineTo(-34, -8); c.lineTo(-34, 8); c.lineTo(-28, 14); c.quadraticCurveTo(14, 16, 34, 0); c.closePath(); c.fillStyle = '#7a4f34'; c.fill(); c.strokeStyle = '#e8dcc0'; c.lineWidth = 2; c.stroke(); c.fillStyle = '#d8d0b8'; c.fillRect(-20, -7, 20, 14); c.fillStyle = '#ffe2a0'; c.beginPath(); c.arc(20, 0, 4, 0, 6.3); c.fill(); c.restore();
+    c.strokeStyle = 'rgba(120,225,235,.6)'; c.lineWidth = 2; [[18, 12], [30, 20], [42, 28]].forEach(([a, b]) => { c.beginPath(); c.ellipse(545, 120, a, b, 0, 0, 6.3); c.stroke(); }); gl(545, 120, 70, '120,225,235', 0.25);
+    for (let i = 0; i < 5; i++) gl(hash2(i, 3, 9) * W, hash2(i, 4, 9) * H, 190, '150,170,190', 0.12);
+    gl(596, 300, 40, '232,226,190', 0.0); c.fillStyle = 'rgba(232,226,190,.7)'; c.beginPath(); c.ellipse(590, 300, 7, 3.5, 0, 0, 6.3); c.ellipse(608, 300, 7, 3.5, 0, 0, 6.3); c.fill();
+    c.textAlign = 'left'; c.fillStyle = '#efe6d6'; c.font = '44px "Black Han Sans", sans-serif'; c.fillText('안개 어장', 28, 120);
+    c.font = '16px "IBM Plex Sans KR", sans-serif'; c.fillStyle = '#b9c4cc'; c.fillText('낮에 낚아 싣고, 밤이 오기 전에 돌아온다', 30, 152);
+    c.fillStyle = '#e3ae45'; c.font = '600 15px "IBM Plex Mono", monospace'; c.fillText('납부 오늘 밤 400' + COIN, 30, 184);
+  }
+
+  L.register({
+    id: ID, name: '안개 어장', tag: '항해 낚시 로그라이크', cat: '아케이드', time: '20–60분', mood: 'calm', ambient: 'harbor',
+    blurb: '작은 배로 나가 낮에 낚고, 모양이 제각각인 고기를 화물칸에 맞춰 싣고, 밤이 오기 전에 돌아와요. 해가 지면 안개가 끼고 공포가 올라요. 밤에만 잡히는 값진 것과 귀항 사이에서 저울질하며 이틀마다 조합에 빚을 갚아요.',
+    minPlayers: 1, maxPlayers: 1, defaultPlayers: 1, undo: false, save: true, aiDelay: 120,
+    aiDelayFor: (s) => (s.ph === 'sea' && !s.pend.length ? 90 : 240),
+    saveLabel: (s) => s.day + '/' + s.days + '일째 · ' + s.money + COIN + ' · 납부 ' + s.paid + '/' + s.inst.length,
+    icon: ICON, tint: '#1f3a4a', preview,
+    options: [{ id: 'len', label: '길이', tip: '이틀마다 조합에 납부해요. 길수록 납부금이 커지고 먼 해역까지 가야 해요.', def: 'M', choices: [
+      { v: 'S', label: '짧게 · 6일', tip: '납부 3번, 약 20분' }, { v: 'M', label: '보통 · 10일', tip: '납부 5번, 약 40분' }, { v: 'L', label: '길게 · 16일', tip: '납부 8번, 1시간 남짓' }] }],
+    controls: [
+      { id: 'up', label: '북쪽으로', keys: ['KeyW', 'ArrowUp'], pad: ['ly-'] }, { id: 'down', label: '남쪽으로', keys: ['KeyS', 'ArrowDown'], pad: ['ly+'] },
+      { id: 'left', label: '서쪽으로', keys: ['KeyA', 'ArrowLeft'], pad: ['lx-'] }, { id: 'right', label: '동쪽으로', keys: ['KeyD', 'ArrowRight'], pad: ['lx+'] },
+      { id: 'act', label: '낚기 · 입항 · 확인', keys: ['Space', 'Enter'], pad: ['a'] }, { id: 'cargo', label: '화물칸', keys: ['KeyE'], pad: ['y'] },
+      { id: 'rot', label: '조각 돌리기', keys: ['KeyR'], pad: ['x'] }, { id: 'lamp', label: '등 켜고 끄기', keys: ['KeyF'], pad: ['rb'] },
+      { id: 'chart', label: '해도', keys: ['KeyM'], pad: ['back'] }, { id: 'haul', label: '그물 올리기', keys: ['KeyG'], pad: ['lb'] }, { id: 'horn', label: '나팔 불기', keys: ['KeyH'], pad: ['b'] },
+    ],
+    quick: [
+      '배를 몰아 물결 고리(어군)에 대고 낚아요. 잡은 고기는 모양대로 화물칸 칸을 차지하고, 본항 어시장에서 팔아요.',
+      '시간은 배가 움직이거나 일을 할 때만 흘러요. 19시부터 해가 지고 안개가 끼며 공포가 올라요. 본항에서 쉬면 다음 날 06시, 공포는 0이 돼요.',
+      '이틀마다 밤이 지날 때 조합 납부금이 빠져나가요. 모자라면 배를 압류당하고, 선체가 0이 되면 배를 잃어요. 마지막 납부까지 치르면 이겨요.',
+    ],
+    rules: [
+      { h: '목표', p: ['혼자 하는 항해 낚시 로그라이크예요. 빚으로 산 작은 배로 고기를 잡아, 이틀마다 돌아오는 조합 납부금을 끝까지 치르면 이겨요.', '길이: 짧게 6일(납부 3번) · 보통 10일(5번) · 길게 16일(8번). 납부금은 갈수록 커져서, 해도를 사서 더 먼 해역으로 나가야 해요.', '끝나는 경우: 납부금이 모자람(압류) · 선체가 0(침몰). 판 밖으로 이어지는 강화는 없어요. 지도 · 어군 · 사건 · 날씨는 판마다 달라요.'] },
+      { h: '하루의 흐름', p: ['06:00 본항에서 시작해요. 시간은 배가 움직일 때, 낚을 때, 일을 할 때만 흘러요. 가만히 있으면 멈춰 있어요.', '낮: 흰 물결 고리(낮 어군)에서 낚아요. 화물칸이 차면 본항으로 돌아가 팔고 다시 나가요.', '19:00 땅거미 → 20:30 밤. 안개가 끼어 시야가 좁아지고 공포가 올라요. 낮 어군은 흩어지고 푸른 빛의 밤 어군이 모여요. 밤 고기는 값이 훨씬 좋아요.', '본항에서 「쉬기」를 누르면 다음 날 06:00이 되고 공포가 0이 돼요. 바다에서 밤을 새워도 되지만 공포는 그대로 남아요.'] },
+      { h: '낚기', p: ['어군 위에 배를 대고 「낚기」. 어종마다 짧은 조작이 달라요.', '띠 맞추기: 바늘이 밝은 띠에 올 때 누르기. 고리 맞추기: 줄어드는 고리가 금색 고리에 겹칠 때 누르기. 깊이 맞추기: 추가 밝은 띠에 닿을 때 누르기. 당겼다 풀기: 누르고 있다가 막대가 붉어지면 떼기.', '잘할수록 낚는 시간이 짧아져요(가장 잘하면 0.7배, 서투르면 1.5배). 아주 잘하면 값이 1.5배인 「큰 놈」이 올라오기도 해요. 너무 못하면 놓쳐요.', '어군 이름표가 붉으면 그 어장에 맞는 낚싯대가 없다는 뜻이에요. 선구점에서 사요.'] },
+      { h: '화물칸', p: ['고기 · 장비 · 재료는 모두 모양대로 화물칸 칸을 차지해요. 조각을 끌어 옮기고 「돌리기」로 돌려 빈틈없이 실어요.', '「바로 싣기: 켬」이면 맞는 자리가 있을 때 알아서 실려요. 자리가 없으면 화물칸이 열려요. 못 실은 것은 닫을 때 바다에 버려져요(본항에서는 팔려요).', '신선도: 싱싱(9시간) → 물감(값 60%, 22시간) → 상함(값 20%). 얼음 상자와 소금 통이 시간을 늘려 줘요.', '예시: 길쭉한 뱀장어(4칸 한 줄)는 가장자리에 붙이고, 네모난 도다리(2×2)는 구석에 넣으면 칸이 덜 남아요.'] },
+      { h: '밤과 공포', p: ['밤에는 공포가 계속 올라요. 먼 해역일수록 빨리 올라요. 등을 켜면 덜 오르고 시야도 넓어져요.', '공포 30: 뱃머리 앞에 없던 암초가 떠올라요(절반은 헛것). 50: 무엇인가 뒤따라와요 — 서서 낚는 동안에도 다가와요. 60: 나침반이 돌아요. 75: 화물이 상해요. 100: 선체가 깎여요.', '등은 대가가 있어요. 갈대 여울과 잠긴 종탑에서는 켜 둔 등에 「빛 먹는 떼」가 끌려와 등을 꺼뜨려요.', '해역마다 밤에 나오는 것이 달라요. 도감 「밤의 것」에 모두 적혀 있어요.'] },
+      { h: '본항', p: ['어시장: 고기와 건진 물건을 팔아요. 그날 「찾는 어종」은 1.5배. 같은 어종을 계속 팔면 값이 5%씩 내려요.', '선구점: 해도(새 해역)와 장비. 낚싯대는 어장마다 다르고, 그물은 지나가기만 해도 잔고기가 들고, 통발은 내려 두었다가 걷어요.', '조선소: 선체 수리, 화물칸 넓히기(돈 + 재료). 재료는 잔해에서 인양 갈고리로 건지거나 사요.', '의뢰: 적힌 것을 가져오면 시세보다 넉넉히 받아요. 조합: 납부 일정과 그날의 날씨.', '바다에는 간이 부두가 두 곳 있어요. 쉬기와 수리만 되고, 쉬면 공포가 60 내려가요.'] },
+      { h: '조작', p: ['폰: 바다를 누르고 있으면 그쪽으로 가요. 누른 채 끌면 그 자리가 가상 막대가 돼요. 손을 떼면 서고, 시간도 멈춰요.', 'PC: WASD/방향키 이동 · Space 낚기 · 입항 · 확인 · E 화물칸 · R(또는 오른쪽 클릭) 조각 돌리기 · F 등 · M 해도 · G 그물 올리기 · H 나팔.', '아래 가운데 큰 단추가 지금 할 수 있는 일이에요(낚기 · 입항 · 통발 걷기 · 인양). 흐리면 눌러서 까닭을 볼 수 있어요.', '본항이 화면 밖이면 가장자리의 금색 화살표가 방향과 거리를 알려 줘요.'] },
+      { h: 'AI', p: ['AI 자리로 두면 AI가 판을 끝까지 운영해요. 난이도는 쉬움 · 보통 · 어려움. 어려움은 낚기가 정확하고 투자 순서를 잘 잡아요. 판마다 밤 욕심과 씀씀이가 조금씩 달라요.'] },
+      { h: '만든 것', p: ['물고기 · 장비 그림은 모두 코드로 그렸어요(외부 그림 · 소리 파일 없음).', '「낮에 낚아 싣고 밤 전에 돌아온다」는 틀은 「Dredge」(Black Salt Games)를 참고했고, 이름 · 그림 · 문구 · 수치는 모두 새로 만들었어요.'] },
+    ],
+    tutorial: [
+      { text: '빚으로 산 배예요. 이틀마다 밤이 지날 때 조합 납부금이 빠져나가요. 안내를 다 읽으면 아래 「출항」으로 바다에 나가요.' },
+      { text: '바다를 누르고 있으면 그쪽으로 가요(PC: WASD). 흰 물결 고리가 어군이에요. 그 위에서 아래 큰 단추로 낚아요.' },
+      { text: '시간은 움직이거나 낚을 때만 흘러요. 19시부터 해가 지니, 화물칸이 차면 금색 화살표를 따라 본항으로 돌아와 팔아요.' },
+    ],
+    hint: (s) => { const D = due(s); return [hintOf(s) || '판이 끝났어요.', s.day + '/' + s.days + '일째 ' + clockText(s.t) + ' · 오늘의 바다: ' + WX[s.wx].n + ' — ' + WX[s.wx].d, '다음 납부: ' + (D.left <= 1 ? '오늘 밤' : D.left + '일 뒤 밤') + ' ' + D.amt + COIN + ' · 가진 돈 ' + s.money + COIN, '선체 ' + s.hp + ' · 공포 ' + Math.round(s.pan) + ' · 빈 칸 ' + freeCells(s)]; },
+    panelInfo: (s) => { const D = due(s); return [{ label: '날', value: s.day + '/' + s.days + '일째 ' + clockText(s.t) }, { label: '가진 돈', value: s.money + COIN }, { label: '다음 납부', value: (D.left <= 1 ? '오늘 밤 ' : D.left + '일 뒤 ') + D.amt + COIN }, { label: '선체', value: s.hp }, { label: '공포', value: Math.round(s.pan) }, { label: '빈 칸', value: freeCells(s) }, { label: '오늘의 바다', value: WX[s.wx].n }, { label: '연 해역', value: s.ch.filter(Boolean).length + '/' + ZONES.length }]; },
+    codex: codexData(),
+    init, actor, apply, ai, result, mount,
+    _t: { FISH, EQ, ZONES, EVENTS, MATS, WX, TH, TIERS, mapOf, nf, eqInfo, freeCells, price },
+  });
+})();

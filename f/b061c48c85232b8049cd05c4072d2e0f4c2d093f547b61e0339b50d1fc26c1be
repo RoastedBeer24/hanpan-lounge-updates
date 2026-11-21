@@ -1,0 +1,543 @@
+/* 뱀 사다리 — reference implementation of the Lounge game interface. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const SPD = () => ((L.debug && L.debug.speed) || 1) * (L.speed ? (L.speed() || 1) : 1);
+  const LADDERS = { 1: 38, 4: 14, 9: 31, 21: 42, 28: 84, 36: 44, 51: 67, 71: 91, 80: 100 };
+  const SNAKES = { 16: 6, 47: 26, 49: 11, 56: 53, 62: 19, 64: 60, 87: 24, 93: 73, 95: 75, 98: 78 };
+
+  const pairs = (o) => Object.keys(o).map((k) => [+k, o[k]]);
+  const CLASSIC = { L: pairs(LADDERS), S: pairs(SNAKES) };
+
+  /* 기대 굴림 수(한 사람 기준, 마르코프 사슬): 판 공정성 검사와 미리보기에 쓴다 */
+  function expRolls(lad, sn) {
+    const jump = new Array(101).fill(0).map((_, i) => i);
+    lad.forEach(([a, b]) => { jump[a] = b; }); sn.forEach(([a, b]) => { jump[a] = b; });
+    const E = new Array(101).fill(0);
+    for (let it = 0; it < 400; it++) {
+      let d = 0;
+      for (let k = 99; k >= 0; k--) {
+        let v = 1;
+        for (let r = 1; r <= 6; r++) v += E[jump[Math.min(100, k + r)]] / 6;
+        d = Math.max(d, Math.abs(v - E[k])); E[k] = v;
+      }
+      if (d < 1e-4) break;
+    }
+    return E[0];
+  }
+  const rowOf = (k) => Math.floor((k - 1) / 10);
+  /* 무작위 판: 사다리 8~9개·뱀 9~10개. 끝점이 서로 겹치지 않아 연쇄·고리가 없고, 100번엔 뱀이 없다.
+     오르는 칸 합과 내려가는 칸 합이 비슷하고(±12%), 기대 굴림 수가 고전 판(약 36번) 근처(25~38번)일 때만 쓴다. */
+  function genBoard(rand) {
+    for (let tries = 0; tries < 400; tries++) {
+      const used = new Set([1, 100]);
+      const nl = 8 + Math.floor(rand() * 2), ns = 9 + Math.floor(rand() * 2);
+      const lad = [], sn = [];
+      const pick = (lo, hi) => lo + Math.floor(rand() * (hi - lo + 1));
+      let bad = false;
+      for (let i = 0; i < nl && !bad; i++) {
+        let ok = false;
+        for (let t = 0; t < 60 && !ok; t++) {
+          const a = pick(2, 80), len = pick(10, Math.min(48, 99 - a)), b = a + len;
+          if (b > 99 || used.has(a) || used.has(b) || rowOf(a) === rowOf(b)) continue;
+          used.add(a); used.add(b); lad.push([a, b]); ok = true;
+        }
+        if (!ok) bad = true;
+      }
+      for (let i = 0; i < ns && !bad; i++) {
+        let ok = false;
+        for (let t = 0; t < 60 && !ok; t++) {
+          const a = pick(18, 99), len = pick(10, Math.min(48, a - 2)), b = a - len;
+          if (b < 2 || used.has(a) || used.has(b) || rowOf(a) === rowOf(b)) continue;
+          if (a > 90 && sn.filter((x) => x[0] > 90).length >= 2) continue; // 마지막 줄 뱀은 2마리까지
+          used.add(a); used.add(b); sn.push([a, b]); ok = true;
+        }
+        if (!ok) bad = true;
+      }
+      if (bad) continue;
+      const up = lad.reduce((t, x) => t + x[1] - x[0], 0), dn = sn.reduce((t, x) => t + x[0] - x[1], 0);
+      if (Math.abs(up - dn) > 0.12 * Math.max(up, dn)) continue;
+      const er = expRolls(lad, sn);
+      if (er < 25 || er > 38) continue;
+      lad.sort((x, y) => x[0] - y[0]); sn.sort((x, y) => x[0] - y[0]);
+      return { L: lad, S: sn, er: Math.round(er) };
+    }
+    return { L: CLASSIC.L, S: CLASSIC.S, er: Math.round(expRolls(CLASSIC.L, CLASSIC.S)) };
+  }
+  const CLASSIC_ER = Math.round(expRolls(CLASSIC.L, CLASSIC.S));
+
+  function init(players, opts) {
+    const bd = opts && opts.bd === 'c' ? { L: CLASSIC.L, S: CLASSIC.S, er: CLASSIC_ER } : genBoard(Math.random);
+    return { n: players.length, names: players.map((p) => p.name), pos: players.map(() => 0), turn: 0, last: null, seq: 0, winner: null, g: Math.floor(Math.random() * 1e6),
+      bk: opts && opts.bd === 'c' ? 'c' : 'r', L: bd.L, S: bd.S, er: bd.er };
+  }
+  const boardOf = (s) => (s && s.L ? s : CLASSIC);
+  const findTo = (list, k) => { for (const x of list) if (x[0] === k) return x[1]; return 0; };
+  function actor(s) { return s.winner == null ? s.turn : null; }
+  function apply(s, seat, a) {
+    if (!a || a.type !== 'roll') throw new Error('bad action');
+    const roll = 1 + Math.floor(Math.random() * 6);
+    const from = s.pos[seat];
+    const land = Math.min(100, from + roll); // reaching or passing 100 wins
+    let to = land, via = null;
+    const bd = boardOf(s), lt = findTo(bd.L, land), sv = findTo(bd.S, land);
+    if (lt) { to = lt; via = 'ladder'; }
+    else if (sv) { to = sv; via = 'snake'; }
+    s.pos[seat] = to;
+    // per-seat result stats: [rolls, ladders, snakes]
+    if (!s.ks) s.ks = s.pos.map(() => [0, 0, 0]);
+    s.ks[seat][0]++; if (via === 'ladder') s.ks[seat][1]++; else if (via === 'snake') s.ks[seat][2]++;
+    s.seq++;
+    s.last = { seat, from, roll, land, to, via, id: s.seq };
+    if (to === 100) { s.winner = seat; return s; }
+    s.turn = (s.turn + 1) % s.n;
+    return s;
+  }
+  function result(s) {
+    if (s.winner == null) return null;
+    const ks = s.ks || s.pos.map(() => [0, 0, 0]);
+    const stats = [{ label: '굴린 횟수', values: ks.map((k) => String(k[0])) }, { label: '사다리 ↑', values: ks.map((k) => String(k[1])) },
+      { label: '뱀 ↓', values: ks.map((k) => String(k[2])) }, { label: '마지막 칸', values: s.pos.map(String) }];
+    return { winners: [s.winner], stats, text: '100번 칸에 먼저 도착했어요.' };
+  }
+
+  /* board geometry: cell k (1..100) → column/row (row 0 at bottom) */
+  function cellXY(k, B) {
+    if (k <= 0) return { x: B.x + B.c * 0.5, y: B.y + B.size + B.c * 0.55 };
+    const r = Math.floor((k - 1) / 10), c0 = (k - 1) % 10;
+    const c = r % 2 === 0 ? c0 : 9 - c0;
+    return { x: B.x + c * B.c + B.c / 2, y: B.y + B.size - (r + 1) * B.c + B.c / 2 };
+  }
+
+  function mount(root, api) {
+    const cv = U.canvas(root);
+    const ctx = cv.ctx;
+    let st = null, B = null;
+    const disp = []; // displayed positions per seat (cell number, float path handled by anims)
+    let anim = null; // {seat, path:[{x,y}], t, speed}
+    let die = { v: 1, rolling: 0 };
+    let shownSeq = 0;
+
+    const hud = L.h('div', { class: 'hud bottom sn-hud' });
+    const info = L.h('div', { class: 'panel sn-info', style: { display: 'flex', alignItems: 'center', gap: '10px', fontWeight: 700, minWidth: 0, maxWidth: '100%', boxSizing: 'border-box' } });
+    const rollBtn = L.h('button', { 'data-action': 'roll', class: 'btn primary sn-roll', text: '주사위 굴리기', onclick() { api.sfx('roll'); api.act({ type: 'roll' }); } });
+    hud.append(info, rollBtn);
+    const top = L.h('div', { class: 'hud top sn-top', style: { gap: '6px' } });
+    // 판 미리보기: 첫 굴림 전까지 판 위에 이번 판 정보(탭하면 닫힘)
+    const intro = L.h('div', { class: 'panel sn-intro', style: { position: 'absolute', left: '50%', top: '58px', transform: 'translateX(-50%)', width: 'max-content', maxWidth: 'calc(100% - 24px)', padding: '6px 12px', textAlign: 'center', display: 'none', zIndex: 3, boxShadow: '0 8px 24px rgba(0,0,0,.5)', cursor: 'pointer' }, onclick() { introOff = true; intro.style.display = 'none'; } });
+    let introOff = false;
+    root.append(hud, top, intro);
+    function renderIntro() {
+      const show = st && !introOff && st.seq === 0 && st.winner == null;
+      intro.style.display = show ? '' : 'none';
+      if (!show) return;
+      intro.style.top = (top.offsetTop + top.offsetHeight + 6) + 'px';
+      const bd = boardOf(st);
+      const up = bd.L.reduce((t, x) => t + x[1] - x[0], 0), dn = bd.S.reduce((t, x) => t + x[0] - x[1], 0);
+      intro.innerHTML = '';
+      intro.append(L.h('div', { style: { fontWeight: 800, fontSize: '14px' }, text: st.bk === 'c' ? '이번 판 · 고전 판' : '이번 판 · 무작위 판 (새로 만듦)' }),
+        L.h('div', { style: { fontSize: '13px' }, text: '사다리 ' + bd.L.length + '개(↑' + up + '칸) · 뱀 ' + bd.S.length + '마리(↓' + dn + '칸)' }),
+        L.h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '2px' }, text: '한 사람이 100번까지 평균 약 ' + (st.er || CLASSIC_ER) + '번 굴려요' }));
+    }
+    function renderTop() {
+      top.innerHTML = '';
+      if (!st) return;
+      const cur = actor(st);
+      for (let i = 0; i < st.n; i++) {
+        const p = api.players[i];
+        top.append(L.h('span', { class: 'turn', style: { opacity: cur === i || cur == null ? 1 : 0.6, borderColor: cur === i ? p.color : '' } },
+          L.h('span', { class: 'dot', style: { '--c': p.color } }), p.name + ' ', L.h('b', { class: 'mono', text: String(disp[i] != null ? disp[i] : st.pos[i]) })));
+      }
+    }
+
+    function layout() {
+      const pad = 16, bottom = 76, topH = 56;
+      const size = Math.min(cv.w - pad * 2 - 14, cv.h - bottom - topH - pad);
+      const c = size / 10;
+      B = { x: (cv.w - size) / 2 + 7, y: topH + Math.max(0, (cv.h - bottom - topH - pad - size) / 2), size, c };
+    }
+    cv.onresize = () => { layout(); draw(); };
+    layout();
+
+    function tokenXY(seat, cellOrXY) {
+      const p = typeof cellOrXY === 'number' ? cellXY(cellOrXY, B) : cellOrXY;
+      const n = st ? st.n : 1;
+      const ang = (seat / n) * Math.PI * 2 - Math.PI / 2;
+      const off = n > 1 ? B.c * 0.2 : 0;
+      return { x: p.x + Math.cos(ang) * off, y: p.y + Math.sin(ang) * off };
+    }
+    function shade(hex, amt) {
+      const n = parseInt(hex.slice(1), 16);
+      const r = U.clamp((n >> 16) + amt, 0, 255), g = U.clamp(((n >> 8) & 255) + amt, 0, 255), b = U.clamp((n & 255) + amt, 0, 255);
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }
+    function rrp(c, x, y, w, hh, r) { c.beginPath(); c.roundRect ? c.roundRect(x, y, w, hh, r) : c.rect(x, y, w, hh); }
+    const rng = (seed) => () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+
+    /* 뱀 몸통 곡선: 머리→꼬리 (그리기와 미끄럼 애니메이션이 같은 길을 쓴다) */
+    function snakePts(head, tail) {
+      const H = cellXY(head, B), T = cellXY(tail, B);
+      const dx = T.x - H.x, dy = T.y - H.y, len = Math.hypot(dx, dy);
+      const nx = -dy / len, ny = dx / len;
+      const waves = Math.max(1.5, len / (B.c * 1.6)), amp = B.c * 0.32, pts = [], N = 48;
+      for (let i = 0; i <= N; i++) {
+        const t = i / N, s = Math.sin(t * Math.PI * waves) * amp * (0.4 + 0.6 * Math.sin(t * Math.PI));
+        pts.push({ x: H.x + dx * t + nx * s, y: H.y + dy * t + ny * s, t });
+      }
+      return pts;
+    }
+    const SNAKE_COL = [['#4f8a3c', '#2c5424', '#d9c46a'], ['#a8452f', '#5e2216', '#e8b25a'], ['#5d5196', '#2f2858', '#c9b8e8'], ['#a7792a', '#5c3f12', '#efd08a'], ['#2f7f86', '#17454a', '#bfe3d0']];
+
+    function drawLadder(b, a, z) {
+      const A = cellXY(a, B), Z = cellXY(z, B);
+      const dx = Z.x - A.x, dy = Z.y - A.y, len = Math.hypot(dx, dy);
+      const nx = -dy / len, ny = dx / len, w = B.c * 0.19, rw = Math.max(2.5, B.c * 0.085);
+      b.lineCap = 'round';
+      b.strokeStyle = 'rgba(30,15,0,.32)'; b.lineWidth = rw * 1.6;
+      for (const s of [-1, 1]) { b.beginPath(); b.moveTo(A.x + nx * w * s + 3, A.y + ny * w * s + 5); b.lineTo(Z.x + nx * w * s + 3, Z.y + ny * w * s + 5); b.stroke(); }
+      const rungs = Math.max(2, Math.round(len / (B.c * 0.4)));
+      for (let i = 1; i < rungs; i++) {
+        const t = i / rungs, x = A.x + dx * t, y = A.y + dy * t;
+        b.strokeStyle = '#5a3818'; b.lineWidth = rw * 0.95; b.beginPath(); b.moveTo(x + nx * w + 1, y + ny * w + 1.5); b.lineTo(x - nx * w + 1, y - ny * w + 1.5); b.stroke();
+        b.strokeStyle = '#a8743c'; b.lineWidth = rw * 0.8; b.beginPath(); b.moveTo(x + nx * w, y + ny * w); b.lineTo(x - nx * w, y - ny * w); b.stroke();
+        b.strokeStyle = 'rgba(255,225,170,.45)'; b.lineWidth = rw * 0.25; b.beginPath(); b.moveTo(x + nx * w, y + ny * w - rw * 0.2); b.lineTo(x - nx * w, y - ny * w - rw * 0.2); b.stroke();
+      }
+      for (const s of [-1, 1]) {
+        const x0 = A.x + nx * w * s, y0 = A.y + ny * w * s, x1 = Z.x + nx * w * s, y1 = Z.y + ny * w * s;
+        b.strokeStyle = '#4a2d12'; b.lineWidth = rw * 1.35; b.beginPath(); b.moveTo(x0, y0); b.lineTo(x1, y1); b.stroke();
+        b.strokeStyle = '#b07a40'; b.lineWidth = rw; b.beginPath(); b.moveTo(x0, y0); b.lineTo(x1, y1); b.stroke();
+        b.strokeStyle = 'rgba(255,230,180,.55)'; b.lineWidth = rw * 0.3; b.beginPath(); b.moveTo(x0 - nx * rw * 0.2, y0 - ny * rw * 0.2); b.lineTo(x1 - nx * rw * 0.2, y1 - ny * rw * 0.2); b.stroke();
+        for (let i = 1; i < rungs; i++) { const t = i / rungs; b.fillStyle = '#3a2410'; b.beginPath(); b.arc(x0 + dx * t, y0 + dy * t, rw * 0.18, 0, 7); b.fill(); }
+      }
+    }
+    function drawSnake(b, head, tail, idx) {
+      const pts = snakePts(head, tail), N = pts.length - 1;
+      const [col, dark, belly] = SNAKE_COL[idx % SNAKE_COL.length];
+      const W = (t) => B.c * (0.27 - 0.2 * t);
+      b.lineCap = 'round'; b.lineJoin = 'round';
+      for (let i = 0; i < N; i++) { const p = pts[i], q = pts[i + 1]; b.strokeStyle = 'rgba(25,15,0,.3)'; b.lineWidth = W(p.t) + 2; b.beginPath(); b.moveTo(p.x + 3, p.y + 5); b.lineTo(q.x + 3, q.y + 5); b.stroke(); }
+      for (let i = 0; i < N; i++) { const p = pts[i], q = pts[i + 1]; b.strokeStyle = dark; b.lineWidth = W(p.t) + 2; b.beginPath(); b.moveTo(p.x, p.y); b.lineTo(q.x, q.y); b.stroke(); }
+      for (let i = 0; i < N; i++) { const p = pts[i], q = pts[i + 1]; b.strokeStyle = col; b.lineWidth = W(p.t); b.beginPath(); b.moveTo(p.x, p.y); b.lineTo(q.x, q.y); b.stroke(); }
+      for (let i = 3; i < N - 1; i += 3) {
+        const p = pts[i], q = pts[i + 1], a = Math.atan2(q.y - p.y, q.x - p.x), w = W(p.t);
+        b.save(); b.translate(p.x, p.y); b.rotate(a);
+        b.fillStyle = i % 6 ? dark : belly; b.globalAlpha = 0.8;
+        b.beginPath(); b.moveTo(-w * 0.45, 0); b.lineTo(0, -w * 0.3); b.lineTo(w * 0.45, 0); b.lineTo(0, w * 0.3); b.closePath(); b.fill();
+        b.restore();
+      }
+      for (let i = 1; i < N; i++) { const p = pts[i], q = pts[i + 1], w = W(p.t); b.strokeStyle = 'rgba(255,255,240,.28)'; b.lineWidth = Math.max(1, w * 0.18); b.beginPath(); b.moveTo(p.x - w * 0.18, p.y - w * 0.22); b.lineTo(q.x - w * 0.18, q.y - w * 0.22); b.stroke(); }
+      const H = pts[0], a = Math.atan2(pts[0].y - pts[3].y, pts[0].x - pts[3].x), hr = B.c * 0.22;
+      b.save(); b.translate(H.x, H.y); b.rotate(a);
+      b.strokeStyle = '#b2322a'; b.lineWidth = Math.max(1, B.c * 0.025);
+      b.beginPath(); b.moveTo(hr * 0.9, 0); b.lineTo(hr * 1.45, 0); b.lineTo(hr * 1.65, -hr * 0.18); b.moveTo(hr * 1.45, 0); b.lineTo(hr * 1.65, hr * 0.18); b.stroke();
+      b.fillStyle = 'rgba(25,15,0,.3)'; b.beginPath(); b.ellipse(2, 4, hr * 1.05, hr * 0.8, 0, 0, 7); b.fill();
+      const hg = b.createRadialGradient(-hr * 0.2, -hr * 0.35, hr * 0.1, 0, 0, hr * 1.1);
+      hg.addColorStop(0, shade(col, 40)); hg.addColorStop(0.7, col); hg.addColorStop(1, dark);
+      b.fillStyle = hg; b.strokeStyle = dark; b.lineWidth = 1.2;
+      b.beginPath(); b.ellipse(0, 0, hr * 1.05, hr * 0.8, 0, 0, 7); b.fill(); b.stroke();
+      for (const s of [-1, 1]) {
+        b.fillStyle = '#f2d36b'; b.beginPath(); b.ellipse(hr * 0.35, s * hr * 0.4, hr * 0.22, hr * 0.17, 0, 0, 7); b.fill();
+        b.fillStyle = '#120c06'; b.beginPath(); b.ellipse(hr * 0.37, s * hr * 0.4, hr * 0.06, hr * 0.15, 0, 0, 7); b.fill();
+      }
+      b.restore();
+    }
+
+    /* 판 그림은 미리 한 장에 그려 둔다(크기·판이 바뀔 때만 다시) */
+    let boardImg = null, boardKey = '';
+    function buildBoard() {
+      const bd = boardOf(st), key = [cv.w, cv.h, cv.dpr, B.x, B.y, B.size, JSON.stringify(bd.L), JSON.stringify(bd.S)].join('|');
+      if (boardImg && key === boardKey) return;
+      boardKey = key;
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(cv.w * cv.dpr)); c.height = Math.max(1, Math.round(cv.h * cv.dpr));
+      const b = c.getContext('2d'); b.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+      const fr = Math.max(5, B.c * 0.16), X = B.x, Y = B.y, S = B.size;
+      b.fillStyle = 'rgba(0,0,0,.5)'; rrp(b, X - fr + 3, Y - fr + 8, S + fr * 2, S + fr * 2, 12); b.fill();
+      const fg = b.createLinearGradient(X - fr, Y - fr, X + S + fr, Y + S + fr);
+      fg.addColorStop(0, '#6b4220'); fg.addColorStop(0.5, '#4d2d14'); fg.addColorStop(1, '#3a210d');
+      b.fillStyle = fg; rrp(b, X - fr, Y - fr, S + fr * 2, S + fr * 2, 12); b.fill();
+      b.strokeStyle = 'rgba(255,215,160,.25)'; b.lineWidth = 1; rrp(b, X - fr + 1, Y - fr + 1, S + fr * 2 - 2, S + fr * 2 - 2, 11); b.stroke();
+      const R = rng(11);
+      b.save(); rrp(b, X - fr, Y - fr, S + fr * 2, S + fr * 2, 12); b.clip();
+      for (let i = 0; i < 60; i++) { b.strokeStyle = 'rgba(20,8,0,.18)'; b.lineWidth = 0.7; const yy = Y - fr + R() * (S + fr * 2); b.beginPath(); b.moveTo(X - fr, yy); b.bezierCurveTo(X + S * 0.3, yy + (R() - 0.5) * 6, X + S * 0.7, yy + (R() - 0.5) * 6, X + S + fr, yy); b.stroke(); }
+      b.restore();
+      b.save(); rrp(b, X, Y, S, S, 5); b.clip();
+      const tones = [['#f3e6c4', '#e9d6a6'], ['#e6cf98', '#d9bd7d']];
+      for (let k = 1; k <= 100; k++) {
+        const p = cellXY(k, B), r = Math.floor((k - 1) / 10), t = tones[(k + r) % 2];
+        const x0 = p.x - B.c / 2, y0 = p.y - B.c / 2;
+        const g = b.createLinearGradient(x0, y0, x0 + B.c, y0 + B.c);
+        g.addColorStop(0, k === 100 ? '#f6cf6a' : t[0]); g.addColorStop(1, k === 100 ? '#c98d28' : t[1]);
+        b.fillStyle = g; b.fillRect(x0, y0, B.c + 0.5, B.c + 0.5);
+        b.lineWidth = 1;
+        b.strokeStyle = 'rgba(255,250,235,.5)'; b.beginPath(); b.moveTo(x0 + 0.5, y0 + B.c); b.lineTo(x0 + 0.5, y0 + 0.5); b.lineTo(x0 + B.c, y0 + 0.5); b.stroke();
+        b.strokeStyle = 'rgba(90,60,20,.22)'; b.beginPath(); b.moveTo(x0 + B.c - 0.5, y0); b.lineTo(x0 + B.c - 0.5, y0 + B.c - 0.5); b.lineTo(x0, y0 + B.c - 0.5); b.stroke();
+      }
+      for (let i = 0; i < 1400; i++) { b.fillStyle = R() < 0.5 ? 'rgba(90,60,20,.08)' : 'rgba(255,255,255,.1)'; b.fillRect(X + R() * S, Y + R() * S, 1.2, 1.2); }
+      const P = cellXY(100, B);
+      b.save(); b.translate(P.x, P.y + B.c * 0.06); b.fillStyle = 'rgba(120,70,0,.35)';
+      b.beginPath(); for (let i = 0; i < 10; i++) { const rr = i % 2 ? B.c * 0.12 : B.c * 0.3, aa = -Math.PI / 2 + i * Math.PI / 5; b.lineTo(Math.cos(aa) * rr, Math.sin(aa) * rr); } b.closePath(); b.fill(); b.restore();
+      b.font = '600 ' + Math.max(8, B.c * 0.22) + 'px "IBM Plex Mono", monospace'; b.textAlign = 'left'; b.textBaseline = 'top';
+      for (let k = 1; k <= 100; k++) { const p = cellXY(k, B); b.fillStyle = 'rgba(255,250,235,.6)'; b.fillText(k, p.x - B.c / 2 + 3.5, p.y - B.c / 2 + 2.5); b.fillStyle = 'rgba(70,45,12,.62)'; b.fillText(k, p.x - B.c / 2 + 3, p.y - B.c / 2 + 2); }
+      const vg = b.createRadialGradient(X + S / 2, Y + S / 2, S * 0.3, X + S / 2, Y + S / 2, S * 0.75);
+      vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(70,40,5,.3)'); b.fillStyle = vg; b.fillRect(X, Y, S, S);
+      b.restore();
+      b.strokeStyle = 'rgba(30,15,0,.6)'; b.lineWidth = 1.5; rrp(b, X, Y, S, S, 5); b.stroke();
+      bd.L.forEach((x) => drawLadder(b, x[0], x[1]));
+      bd.S.forEach((x, i) => drawSnake(b, x[0], x[1], i));
+      boardImg = c;
+    }
+
+    /* 말: 윤나는 구슬 말 + 받침 */
+    function drawToken(i, x, y, lift, sq, cur) {
+      const r = B.c * 0.2, col = api.players[i].color;
+      const ls = 1 - Math.min(0.5, lift / (B.c * 0.8));
+      ctx.fillStyle = 'rgba(0,0,0,' + (0.38 * ls) + ')'; ctx.beginPath(); ctx.ellipse(x + 1.5, y + r * 0.72, r * ls * 1.05, r * 0.42 * ls, 0, 0, 7); ctx.fill();
+      if (cur) {
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260);
+        ctx.strokeStyle = 'rgba(20,12,24,.8)'; ctx.lineWidth = 5; ctx.beginPath(); ctx.ellipse(x, y + r * 0.5, r + 5, r * 0.55 + 3, 0, 0, 7); ctx.stroke();
+        ctx.strokeStyle = api.canAct(i) ? 'rgba(227,174,69,' + (0.65 + 0.35 * pulse) + ')' : '#f2e9d8'; ctx.lineWidth = 2.5; ctx.stroke();
+      }
+      const yy = y - lift, sx = 1 + (sq || 0) * 0.18, sy = 1 - (sq || 0) * 0.18;
+      ctx.save(); ctx.translate(x, yy + r * 0.5); ctx.scale(sx, sy); ctx.translate(-x, -(yy + r * 0.5));
+      ctx.fillStyle = shade(col, -60); ctx.beginPath(); ctx.ellipse(x, yy + r * 0.5, r * 0.95, r * 0.4, 0, 0, 7); ctx.fill();
+      ctx.fillStyle = shade(col, -25); ctx.beginPath(); ctx.ellipse(x, yy + r * 0.38, r * 0.95, r * 0.4, 0, 0, 7); ctx.fill();
+      const g = ctx.createRadialGradient(x - r * 0.35, yy - r * 0.55, r * 0.08, x, yy - r * 0.2, r * 0.95);
+      g.addColorStop(0, shade(col, 75)); g.addColorStop(0.55, col); g.addColorStop(1, shade(col, -45));
+      ctx.fillStyle = g; ctx.strokeStyle = 'rgba(20,12,24,.75)'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(x, yy - r * 0.2, r * 0.78, 0, 7); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.beginPath(); ctx.ellipse(x - r * 0.28, yy - r * 0.5, r * 0.22, r * 0.14, -0.6, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+
+    /* 반짝이·먼지 효과와 짧은 알림 글자 */
+    const fx = [];
+    let banner = null;
+    function burst(x, y, n, cols, sp, up) {
+      for (let k = 0; k < n; k++) { const a = Math.random() * Math.PI * 2, v = sp * (0.4 + Math.random()); fx.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - (up || 0), life: 0.6 + Math.random() * 0.6, t: 0, c: cols[k % cols.length], r: 1.5 + Math.random() * 2.2 }); }
+      ensureLoop();
+    }
+    function drawFx(dt) {
+      for (let k = fx.length - 1; k >= 0; k--) {
+        const p = fx[k]; p.t += dt; if (p.t >= p.life) { fx.splice(k, 1); continue; }
+        p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 260 * dt; p.vx *= 0.98;
+        ctx.globalAlpha = 1 - p.t / p.life; ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      if (banner) {
+        banner.t += dt; const T = banner.t; if (T > 1.4) { banner = null; return; }
+        const a = Math.min(1, T * 6) * Math.min(1, (1.4 - T) * 4), sc = 0.85 + 0.15 * Math.min(1, T * 5);
+        ctx.save(); ctx.globalAlpha = a; ctx.translate(B.x + B.size / 2, B.y + B.size / 2); ctx.scale(sc, sc);
+        const fs = Math.round(Math.max(18, B.c * 0.62) * (L.ui.scale ? L.ui.scale() : 1));
+        ctx.font = '400 ' + fs + 'px "Black Han Sans", "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        const w = Math.min(B.size * 0.95, ctx.measureText(banner.text).width + fs * 1.2);
+        ctx.fillStyle = 'rgba(16,10,20,.55)'; rrp(ctx, -w / 2, -fs * 0.8, w, fs * 1.6, fs * 0.4); ctx.fill();
+        ctx.strokeStyle = banner.col; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = banner.col; L.ui.strokeText(ctx, banner.text, 0, fs * 0.05);
+        ctx.restore();
+      }
+    }
+
+    function draw(dt) {
+      cv.clear();
+      if (!B) return;
+      buildBoard();
+      ctx.drawImage(boardImg, 0, 0, cv.w, cv.h);
+      if (st) {
+        const cur = !anim && die.rolling <= 0 && st.winner == null ? actor(st) : null;
+        const order = [];
+        for (let i = 0; i < st.n; i++) if (i !== cur && !(anim && anim.seat === i)) order.push(i);
+        if (anim) order.push(anim.seat); else if (cur != null) order.push(cur);
+        for (const i of order) {
+          if (anim && anim.seat === i) { const a = animPoint(), p = tokenXY(i, a); drawToken(i, p.x, p.y, a.lift, a.sq, false); }
+          else { const p = tokenXY(i, disp[i] != null ? disp[i] : st.pos[i]); drawToken(i, p.x, p.y, 0, 0, i === cur); }
+        }
+      }
+      drawFx(dt || 0);
+    }
+
+    /* animation: 주사위 → 한 칸씩 깡충 → 사다리는 타고 오르고, 뱀은 몸을 따라 미끄러진다 */
+    function animPoint() {
+      if (anim.ph === 'hop' && anim.hops > 0) {
+        const f = Math.min(anim.pos, anim.hops - 1e-6), i = Math.floor(f), t = f - i;
+        const a = anim.path[i], b = anim.path[i + 1], e = t * t * (3 - 2 * t);
+        return { x: U.lerp(a.x, b.x, e), y: U.lerp(a.y, b.y, e), lift: Math.sin(t * Math.PI) * B.c * 0.42, sq: 0 };
+      }
+      if (anim.ph === 'slide') {
+        const P = anim.slide, s = Math.min(1, anim.sp);
+        const u = anim.via === 'ladder' ? (s < 0.5 ? 2 * s * s : 1 - Math.pow(-2 * s + 2, 2) / 2) : s * s * (1.6 - 0.6 * s);
+        const f = Math.min(u, 1) * (P.length - 1), i = Math.min(P.length - 2, Math.floor(f)), t = f - i;
+        return { x: U.lerp(P[i].x, P[i + 1].x, t), y: U.lerp(P[i].y, P[i + 1].y, t), lift: anim.via === 'ladder' ? B.c * 0.12 : 0, sq: 0 };
+      }
+      const e = anim.ph === 'dice' ? anim.path[0] : anim.endP;
+      return { x: e.x, y: e.y, lift: 0, sq: anim.land > 0 ? anim.land * 5 : 0 };
+    }
+    let stopLoop = null, fxStop = null;
+    function ensureLoop() {
+      if (fxStop || stopLoop) return;
+      fxStop = U.loop((dt) => { draw(dt); if (!fx.length && !banner && !(st && st.winner == null && api.canAct(actor(st)))) { fxStop(); fxStop = null; } });
+    }
+    function runAnim(last) {
+      const cells = [];
+      for (let k = last.from + 1; k <= last.land; k++) cells.push(k);
+      const path = [cellXY(last.from, B), ...cells.map((c) => cellXY(c, B))];
+      let slide = null;
+      if (last.via === 'ladder') slide = [cellXY(last.land, B), cellXY(last.to, B)];
+      else if (last.via === 'snake') slide = snakePts(last.land, last.to);
+      anim = { seat: last.seat, path, pos: 0, hops: path.length - 1, ph: 'dice', via: last.via, slide, sp: 0, land: 0, endP: cellXY(last.to, B) };
+      die.rolling = 0.55; die.tum = 0;
+      api.setBusy(true);
+      let lastHop = 0, won = false;
+      if (stopLoop) stopLoop();
+      if (fxStop) { fxStop(); fxStop = null; }
+      clearTimeout(watchdog);
+      // background tabs pause rAF; finish the move anyway so the game never stalls
+      watchdog = setTimeout(() => { if (anim) { die.rolling = 0; die.v = last.roll; finish(); } }, (2200 + path.length * 400) / SPD() + 2000);
+      const mine = api.canAct(last.seat);
+      function finish() {
+        disp[last.seat] = last.to; anim = null; if (stopLoop) stopLoop(); stopLoop = null; clearTimeout(watchdog);
+        renderInfo(); renderTop(); refreshButton(); api.setBusy(false); ensureLoop(); draw(0);
+      }
+      function tickAnim(dt) {
+        if (!anim) return;
+        if (anim.ph === 'dice') {
+          die.rolling -= dt * SPD(); die.tum += dt;
+          if (die.tum > 0.07) { die.tum = 0; die.v = 1 + Math.floor(Math.random() * 6); renderInfo(); }
+          if (die.rolling <= 0) { die.rolling = 0; die.v = last.roll; renderInfo(); api.sfx('thud'); anim.ph = anim.hops > 0 ? 'hop' : slide ? 'slide' : 'end'; if (anim.ph === 'end') anim.land = 0.12; }
+          draw(dt); return;
+        }
+        if (anim.ph === 'hop') {
+          anim.pos += dt * 4.2 * SPD();
+          if (Math.floor(anim.pos) > lastHop && anim.pos < anim.hops) { lastHop = Math.floor(anim.pos); api.sfx('tick'); }
+          if (anim.pos >= anim.hops) {
+            anim.pos = anim.hops;
+            const E = cellXY(last.land, B);
+            if (slide) {
+              anim.ph = 'slide';
+              if (last.via === 'ladder') { api.sfx('whoosh'); burst(E.x, E.y, 10, ['#f6d27a', '#fff3c4'], 70, 40); }
+              else { api.sfx('lose'); burst(E.x, E.y, 10, ['#c0392b', '#7a2a20', '#e2c08a'], 60, 30); }
+              if (mine) api.buzz(last.via === 'ladder' ? 15 : 35);
+            } else { anim.ph = 'end'; anim.land = 0.12; api.sfx('click'); }
+          }
+        } else if (anim.ph === 'slide') {
+          anim.sp += dt * SPD() / (last.via === 'ladder' ? 0.75 : 1.0);
+          if (anim.sp >= 1) {
+            anim.ph = 'end'; anim.land = 0.12;
+            const E = anim.endP;
+            if (last.via === 'ladder') { api.sfx('chip'); burst(E.x, E.y, 16, ['#f6d27a', '#fff3c4', '#e3ae45'], 110, 70); banner = { text: '사다리 ↑ ' + last.to, col: '#f2c96a', t: 0 }; }
+            else { api.sfx('thud'); burst(E.x, E.y, 12, ['#b99a6a', '#7d6040'], 70, 20); banner = { text: '뱀 ↓ ' + last.to, col: '#ef8a74', t: 0 }; }
+          }
+        } else {
+          if (last.to === 100 && !won) {
+            won = true; const E = anim.endP;
+            burst(E.x, E.y, 44, ['#f6d27a', '#fff3c4', api.players[last.seat].color, '#e3ae45'], 190, 120);
+            banner = { text: api.players[last.seat].name + ' 골인!', col: '#f6d27a', t: 0 }; api.sfx('win');
+          }
+          anim.land -= dt * SPD();
+          if (anim.land <= 0) { anim.land = 0; finish(); return; }
+        }
+        draw(dt);
+      }
+      stopLoop = U.loop(tickAnim);
+    }
+    let watchdog = 0, pending = false;
+
+    function renderInfo() {
+      if (!st) return;
+      info.innerHTML = '';
+      const PIPS = { 1: [4], 2: [0, 8], 3: [0, 4, 8], 4: [0, 2, 6, 8], 5: [0, 2, 4, 6, 8], 6: [0, 2, 3, 5, 6, 8] };
+      const dieEl = L.h('span', { style: { display: 'inline-grid', gridTemplate: 'repeat(3,1fr)/repeat(3,1fr)', padding: '5px', gap: '1px', width: '36px', height: '36px', boxSizing: 'border-box', flex: 'none', borderRadius: '9px',
+        background: 'radial-gradient(circle at 30% 25%, #fffdf6, #efe4cc 60%, #cdbb96)', boxShadow: 'inset 0 -3px 0 rgba(120,90,40,.35), 0 3px 6px rgba(0,0,0,.45)',
+        transform: die.rolling > 0 ? 'rotate(' + (Math.random() * 40 - 20) + 'deg) scale(1.08)' : 'none', transition: 'transform .08s' } });
+      for (let k = 0; k < 9; k++) dieEl.append(L.h('i', { style: { placeSelf: 'center', width: '7px', height: '7px', borderRadius: '50%', background: (PIPS[die.v] || []).includes(k) ? (die.v === 1 ? '#a3321f' : '#2a1d12') : 'transparent', boxShadow: (PIPS[die.v] || []).includes(k) ? 'inset 0 1px 1px rgba(0,0,0,.5)' : 'none' } }));
+      const l = st.last, moving = !!(anim || die.rolling > 0);
+      const line = (seat, text, style) => L.h('div', { style: Object.assign({ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden' }, style || {}) },
+        seat != null ? L.h('span', { class: 'dot', style: { '--c': api.players[seat].color, flex: 'none' } }) : null,
+        L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, text }));
+      // line 1: what just happened (the dot is the colour of the player it is about)
+      let top = null;
+      if (l && moving) top = line(l.seat, api.players[l.seat].name + (die.rolling > 0 ? ' 굴리는 중…' : ' ' + l.roll + '칸 이동'));
+      else if (l) top = line(l.seat, api.players[l.seat].name + ' ' + l.roll + (l.to === 100 ? ' · 골인!' : l.via === 'ladder' ? ' · 사다리 ↑' + l.to : l.via === 'snake' ? ' · 뱀 ↓' + l.to : ' → ' + l.to));
+      else top = line(null, '100번 칸에 먼저 닿으면 승리');
+      // line 2: whose turn now, with a hint for the human on this phone
+      let bottom = null;
+      const cur = actor(st);
+      if (!moving && cur != null) {
+        const me = api.canAct(cur);
+        let mine = 0; for (let i = 0; i < st.n; i++) if (api.canAct(i)) mine++;
+        bottom = line(cur, me ? (mine > 1 ? api.players[cur].name + ' 차례 · ' : '내 차례 · ') + '굴리기 또는 판을 톡' : api.players[cur].name + ' 차례',
+          { fontSize: '13px', color: me ? 'var(--brass)' : 'var(--muted)' });
+      }
+      const col = L.h('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0, flex: '1 1 auto', fontSize: bottom ? '13px' : '15px' } }, top, bottom);
+      if (bottom && top) { top.style.color = 'var(--ink)'; top.style.opacity = '0.85'; }
+      info.append(dieEl, col);
+    }
+
+    function refreshButton() {
+      const a = st && actor(st);
+      rollBtn.hidden = !(a != null && api.canAct(a));
+      rollBtn.disabled = !!anim || die.rolling > 0 || pending;
+    }
+    cv.cv.addEventListener('click', () => { if (!rollBtn.hidden && !rollBtn.disabled) rollBtn.click(); });
+    rollBtn.addEventListener('click', () => { pending = true; api.buzz(12); refreshButton(); setTimeout(() => { pending = false; refreshButton(); }, 3000); }, true);
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prev) {
+        st = next;
+        pending = false;
+        const key = next.last ? next.g + ':' + next.last.id : '';
+        if (next.last && key !== shownSeq && prev && B) {
+          shownSeq = key;
+          if (anim && stopLoop) { stopLoop(); stopLoop = null; anim = null; }
+          for (let i = 0; i < next.n; i++) disp[i] = next.pos[i];
+          disp[next.last.seat] = next.last.from;
+          runAnim(next.last);
+        } else {
+          shownSeq = key;
+          if (!anim) for (let i = 0; i < next.n; i++) disp[i] = next.pos[i];
+        }
+        renderInfo(); renderTop(); refreshButton(); renderIntro(); draw(); ensureLoop();
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true); if (stopLoop) stopLoop(); if (fxStop) fxStop(); clearTimeout(watchdog); if (anim) api.setBusy(false); cv.destroy(); hud.remove(); top.remove(); intro.remove(); },
+    };
+  }
+
+  L.register({
+    id: 'snakes', name: '뱀 사다리', tag: '주사위', blurb: '주사위를 굴려 100번 칸에 먼저 닿으면 승리. 사다리는 올라가고 뱀은 미끄러져요.',
+    quick: [
+      '말을 100번 칸에 가장 먼저 닿게 하면 이겨요.',
+      '내 차례: 주사위를 한 번 굴려 나온 수만큼 앞으로 가요.',
+      '사다리 아래에 멈추면 위로 쑥! 뱀 머리에 멈추면 꼬리로 주르륵.',
+    ],
+    rules: [
+      { h: '그림으로 보기', fig: [{"svg": "<svg viewBox=\"0 0 340 144\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"sans-serif\"><rect width=\"340\" height=\"144\" rx=\"10\" fill=\"#1f2a24\"/><rect x=\"50\" y=\"10\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"90\" y=\"10\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"130\" y=\"10\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"170\" y=\"10\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"210\" y=\"10\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"250\" y=\"10\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"50\" y=\"44\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"90\" y=\"44\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"130\" y=\"44\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"170\" y=\"44\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"210\" y=\"44\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"250\" y=\"44\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"50\" y=\"78\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"90\" y=\"78\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"130\" y=\"78\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"170\" y=\"78\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><rect x=\"210\" y=\"78\" width=\"40\" height=\"34\" fill=\"#d8c79a\"/><rect x=\"250\" y=\"78\" width=\"40\" height=\"34\" fill=\"#f1e6c8\"/><path d=\"M84 96L124 28M98 100L138 32\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M91 85l14 4\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M97 73l14 4\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M104 62l14 4\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M111 51l14 4\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M117 39l14 4\" stroke=\"#8a5a2b\" stroke-width=\"3\"/><path d=\"M250 30C220 50 260 60 230 80S200 100 190 96\" stroke=\"#3a9a4a\" stroke-width=\"8\" fill=\"none\" stroke-linecap=\"round\"/><circle cx=\"250\" cy=\"30\" r=\"8\" fill=\"#3a9a4a\"/><circle cx=\"247\" cy=\"28\" r=\"2\" fill=\"#fff\"/><text x=\"90\" y=\"134\" font-size=\"12\" fill=\"#9fd59f\" text-anchor=\"middle\">사다리 발 → 위로</text><text x=\"250\" y=\"134\" font-size=\"12\" fill=\"#f2a0a0\" text-anchor=\"middle\">뱀 머리 → 꼬리로</text></svg>", "cap": "주사위만큼 가서 사다리 발이면 올라가고, 뱀 머리면 내려가요"}] },
+      { h: '목표', p: ['주사위를 굴려 말을 움직여요.', '100번 칸(금색)에 가장 먼저 닿는 사람이 이겨요.'] },
+      { h: '준비', p: ['모든 말은 판 밖(1번 칸 아래)에서 출발해요.', '칸 번호는 1번(왼쪽 아래)부터 지그재그로 올라가 100번(왼쪽 위)까지 있어요.'] },
+      { h: '차례에 할 일', p: ['주사위를 한 번 굴려요.', '나온 수만큼 칸 번호가 커지는 쪽으로 가요.', '6이 나와도 한 번 더 굴리지 않아요. 바로 다음 사람 차례예요.', '같은 칸에 여러 말이 있어도 괜찮아요. 서로 잡지 않아요.'] },
+      { h: '사다리와 뱀', p: ['사다리 아래 칸에 멈추면 → 사다리 꼭대기로 올라가요.', '뱀 머리 칸에 멈추면 → 꼬리 칸으로 내려가요.', '지나가기만 하면 아무 일도 없어요. 멈춘 칸만 따져요.'] },
+      { h: '판 고르기', p: ['기본은 「무작위 판」: 판마다 사다리·뱀 자리가 새로 정해져요. 시작할 때 판 가운데에 이번 판 정보가 떠요.', '무작위 판도 공정하게 만들어요. 사다리·뱀이 이어지지 않고(올라간 곳이 바로 뱀 머리인 일 없음), 100번 칸엔 뱀이 없고, 오르는 칸 합과 내려가는 칸 합이 비슷해요.', '「고전 판」을 고르면 늘 같은 판(28→84, 80→100, 98→78…)으로 해요.'] },
+      { h: '점수·승리', p: ['100번 칸에 닿으면 바로 이겨요.', '정확히 100을 맞출 필요가 없어요. 97에서 5가 나와도 100에 닿아 승리!'] },
+      { h: '조작', p: ['내 차례에 아래 「주사위 굴리기」를 누르거나 판을 톡 치세요.', '위쪽에 사람마다 지금 칸 번호가 보여요. 지금 차례인 말에는 동그란 테두리가 있어요.', '아래 칸에 방금 나온 수와 결과, 다음 차례가 보여요.'] },
+      { h: '예시', p: ['(고전 판) 내 말이 24번 칸에 있어요. 주사위 4 → 28번 칸 → 사다리라서 84번으로 쑥!', '84번에서 3 → 87번 칸 → 뱀 머리라서 24번으로 주르륵…', '운이 전부인 게임이에요. 마음 편히 즐기세요!'] },
+    ],
+    tutorial: [
+      { sel: 'canvas', text: '1번(왼쪽 아래)부터 100번(왼쪽 위)까지 지그재그로 올라가는 판이에요. 100번에 먼저 닿으면 이겨요!' },
+      { sel: '.sn-top', text: '위쪽에 사람마다 지금 몇 번 칸에 있는지 보여요. 모두 0(판 밖)에서 시작해요.' },
+      { sel: '.sn-hud', text: '내 차례엔 「주사위 굴리기」를 누르거나 판을 톡 치세요. 나온 수만큼 말이 앞으로 가요.' },
+      { sel: 'canvas', text: '사다리 아래 칸에 멈추면 꼭대기로 올라가고, 뱀 머리 칸에 멈추면 꼬리로 미끄러져요. 지나가기만 하면 괜찮아요.' },
+      { sel: '.sn-info', text: '여기에 방금 나온 수와 결과(사다리 ↑, 뱀 ↓), 다음 차례가 나와요. 그럼 굴려 볼까요?' },
+    ],
+    controls: [
+      { id: 'roll', label: '주사위 굴리기', keys: ['Space', 'Enter'], pad: ['a'] },
+    ],
+    minPlayers: 2, maxPlayers: 6, defaultPlayers: 4, aiDelay: 550,
+    options: [{ id: 'bd', label: '판', tip: '뱀·사다리 위치.', choices: [{ v: 'r', label: '무작위 판', tip: '판마다 새로 배치.' }, { v: 'c', label: '고전 판', tip: '정해진 고전 배치.' }], def: 'r' }],
+    init, actor, apply, result, ai: () => ({ type: 'roll' }), mount,
+  });
+})();

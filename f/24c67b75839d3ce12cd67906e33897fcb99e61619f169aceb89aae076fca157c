@@ -1,0 +1,2179 @@
+/* 다리 건설 시험 — 옆에서 본 격자 위에 점(이음새)을 찍고 재료(나무 길·나무 들보·쇠 들보·밧줄·케이블·받침)를 이어 다리를 설계한 뒤,
+   자동차·트럭·기차가 실제로 건너가는지 시험한다. 예산 안에서 버티면 성공, 힘이 모자란 부재는 끊어지고 다리가 무너진다.
+   물리: 이음새 = 질점, 부재 = 축력만 받는 막대(XPBD 위치 기반, 고정 스텝 1/60초 × 12 부분 스텝, Math.random 없음 → 결정적).
+         부재 힘 = λ/h² (당김 +, 누름 −). 당김 한계 T, 누름 한계 C × min(1, 좌굴길이/길이) (길수록 누름에 약함). 밧줄·케이블은 당김만.
+         힘을 살짝 걸러(0.06초) 한계 넘으면 끊어짐. 차는 길 부재 위를 일정 속도로 달리며 바퀴 무게를 양 끝 이음새에 나눠 건다.
+   apply에서 끝까지 계산해 결과를 state.last.res에 담고, 화면은 같은 계산을 다시 돌려 애니메이션만 한다.
+   설계 문자열: "이음새들|부재들" — 이음새 = x,y 두 글자(64진, +16), 부재 = a,b(이음새 번호, 고정점 먼저) + 재료 글자.
+   State: { n, nm[], R, r, ph 'pick'|'b'|'v'|'end', ss[] (판별 현장), vs[] (판별 차), si, vh, tl, d[] (낸 설계|null), rd[], sc[], rs[[]],
+            solo, last {id, r, si, vh, d[], res[[ok, 점수, 비용, 최대힘%, 실패코드, 프레임]]}, seq, t0 } */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ======================= 재료 ======================= */
+  // m: 무게(t/m), EA: 늘어남 강성(kN), T/C: 당김/누름 한계(kN), bk: 좌굴 기준 길이(m), mx: 최대 길이(m), cost: m당 값
+  const MAT = {
+    R: { n: '나무 길', s: '길', cost: 100, m: 0.10, EA: 12000, T: 170, C: 150, bk: 3, mx: 3, road: 1, col: '#9b6a3c', d: '차가 달리는 길이에요. 기울기는 2칸에 1칸까지. 최대 3m.' },
+    W: { n: '나무 들보', s: '나무', cost: 70, m: 0.05, EA: 8000, T: 110, C: 100, bk: 2, mx: 4, col: '#d9a35a', d: '싸고 가벼운 기본 들보. 당김·누름 둘 다 버텨요. 길면 누르는 힘에 약해요. 최대 4m.' },
+    S: { n: '쇠 들보', s: '쇠', cost: 200, m: 0.12, EA: 40000, T: 360, C: 320, bk: 2.5, mx: 5, col: '#8fa6c8', d: '비싸지만 나무보다 3배 넘게 튼튼해요. 최대 5m.' },
+    P: { n: '밧줄', s: '밧줄', cost: 20, m: 0.01, EA: 1500, T: 50, C: 0, bk: 1, mx: 10, rope: 1, col: '#e8d39a', d: '아주 싸고 가볍지만 당기는 힘만 버티고 잘 늘어나요. 최대 10m.' },
+    C: { n: '케이블', s: '케이블', cost: 120, m: 0.03, EA: 25000, T: 300, C: 0, bk: 1, mx: 12, rope: 1, col: '#c9d2dc', d: '쇠줄. 당기는 힘에 아주 강해요(누르는 힘은 0). 최대 12m.' },
+    K: { n: '받침', s: '받침', cost: 110, m: 0.3, EA: 80000, T: 30, C: 700, bk: 4, mx: 8, col: '#b8b2a6', d: '콘크리트 기둥. 누르는 힘에 아주 강하지만 무겁고 당김엔 약해요. 최대 8m.' },
+  };
+  const MATS = 'RWSPCK';
+  const J_COST = 25, FD_COST = 300, MAXD = 480, MAXJ = 64;
+  const ALPH = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_', OFF = 16;
+  const enc = (v) => ALPH[v + OFF], dec = (c) => ALPH.indexOf(c) - OFF;
+
+  /* ======================= 차 ======================= */
+  // ax: 앞바퀴 기준 뒤로 떨어진 거리(m), w: 바퀴마다 무게(t), v: 속도(m/s)
+  const VEH = [
+    { n: '자동차', e: '🚗', ax: [0, 2.4], w: [0.8, 0.8], v: 5, len: 3.4 },
+    { n: '트럭', e: '🚚', ax: [0, 3.4, 4.6], w: [3, 4.5, 4.5], v: 3.5, len: 5.6 },
+    { n: '기차', e: '🚂', ax: [0, 3, 5, 8, 10, 13], w: [6, 6, 5, 5, 5, 5], v: 3, len: 14 },
+    { n: '긴 화물 기차', e: '🚆', ax: [0, 3, 5, 8, 10, 13, 15, 18, 20, 23], w: [6, 6, 6, 6, 6, 6, 6, 6, 6, 6], v: 2.5, len: 24 },
+    { n: '중장비 트레일러', e: '🚛', ax: [0, 3, 4.2, 8, 9.2], w: [5, 7.5, 7.5, 8, 8], v: 2.5, len: 10.4 },   // 혼자 하기 현장·도전 전용
+  ];
+
+  /* ======================= 현장 ======================= */
+  // L: 너비, r: 오른쪽 길 높이(왼쪽 0), D: 바닥 깊이, top: 위로 지을 수 있는 높이, an: 벼랑 고정점, fd: 기초 자리(쓰면 300),
+  // rk: 바위 기둥 [x, 꼭대기](꼭대기가 고정점), w: 물 높이, bt: 배 길 [x0,x1,y0,y1](아무것도 못 지음), B: 차마다 예산 [자동차, 트럭, 기차, 긴 기차], v: 혼자 하기 차, vs: 대결용
+  const SITES = [
+    { n: '첫 개울', e: '🌱', L: 6, r: 0, D: 3, top: 4, an: [], w: -2, B: [2500, 2800, 2500, 2500], v: 0, th: 0, d: '좁은 개울이에요. 길만 놓으면 가운데가 처져요. 세모를 만들어 받쳐 보세요.' },
+    { n: '도랑 건너기', e: '🌾', L: 8, r: 0, D: 4, top: 4, an: [[0, -2], [8, -2]], B: [3600, 3900, 3500, 3800], v: 0, th: 0, d: '벼랑 아래에도 고정점이 있어요. 아래에서 받치면 튼튼해요.' },
+    { n: '시골 냇가', e: '🐟', L: 10, r: 0, D: 3, top: 4, an: [], w: -2, B: [4500, 5800, 5300, 5300], v: 0, th: 1, d: '조금 넓어요. 세모 여러 개(트러스)를 이어 보세요.' },
+    { n: '트럭 왔어요', e: '🚚', L: 8, r: 0, D: 5, top: 4, an: [[0, -2], [8, -2]], B: [3600, 3900, 3500, 3800], v: 1, th: 0, d: '무거운 트럭이 건너요. 약한 곳을 찾아 쇠 들보로 바꿔 보세요.' },
+    { n: '굴다리 아래', e: '🛤️', L: 10, r: 0, D: 6, top: 0, an: [[0, -3], [10, -3]], B: [3600, 6100, 5600, 5600], v: 1, th: 2, d: '위에 철길이 있어서 길보다 높게는 못 지어요. 아래로 받쳐요.', vs: 1 },
+    { n: '얕은 늪', e: '🐸', L: 12, r: 0, D: 2, top: 5, an: [], w: -1, B: [6100, 7700, 7600, 7600], v: 1, th: 1, d: '아래가 늪이라 깊이 못 내려가요. 길 위로 트러스를 세워요.', vs: 1 },
+    { n: '배가 지나는 강', e: '⛵', L: 12, r: 0, D: 5, top: 4, an: [], w: -3, bt: [3, 9, -3, -0.5], B: [6100, 7700, 7600, 7600], v: 1, th: 1, d: '가운데로 배가 지나가요. 회색 배 길에는 아무것도 지을 수 없어요.', vs: 1 },
+    { n: '오르막 다리', e: '⛰️', L: 10, r: 2, D: 5, top: 4, an: [[0, -2], [10, 0]], B: [3500, 6200, 6000, 6000], v: 1, th: 2, d: '오른쪽이 2m 높아요. 길은 2칸에 1칸까지만 기울일 수 있어요.', vs: 1 },
+    { n: '내리막 다리', e: '🏞️', L: 12, r: -2, D: 7, top: 4, an: [[0, -3], [12, -5]], B: [4400, 7900, 7900, 8000], v: 1, th: 3, d: '오른쪽이 낮아요. 벼랑 아래 고정점도 써 보세요.', vs: 1 },
+    { n: '바위섬', e: '🪨', L: 16, r: 0, D: 5, top: 4, an: [], w: -3, rk: [[8, -2]], B: [7800, 9000, 8200, 8800], v: 1, th: 1, d: '가운데 바위섬 꼭대기가 고정점이에요. 받침으로 이어 보세요.', vs: 1 },
+    { n: '깊은 협곡', e: '🏜️', L: 14, r: 0, D: 12, top: 4, an: [[0, -2], [0, -5], [14, -2], [14, -5]], B: [6800, 9600, 10400, 10400], v: 2, th: 2, d: '아주 깊어요. 벼랑의 고정점들로 아치를 만들어 보세요.', vs: 1 },
+    { n: '기찻길 첫 운행', e: '🚂', L: 10, r: 0, D: 4, top: 4, an: [[0, -2], [10, -2]], B: [4500, 5200, 5300, 5300], v: 2, th: 0, d: '무거운 기차예요. 길 위와 아래 모두 튼튼해야 해요.', vs: 1 },
+    { n: '넓은 강', e: '🌊', L: 16, r: 0, D: 6, top: 4, an: [], w: -3, fd: [[6, -6], [10, -6]], bt: [7, 9, -3, -0.5], B: [15200, 17000, 15500, 15500], v: 2, th: 1, d: '강바닥에 기초 자리가 둘 있어요(쓰면 하나에 300). 가운데는 배 길.', vs: 1 },
+    { n: '출렁다리 골짜기', e: '🌉', L: 16, r: 0, D: 10, top: 5, an: [], rk: [[-2, 4], [18, 4]], B: [7200, 12100, 16400, 18000], v: 1, th: 3, d: '양쪽 높은 바위가 고정점이에요. 케이블로 길을 매달아 보세요.', vs: 1 },
+    { n: '계단 협곡', e: '🪜', L: 14, r: 3, D: 8, top: 4, an: [[0, -2], [14, 0]], rk: [[6, -1]], B: [7000, 8000, 7500, 7900], v: 1, th: 2, d: '오른쪽이 3m 높고 가운데 바위 기둥이 있어요.', vs: 1 },
+    { n: '얼음 골짜기', e: '🧊', L: 12, r: 0, D: 8, top: 2, an: [[0, -2], [12, -2]], B: [4400, 7700, 7600, 7600], v: 2, th: 4, d: '위로는 2m까지만. 아래 고정점을 잘 써요.', vs: 1 },
+    { n: '운하 다리', e: '🚢', L: 14, r: 0, D: 5, top: 6, an: [], w: -2, bt: [2, 12, -2, -0.5], B: [7100, 9600, 10600, 13200], v: 2, th: 1, d: '배 길이 넓어서 아래로는 거의 못 지어요. 위로 높게!', vs: 1 },
+    { n: '긴 협곡', e: '🏔️', L: 18, r: 0, D: 8, top: 4, an: [[0, -3], [18, -3]], B: [7900, 14300, 19500, 20000], v: 1, th: 4, d: '길어요! 쉬지 않고 18m를 건너야 해요.', vs: 1 },
+    { n: '두 바위', e: '🗿', L: 18, r: 0, D: 6, top: 4, an: [], w: -4, rk: [[6, -2], [12, -2]], B: [5600, 8200, 8600, 9500], v: 2, th: 1, d: '바위 기둥 두 개를 디딤돌로 써요.', vs: 1 },
+    { n: '높은 오르막', e: '🧗', L: 14, r: 4, D: 6, top: 4, an: [[0, -2], [14, 1]], B: [7600, 10100, 10900, 11400], v: 1, th: 2, d: '오른쪽이 4m 높아요. 기울기 제한을 지키며 올라가요.' },
+    { n: '화물 열차', e: '🚆', L: 14, r: 0, D: 6, top: 4, an: [[0, -3], [14, -3]], B: [4800, 9100, 9500, 9500], v: 3, th: 0, d: '아주 긴 화물 기차. 다리 전체가 한꺼번에 무거워져요.' },
+    { n: '큰 강 화물선', e: '🛳️', L: 18, r: 0, D: 7, top: 5, an: [], w: -3, fd: [[4, -7], [14, -7]], bt: [6, 12, -3, -0.4], B: [13300, 14600, 14500, 14500], v: 2, th: 1, d: '큰 배 길 양옆에 기초 자리가 있어요.' },
+    { n: '천장 낮은 협곡', e: '🦇', L: 16, r: 0, D: 10, top: 0, an: [[0, -2], [0, -4], [16, -2], [16, -4]], B: [7900, 12000, 13500, 14100], v: 2, th: 3, d: '위로는 하나도 못 지어요. 아래 아치로만!' },
+    { n: '마지막 시험', e: '🏆', L: 20, r: 0, D: 10, top: 5, an: [[0, -3], [20, -3]], fd: [[10, -10]], B: [15600, 22300, 26700, 33200], v: 3, th: 4, d: '20m 협곡을 긴 화물 기차가 건너요. 지금까지 배운 걸 다 써요!' },
+    // ---- 새 현장 (라운드 28) ----
+    { n: '바람 부는 협곡', e: '🌬️', L: 12, r: 0, D: 8, top: 4, an: [[0, -2], [12, -2]], wd: 5, B: [5000, 7300, 7600, 7600, 8000], v: 1, th: 2, d: '골짜기에 옆바람이 세게 불어요(→). 바람이 다리를 옆으로 밀어요. 세모로 단단히 묶어요.', vs: 1 },
+    { n: '계곡 강', e: '🏞️', L: 14, r: 0, D: 6, top: 4, an: [], w: -3, fd: [[7, -6]], B: [8200, 10900, 11200, 11200, 11500], v: 1, th: 1, d: '계곡 한가운데 강바닥에 기초 자리가 하나 있어요(쓰면 300). 가운데를 받치면 짧은 다리 두 개!', vs: 1 },
+    { n: '비탈 협곡', e: '📐', L: 12, r: 3, D: 7, top: 4, an: [[0, -2], [12, 1]], B: [5000, 8300, 8200, 8300, 9000], v: 1, th: 2, d: '오른쪽이 3m 높은 비탈이에요. 길 기울기(2칸에 1칸)를 지키며 아래에서 받쳐요.', vs: 1 },
+    { n: '중간 지지대', e: '🏛️', L: 16, r: 0, D: 5, top: 4, an: [], w: -2, fd: [[5, -5], [11, -5]], B: [10000, 11000, 11500, 12500, 14000], v: 2, th: 1, d: '기초 자리 두 곳에 받침 기둥을 세우면 세 칸짜리 다리가 돼요. 기차가 건너요.', vs: 1 },
+    { n: '돌풍 해협', e: '🌪️', L: 14, r: 0, D: 5, top: 6, an: [], w: -3, bt: [4, 10, -3, -0.8], wd: 4, B: [7600, 10400, 11000, 11000, 11500], v: 1, th: 3, d: '배 길 위로 돌풍이 불어요. 아래로는 못 지으니 위로 높이, 바람에도 버티게!' },
+    { n: '무거운 짐 고개', e: '🚛', L: 10, r: 0, D: 6, top: 4, an: [[0, -2], [10, -2]], B: [4500, 6000, 6500, 6500, 7800], v: 4, th: 0, d: '중장비 트레일러(40t 가까이)가 건너요. 뒤쪽 바퀴가 아주 무거워요. 쇠 들보가 필요해요.' },
+    { n: '산악 철도', e: '🚞', L: 16, r: 0, D: 9, top: 4, an: [[0, -3], [16, -3]], B: [7400, 11000, 15000, 17000, 19000], v: 2, th: 4, d: '깊은 산골짜기를 기차가 건너요. 벼랑 고정점으로 아래를 받쳐요.', vs: 1 },
+    { n: '높은 협곡 철교', e: '🏜️', L: 18, r: 0, D: 12, top: 3, an: [[0, -2], [0, -6], [18, -2], [18, -6]], B: [8500, 15000, 20000, 22500, 25000], v: 3, th: 2, d: '아주 깊고 넓은 협곡. 위로는 3m까지만. 긴 화물 기차가 건너요. 아래 아치를 노려요!' },
+    { n: '두 기둥 강', e: '🌉', L: 18, r: 0, D: 6, top: 4, an: [], w: -3, rk: [[6, -1], [12, -1]], wd: 3, B: [7000, 9500, 10500, 11500, 11000], v: 4, th: 1, d: '강 속 바위 기둥 둘 + 옆바람. 중장비 트레일러가 건너요.' },
+    // ---- 새 현장 28곳 (예산 = 어려움 AI가 실제로 건너 본 비용 기준, 대결용은 자동차~긴 기차 모두 확인) ----
+    { n: '이끼 낀 개울', e: '🍄', L: 8, r: 0, D: 3, top: 3, an: [], w: -2, B: [2500, 3600, 3600, 3400, 3600], v: 0, th: 3, d: '밤 숲속 작은 개울이에요. 짧은 트러스 하나면 충분해요.' },
+    { n: '눈 덮인 도랑', e: '⛄', L: 10, r: 0, D: 5, top: 4, an: [[10, -2]], B: [3200, 5300, 5400, 5300, 6200], v: 0, th: 4, d: '고정점이 오른쪽 벼랑 아래에만 있어요. 왼쪽은 위로 받쳐요.' },
+    { n: '가파른 고갯길', e: '🚵', L: 12, r: 5, D: 6, top: 3, an: [[0, -2], [12, 2]], B: [4500, 6400, 8000, 8000, 11300], v: 0, th: 0, d: '오른쪽이 5m나 높아요. 칸마다 기울기를 꽉 채워 올라가요.' },
+    { n: '징검돌 여울', e: '👣', L: 18, r: 0, D: 4, top: 3, an: [], w: -2, rk: [[4, -1], [9, -1], [14, -1]], B: [4500, 9000, 8600, 8600, 12200], v: 0, th: 1, d: '얕은 여울에 작은 바위가 셋. 바위마다 디뎌서 짧게 끊어 가요.', vs: 1 },
+    { n: '좁은 틈', e: '🕳️', L: 6, r: 0, D: 12, top: 3, an: [[0, -3], [0, -7], [6, -3], [6, -7]], B: [1600, 2100, 2000, 2000, 2500], v: 2, th: 3, d: '좁지만 끝없이 깊은 틈이에요. 짧아도 기차는 무거워요.', vs: 1 },
+    { n: '빠듯한 도랑', e: '💸', L: 6, r: 0, D: 4, top: 3, an: [[0, -2], [6, -2]], B: [1500, 1800, 1900, 1900, 2100], v: 1, th: 0, d: '짧지만 예산이 아주 빠듯해요. 꼭 필요한 부재만!' },
+    { n: '한쪽 벼랑 고정점', e: '🪢', L: 12, r: 0, D: 8, top: 4, an: [[0, -2], [0, -4], [0, -6]], B: [4300, 6300, 7000, 7000, 9900], v: 1, th: 2, d: '왼쪽 벼랑에만 고정점이 셋 있어요. 오른쪽은 위로 버텨요.', vs: 1 },
+    { n: '한쪽 배 길', e: '🚤', L: 14, r: 0, D: 5, top: 5, an: [], w: -3, bt: [9, 13, -3, -0.5], B: [5800, 9200, 9600, 11000, 13400], v: 1, th: 1, d: '배 길이 오른쪽으로 치우쳐 있어요. 왼쪽은 아래로, 오른쪽은 위로.', vs: 1 },
+    { n: '얼어붙은 호수', e: '⛸️', L: 16, r: 0, D: 2, top: 4, an: [], w: -1, rk: [[8, -1]], B: [5100, 8500, 9500, 8400, 10500], v: 1, th: 4, d: '넓고 얕은 얼음 호수. 가운데 작은 바위섬 하나뿐이에요.', vs: 1 },
+    { n: '운하 갑문', e: '🔒', L: 12, r: 2, D: 4, top: 4, an: [[12, 0]], w: -2, bt: [4, 8, -2, -0.5], B: [4700, 7200, 8100, 8800, 12200], v: 1, th: 1, d: '갑문 오른쪽이 2m 높고 가운데로 배가 지나가요.', vs: 1 },
+    { n: '넓은 갯벌', e: '🦀', L: 20, r: 0, D: 2, top: 5, an: [], w: -1, B: [11400, 18700, 25000, 25000, 30000], v: 0, th: 1, d: '20m나 되지만 아래가 갯벌이라 받칠 데가 없어요. 위로 긴 트러스!' },
+    { n: '계단 내리막', e: '⬇️', L: 14, r: -4, D: 9, top: 4, an: [[0, -2], [14, -7]], B: [5200, 10900, 12900, 12100, 16200], v: 1, th: 2, d: '오른쪽이 4m 낮아요. 아래 고정점은 오른쪽이 훨씬 깊어요.', vs: 1 },
+    { n: '동굴 속 물길', e: '🕯️', L: 12, r: 0, D: 5, top: 1, an: [], w: -3, fd: [[6, -5]], B: [6100, 8000, 6700, 7100, 7800], v: 1, th: 3, d: '동굴 천장이 낮아 위로 1m뿐. 물 밑 기초 자리(300)로 받쳐요.' },
+    { n: '엇갈린 기초', e: '🧱', L: 16, r: 0, D: 7, top: 4, an: [], w: -3, fd: [[3, -7], [12, -7]], B: [11700, 16600, 16900, 17600, 19200], v: 3, th: 0, d: '기초 자리가 한쪽으로 쏠려 있어요. 긴 칸과 짧은 칸을 같이 지어요. 긴 화물 기차가 건너요.', vs: 1 },
+    { n: '바람의 언덕', e: '🎐', L: 14, r: 3, D: 7, top: 4, an: [[0, -2], [14, 0]], wd: 5, B: [8300, 13300, 18000, 18000, 18600], v: 1, th: 2, d: '오르막에 옆바람까지 불어요(→). 기울기와 바람을 같이 버텨요.', vs: 1 },
+    { n: '외기둥 탑', e: '🗼', L: 12, r: 0, D: 10, top: 5, an: [], rk: [[-2, 5]], B: [4700, 6900, 7800, 7300, 10600], v: 1, th: 3, d: '왼쪽에만 높은 바위 탑이 있어요. 케이블을 부채처럼 뻗어 보세요.' },
+    { n: '낮은 고정점 협곡', e: '⚓', L: 14, r: 0, D: 9, top: 2, an: [[0, -6], [14, -6]], B: [6400, 8600, 10300, 11500, 14200], v: 2, th: 4, d: '고정점이 벼랑 아주 아래에만 있어요. 위로는 2m. 깊은 아치를 그려요.', vs: 1 },
+    { n: '강 속 바위밭', e: '🛶', L: 16, r: 0, D: 6, top: 4, an: [], w: -3, rk: [[5, -2], [11, -3]], B: [6600, 9500, 9700, 10300, 11800], v: 2, th: 1, d: '높이가 다른 바위 기둥 둘. 받침 길이를 각각 맞춰요.', vs: 1 },
+    { n: '내리막 철길', e: '🚃', L: 16, r: -3, D: 8, top: 4, an: [[0, -3], [16, -6]], B: [6900, 12100, 17000, 18700, 21800], v: 2, th: 0, d: '오른쪽이 3m 낮은 긴 내리막을 기차가 건너요.', vs: 1 },
+    { n: '비탈 짐길', e: '🏗️', L: 10, r: 2, D: 6, top: 4, an: [[0, -2], [10, 0]], B: [3500, 5100, 5200, 5200, 7500], v: 4, th: 2, d: '오르막을 중장비 트레일러가 올라가요. 무거운 뒷바퀴가 비탈에 걸려요.' },
+    { n: '폭풍 협곡', e: '⛈️', L: 18, r: 0, D: 8, top: 4, an: [[0, -3], [18, -3]], wd: 7, B: [11200, 23400, 30000, 30000, 35000], v: 1, th: 4, d: '아주 센 옆바람(→)이 긴 다리를 흔들어요. 위아래로 꼭 묶어요.' },
+    { n: '한쪽 큰 배 길', e: '🛥️', L: 18, r: 0, D: 6, top: 5, an: [], w: -3, bt: [2, 8, -3, -0.4], fd: [[13, -6]], B: [10900, 14000, 17400, 17500, 25700], v: 2, th: 1, d: '왼쪽에 넓은 배 길, 오른쪽에 기초 자리 하나. 모양이 한쪽으로 기울어요.' },
+    { n: '바위 탑 셋', e: '🏯', L: 20, r: 0, D: 10, top: 4, an: [], rk: [[5, -4], [10, -2], [15, -4]], B: [8200, 10000, 9800, 9800, 13200], v: 2, th: 2, d: '깊은 골짜기에 높이가 다른 바위 탑 셋. 가운데 탑이 가장 높아요.' },
+    { n: '쌍둥이 섬 해협', e: '🏝️', L: 20, r: 0, D: 6, top: 5, an: [], w: -3, fd: [[6, -6], [14, -6]], bt: [8, 12, -3, -0.5], wd: 3, B: [18600, 18300, 19200, 19200, 22800], v: 3, th: 1, d: '두 섬 사이로 배가 지나가고 바람도 불어요. 긴 화물 기차가 건너요.' },
+    { n: '짧은 철길 틈', e: '🚧', L: 8, r: 0, D: 3, top: 0, an: [[0, -2], [8, -2]], B: [2400, 2700, 2700, 2900, 3400], v: 2, th: 0, d: '위로는 못 짓고 아래도 3m뿐. 기차가 지나요. 예산도 빠듯해요.' },
+    { n: '낮은 천장 깊은 골', e: '🌑', L: 12, r: 0, D: 12, top: 1, an: [[0, -3], [0, -7], [12, -3], [12, -7]], fd: [[6, -12]], B: [6300, 13200, 13400, 14200, 15000], v: 2, th: 3, d: '위로는 1m, 아래는 12m. 바닥 기초에서 긴 기둥을 올려도 돼요.' },
+    { n: '끝없는 협곡', e: '🗻', L: 22, r: 0, D: 10, top: 5, an: [[0, -3], [0, -6], [22, -3], [22, -6]], B: [10500, 25500, 34700, 34700, 42700], v: 1, th: 4, d: '22m! 가장 넓은 협곡이에요. 위아래를 다 써야 해요.' },
+    { n: '최후의 철교', e: '👑', L: 22, r: 0, D: 12, top: 5, an: [[0, -4], [22, -4]], fd: [[11, -12]], B: [17400, 30300, 52000, 52700, 41000], v: 4, th: 4, d: '22m 깊은 협곡 바닥에 기초 자리 하나. 중장비 트레일러로 마지막 시험!' },
+  ];
+  const VS = SITES.map((s, i) => (s.vs ? i : -1)).filter((i) => i >= 0);
+  const FAIL = { fall: '차가 떨어졌어요', sag: '다리가 너무 처졌어요', steep: '길이 너무 기울었어요', boat: '배와 부딪혔어요', stuck: '시간 안에 못 건넜어요', budget: '예산 초과' };
+  const FCODE = ['', 'fall', 'sag', 'steep', 'boat', 'stuck', 'budget'];
+
+  // 현장의 고정점 목록 (캐시) — [x, y, 종류] 종류 0 길 끝·벼랑, 1 기초(유료), 2 바위
+  const ANC = new WeakMap();
+  function anchors(site) {
+    let a = ANC.get(site);
+    if (a) return a;
+    a = [[0, 0, 0], [site.L, site.r, 0]];
+    (site.an || []).forEach((p) => a.push([p[0], p[1], 0]));
+    (site.rk || []).forEach((p) => a.push([p[0], p[1], 2]));
+    (site.fd || []).forEach((p) => a.push([p[0], p[1], 1]));
+    ANC.set(site, a);
+    return a;
+  }
+  const topY = (site) => Math.max(0, site.r) + site.top;
+  // 땅 속인지(겉면 포함 여부 strict=false면 겉면도 땅)
+  function solid(site, x, y, strict) {
+    const e = strict ? 0.02 : -0.02;
+    if (x < -e && y < 0 - e) return true;
+    if (x > site.L + e && y < site.r - e) return true;
+    if (y < -site.D - e) return true;
+    if (!strict) {
+      if (x <= 0.02 && y <= 0.02) return true;
+      if (x >= site.L - 0.02 && y <= site.r + 0.02) return true;
+      if (y <= -site.D + 0.02) return true;
+    }
+    if (site.rk) for (const k of site.rk) if (Math.abs(x - k[0]) < 0.5 - e && y < k[1] - e) return true;
+    return false;
+  }
+  function groundY(site, x) {
+    let g = x <= 0 ? 0 : x >= site.L ? site.r : -site.D;
+    if (site.rk) for (const k of site.rk) if (Math.abs(x - k[0]) < 0.5 && k[1] > g) g = k[1];
+    return g;
+  }
+  const xMin = () => -4, xMax = (site) => site.L + 4;
+
+  /* ======================= 설계 문자열 ======================= */
+  function parse(site, str) {
+    const A = anchors(site);
+    const out = { x: A.map((p) => p[0]), y: A.map((p) => p[1]), na: A.length, m: [] };
+    str = String(str || '');
+    const bar = str.indexOf('|');
+    const js = bar < 0 ? '' : str.slice(0, bar), ms = bar < 0 ? str : str.slice(bar + 1);
+    for (let i = 0; i + 1 < js.length; i += 2) { out.x.push(dec(js[i])); out.y.push(dec(js[i + 1])); }
+    for (let i = 0; i + 2 < ms.length; i += 3) out.m.push([ALPH.indexOf(ms[i]), ALPH.indexOf(ms[i + 1]), ms[i + 2]]);
+    return out;
+  }
+  function serialize(D) {
+    let s = '';
+    for (let i = D.na; i < D.x.length; i++) s += enc(D.x[i]) + enc(D.y[i]);
+    s += '|';
+    for (const m of D.m) s += ALPH[m[0]] + ALPH[m[1]] + m[2];
+    return s;
+  }
+  // 쓰이지 않는 이음새 지우고 번호 다시 매기기
+  function compact(D) {
+    const used = new Array(D.x.length).fill(false);
+    D.m.forEach((m) => { used[m[0]] = used[m[1]] = true; });
+    const map = [], x = [], y = [];
+    for (let i = 0; i < D.x.length; i++) {
+      if (i < D.na || used[i]) { map[i] = x.length; x.push(D.x[i]); y.push(D.y[i]); } else map[i] = -1;
+    }
+    return { x, y, na: D.na, m: D.m.map((m) => [map[m[0]], map[m[1]], m[2]]) };
+  }
+  function segBox(ax, ay, bx, by, b) {   // 선분이 상자 [x0,x1,y0,y1] 안을 지나는지 (Liang–Barsky)
+    let t0 = 0, t1 = 1;
+    const dx = bx - ax, dy = by - ay;
+    const P = [-dx, dx, -dy, dy], Q = [ax - b[0], b[1] - ax, ay - b[2], b[3] - ay];
+    for (let i = 0; i < 4; i++) {
+      if (P[i] === 0) { if (Q[i] < 0) return false; }
+      else { const t = Q[i] / P[i]; if (P[i] < 0) { if (t > t1) return false; if (t > t0) t0 = t; } else { if (t < t0) return false; if (t < t1) t1 = t; } }
+    }
+    return t1 - t0 > 1e-6;
+  }
+  // 이음새 하나를 놓을 수 있는지 ('' = 됨)
+  function jointErr(site, x, y) {
+    if (x < xMin(site) || x > xMax(site)) return '현장 밖이에요';
+    if (y > topY(site)) return '이보다 높이는 못 지어요';
+    if (solid(site, x, y, false)) return '땅 속에는 못 지어요';
+    if (site.bt && x >= site.bt[0] && x <= site.bt[1] && y >= site.bt[2] && y <= site.bt[3]) return '배 길이에요';
+    return '';
+  }
+  // 부재 하나를 놓을 수 있는지
+  function memberErr(site, ax, ay, bx, by, mat) {
+    const M = MAT[mat];
+    if (!M) return '재료가 없어요';
+    const len = Math.hypot(bx - ax, by - ay);
+    if (len < 0.5) return '너무 짧아요';
+    if (len > M.mx + 1e-6) return M.n + '는 ' + M.mx + 'm까지만 돼요';
+    if (M.road && (ax === bx || Math.abs(by - ay) > Math.abs(bx - ax) * 0.5 + 1e-6)) return '길은 2칸에 1칸보다 가파를 수 없어요';
+    for (let k = 1; k < 8; k++) { const t = k / 8; if (solid(site, ax + (bx - ax) * t, ay + (by - ay) * t, true)) return '땅을 뚫고 지나가요'; }
+    if (site.bt && segBox(ax, ay, bx, by, site.bt)) return '배 길을 막아요';
+    return '';
+  }
+  // 설계 전체 검사 ('' = 됨)
+  function designErr(site, str) {
+    str = String(str == null ? '' : str);
+    if (str.length > MAXD) return '너무 커요';
+    if (str && !/^[0-9a-zA-Z_-]*\|?[0-9a-zA-Z_-]*$/.test(str)) return '형식';
+    const D = parse(site, str);
+    if (D.x.length > MAXJ) return '이음새가 너무 많아요';
+    const seen = new Set();
+    for (let i = 0; i < D.x.length; i++) {
+      const k = D.x[i] + ',' + D.y[i];
+      if (seen.has(k)) return '겹친 이음새';
+      seen.add(k);
+      if (i >= D.na && jointErr(site, D.x[i], D.y[i])) return '이음새 자리';
+    }
+    const ms = new Set();
+    for (const m of D.m) {
+      if (!(m[0] >= 0 && m[0] < D.x.length && m[1] >= 0 && m[1] < D.x.length) || m[0] === m[1]) return '부재 번호';
+      if (MATS.indexOf(m[2]) < 0) return '재료';
+      const k = Math.min(m[0], m[1]) + ':' + Math.max(m[0], m[1]);
+      if (ms.has(k)) return '겹친 부재';
+      ms.add(k);
+      const e = memberErr(site, D.x[m[0]], D.y[m[0]], D.x[m[1]], D.y[m[1]], m[2]);
+      if (e) return e;
+    }
+    return '';
+  }
+  function costOf(site, D) {
+    let c = 0;
+    const A = anchors(site), usedFd = new Set();
+    for (const m of D.m) {
+      c += Math.hypot(D.x[m[1]] - D.x[m[0]], D.y[m[1]] - D.y[m[0]]) * MAT[m[2]].cost;
+      for (const j of [m[0], m[1]]) if (j < D.na && A[j][2] === 1) usedFd.add(j);
+    }
+    const used = new Set(); D.m.forEach((m) => { if (m[0] >= D.na) used.add(m[0]); if (m[1] >= D.na) used.add(m[1]); });
+    return Math.round(c / 10) * 10 + used.size * J_COST + usedFd.size * FD_COST;
+  }
+  const GEN = 999;   // 도전 현장 번호(현장은 state.gs에 들어 있다)
+  const SITE = (s, i) => (i === GEN && s && s.gs ? s.gs : SITES[i] || SITES[0]);
+  const budgetOf = (s) => SITE(s, s.si).B[s.vh];
+
+  /* ======================= 물리 ======================= */
+  const FPS = 60, SUB = 12, HH = 1 / (FPS * SUB), GRAV = 9.81, DAMP = 0.9985, KF = 1 / (0.06 * FPS * SUB), WAIT = 45;
+  // site, vh(−1이면 차 없이 자기 무게만), des(설계 문자열)
+  function makeSim(site, vh, des) {
+    const D = typeof des === 'string' ? parse(site, des) : des;
+    const nJ = D.x.length, nM = D.m.length;
+    const x = new Float64Array(nJ), y = new Float64Array(nJ), px = new Float64Array(nJ), py = new Float64Array(nJ);
+    const vx = new Float64Array(nJ), vy = new Float64Array(nJ), im = new Float64Array(nJ), fx = new Float64Array(nJ), fy = new Float64Array(nJ);
+    const ma = new Int32Array(nM), mb = new Int32Array(nM), L0 = new Float64Array(nM), al = new Float64Array(nM);
+    const tl = new Float64Array(nM), cl = new Float64Array(nM), rope = new Uint8Array(nM), road = new Uint8Array(nM);
+    const ff = new Float64Array(nM), ra = new Float64Array(nM), pk = new Float64Array(nM), pT = new Float64Array(nM), pC = new Float64Array(nM);
+    const br = new Int32Array(nM).fill(-1);
+    const mass = new Float64Array(nJ);
+    for (let i = 0; i < nJ; i++) { x[i] = D.x[i]; y[i] = D.y[i]; mass[i] = 0.02; }
+    for (let k = 0; k < nM; k++) {
+      const m = D.m[k], M = MAT[m[2]];
+      ma[k] = m[0]; mb[k] = m[1];
+      const len = Math.hypot(D.x[m[1]] - D.x[m[0]], D.y[m[1]] - D.y[m[0]]);
+      L0[k] = len; al[k] = len / M.EA / (HH * HH);
+      tl[k] = M.T; cl[k] = M.C * Math.min(1, M.bk / len); rope[k] = M.rope ? 1 : 0; road[k] = M.road ? 1 : 0;
+      mass[m[0]] += M.m * len / 2; mass[m[1]] += M.m * len / 2;
+    }
+    for (let i = 0; i < nJ; i++) im[i] = i < D.na ? 0 : 1 / mass[i];
+    const V = vh >= 0 ? VEH[vh] : null;
+    const nA = V ? V.ax.length : 0;
+    const S = {
+      site, vh, D, nJ, nM, x, y, ma, mb, br, ra, pk, pT, pC, tl, cl, rope, road, L0,
+      f: 0, done: false, ok: false, fail: '', front: -1.2, ay: new Float64Array(nA), axx: new Float64Array(nA), on: true, failF: -1,
+      maxF: V ? Math.ceil(WAIT + (site.L + 1.5 + V.len + 1.2) / V.v * FPS + 8 * FPS) : 90,
+      peak: 0, sg: 0,
+    };
+    const fail = (code) => { if (!S.fail) { S.fail = code; S.failF = S.f; S.on = false; S.done = true; } };
+    function roadAt(ax, prevY) {   // 바퀴 아래 길 찾기 → [부재, t, y, 기울기] 또는 null
+      let best = -1, bt = 0, by = 0, bd = 0.7, bs = 0;
+      for (let k = 0; k < nM; k++) {
+        if (!road[k] || br[k] >= 0) continue;
+        const a = ma[k], b = mb[k];
+        let x0 = x[a], x1 = x[b];
+        if (x0 > x1) { const t = x0; x0 = x1; x1 = t; }
+        if (ax < x0 - 1e-9 || ax > x1 + 1e-9 || x1 - x0 < 1e-6) continue;
+        const t = (ax - x[a]) / (x[b] - x[a]), yy = y[a] + (y[b] - y[a]) * t;
+        const d = Math.abs(yy - prevY);
+        if (d < bd) { bd = d; best = k; bt = t; by = yy; bs = Math.abs((y[b] - y[a]) / (x[b] - x[a])); }
+      }
+      return best < 0 ? null : [best, bt, by, bs];
+    }
+    function wind() {   // 옆바람: 부재 길이만큼 바람을 받아 양 끝 이음새를 → 쪽으로 민다(천천히 세졌다 약해지는 돌풍, 결정적)
+      const g = site.wd * (0.6 + 0.4 * Math.sin(S.f * 0.045) * Math.sin(S.f * 0.013 + 1));
+      for (let k = 0; k < nM; k++) { if (br[k] >= 0) continue; const f = g * L0[k] * 0.5; fx[ma[k]] += f; fx[mb[k]] += f; }
+    }
+    function vehicle() {
+      fx.fill(0); fy.fill(0);
+      if (site.wd) wind();
+      if (!V || !S.on) return;
+      if (S.f >= WAIT) S.front += V.v / FPS;
+      const Lx = site.L;
+      for (let k = 0; k < nA; k++) {
+        const ax = S.front - V.ax[k];
+        S.axx[k] = ax;
+        if (ax <= 0) { S.ay[k] = 0; continue; }
+        if (ax >= Lx) {
+          if (Math.abs(S.ay[k] - site.r) > 0.6) return fail('fall');
+          S.ay[k] = site.r; continue;
+        }
+        const r = roadAt(ax, S.ay[k]);
+        if (!r) return fail('fall');
+        if (r[3] > 0.8) return fail('steep');
+        const dd = site.r * ax / Lx - r[2];   // 곧은 길보다 얼마나 내려갔나(처짐)
+        if (dd > 1.5) return fail('sag');
+        const a0 = ma[r[0]], b0 = mb[r[0]], dfl = D.y[a0] + (D.y[b0] - D.y[a0]) * r[1] - r[2];   // 설계한 높이보다 얼마나 내려갔나
+        if (dfl > S.sg) S.sg = dfl;
+        S.ay[k] = r[2];
+        const F = V.w[k] * GRAV, a = ma[r[0]], b = mb[r[0]];
+        fy[a] -= F * (1 - r[1]); fy[b] -= F * r[1];
+      }
+      if (S.front - V.ax[nA - 1] >= Lx + 0.5) { S.ok = true; S.done = true; S.on = false; }
+    }
+    function boat() {
+      const bt = site.bt;
+      for (let k = 0; k < nM; k++) if (br[k] < 0 && segBox(x[ma[k]], y[ma[k]], x[mb[k]], y[mb[k]], bt)) return fail('boat');
+    }
+    S.step = function () {
+      if (V && !S.done) vehicle(); else if (site.wd) { fx.fill(0); fy.fill(0); if (!S.done) wind(); }
+      for (let s = 0; s < SUB; s++) {
+        for (let i = 0; i < nJ; i++) {
+          if (im[i] === 0) continue;
+          vy[i] = (vy[i] - GRAV * HH + fy[i] * im[i] * HH) * DAMP;
+          vx[i] = (vx[i] + fx[i] * im[i] * HH) * DAMP;
+          px[i] = x[i]; py[i] = y[i];
+          x[i] += vx[i] * HH; y[i] += vy[i] * HH;
+        }
+        for (let k = 0; k < nM; k++) {
+          if (br[k] >= 0) continue;
+          const a = ma[k], b = mb[k];
+          const dx = x[b] - x[a], dy = y[b] - y[a];
+          const len = Math.sqrt(dx * dx + dy * dy) || 1e-9;
+          const C = len - L0[k];
+          let F = 0;
+          if (!(rope[k] && C <= 0)) {
+            const wa = im[a], wb = im[b], wsum = wa + wb + al[k];
+            if (wa + wb > 0) {
+              const dl = -C / wsum, nx = dx / len, ny = dy / len;
+              x[a] -= wa * dl * nx; y[a] -= wa * dl * ny; x[b] += wb * dl * nx; y[b] += wb * dl * ny;
+              F = -dl / (HH * HH);
+            }
+          }
+          ff[k] += (F - ff[k]) * KF;
+          const f = ff[k], r = f >= 0 ? f / tl[k] : (cl[k] > 0 ? -f / cl[k] : 9);
+          ra[k] = r;
+          if (f > pT[k]) pT[k] = f;
+          if (-f > pC[k]) pC[k] = -f;
+          if (r > pk[k]) pk[k] = r;
+          if (r > 1) br[k] = S.f;
+        }
+        for (let i = 0; i < nJ; i++) {
+          if (im[i] === 0) continue;
+          let X = x[i], Y = y[i];
+          if (solid(site, X, Y, true)) {
+            const g = groundY(site, X);
+            if (X < 0 && Y < 0 && -X < g - Y) X = 0.001;
+            else if (X > site.L && Y < site.r && X - site.L < site.r - Y) X = site.L - 0.001;
+            else Y = Math.max(Y, X < 0 ? 0 : X > site.L ? site.r : g);
+            if (Y < -site.D) Y = -site.D;
+            x[i] = X; y[i] = Y;
+          }
+          vx[i] = (x[i] - px[i]) / HH; vy[i] = (y[i] - py[i]) / HH;
+        }
+      }
+      if (site.bt && V && !S.done && (S.f & 1) === 0) boat();
+      S.f++;
+      if (!S.done && S.f >= S.maxF) { if (V) fail('stuck'); else S.done = true; }
+      return S;
+    };
+    S.run = function () { while (!S.done) S.step(); let p = 0; for (let k = 0; k < nM; k++) if (br[k] < 0 && pk[k] > p) p = pk[k]; else if (br[k] >= 0) p = Math.max(p, 1); S.peak = p; return S; };
+    return S;
+  }
+  // 처짐 감점: 차가 지날 때 길이 설계 높이보다 내려간 만큼. 너비의 1/100까지는 괜찮고, 거기서 너비의 1/40 더 처지면 −40(최대).
+  const DEF_MAX = 40;
+  function defPen(L, dfl) { const ok = L / 100, span = L / 40; return Math.round(DEF_MAX * Math.max(0, Math.min(1, (dfl - ok) / span))); }
+  // 시험 결과 [ok, 점수, 비용, 최대힘%, 실패코드, 프레임, 처짐(cm)]
+  function evaluate(site, vh, str, B) {
+    const D = parse(site, str), cost = costOf(site, D);
+    const S = makeSim(site, vh, D).run();
+    let ok = S.ok ? 1 : 0, fc = FCODE.indexOf(S.fail);
+    if (fc < 0) fc = 0;
+    if (cost > B) { ok = 0; fc = 6; }
+    const pk = Math.min(1, S.peak);
+    let sc = 0;
+    const dcm = Math.round(S.sg * 100);
+    if (ok) sc = 60 + Math.round(25 * Math.max(0, Math.min(1, (B - cost) / (0.5 * B)))) + Math.round(15 * Math.max(0, Math.min(1, (1 - pk) / 0.5))) - defPen(site.L, dcm / 100);
+    return [ok, sc, cost, Math.round(pk * 100), fc, S.ok ? S.f : S.failF, dcm];
+  }
+
+  /* ======================= 규칙 ======================= */
+  const T_LIM = { 0: 0, 180: 180, 300: 300 };
+  const VSEQ = { 2: [0, 1], 3: [0, 1, 2], 4: [0, 1, 2, 3] };
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = n === 1 ? 1 : ([2, 3, 4].includes(opts.rounds) ? opts.rounds : 3);
+    const tl = T_LIM[opts.time] != null ? T_LIM[opts.time] : 300;
+    let ss;
+    const fixed = typeof opts.site === 'number' && opts.site >= 0 && VS.includes(opts.site) ? opts.site : -1;
+    if (fixed >= 0) ss = Array(R).fill(fixed);
+    else ss = U.shuffle(VS.slice()).slice(0, R);
+    return {
+      n, nm: players.map((p, i) => String(p.name || i + 1 + '번').slice(0, 10)), R, r: 0, ph: n === 1 ? 'pick' : 'b',
+      ss, vs: VSEQ[R] || VSEQ[3], si: n === 1 ? -1 : ss[0], vh: n === 1 ? 0 : (VSEQ[R] || VSEQ[3])[0], tl, solo: n === 1 ? 1 : 0,
+      d: Array(n).fill(null), rd: Array(n).fill(0), sc: Array(n).fill(0), rs: [], last: null, seq: 0, t0: Date.now(),
+      hu: players.map((p) => (p.ai ? 0 : 1)),
+    };
+  }
+  function actor(s) {
+    if (s.ph === 'end') return null;
+    if (s.ph === 'pick') return [0];
+    const a = []; for (let i = 0; i < s.n; i++) a.push(i); return a;
+  }
+  function finishRound(s) {
+    const site = SITE(s, s.si), B = budgetOf(s);
+    const res = [], rsc = [];
+    for (let i = 0; i < s.n; i++) { const r = evaluate(site, s.vh, s.d[i], B); res.push(r); rsc.push(r[1]); s.sc[i] += r[1]; }
+    s.rs.push(rsc);
+    s.last = { id: ++s.seq, r: s.r, si: s.si, vh: s.vh, B, d: s.d.slice(), res };
+    s.ph = 'v'; s.d = Array(s.n).fill(null); s.rd = Array(s.n).fill(0); s.t0 = Date.now();
+  }
+  function advance(s) {
+    if (s.r + 1 >= s.R) { s.ph = 'end'; return; }
+    s.r++; s.si = s.ss[s.r]; s.vh = s.vs[s.r]; s.ph = 'b'; s.last = null;
+    s.d = Array(s.n).fill(null); s.rd = Array(s.n).fill(0); s.t0 = Date.now();
+  }
+  function apply(s, seat, a) {
+    if (!a || typeof a !== 'object' || seat < 0 || seat >= s.n) throw new Error('bad action');
+    if (a.k === 'p') {
+      if (s.ph !== 'pick' || seat !== 0) throw new Error('not now');
+      const i = a.i | 0;
+      if (!(i >= 0 && i < SITES.length)) throw new Error('bad site');
+      s.si = i; s.ss = [i]; s.vh = SITES[i].v; s.vs = [s.vh]; s.ph = 'b'; s.t0 = Date.now();
+      return s;
+    }
+    if (a.k === 'c') {   // 혼자: 도전(만든 현장)
+      if (s.ph !== 'pick' || seat !== 0 || !s.solo) throw new Error('not now');
+      const lv = U.clamp(a.lv | 0, 1, 999), g = okGen(a.g) ? a.g : genSite(lv, (a.seed | 0) >>> 0);
+      s.gs = g; s.cl = lv; s.si = GEN; s.ss = [GEN]; s.vh = g.v; s.vs = [g.v]; s.ph = 'b'; s.t0 = Date.now();
+      return s;
+    }
+    if (a.k === 'd') {
+      if (s.ph !== 'b' || s.d[seat] != null) throw new Error('not now');
+      const c = String(a.d == null ? '' : a.d);
+      const e = designErr(SITE(s, s.si), c);
+      if (e) throw new Error('bad design: ' + e);
+      s.d[seat] = c;
+      if (s.d.every((x) => x != null)) finishRound(s);
+      return s;
+    }
+    if (a.k === 'n') {
+      if (s.ph !== 'v' || s.rd[seat]) throw new Error('not now');
+      s.rd[seat] = 1;
+      if (s.rd.every((x) => x)) advance(s);
+      return s;
+    }
+    throw new Error('unknown action');
+  }
+  const STARS = [60, 75, 88];
+  const CSTAR = [0.8, 0.65];   // 도전 별: 성공 ★ · 예산의 80% 이하 ★★ · 65% 이하 ★★★ (재료비 기준)
+  function chalStars(r, B) { return !r || !r[0] ? 0 : r[2] <= B * CSTAR[1] ? 3 : r[2] <= B * CSTAR[0] ? 2 : 1; }
+  function result(s) {
+    if (!s || s.ph !== 'end') return null;
+    const nm = (i) => s.nm[i] || i + 1 + '번';
+    if (s.solo && s.gs && s.si === GEN) {
+      const r = s.last && s.last.res[0], B = s.last ? s.last.B : 0, st = chalStars(r, B), g = s.gs;
+      return { winners: st ? [0] : [], title: st ? '도전 ' + s.cl + '단계 성공! 별 ' + st + '개' : '도전 실패',
+        text: '★'.repeat(st) + '☆'.repeat(3 - st) + '  ' + g.n + (r ? ' · 재료비 ' + r[2].toLocaleString('ko-KR') + ' / 예산 ' + B.toLocaleString('ko-KR') : '') + (r && !r[0] ? ' (' + FAIL[FCODE[r[4]]] + ')' : '') +
+          '\n별: 성공 ★ · 재료비 ' + Math.floor(B * CSTAR[0]).toLocaleString('ko-KR') + ' 이하 ★★ · ' + Math.floor(B * CSTAR[1]).toLocaleString('ko-KR') + ' 이하 ★★★' +
+          '\n' + (st ? '「한 판 더」로 ' + (s.cl + 1) + '단계에 도전!' : '「한 판 더」로 ' + s.cl + '단계 새 현장에 다시 도전!') };
+    }
+    if (s.solo) {
+      const r = s.last && s.last.res[0], v = r ? r[1] : 0, st = STARS.filter((x) => v >= x).length;
+      const site = SITES[s.ss[0]];
+      return { winners: st ? [0] : [], title: st ? '별 ' + st + '개!' : '시험 실패',
+        text: '★'.repeat(st) + '☆'.repeat(3 - st) + '  ' + (site ? site.n : '') + ' · ' + v + '점' + (r && !r[0] ? ' (' + FAIL[FCODE[r[4]]] + ')' : '') + '\n별: 성공 · ' + STARS[1] + '점 · ' + STARS[2] + '점' };
+    }
+    const per = (i) => s.rs.map((r) => r[i]).join(' · ');
+    const ord = s.sc.map((_, i) => i).sort((a, b) => s.sc[b] - s.sc[a] || a - b);
+    const top = s.sc[ord[0]], winners = ord.filter((i) => s.sc[i] === top);
+    return { winners, stats: [{ label: '총점', values: s.sc.slice() }, { label: '최고 라운드', values: s.sc.map((_, i) => Math.max(0, ...s.rs.map((r) => +r[i] || 0))) }],
+      title: winners.length === 1 ? nm(winners[0]) + ' 우승!' : '공동 우승',
+      text: ord.map((i) => (s.sc.filter((v) => v > s.sc[i]).length + 1) + '위  ' + nm(i) + '  ' + s.sc[i] + '점  (' + per(i) + ')').join('\n') };
+  }
+
+  /* ======================= AI 설계 ======================= */
+  // 틀(스타일)로 다리를 짓고, 시험 운행에서 잰 힘으로 부재 재료를 고쳐 가며 다듬는다.
+  function Builder(site) {
+    const A = anchors(site);
+    const B = { x: A.map((p) => p[0]), y: A.map((p) => p[1]), na: A.length, m: [], key: new Map(), mk: new Set() };
+    A.forEach((p, i) => B.key.set(p[0] + ',' + p[1], i));
+    B.j = (x, y) => {
+      const k = x + ',' + y;
+      if (B.key.has(k)) return B.key.get(k);
+      if (jointErr(site, x, y)) return -1;
+      B.x.push(x); B.y.push(y); B.key.set(k, B.x.length - 1); return B.x.length - 1;
+    };
+    B.add = (a, b, mat) => {
+      if (a < 0 || b < 0 || a === b) return false;
+      const k = Math.min(a, b) + ':' + Math.max(a, b);
+      if (B.mk.has(k)) return false;
+      if (memberErr(site, B.x[a], B.y[a], B.x[b], B.y[b], mat)) return false;
+      B.mk.add(k); B.m.push([a, b, mat]); return true;
+    };
+    return B;
+  }
+  function deckXs(site, p) {
+    const xs = new Set([0, site.L]);
+    for (let x = p; x < site.L; x += p) xs.add(x);
+    (site.rk || []).concat(site.fd || []).forEach((q) => { if (q[0] > 0 && q[0] < site.L) xs.add(q[0]); });
+    const a = [...xs].sort((u, v) => u - v);
+    // 3m 넘는 칸은 나누기
+    for (let i = 0; i + 1 < a.length; i++) if (a[i + 1] - a[i] > 2) { a.splice(i + 1, 0, a[i] + 2); }
+    return a.filter((v, i) => i === 0 || v - a[i - 1] >= 1);
+  }
+  const deckY = (site, x) => Math.round(site.r * x / site.L);
+  // style: 'below' | 'above' | 'pony' | 'stay' | 'deck'(길만)
+  function genStyle(site, st, h, mats, rnd, drop) {
+    const B = Builder(site), A = anchors(site);
+    const xs = deckXs(site, 2), dk = xs.map((x) => B.j(x, deckY(site, x)));
+    if (dk.some((j) => j < 0)) return null;
+    for (let i = 0; i + 1 < dk.length; i++) if (!B.add(dk[i], dk[i + 1], 'R')) return null;
+    const keep = () => !drop || rnd() > drop;
+    const ch = mats.ch, dg = mats.dg;
+    // 기초·바위 기둥 받침
+    A_SUP: for (const q of (site.rk || []).concat(site.fd || [])) {
+      const i = xs.indexOf(q[0]); if (i < 0) continue;
+      const top = dk[i], base = B.key.get(q[0] + ',' + q[1]);
+      let len = B.y[top] - q[1];
+      if (len <= 0) continue;
+      let prev = base, yy = q[1];
+      while (B.y[top] - yy > MAT.K.mx) { yy += MAT.K.mx; const j = B.j(q[0], yy); if (j < 0) continue A_SUP; B.add(prev, j, 'K'); prev = j; }
+      B.add(prev, top, 'K');
+      // 기둥 옆 버팀(좌우 들보)
+      const jl = B.j(q[0] - 1, Math.min(B.y[top] - 1, q[1] + 2)), jr = B.j(q[0] + 1, Math.min(B.y[top] - 1, q[1] + 2));
+      if (i > 0 && jl >= 0 && B.y[top] - q[1] > 2) { B.add(base, jl, dg); B.add(jl, dk[i - 1], dg); B.add(jl, top, dg); }
+      if (i + 1 < dk.length && jr >= 0 && B.y[top] - q[1] > 2) { B.add(base, jr, dg); B.add(jr, dk[i + 1], dg); B.add(jr, top, dg); }
+    }
+    const has = (k) => st.split('+').includes(k);
+    if (has('below')) {
+      const bj = [];
+      for (let i = 0; i + 1 < xs.length; i++) {
+        const mx = (xs[i] + xs[i + 1]) / 2;
+        if (mx !== Math.round(mx)) { bj.push(-1); continue; }
+        const yy = Math.min(deckY(site, xs[i]), deckY(site, xs[i + 1])) - h;
+        bj.push(B.j(mx, yy));
+      }
+      if (bj.filter((j) => j >= 0).length < Math.max(1, bj.length - 2)) return null;
+      for (let i = 0; i < bj.length; i++) {
+        if (bj[i] < 0) continue;
+        if (keep()) B.add(dk[i], bj[i], dg);
+        if (keep()) B.add(dk[i + 1], bj[i], dg);
+        if (i + 1 < bj.length && bj[i + 1] >= 0) B.add(bj[i], bj[i + 1], ch);
+      }
+      // 벼랑 고정점으로 아래 줄 끝 잇기
+      const firstB = bj.find((j) => j >= 0), lastB = [...bj].reverse().find((j) => j >= 0);
+      A.forEach((p, ai) => {
+        if (ai < 2 || p[2] !== 0) return;
+        const tgt = p[0] <= 0 ? firstB : lastB;
+        if (tgt != null && tgt >= 0) B.add(ai, tgt, ch) || B.add(ai, tgt, 'S');
+      });
+    }
+    if (has('above') || has('pony')) {
+      const tj = [];
+      if (has('above')) {
+        for (let i = 1; i + 1 < xs.length; i++) tj[i] = B.j(xs[i], deckY(site, xs[i]) + Math.min(h, site.top));
+        const n = xs.length - 1, mid = site.L / 2;
+        for (let i = 1; i < n; i++) {
+          if (tj[i] < 0) return null;
+          B.add(dk[i], tj[i], dg);
+          if (i + 1 < n) B.add(tj[i], tj[i + 1], ch);
+        }
+        if (!B.add(dk[0], tj[1], ch)) return null;
+        if (!B.add(dk[n], tj[n - 1], ch)) return null;
+        for (let i = 1; i + 1 < n; i++) {
+          if (!keep()) continue;
+          if ((xs[i] + xs[i + 1]) / 2 <= mid) B.add(tj[i], dk[i + 1], dg); else B.add(tj[i + 1], dk[i], dg);
+        }
+      } else {
+        for (let i = 0; i + 1 < xs.length; i++) {
+          const mx = (xs[i] + xs[i + 1]) / 2;
+          tj[i] = mx === Math.round(mx) ? B.j(mx, Math.max(deckY(site, xs[i]), deckY(site, xs[i + 1])) + Math.min(h, site.top, 2)) : -1;
+        }
+        for (let i = 0; i < tj.length; i++) {
+          if (tj[i] < 0) continue;
+          if (keep() || i === 0) B.add(dk[i], tj[i], dg);
+          if (keep() || i === tj.length - 1) B.add(dk[i + 1], tj[i], dg);
+          if (i + 1 < tj.length && tj[i + 1] >= 0) B.add(tj[i], tj[i + 1], ch);
+        }
+      }
+    }
+    if (has('stay')) {
+      const hi = A.map((p, i) => i).filter((i) => i >= 2 && A[i][1] > 0);
+      if (!hi.length) return null;
+      for (let i = 1; i + 1 < dk.length; i++) {
+        let best = -1, bd = 1e9;
+        for (const a of hi) { const d = Math.hypot(A[a][0] - B.x[dk[i]], A[a][1] - B.y[dk[i]]); if (d < bd) { bd = d; best = a; } }
+        if (best >= 0 && bd <= MAT[mats.cb].mx && keep()) B.add(best, dk[i], mats.cb);
+      }
+      // 길 위 버팀 (얕은 트러스)
+      if (h > 0) {
+        for (let i = 0; i + 1 < xs.length; i++) {
+          const mx = (xs[i] + xs[i + 1]) / 2;
+          if (mx !== Math.round(mx)) continue;
+          const t = B.j(mx, deckY(site, xs[i]) - h);
+          if (t < 0) continue;
+          B.add(dk[i], t, dg); B.add(dk[i + 1], t, dg);
+          const pt = B.key.get((mx - 2) + ',' + (deckY(site, xs[i]) - h));
+          if (pt != null) B.add(pt, t, ch);
+        }
+      }
+    }
+    return B;
+  }
+  function bStr(B) { return serialize(compact(B)); }
+  // 잰 힘으로 재료 고르기: 각 부재에 대해 한계 대비 비율이 target 아래인 가장 싼 재료
+  function refit(site, B, S, target, upOnly) {
+    let changed = 0;
+    for (let k = 0; k < B.m.length; k++) {
+      const m = B.m[k], cur = m[2];
+      if (cur === 'R') continue;
+      const len = S.L0[k], T = S.pT[k] * 1.05, C = S.pC[k] * 1.05;
+      const pool = MAT[cur].rope ? ['P', 'C'] : ['W', 'K', 'S'];
+      const ratio = (mt) => { const M = MAT[mt]; const cl = M.C * Math.min(1, M.bk / len); return Math.max(T / M.T, M.rope ? (C > 1 ? 9 : 0) : C / cl); };
+      let pick = cur;
+      if (upOnly) {
+        if (S.br[k] >= 0 || ratio(cur) > target) {
+          let br = ratio(cur) - 0.05;
+          for (const mt of pool) if (len <= MAT[mt].mx && ratio(mt) < br) { br = ratio(mt); pick = mt; }
+        }
+      } else {
+        pick = '';
+        for (const mt of pool) if (len <= MAT[mt].mx && ratio(mt) <= target) { pick = mt; break; }
+        if (!pick) pick = MAT[cur].rope ? 'C' : len <= MAT.S.mx ? 'S' : cur;
+      }
+      if (pick !== cur) { m[2] = pick; changed++; }
+    }
+    return changed;
+  }
+  const AIP = {
+    1: { drop: 0.22, hs: [1, 2] },
+    2: { sims: 10, tg: [0.95], styles: 3, hs: [1, 2, 3], refine: 2, ms: 220 },
+    3: { sims: 30, tg: [0.75, 0.9], styles: 4, hs: [1, 2, 3], refine: 2, ms: 350 },
+  };
+  function styleList(site, vh) {
+    const out = [];
+    const below = -site.D <= -2.5 && !(site.bt && site.bt[0] < site.L * 0.4 && site.bt[1] > site.L * 0.6);
+    if (site.rk && site.rk.some((q) => q[1] > 0)) out.push('stay');
+    if (below) out.push('below');
+    if (site.top >= 2) out.push('above');
+    if (site.top >= 1) out.push('pony');
+    if (below && site.top >= 2) out.push('below+above');
+    if (below && site.top >= 1 && site.top < 2) out.push('below+pony');
+    if (!out.length) out.push('below');
+    if (site.L >= 16 && vh >= 2) out.sort((a, b) => (b.includes('+') ? 1 : 0) - (a.includes('+') ? 1 : 0));
+    return out;
+  }
+  function* aiDesignG(site, vh, lv, rnd, Bud, noT) {   // 시뮬레이션 한 번마다 yield (도전 현장 만들기를 잘게 나눠 돌리려고)
+    const P = AIP[lv] || AIP[2];
+    if (Bud == null) Bud = site.B[vh];
+    let styles = styleList(site, vh);
+    if (lv === 1) {   // 쉬움: 틀 하나를 대충(가끔 빗대 빠짐), 재료는 짐작으로, 시험은 안 해 봄
+      const st = styles[Math.floor(rnd() * styles.length)], h = P.hs[Math.floor(rnd() * P.hs.length)];
+      const mats = { ch: vh >= 2 || (vh === 1 && rnd() < 0.5) ? 'S' : 'W', dg: vh >= 2 && rnd() < 0.5 ? 'S' : 'W', cb: vh >= 1 ? 'C' : 'P' };
+      for (let t = 0; t < 4; t++) {
+        const Bd = genStyle(site, styles[(styles.indexOf(st) + t) % styles.length], Math.max(1, Math.min(h, site.top || h)), mats, rnd, P.drop);
+        if (Bd) { const str = bStr(Bd); if (!designErr(site, str)) return str; }
+      }
+      return '';
+    }
+    styles = styles.slice(0, P.styles);
+    // 같은 난이도 봇끼리도 설계가 조금씩 다르게: 보통은 틀 순서를 섞고, 어려움은 목표 여유를 살짝 흔든다
+    if (lv === 2) for (let i = styles.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = styles[i]; styles[i] = styles[j]; styles[j] = t; }
+    const tgs = lv >= 3 ? P.tg.map((t) => t - 0.08 * rnd()) : P.tg;
+    let best = '', bestSc = -1, sims = 0;
+    {   // 길만 놓은 가장 싼 다리도 후보로(가벼운 차·짧은 현장에선 이게 최고점일 때가 있다)
+      const Bd = genStyle(site, 'deck', 1, { ch: 'S', dg: 'S', cb: 'C' }, rnd, 0);
+      const str = Bd ? bStr(Bd) : '';
+      if (str && !designErr(site, str)) { const ev = evaluate(site, vh, str, Bud); sims++; yield; if (ev[0] && ev[1] > bestSc) { bestSc = ev[1]; best = str; } }
+    }
+    const tEnd = Date.now() + (P.ms || 400);
+    for (const h0 of P.hs) {
+      for (const st of styles) {
+        if (sims >= P.sims || (best && bestSc > 0 && !noT && Date.now() > tEnd)) break;
+        const h = st === 'above' ? Math.min(h0, site.top) : st === 'pony' ? Math.min(h0, site.top, 2) : h0;
+        if (h < 1) continue;
+        // 1) 전부 쇠로 지어 힘을 재고 → 2) 버틸 만한 가장 싼 재료로 → 3) 끊어지면 그 부재만 올리기
+        const Bd = genStyle(site, st, h, { ch: 'S', dg: 'S', cb: 'C' }, rnd, 0);
+        if (!Bd) continue;
+        const s0 = bStr(Bd);
+        if (designErr(site, s0)) continue;
+        let D = parse(site, s0), S0 = makeSim(site, vh, D).run(); sims++; yield;
+        for (let k = 0; k < 2 && !S0.ok && lv >= 3; k++) {   // 다 쇠여도 안 되면 끊어진 곳만 더 맞는 재료로
+          const BB = { x: D.x, y: D.y, na: D.na, m: D.m.map((m) => m.slice()) };
+          if (!refit(site, BB, S0, 0.9, true)) break;
+          D = BB; S0 = makeSim(site, vh, D).run(); sims++; yield;
+        }
+        if (!S0.ok) { if (!best) best = s0; continue; }
+        for (const tg of tgs) {
+          const BB = { x: D.x, y: D.y, na: D.na, m: D.m.map((m) => m.slice()) };
+          refit(site, BB, S0, tg, false);
+          let S = null;
+          for (let it = 0; it <= P.refine && sims < P.sims; it++) {
+            if (S && !refit(site, BB, S, tg * 0.9, true)) break;
+            const str = serialize(BB);
+            if (designErr(site, str)) break;
+            const ev = evaluate(site, vh, str, Bud); sims++; yield;
+            if (ev[1] > bestSc) { bestSc = ev[1]; best = str; }
+            if (ev[0]) break;
+            S = makeSim(site, vh, parse(site, str)).run(); sims++; yield;
+          }
+        }
+        if (bestSc <= 0) { const ev = evaluate(site, vh, s0, Bud); sims++; yield; if (ev[1] > bestSc) { bestSc = ev[1]; best = s0; } }
+        if (lv === 2 && bestSc > 0) return best;
+      }
+    }
+    return best;
+  }  function runG(it) { let r; do r = it.next(); while (!r.done); return r.value; }
+  function aiDesign(site, vh, lv, rnd, Bud) { return runG(aiDesignG(site, vh, lv, rnd, Bud, 0)); }
+
+  // 시험 공개 재생 빠르기: me = 사람의 다리(보통 빠르기), fast = 봇의 다리(빠르게). intro/card는 초, rate는 배속.
+  const RIDE = { me: { intro: 0.9, rate: 1.8, card: 2.4 }, fast: { intro: 0.4, rate: 3.6, card: 1.3 } };
+  const TAIL_OK = 20, TAIL_FAIL = 100;   // 건넌 뒤 / 무너진 뒤 더 보여 주는 프레임
+  const rideSecs = (r, P) => P.intro + (r[5] + (r[0] ? TAIL_OK : TAIL_FAIL)) / FPS / P.rate + P.card;
+  const BOARD_BOT = 2.5;   // 봇만 있을 때 결과판을 보여 주는 시간(초)
+  function revealMs(last) { let t = BOARD_BOT; last.res.forEach((r) => { t += rideSecs(r, RIDE.fast); }); return t * 1000; }
+  const anyHuman = (s) => !s.hu || s.hu.some((x) => x);
+  function aiDelayFor(s, seat, lv) {
+    const sp = (L.debug && L.debug.speed) || 1;
+    const el = Math.max(0, Date.now() - (s.t0 || 0)) * sp;
+    if (s.ph === 'pick') return 700;
+    // 봇 설계는 바로(자리마다 조금씩 엇갈려 한꺼번에 몰리지 않게)
+    if (s.ph === 'b') return s.d[seat] != null ? -1 : 350 + 250 * (seat % 4);
+    if (s.ph === 'v') {
+      if (s.rd[seat] || !s.last) return -1;
+      if (anyHuman(s)) return 250;   // 사람이 있으면 봇은 바로 준비 → 사람이 「다음」 누르면 곧장 다음 판
+      return Math.max(300, revealMs(s.last) - el);   // 봇끼리: 빠른 재생이 끝날 만큼만
+    }
+    return -1;
+  }
+  function ai(s, seat, lv) {
+    if (s.ph === 'pick') return seat === 0 ? { k: 'p', i: Math.floor(Math.random() * SITES.length) } : null;
+    if (s.ph === 'v') return s.rd[seat] ? null : { k: 'n' };
+    if (s.ph !== 'b' || s.d[seat] != null) return null;
+    // 성향: 공격형은 싸게(예산 90%), 도박형은 가끔 아주 아슬하게(75%), 수비형은 넉넉히 튼튼하게. 안 되면 원래대로
+    const sty = (L.aiStyle && L.aiStyle(seat)) || 'bal', B0 = budgetOf(s);
+    const kb = sty === 'agg' ? 0.9 : sty === 'gamble' && Math.random() < 0.5 ? 0.75 : 1;
+    let d = kb < 1 && B0 != null ? aiDesign(SITE(s, s.si), s.vh, lv || 2, Math.random, B0 * kb) : '';
+    if (!d || designErr(SITE(s, s.si), d)) d = aiDesign(SITE(s, s.si), s.vh, lv || 2, Math.random, B0);
+    if (designErr(SITE(s, s.si), d)) d = '';
+    return { k: 'd', d };
+  }
+
+  /* ======================= 도전: 현장 만들기 =======================
+     단계(lv)가 오를수록 넓고 깊고 무거운 차. 만든 현장은 어려움 AI가 직접 다리를 지어 건너는 것까지 확인한 뒤,
+     그 설계 비용의 1.3배를 예산으로 정한다(→ 반드시 풀 수 있음). 실패하면 다른 모양으로 다시, 끝까지 안 되면 검증된 현장. */
+  function mkRng(seed) {
+    let a = (seed >>> 0) || 0x9e3779b9;
+    return function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const GKIND = [['협곡', '🏜️'], ['강', '🌊'], ['비탈', '📐'], ['지지대', '🏛️'], ['바람', '🌬️'], ['배 길', '⛵']];
+  function siteShape(lv, r) {
+    const pick = (a) => a[Math.floor(r() * a.length)];
+    const kinds = lv < 3 ? [0, 1] : lv < 5 ? [0, 1, 2, 3] : [0, 1, 2, 3, 4, 5];
+    const kd = pick(kinds);
+    let L = 6 + 2 * Math.min(6, Math.floor((lv - 1) / 2) + Math.floor(r() * 2));
+    const g = { n: '', e: GKIND[kd][1], L, r: 0, D: 4, top: 4, an: [], th: Math.floor(r() * 5), d: '' };
+    const vh = lv <= 2 ? 0 : lv <= 4 ? 1 : lv <= 7 ? pick([1, 2]) : pick([2, 4, 2, 3, 1]);
+    if (kd === 0) { g.D = 5 + Math.floor(r() * Math.min(8, 2 + lv)); g.an = [[0, -2], [L, -2]]; if (g.D >= 8) g.an.push([0, -5], [L, -5]); g.top = r() < 0.25 ? 2 : 4; g.d = '깊은 협곡이에요. 벼랑 고정점으로 아래를 받쳐 보세요.'; }
+    else if (kd === 1) { g.D = 3 + Math.floor(r() * 4); g.w = -Math.min(g.D - 1, 2 + Math.floor(r() * 2)); if (L >= 10 && r() < 0.6) g.fd = [[L / 2, -g.D]]; g.d = '강을 건너요.' + (g.fd ? ' 강바닥 가운데 기초 자리(300)가 있어요.' : ''); }
+    else if (kd === 2) { const up = r() < 0.6 ? 1 : -1, h = Math.max(1, Math.min(Math.floor(L / 4), 1 + Math.floor(r() * 4))); g.r = up * h; g.D = 5 + Math.floor(r() * 4); g.an = [[0, -2], [L, g.r - 2]]; g.d = '양쪽 높이가 ' + h + 'm 달라요. 길 기울기를 지켜요.'; }
+    else if (kd === 3) { L = g.L = Math.max(L, 12); g.D = 4 + Math.floor(r() * 3); g.w = -2; if (r() < 0.5) g.rk = [[L / 2, -1 - Math.floor(r() * 2)]]; else g.fd = [[Math.round(L / 3), -g.D], [L - Math.round(L / 3), -g.D]]; g.d = '가운데를 받칠 자리가 있어요. 받침 기둥으로 칸을 나눠요.'; }
+    else if (kd === 4) { g.D = 6 + Math.floor(r() * 4); g.an = [[0, -2], [L, -2]]; g.wd = 3 + Math.min(5, lv * 0.5 + r() * 2); g.d = '옆바람이 다리를 밀어요(→). 세모로 단단히!'; g.wd = Math.round(g.wd * 10) / 10; }
+    else { L = g.L = Math.max(L, 12); g.D = 5; g.w = -3; g.top = 6; const a = 2 + Math.floor(r() * 2); g.bt = [L / 2 - a, L / 2 + a, -3, -0.5]; g.d = '가운데 배 길에는 아무것도 못 지어요. 위로!'; }
+    if (kd !== 4 && lv >= 6 && r() < 0.3) { g.wd = 2 + Math.round(r() * 30) / 10; g.d += ' 바람도 불어요.'; }
+    return { g, vh, kd };
+  }
+  function okGen(g) {   // 화면이 미리 만들어 보낸 도전 현장 검사(모양만 — 풀 수 있는지는 만들 때 확인)
+    if (!g || typeof g !== 'object' || JSON.stringify(g).length > 700) return false;
+    const n = (v, a, b) => typeof v === 'number' && isFinite(v) && v >= a && v <= b;
+    return n(g.L, 4, 24) && n(g.r, -6, 6) && n(g.D, 1, 14) && n(g.top, 0, 8) && n(g.v, 0, VEH.length - 1) && Array.isArray(g.B) && g.B.length === 5 && g.B.every((x) => n(x, 100, 1e6)) && Array.isArray(g.an) && typeof g.n === 'string';
+  }
+  function genSite(lv, seed) { return runG(genSiteG(lv, seed)); }
+  function* genSiteG(lv, seed) {
+    for (let t = 0; t < 6; t++) {
+      const r = mkRng((seed ^ Math.imul(lv, 0x9e3779b9) ^ Math.imul(t + 1, 0x85ebca6b)) >>> 0);
+      const { g, vh, kd } = siteShape(Math.max(1, lv - t), r);
+      g.B = [1e7, 1e7, 1e7, 1e7, 1e7]; g.v = vh;
+      let c = 0;   // 어려움 AI로 두 번 지어 보고 더 싼 쪽 기준
+      for (let k = 0; k < 2; k++) {
+        const d = yield* aiDesignG(g, vh, 3, r, 1e7, 1);
+        if (!d || designErr(g, d)) continue;
+        const ev = evaluate(g, vh, d, 1e7); yield;
+        if (ev[0] && (!c || ev[2] < c)) c = ev[2];
+      }
+      if (!c) continue;
+      const B = Math.ceil(c * 1.3 / 100) * 100;
+      g.B = [B, B, B, B, B]; g.n = '도전 ' + lv + '단계 · ' + GKIND[kd][0]; g.ok = 1;
+      return g;
+    }
+    const f = JSON.parse(JSON.stringify(SITES[1])); f.n = '도전 ' + lv + '단계 · 도랑'; f.v = 0; f.ok = 0; return f;
+  }
+
+  /* ======================= 화면 ======================= */
+  const FONT = '"IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif';
+  const DISP = '"Black Han Sans", ' + FONT;
+  const MONO = '"IBM Plex Mono", ui-monospace, Menlo, monospace';
+  const EMO = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  const THEMES = [
+    { sky: ['#241c3e', '#5e4470', '#d2926a'], hill: '#3a3550', rock: '#6b4c3c', rock2: '#55392c', top: '#5d8a3e' },
+    { sky: ['#17213c', '#35557c', '#93b8d2'], hill: '#2c3e58', rock: '#5c564a', rock2: '#47423a', top: '#4f8a4a' },
+    { sky: ['#2c1a36', '#82463f', '#e39a5c'], hill: '#5a3040', rock: '#a65a36', rock2: '#86452a', top: '#cf8a50' },
+    { sky: ['#0c1124', '#1d2a48', '#3a566a'], hill: '#18243a', rock: '#423d48', rock2: '#332f38', top: '#2f5a3a' },
+    { sky: ['#182846', '#46689a', '#b4c8e2'], hill: '#5a7090', rock: '#687286', rock2: '#545d6e', top: '#eef4fa' },
+  ];
+  const fmt = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  function stressCol(r) {   // 0 초록 → 0.6 노랑 → 0.85 주황 → 1 빨강
+    r = Math.max(0, Math.min(1, r));
+    const P = [[0, 80, 200, 120], [0.6, 235, 215, 70], [0.85, 255, 140, 50], [1, 255, 60, 60]];
+    for (let i = 1; i < P.length; i++) if (r <= P[i][0]) {
+      const a = P[i - 1], b = P[i], t = (r - a[0]) / (b[0] - a[0]);
+      return 'rgb(' + Math.round(a[1] + (b[1] - a[1]) * t) + ',' + Math.round(a[2] + (b[2] - a[2]) * t) + ',' + Math.round(a[3] + (b[3] - a[3]) * t) + ')';
+    }
+    return 'rgb(255,60,60)';
+  }
+  // [건넘, 남은 예산, 버팀 여유, 처짐 감점]
+  const scoreParts = (r, B, L) => { if (!r[0]) return [0, 0, 0, 0]; const b = Math.round(25 * Math.max(0, Math.min(1, (B - r[2]) / (0.5 * B)))), p = defPen(L, (r[6] || 0) / 100); return [60, b, r[1] - 60 - b + p, p]; };
+
+  const CSS = `
+.bg-brief{position:absolute;left:8px;right:8px;top:6px;z-index:3;background:rgba(30,23,40,.93);border:1px solid var(--line);border-radius:14px;padding:6px 10px 7px;display:flex;flex-direction:column;gap:4px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+.bg-b1{display:flex;align-items:center;gap:8px;min-width:0}
+.bg-b1 .nm{font:400 18px var(--f-display);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.bg-b1 .rd{font:600 12px var(--f-body);color:var(--muted);white-space:nowrap}
+.bg-b1 .tm{margin-left:auto;font:600 15px var(--f-mono);color:var(--brass);white-space:nowrap}
+.bg-b1 .tm.low{color:var(--coral)}
+.bg-b1 .more{font:600 11px var(--f-body);color:var(--muted);border:1px solid var(--line);border-radius:8px;padding:1px 6px;white-space:nowrap}
+.bg-b2{display:flex;align-items:center;gap:7px;min-width:0;font:600 12.5px var(--f-body)}
+.bg-bud{flex:0 0 auto;font-family:var(--f-mono);font-size:12px}
+.bg-bud.over{color:var(--coral)}
+.bg-budbar{flex:0 0 46px;height:7px;border-radius:4px;background:#3a3048;overflow:hidden}
+.bg-budbar i{display:block;height:100%;background:var(--brass);transition:width .2s}
+.bg-budbar.over i{background:var(--coral)}
+.bg-run{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+.bg-run.ok{color:#8fe3b0}.bg-run.bad{color:#ff8a78}.bg-run.warn{color:#ffc46a}
+.bg-bot{position:absolute;left:0;right:0;bottom:0;z-index:3;padding:4px 6px 7px;display:flex;flex-direction:column;gap:5px;background:linear-gradient(rgba(23,19,31,.0),rgba(23,19,31,.95) 10px)}
+.bg-info{font:500 12px var(--f-body);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 4px;min-height:16px}
+.bg-info b{color:var(--ink);font-weight:600}.bg-info .er{color:#ff8a78}
+.bg-mats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px}
+.bg-m{appearance:none;height:50px;border-radius:10px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:1px 0;font:600 11px/1.1 var(--f-body);cursor:pointer;touch-action:manipulation;min-width:0;white-space:nowrap;user-select:none;-webkit-user-select:none}
+.bg-m i{display:block;width:30px;border-radius:3px;pointer-events:none}
+.bg-m .c{font:500 9.5px var(--f-mono);color:var(--muted)}
+.bg-m.on{background:#43351f;border-color:var(--brass);box-shadow:inset 0 0 0 1px var(--brass)}
+.bg-m:active{transform:scale(.94)}
+.bg-tools{display:flex;gap:5px}
+.bg-tools .btn{min-height:46px;padding:0 4px;font-size:15px}
+.bg-t{flex:0 0 46px;font-size:19px!important}
+.bg-t.on{background:#43351f;border-color:var(--brass);color:var(--brass)}
+.bg-t.del.on{background:#4a2224;border-color:var(--coral);color:#ffb0a4}
+.bg-t:disabled{opacity:.35}
+.bg-test{flex:1 1 0;min-width:0;white-space:nowrap}
+.bg-test.on{background:#24453a;border-color:#4fc08a}
+.bg-done{flex:1 1 0;min-width:0;white-space:nowrap}
+.bg-done.armed{background:var(--coral);border-color:var(--coral);animation:bgPulse .7s ease-in-out infinite}
+@keyframes bgPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.04)}}
+.bg-hid{display:none!important}
+.bg-rev{position:absolute;left:0;right:0;bottom:0;z-index:3;display:flex;gap:8px;align-items:center;padding:8px 10px 10px;background:linear-gradient(rgba(23,19,31,0),rgba(23,19,31,.94) 14px)}
+.bg-rev .btn{flex:1;min-height:50px;font-size:16px}
+.bg-rev .muted{flex:1;text-align:center;font-size:14px;min-height:44px;display:flex;align-items:center;justify-content:center}
+.bg-hand,.bg-pick{position:absolute;inset:0;z-index:12;background:radial-gradient(circle at 50% 35%,#2c3244,#10121a 72%)}
+.bg-hand{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:24px}
+.bg-hand .big{font-family:var(--f-display);font-size:30px}
+.bg-hand .btn{min-width:200px;min-height:52px;font-size:17px}
+.bg-gen{position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px;text-align:center;background:rgba(12,13,20,.88);color:var(--ink,#f2e9d8);font:500 13px var(--f-body,sans-serif)}.bg-gen b{font:400 22px var(--f-display,sans-serif);color:var(--brass,#e3ae45)}.bg-genbar{width:min(260px,80%);height:8px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden}.bg-genbar i{display:block;height:100%;width:0;background:var(--brass,#e3ae45);transition:width .15s}
+.bg-pick{overflow-y:auto;padding:12px 12px 24px;-webkit-overflow-scrolling:touch;touch-action:pan-y}
+.bg-pick h3{margin:2px 2px 2px;font:400 22px var(--f-display)}
+.bg-pick .sub{color:var(--muted);font:500 12.5px var(--f-body);margin:0 2px 10px}
+.bg-card{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:1px solid var(--line);background:var(--surface);border-radius:14px;padding:8px 10px;margin:0 0 7px;color:var(--ink);cursor:pointer;min-height:58px;font:inherit}
+.bg-card:active{transform:scale(.98)}
+.bg-card .em{font:24px/1 ${EMO};flex:0 0 32px;text-align:center}
+.bg-card .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.bg-card .t1{font:700 15px var(--f-body)}
+.bg-card .t2{font:500 11.5px var(--f-body);color:var(--muted);white-space:normal}
+.bg-card .stars{font:600 15px var(--f-mono);color:var(--brass);flex:0 0 auto;letter-spacing:1px}
+.bg-spot{position:absolute;pointer-events:none;border-radius:12px}
+.bg-zm{position:absolute;right:10px;z-index:3;display:flex;flex-direction:column;gap:6px}
+.bg-zm .btn{width:44px;height:44px;min-height:44px;padding:0;font-size:20px;border-radius:12px;background:rgba(46,38,64,.88)}
+.bg-ov{position:absolute;inset:0;z-index:16;background:rgba(10,8,15,.78);display:flex;align-items:flex-end;justify-content:center;padding:10px;animation:fade .15s ease-out}
+.bg-sheet{background:var(--surface);border:1px solid var(--line);border-radius:18px;width:min(460px,100%);max-height:calc(100% - 6px);box-sizing:border-box;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:8px;touch-action:pan-y}
+.bg-sheet>*{flex:none}
+.bg-sheet h3{font-family:var(--f-display);font-weight:400;font-size:21px;margin:0}
+.bg-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.bg-x{min-width:44px;min-height:44px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);font-size:18px;cursor:pointer}
+.bg-li{font-size:13.5px;line-height:1.45;background:var(--surface-2);border-radius:10px;padding:7px 10px}
+.bg-li b{color:var(--brass)}
+`;
+
+  function mount(root, api) {
+    const h = L.h;
+    root.appendChild(h('style', { text: CSS }));
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const spd = () => (L.debug && L.debug.speed) || 1;
+    let st = null, dead = false;
+    const nm = (i) => (api.players[i] ? api.players[i].name : (st && st.nm[i]) || i + 1 + '번');
+    const col = (i) => (api.players[i] ? api.players[i].color : '#e3ae45');
+    const multi = () => !api.online && api.mySeats().length >= 2;
+    const sfx = (n) => { try { api.sfx(n); } catch (e) {} };
+
+    /* ---- DOM ---- */
+    const bName = h('span', { class: 'nm' }), bRound = h('span', { class: 'rd' }), bTime = h('span', { class: 'tm' });
+    const budTxt = h('span', { class: 'bg-bud' }), budBar = h('i'), budWrap = h('span', { class: 'bg-budbar' }, budBar), runTxt = h('span', { class: 'bg-run' });
+    const brief = h('div', { class: 'bg-brief', role: 'button', 'data-action': 'brief', 'aria-label': '현장 자세히', onclick: () => openBrief() },
+      h('div', { class: 'bg-b1' }, bName, bRound, bTime, h('span', { class: 'more', text: '자세히' })),
+      h('div', { class: 'bg-b2' }, budTxt, budWrap, runTxt));
+    const spotView = h('div', { class: 'bg-spot bg-view' });
+    const info = h('div', { class: 'bg-info' });
+    const matsEl = h('div', { class: 'bg-mats' });
+    const matBtns = {};
+    MATS.split('').forEach((c, i) => {
+      const M = MAT[c];
+      const sw = h('i', { style: { height: (c === 'P' || c === 'C' ? 3 : c === 'K' ? 9 : c === 'R' ? 7 : 5) + 'px', background: M.col } });
+      const b = h('button', { class: 'bg-m', type: 'button', 'data-action': 'm' + (i + 1), title: M.n + ' (' + M.cost + '/m) — ' + M.d + ' [' + (i + 1) + ']', 'aria-label': M.n },
+        sw, h('span', { text: M.n }), h('span', { class: 'c', text: M.cost + '/m' }));
+      b.addEventListener('click', () => setMat(c));
+      matBtns[c] = b; matsEl.append(b);
+    });
+    const undoBtn = h('button', { 'data-action': 'undo', class: 'btn bg-t', type: 'button', 'aria-label': '되돌리기', title: '되돌리기 (Z)', text: '↶', onclick: () => undo() });
+    const delBtn = h('button', { 'data-action': 'del', class: 'btn bg-t del', type: 'button', 'aria-label': '지우기 모드', title: '지우기 모드 (X)', text: '✕', onclick: () => toggleDel() });
+    const mirBtn = h('button', { 'data-action': 'mirror', class: 'btn bg-t', type: 'button', 'aria-label': '좌우 대칭', title: '좌우 대칭 (M)', text: '⇋', onclick: () => toggleMir() });
+    const testBtn = h('button', { 'data-action': 'test', class: 'btn bg-test', type: 'button', text: '▶ 시험', title: '시험 운행 (T)', onclick: () => toggleTest() });
+    const doneBtn = h('button', { 'data-action': 'done', class: 'btn primary bg-done', type: 'button', text: '완성!', title: '제출 (Enter 두 번)', onclick: () => pressDone() });
+    const tools = h('div', { class: 'bg-tools' }, undoBtn, delBtn, mirBtn, testBtn, doneBtn);
+    const bot = h('div', { class: 'bg-bot' }, info, matsEl, tools);
+    const zIn = h('button', { 'data-action': 'zin', class: 'btn', type: 'button', 'aria-label': '크게', title: '크게 (+)', text: '+', onclick: () => zoomBy(1.6) });
+    const zOut = h('button', { 'data-action': 'zout', class: 'btn', type: 'button', 'aria-label': '작게', title: '작게 (−)', text: '−', onclick: () => zoomBy(1 / 1.6) });
+    const zoomEl = h('div', { class: 'bg-zm' }, zIn, zOut);
+    const revBtn = h('button', { 'data-action': 'done', class: 'btn primary', type: 'button', text: '', onclick: () => pressRev() });
+    const skipBtn = h('button', { 'data-action': 'skip', class: 'btn ghost', type: 'button', text: '⏭ 결과로', title: '남은 시험 모두 건너뛰기 (N)', onclick: () => skipAll() });
+    const revMsg = h('div', { class: 'muted', text: '' });
+    const revBar = h('div', { class: 'bg-rev bg-hid' }, revBtn, skipBtn, revMsg);
+    root.append(brief, spotView, zoomEl, bot, revBar);
+
+    /* ---- 상태 ---- */
+    let roundKey = '', active = -1, curMode = '', work = {}, tStart = {}, tPause = {}, sent = {}, readySent = {};
+    let armedT = 0, handEl = null, handKey = '', pickEl = null, sheetEl = null, lastTick = -1, clock = 0, drawErr = 0;
+    let mat = 'R', delMode = false, mirror = false;
+    let settle = null, setKey = '', test = null, testRes = null, ghost = null;
+    const cam = { sc: 20, ox: 0, oy: 0, fit: 20, key: '', top: 0, bot: 0 };
+    let drag = null;
+    const ptrs = new Map();
+    let pinch = null;
+    let rv = null, revId = -1, autoT = -1;
+    const parts = [];
+    let shake = 0;
+    let skyC = null, skyKey = '';
+
+    const rKey = () => (st ? st.r + ':' + st.si + ':' + st.ph : '');
+    function pendingLocal() {
+      if (!st || st.ph !== 'b') return [];
+      const out = [];
+      for (let i = 0; i < st.n; i++) if (api.canAct(i) && st.d[i] == null && sent[i] !== roundKey) out.push(i);
+      return out;
+    }
+    function editSeat() { const p = pendingLocal(); if (!p.length) return -1; if (multi()) return p.includes(active) ? active : -1; return p[0]; }
+    function mode() {
+      if (!st) return 'none';
+      if (st.ph === 'pick') return 'pick';
+      if (st.ph === 'b') { if (editSeat() >= 0) return 'edit'; if (multi() && pendingLocal().length) return 'hand'; return 'wait'; }
+      return st.last ? 'rev' : 'wait';
+    }
+    const site = () => (st && st.si >= 0 ? SITE(st, st.si) : SITES[0]);
+    function W(seat) { if (!work[seat]) work[seat] = { D: parse(site(), ''), undo: [], sel: -1 }; return work[seat]; }
+    function paused() { return !!document.querySelector('.tut-layer') || (!api.online && !!document.querySelector('.overlay.rules-ov')); }
+    function elapsed(seat) { if (tStart[seat] == null) return 0; return ((clock - tStart[seat] - (tPause[seat] || 0)) * spd()) / 1000; }
+    function mySeatShown() { const m = api.mySeats(); if (!m.length) return -1; if (multi()) return active >= 0 ? active : -1; return m[0]; }
+    function curD() { const s = editSeat(); return s >= 0 ? W(s).D : null; }
+
+    /* ---- 카메라 ---- */
+    function bounds(sv) { return [-3.2, sv.L + 3.2, -sv.D - 0.7, sv.top <= 2 ? Math.max(topY(sv) + 1.3, Math.max(0, sv.r) + 3.3) : topY(sv) + 1.3]; }
+    function viewSite() { return curMode === 'rev' && rv ? SITE(st, rv.si) : site(); }
+    function layoutView() {
+      const Wd = cv.w, Hh = cv.h, m = curMode, sv = viewSite();
+      const bTop = brief.classList.contains('bg-hid') ? 0 : brief.offsetTop + brief.offsetHeight;
+      const top = m === 'rev' ? 54 : Math.max(8, bTop + 6);
+      const bottom = !bot.classList.contains('bg-hid') ? Hh - bot.offsetHeight : !revBar.classList.contains('bg-hid') ? Hh - revBar.offsetHeight : Hh;
+      cam.top = top; cam.bot = bottom;
+      const [x0, x1, y0, y1] = bounds(sv);
+      const vh = Math.max(60, bottom - top);
+      cam.fit = Math.min((Wd - 8) / (x1 - x0), vh / (y1 - y0));
+      cam.sc = cam.fit;
+      cam.ox = Wd / 2 - (x0 + x1) / 2 * cam.sc;
+      cam.oy = (top + bottom) / 2 + (y0 + y1) / 2 * cam.sc;
+      cam.key = Wd + 'x' + Hh + ':' + m + ':' + bTop + ':' + bot.offsetHeight + ':' + sv.n;
+      spotView.style.left = '4px'; spotView.style.top = top + 'px'; spotView.style.width = (Wd - 8) + 'px'; spotView.style.height = Math.max(20, bottom - top) + 'px';
+      zoomEl.style.top = (top + 6) + 'px';
+      skyKey = '';
+      clampCam();
+    }
+    function clampCam() {
+      const sv = viewSite(), [x0, x1, y0, y1] = bounds(sv), Wd = cv.w;
+      cam.sc = U.clamp(cam.sc, cam.fit, cam.fit * 4.5);
+      const cw = (x1 - x0) * cam.sc, ch = (y1 - y0) * cam.sc, vh = cam.bot - cam.top;
+      if (cw <= Wd) cam.ox = Wd / 2 - (x0 + x1) / 2 * cam.sc; else cam.ox = U.clamp(cam.ox, Wd - x1 * cam.sc, -x0 * cam.sc);
+      if (ch <= vh) cam.oy = (cam.top + cam.bot) / 2 + (y0 + y1) / 2 * cam.sc; else cam.oy = U.clamp(cam.oy, cam.bot + y0 * cam.sc, cam.top + y1 * cam.sc);
+    }
+    const X = (x) => cam.ox + x * cam.sc, Y = (y) => cam.oy - y * cam.sc;
+    const WX = (px) => (px - cam.ox) / cam.sc, WY = (py) => (cam.oy - py) / cam.sc;
+    function zoomAt(px, py, f) {
+      const wx = WX(px), wy = WY(py);
+      cam.sc = U.clamp(cam.sc * f, cam.fit, cam.fit * 4.5);
+      cam.ox = px - wx * cam.sc; cam.oy = py + wy * cam.sc;
+      clampCam();
+    }
+    function zoomBy(f) {
+      const d = curD(), s = editSeat();
+      let px = cv.w / 2, py = (cam.top + cam.bot) / 2;
+      if (d && s >= 0 && W(s).sel >= 0) { const j = W(s).sel; px = X(d.x[j]); py = Y(d.y[j]); }
+      zoomAt(px, py, f); sfx('click');
+    }
+    cv.onresize = () => { cam.key = ''; };
+
+    /* ---- 설계 편집 ---- */
+    function jIdx(D, x, y) { for (let i = 0; i < D.x.length; i++) if (D.x[i] === x && D.y[i] === y) return i; return -1; }
+    function mIdx(D, a, b) { for (let k = 0; k < D.m.length; k++) { const m = D.m[k]; if ((m[0] === a && m[1] === b) || (m[0] === b && m[1] === a)) return k; } return -1; }
+    function snap(D) { return serialize(D); }
+    function pushUndo(w) { w.undo.push(snap(w.D)); if (w.undo.length > 80) w.undo.shift(); }
+    function placeErr(D, x1, y1, x2, y2, mt) {
+      const sv = site();
+      if (x1 === x2 && y1 === y2) return '같은 점이에요';
+      if (jIdx(D, x1, y1) < 0) { const e = jointErr(sv, x1, y1); if (e) return e; }
+      if (jIdx(D, x2, y2) < 0) { const e = jointErr(sv, x2, y2); if (e) return e; }
+      return memberErr(sv, x1, y1, x2, y2, mt);
+    }
+    function placeOne(D, x1, y1, x2, y2, mt) {
+      let a = jIdx(D, x1, y1), b = jIdx(D, x2, y2);
+      if (a < 0) { D.x.push(x1); D.y.push(y1); a = D.x.length - 1; }
+      if (b < 0) { D.x.push(x2); D.y.push(y2); b = D.x.length - 1; }
+      const k = mIdx(D, a, b);
+      if (k >= 0) { if (D.m[k][2] === mt) return 0; D.m[k][2] = mt; return 2; }
+      D.m.push([a, b, mt]); return 1;
+    }
+    const canMirror = () => site().r === 0;
+    function place(x1, y1, x2, y2) {
+      const s = editSeat(); if (s < 0) return false;
+      const w = W(s), D = w.D, sv = site();
+      const e = placeErr(D, x1, y1, x2, y2, mat);
+      if (e) { api.toast(e); sfx('thud'); api.buzz(20); return false; }
+      const before = snap(D);
+      const r = placeOne(D, x1, y1, x2, y2, mat);
+      if (r === 0) { api.toast('이미 같은 ' + MAT[mat].n + '가 있어요'); return false; }
+      let mr = 0;
+      if (mirror && canMirror()) {
+        const mx1 = sv.L - x1, mx2 = sv.L - x2;
+        if (!((mx1 === x1 && mx2 === x2) || (mx1 === x2 && mx2 === x1 && y1 === y2)) && !placeErr(D, mx1, y1, mx2, y2, mat)) mr = placeOne(D, mx1, y1, mx2, y2, mat);
+      }
+      if (D.x.length > MAXJ || serialize(D).length > MAXD) { w.D = parse(sv, before); api.toast('더는 못 지어요 (설계가 너무 커요)'); return false; }
+      w.undo.push(before); if (w.undo.length > 80) w.undo.shift();
+      w.sel = jIdx(w.D, x2, y2);
+      sfx(r === 2 ? 'chip' : 'pop'); api.buzz(8);
+      if (r === 2) api.toast(MAT[mat].n + '(으)로 바꿨어요');
+      changed();
+      return true;
+    }
+    function delMember(k) {
+      const s = editSeat(); if (s < 0) return;
+      const w = W(s), D = w.D, sv = site();
+      pushUndo(w);
+      const m = D.m[k], ax = D.x[m[0]], ay = D.y[m[0]], bx = D.x[m[1]], by = D.y[m[1]];
+      D.m.splice(k, 1);
+      if (mirror && canMirror()) { const a = jIdx(D, sv.L - ax, ay), b = jIdx(D, sv.L - bx, by); const k2 = a >= 0 && b >= 0 ? mIdx(D, a, b) : -1; if (k2 >= 0) D.m.splice(k2, 1); }
+      w.D = compact(D); w.sel = -1; sfx('thud'); api.buzz(10); changed();
+    }
+    function delJoint(j) {
+      const s = editSeat(); if (s < 0) return;
+      const w = W(s), D = w.D, sv = site();
+      if (j < D.na) { api.toast('고정점은 못 지워요'); return; }
+      pushUndo(w);
+      const x0 = D.x[j], y0 = D.y[j];
+      D.m = D.m.filter((m) => m[0] !== j && m[1] !== j);
+      if (mirror && canMirror()) { const j2 = jIdx(D, sv.L - x0, y0); if (j2 >= D.na && j2 !== j) D.m = D.m.filter((m) => m[0] !== j2 && m[1] !== j2); }
+      w.D = compact(D); w.sel = -1; sfx('thud'); api.buzz(10); changed();
+    }
+    function undo() {
+      const s = editSeat(); if (s < 0 || test) return;
+      const w = W(s); if (!w.undo.length) return;
+      w.D = parse(site(), w.undo.pop()); w.sel = -1; sfx('click'); changed();
+    }
+    function setMat(c) {
+      if (curMode !== 'edit') return;
+      mat = c; if (delMode) toggleDel(); sfx('click');
+      MATS.split('').forEach((k) => matBtns[k].classList.toggle('on', k === c));
+      syncInfo();
+    }
+    function toggleDel() { if (test) return; delMode = !delMode; delBtn.classList.toggle('on', delMode); const s = editSeat(); if (s >= 0) W(s).sel = -1; sfx('click'); syncInfo(); }
+    function toggleMir() {
+      if (test) return;
+      if (!canMirror()) { api.toast('높이가 다른 현장이라 대칭을 못 써요'); return; }
+      mirror = !mirror; mirBtn.classList.toggle('on', mirror); sfx('click');
+      api.toast(mirror ? '좌우 대칭 켬: 반대쪽에도 똑같이 지어요' : '좌우 대칭 끔');
+    }
+    function changed() { settle = null; setKey = ''; testRes = null; syncStat(); syncInfo(); }
+
+    /* ---- 자기 무게 미리 보기 + 시험 운행 ---- */
+    function ensureSettle() {
+      const D = curD(); if (!D) return null;
+      const key = serialize(D) + '|' + st.si;
+      if (setKey === key && settle) return settle;
+      const S = makeSim(site(), -1, D);
+      for (let i = 0; i < 80; i++) S.step();
+      let pk = 0, nb = 0; for (let k = 0; k < S.nM; k++) { if (S.br[k] >= 0) nb++; else if (S.ra[k] > pk) pk = S.ra[k]; }
+      settle = { S, pk, nb, cost: costOf(site(), D) }; setKey = key;
+      return settle;
+    }
+    function toggleTest() {
+      if (curMode !== 'edit') return;
+      if (test) { stopTest(); return; }
+      const D = curD(); if (!D) return;
+      if (!D.m.some((m) => m[2] === 'R')) { api.toast('먼저 나무 길을 놓아 주세요'); return; }
+      const s = editSeat(); W(s).sel = -1; ghost = null;
+      parts.length = 0;
+      test = { S: makeSim(site(), st.vh, D), acc: 0, end: -1, fall: null, nb: 0, hold: 0 };
+      testBtn.textContent = '■ 멈춤'; testBtn.classList.add('on');
+      [undoBtn, delBtn, mirBtn, doneBtn].forEach((b) => { b.disabled = true; });
+      sfx('whoosh'); syncStat(); syncInfo();
+    }
+    function stopTest() {
+      test = null; testBtn.textContent = '▶ 시험'; testBtn.classList.remove('on');
+      [undoBtn, delBtn, mirBtn, doneBtn].forEach((b) => { b.disabled = false; });
+      syncStat(); syncInfo();
+    }
+    function stepSim(T, dt, playRate) {   // T: {S, acc, end, fall, nb} → 끝났으면 true
+      const S = T.S;
+      T.acc += dt * FPS * playRate * spd();
+      let n = Math.min(40 * spd(), Math.floor(T.acc));
+      T.acc -= Math.floor(T.acc);
+      while (n-- > 0) {
+        if (T.end >= 0 && S.f >= T.end) break;
+        S.step();
+        if (S.fail && !T.fall) { T.fall = { x: Array.from(S.axx), y: Array.from(S.ay), f: S.f, hit: -1 }; T.end = S.f + TAIL_FAIL; sfx('thud'); api.buzz(60); shake = Math.max(shake, 0.5 * ((typeof L.fx === 'function') ? L.fx() : 1)); }
+        if (S.ok && T.end < 0) T.end = S.f + TAIL_OK;
+      }
+      let nb = 0; for (let k = 0; k < S.nM; k++) if (S.br[k] >= 0) nb++;
+      if (nb > T.nb) {
+        for (let k = 0; k < S.nM; k++) if (S.br[k] >= S.f - 3 && S.br[k] >= 0) burst((S.x[S.ma[k]] + S.x[S.mb[k]]) / 2, (S.y[S.ma[k]] + S.y[S.mb[k]]) / 2, S.D.m[k][2]);
+        sfx('hit'); api.buzz(30); T.nb = nb;
+      }
+      return T.end >= 0 && S.f >= T.end;
+    }
+    function burst(x, y, mt) {   // 부재가 끊어질 때: 조각 + 먼지 + 화면 흔들림
+      const c = MAT[mt].col, o = parts.length * 0.7;
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2 + o, sp = 1.5 + (i % 4) * 0.7;
+        parts.push({ k: 1, x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp + 2.2, t: 1.1, c, r: a, vr: (i % 2 ? 1 : -1) * (4 + i), L: 0.22 + (i % 3) * 0.12 });
+      }
+      for (let i = 0; i < 3; i++) parts.push({ k: 2, x: x + (i - 1) * 0.2, y, vx: (i - 1) * 0.4, vy: 0.5, t: 0.8, c: 'rgba(230,220,200,', R: 0.18 });
+      if (parts.length > 160) parts.splice(0, parts.length - 160);
+      shake = Math.max(shake, 0.3 * ((typeof L.fx === 'function') ? L.fx() : 1));
+    }
+
+    /* ---- 제출 ---- */
+    function pressDone() {
+      const s = editSeat(); if (s < 0 || test) return;
+      const now = performance.now();
+      if (now - armedT < 2600) { armedT = 0; resetDone(); submit(s, false); return; }
+      armedT = now; doneBtn.classList.add('armed');
+      const D = W(s).D, cost = costOf(site(), D), B = budgetOf(st);
+      doneBtn.textContent = !D.m.length ? '빈 채로 낼까요?' : cost > B ? '예산 초과! 낼까요?' : testRes && !testRes[0] ? '실패했는데 낼까요?' : '한 번 더 = 제출';
+      api.buzz(10); sfx('click');
+    }
+    function resetDone() { armedT = 0; doneBtn.classList.remove('armed'); doneBtn.textContent = '완성!'; }
+    function submit(seat, auto) {
+      if (!st || st.ph !== 'b') return;
+      if (test) stopTest();
+      const w = W(seat); sent[seat] = roundKey;
+      let d = serialize(w.D);
+      if (designErr(site(), d)) d = '';
+      if (multi()) active = -1;
+      sfx('win'); api.buzz(25);
+      if (auto) api.toast('시간 끝! 지금 설계 그대로 냈어요');
+      api.actAs(seat, { k: 'd', d });
+      sync();
+    }
+
+    /* ---- 글자 줄 ---- */
+    function syncStat() {
+      if (curMode !== 'edit' && curMode !== 'wait') return;
+      const sv = site(), B = st ? budgetOf(st) : 0;
+      let D = curD();
+      if (!D && curMode === 'wait') { const s = mySeatShown(); D = s >= 0 && work[s] && work[s].D.m.length ? work[s].D : s >= 0 && st.d[s] ? parse(sv, st.d[s]) : null; }
+      const cost = D ? costOf(sv, D) : 0;
+      budTxt.textContent = '💰' + fmt(cost) + '/' + fmt(B); budTxt.classList.toggle('over', cost > B);
+      budBar.style.width = Math.min(100, B ? cost / B * 100 : 0) + '%'; budWrap.classList.toggle('over', cost > B);
+      let cls = 'ok', txt = '';
+      if (curMode === 'wait') { txt = api.mySeats().length ? '제출 완료' : '설계하는 중…'; }
+      else if (test) { cls = 'warn'; txt = VEH[st.vh].e + ' 시험 운행 중…'; }
+      else if (testRes) { const r = testRes; if (r[0]) { const pn = defPen(sv.L, r[6] / 100); txt = '✓ 시험 성공 · 예상 ' + r[1] + '점' + (pn ? ' · 처짐 −' + pn : ''); if (pn) cls = 'warn'; } else { cls = 'bad'; txt = '✗ ' + FAIL[FCODE[r[4]]]; } }
+      else if (!D || !D.m.length) { cls = 'warn'; txt = '나무 길로 양쪽을 이어요'; }
+      else {
+        const se = ensureSettle();
+        if (se.nb) { cls = 'bad'; txt = '✗ 자기 무게로 무너져요'; }
+        else if (se.pk > 0.8) { cls = 'warn'; txt = '⚠ 벌써 힘들어요 ' + Math.round(se.pk * 100) + '%'; }
+        else txt = '자기 무게 ' + Math.round(se.pk * 100) + '% · ▶ 시험해 봐요';
+      }
+      runTxt.className = 'bg-run ' + cls; runTxt.textContent = txt;
+      const s = editSeat();
+      undoBtn.disabled = !!test || !(s >= 0 && W(s).undo.length);
+    }
+    function syncInfo() {
+      if (curMode !== 'edit') return;
+      const s = editSeat(), w = s >= 0 ? W(s) : null, M = MAT[mat];
+      info.innerHTML = '';
+      if (test) { info.append(h('b', { text: '시험 운행 ' }), '색 = 힘: 초록 여유 → 노랑 → 빨강 끊어지기 직전'); return; }
+      if (ghost && ghost.err) { info.append(h('span', { class: 'er', text: '✗ ' + ghost.err })); return; }
+      if (ghost) { info.append(h('b', { text: M.n + ' ' + ghost.len.toFixed(1) + 'm' }), ' · ' + fmt(ghost.cost) + '원 — 손을 떼면 놓여요'); return; }
+      if (delMode) { info.append(h('b', { text: '지우기 모드 ' }), '· 부재나 점을 누르면 지워져요'); return; }
+      if (w && w.sel >= 0) { info.append(h('b', { text: '점 고름 ' }), '→ 이을 곳을 누르세요 (같은 점 = 취소)'); return; }
+      info.append(h('b', { text: M.n + ' ' }), M.cost + '/m · 최대 ' + M.mx + 'm — 점을 누르고 다른 점을 눌러요');
+    }
+
+    /* ---- 시트 ---- */
+    function closeSheet() { if (sheetEl) { sheetEl.remove(); sheetEl = null; } }
+    function openSheet(title, kids) {
+      closeSheet();
+      const sh = h('div', { class: 'bg-sheet' }, h('div', { class: 'bg-head' }, h('h3', { text: title }), h('button', { class: 'bg-x', type: 'button', 'aria-label': '닫기', text: '✕', onclick: () => closeSheet() })), ...kids);
+      sheetEl = h('div', { class: 'bg-ov', onclick: (e) => { if (e.target === sheetEl) closeSheet(); } }, sh);
+      root.append(sheetEl);
+    }
+    function openBrief() {
+      if (!st || st.si < 0) return;
+      const sv = site(), V = VEH[st.vh]; sfx('click');
+      openSheet(sv.e + ' ' + sv.n, [
+        h('div', { class: 'bg-li', text: sv.d }),
+        h('div', { class: 'bg-li' }, h('b', { text: '조건  ' }), '너비 ' + sv.L + 'm · 예산 ' + fmt(budgetOf(st)) + ' · 시험 차 ' + V.e + ' ' + V.n + ' (' + fmt(V.w.reduce((a, b) => a + b, 0)) + '톤)' +
+          (sv.r ? ' · 오른쪽이 ' + Math.abs(sv.r) + 'm ' + (sv.r > 0 ? '높아요' : '낮아요') : '') + (sv.bt ? ' · 배 길 있음' : '') + (sv.fd ? ' · 기초 자리(하나에 ' + FD_COST + ')' : '') + ' · 위로 ' + sv.top + 'm까지'),
+        h('div', { class: 'bg-li', text: '점수 = 성공 60 + 남은 예산(절반 넘게 남기면 25) + 버팀 여유(가장 힘든 부재가 50% 밑이면 15) − 처짐 감점(이 현장은 ' + Math.round(sv.L) + 'cm 넘게 처지면 깎여요, 최대 −' + DEF_MAX + '). 실패하면 0점!' }),
+        h('div', { class: 'bg-li', text: '이음새(점) 하나에 ' + J_COST + '원. 벼랑의 금색 점은 고정점(공짜)이에요.' }),
+        ...MATS.split('').map((c) => h('div', { class: 'bg-li' }, h('b', { text: MAT[c].n + ' ' + MAT[c].cost + '/m  ' }), MAT[c].d)),
+      ]);
+    }
+
+    /* ---- 한 폰 여럿: 넘겨주기 ---- */
+    function syncHand() {
+      let want = -1;
+      if (st && st.ph === 'b' && multi()) { const p = pendingLocal(); if (p.length && !p.includes(active)) want = p[0]; }
+      const key = want + ':' + roundKey;
+      if (key === handKey) return;
+      handKey = key;
+      if (handEl) { handEl.remove(); handEl = null; }
+      if (want < 0) return;
+      closeSheet();
+      const sv = site();
+      handEl = h('div', { class: 'bg-hand' },
+        h('span', { class: 'dot', style: { '--c': col(want), width: '18px', height: '18px' } }),
+        h('div', { class: 'big', text: nm(want) }),
+        h('div', { style: { fontWeight: 700, color: 'var(--brass)' }, text: (st.r + 1) + '/' + st.R + '판 · ' + sv.e + ' ' + sv.n + ' · ' + VEH[st.vh].e + ' ' + VEH[st.vh].n }),
+        h('div', { class: 'muted', text: '혼자 몰래 설계해요. 다른 사람은 보지 마세요!' }),
+        h('button', { class: 'btn primary', type: 'button', text: '설계 시작', onclick: () => { active = want; sfx('click'); handKey = ''; sync(); } }));
+      root.append(handEl);
+    }
+    /* ---- 혼자: 현장 고르기 ---- */
+    function bests() { try { return JSON.parse(localStorage.getItem('lounge.bridge.best') || '{}') || {}; } catch (e) { return {}; } }
+    function saveBest(si, stars, score) {
+      const b = bests(), o = b[si] || [0, 0];
+      if (stars < o[0] || (stars === o[0] && score <= o[1])) return;
+      b[si] = [stars, score]; try { localStorage.setItem('lounge.bridge.best', JSON.stringify(b)); } catch (e) {}
+    }
+    let chalKey = -1, genJob = null;
+    function startChal(lv) {   // 현장을 10ms씩 잘게 만들고(화면 안 멈춤) 다 되면 그 현장으로 시작
+      if (genJob || !st || st.ph !== 'pick') return;
+      sfx('click'); api.buzz(12);
+      const it = genSiteG(lv, Math.floor(Math.random() * 2147483647)), bar = h('i'), ov = h('div', { class: 'bg-gen' }, h('b', { text: '현장 준비 중…' }), h('span', { text: '도전 ' + lv + '단계 · 다리가 놓일 수 있는지 확인하고 있어요' }), h('div', { class: 'bg-genbar' }, bar));
+      root.append(ov);
+      const job = genJob = { n: 0 };
+      const tick = () => {
+        if (dead || genJob !== job) { ov.remove(); return; }
+        const t0 = performance.now();
+        let r;
+        do { r = it.next(); job.n++; } while (!r.done && performance.now() - t0 < 10);
+        bar.style.width = Math.min(95, 100 * (1 - Math.exp(-job.n / 60))) + '%';
+        if (!r.done) { setTimeout(tick, 0); return; }
+        ov.remove(); genJob = null;
+        if (st && st.ph === 'pick') api.act({ k: 'c', lv, g: r.value });
+      };
+      setTimeout(tick, 30);
+    }
+    const chalLv = () => U.clamp((U.store.get('bridge.chal', 0) | 0) + 1, 1, 999);
+    function saveChal(s) {   // 도전 성공 → 다음 단계 열기 + 최고 단계 기록
+      const r = s.last.res[0]; if (!r || !r[0]) return;
+      if (s.cl >= chalLv()) U.store.set('bridge.chal', s.cl);
+      api.best('chal', s.cl, { label: '도전 최고 단계', unit: '단계' });
+      api.best('chal3', chalStars(r, s.last.B) === 3 ? s.cl : 0, { label: '도전 ★★★ 최고 단계', unit: '단계' });
+    }
+    function syncPick() {
+      const want = st && st.ph === 'pick';
+      if (!want) { if (pickEl) { pickEl.remove(); pickEl = null; } return; }
+      if (pickEl) return;
+      const can = api.canAct(0), b = bests();
+      const list = SITES.map((sv, si) => {
+        const bs = b[si] ? b[si][0] : 0, V = VEH[sv.v];
+        return h('button', { class: 'bg-card', type: 'button', disabled: !can, onclick: () => { if (!can || !st || st.ph !== 'pick') return; sfx('click'); api.buzz(12); api.act({ k: 'p', i: si }); } },
+          h('span', { class: 'em', text: sv.e }),
+          h('span', { class: 'tx' }, h('span', { class: 't1', text: (si + 1) + '. ' + sv.n }), h('span', { class: 't2', text: V.e + ' ' + V.n + ' · 너비 ' + sv.L + 'm · 예산 ' + fmt(sv.B[sv.v]) })),
+          h('span', { class: 'stars', text: '★'.repeat(bs) + '☆'.repeat(3 - bs) }));
+      });
+      const cl = chalLv();
+      const chal = h('button', { class: 'bg-card', type: 'button', disabled: !can, style: { borderColor: 'var(--brass)' },
+        onclick: () => { if (!can || !st || st.ph !== 'pick') return; startChal(cl); } },
+        h('span', { class: 'em', text: '♾' }),
+        h('span', { class: 'tx' }, h('span', { class: 't1', text: '도전 · ' + cl + '단계' }), h('span', { class: 't2', text: '매번 새로 만든 현장(풀 수 있는지 확인됨). 성공하면 다음 단계! 별은 재료비로.' })),
+        h('span', { class: 'stars', text: '' }));
+      const chalRe = cl > 1 ? h('button', { class: 'btn sm', type: 'button', disabled: !can, text: '도전 1단계부터 다시', style: { minHeight: '44px', margin: '0 0 8px' },
+        onclick: () => { if (!can || !st || st.ph !== 'pick') return; startChal(1); } }) : null;
+      pickEl = h('div', { class: 'bg-pick' }, h('h3', { text: '혼자 하기 · 현장 고르기' }), chal, ...(chalRe ? [chalRe] : []),
+        h('div', { class: 'sub', text: can ? '위에서부터 차례로 어려워져요. 성공 ★ · ' + STARS[1] + '점 ★★ · ' + STARS[2] + '점 ★★★' : 'AI가 현장을 고르는 중…' }), ...list);
+      root.append(pickEl);
+    }
+
+    /* ---- 시험 공개 ---- */
+    const rp = (i) => (api.players[i] && api.players[i].ai ? RIDE.fast : RIDE.me);
+    function startRev(s) {
+      rv = { id: s.last.id, si: s.last.si, vh: s.last.vh, i: 0, ph: 'intro', t: 0, T: null, done: false };
+      revId = s.last.id; autoT = -1; parts.length = 0;
+      cam.key = '';
+      setRide(0);
+    }
+    function setRide(i) {
+      const last = st.last;
+      if (i >= st.n) {
+        rv.ph = 'board'; rv.t = 0; rv.done = true; rv.T = null; parts.length = 0;
+        // 결과판: 나 말고 사람이 없으면(혼자·봇전) 5초, 다른 사람이 있으면 10초 뒤 자동으로 「다음」
+        const mine = api.mySeats(), otherHuman = (st.hu || []).some((x, k) => x && !mine.includes(k));
+        autoT = otherHuman ? 10 : 5;
+        sfx(st.solo && !last.res[0][0] ? 'lose' : 'win'); syncRev(); return;
+      }
+      rv.i = i; rv.ph = 'intro'; rv.t = 0;
+      rv.T = { S: makeSim(SITE(st, last.si), last.vh, last.d[i] || ''), acc: 0, end: -1, fall: null, nb: 0, creak: 0 };
+      syncRev();
+    }
+    function pressRev() {
+      if (!st || !st.last || !rv) return;
+      if (st.ph === 'v' && rv.done) { pressNext(); return; }
+      if (rv.ph === 'board') return;
+      sfx('click');
+      if (rv.ph === 'intro' || rv.ph === 'ride') { rv.ph = 'card'; rv.t = 0; }
+      else setRide(rv.i + 1);
+      syncRev();
+    }
+    function skipAll() {
+      if (!st || !st.last || !rv || rv.done) return;
+      sfx('click'); setRide(st.n);
+    }
+    function pressNext() {
+      if (!st || st.ph !== 'v' || !st.last) return;
+      const id = st.last.id;
+      const seats = api.mySeats().filter((i) => !st.rd[i] && readySent[i] !== id);
+      seats.forEach((i) => { readySent[i] = id; });
+      sfx('click');
+      seats.forEach((i) => { if (st && st.ph === 'v' && !st.rd[i]) api.actAs(i, { k: 'n' }); });
+      syncRev();
+    }
+    function syncRev() {
+      const m = curMode;
+      if (m === 'wait') {
+        revBtn.classList.add('bg-hid'); skipBtn.classList.add('bg-hid'); revMsg.classList.remove('bg-hid');
+        const done = st ? st.d.filter((x) => x != null).length : 0;
+        revMsg.textContent = (api.mySeats().length ? '제출 완료! ' : '') + '다른 설계자를 기다려요 (' + done + '/' + (st ? st.n : 0) + ')';
+        return;
+      }
+      if (m !== 'rev' || !st || !st.last || !rv) return;
+      const mine = api.mySeats(), pend = mine.filter((i) => !st.rd[i] && readySent[i] !== st.last.id);
+      if (!rv.done) {
+        revBtn.classList.remove('bg-hid'); revMsg.classList.add('bg-hid');
+        const lastOne = rv.i >= st.n - 1;
+        revBtn.textContent = rv.ph === 'card' ? (lastOne ? '결과 보기 ▶' : '다음 다리 ▶') : '▶▶ 건너뛰기';
+        skipBtn.classList.toggle('bg-hid', lastOne);
+        return;
+      }
+      skipBtn.classList.add('bg-hid');
+      if (st.ph === 'v' && pend.length) {
+        revBtn.classList.remove('bg-hid'); revMsg.classList.add('bg-hid');
+        const left = autoT >= 0 ? Math.ceil(autoT) : -1, fin = st.last.r + 1 >= st.R;
+        revBtn.textContent = (st.solo ? '결과 보기' : fin ? '최종 결과 보기' : '다음 판 ▶') + (left >= 0 && left <= 10 ? ' (' + left + ')' : '');
+      } else {
+        revBtn.classList.add('bg-hid'); revMsg.classList.remove('bg-hid');
+        const ready = st.rd.filter((x) => x).length;
+        revMsg.textContent = st.ph === 'end' ? '최종 결과!' : mine.length ? '다른 사람을 기다려요 (' + ready + '/' + st.n + ')' : '시험 보는 중… (' + ready + '/' + st.n + ')';
+      }
+    }
+
+    /* ---- 화면 상태 맞추기 ---- */
+    function sync() {
+      const m = mode();
+      const chg = m !== curMode;
+      curMode = m;
+      bot.classList.toggle('bg-hid', m !== 'edit');
+      brief.classList.toggle('bg-hid', !(m === 'edit' || m === 'wait'));
+      zoomEl.classList.toggle('bg-hid', m !== 'edit');
+      revBar.classList.toggle('bg-hid', !(m === 'rev' || m === 'wait'));
+      if (m === 'edit') {
+        const s = editSeat();
+        if (tStart[s] == null) { tStart[s] = clock || performance.now(); tPause[s] = 0; lastTick = -1; cam.key = ''; }
+        MATS.split('').forEach((k) => matBtns[k].classList.toggle('on', k === mat));
+        mirBtn.classList.toggle('on', mirror && canMirror()); mirBtn.disabled = !canMirror();
+      }
+      if (m !== 'edit') { resetDone(); if (test) stopTest(); ghost = null; }
+      if (m !== 'edit' && m !== 'wait' && sheetEl) closeSheet();
+      if (st && st.si >= 0) { const sv = site(); bName.textContent = sv.e + ' ' + sv.n; bRound.textContent = (st.solo ? '혼자' : (st.r + 1) + '/' + st.R + '판') + ' · ' + VEH[st.vh].e + ' ' + VEH[st.vh].n; }
+      syncHand(); syncPick();
+      if (chg) cam.key = '';
+      syncStat(); syncInfo(); syncRev();
+    }
+
+    /* ---- 그리기 ---- */
+    function buildSky(sv) {
+      const Wd = cv.w, Hh = cv.h, dpr = cv.dpr, th = THEMES[sv.th || 0];
+      if (!skyC) skyC = document.createElement('canvas');
+      skyC.width = Math.round(Wd * dpr); skyC.height = Math.round(Hh * dpr);
+      const g = skyC.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const gr = g.createLinearGradient(0, 0, 0, Hh);
+      gr.addColorStop(0, th.sky[0]); gr.addColorStop(0.55, th.sky[1]); gr.addColorStop(1, th.sky[2]);
+      g.fillStyle = gr; g.fillRect(0, 0, Wd, Hh);
+      // 별·구름 몇 개 (고정 무늬)
+      g.fillStyle = 'rgba(255,255,255,.5)';
+      for (let i = 0; i < 26; i++) { const x = (i * 97.3 % 1) * Wd + (i * 53) % Wd, y = ((i * 37) % 100) / 100 * Hh * 0.35; g.fillRect(x % Wd, y, 1.4, 1.4); }
+      // 먼 산
+      const base = Y(0);
+      g.fillStyle = th.hill; g.globalAlpha = 0.75;
+      g.beginPath(); g.moveTo(0, Hh);
+      for (let x = 0; x <= Wd; x += 8) g.lineTo(x, base - 40 - 34 * Math.sin(x / 61 + sv.L) - 18 * Math.sin(x / 23 + 1.3));
+      g.lineTo(Wd, Hh); g.closePath(); g.fill(); g.globalAlpha = 1;
+    }
+    function rr(x, y, w, hh, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + hh, r); ctx.arcTo(x + w, y + hh, x, y + hh, r); ctx.arcTo(x, y + hh, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+    function drawTerrain(sv, tt) {
+      const th = THEMES[sv.th || 0], Wd = cv.w, Hh = cv.h, s = cam.sc;
+      // 물
+      if (sv.w != null) {
+        ctx.fillStyle = 'rgba(40,110,160,.55)';
+        ctx.fillRect(X(0), Y(sv.w), (sv.L) * s, (sv.w + sv.D) * s);
+        ctx.strokeStyle = 'rgba(190,230,255,.55)'; ctx.lineWidth = 1.5; ctx.beginPath();
+        for (let x = 0; x <= sv.L; x += 0.25) { const yy = Y(sv.w) + Math.sin(x * 2.1 + tt * 2.2) * 1.6; if (x === 0) ctx.moveTo(X(x), yy); else ctx.lineTo(X(x), yy); }
+        ctx.stroke();
+      }
+      // 배 길
+      if (sv.bt) {
+        const b = sv.bt;
+        ctx.save(); ctx.beginPath(); ctx.rect(X(b[0]), Y(b[3]), (b[1] - b[0]) * s, (b[3] - b[2]) * s); ctx.clip();
+        ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 1;
+        for (let x = X(b[0]) - 200; x < X(b[1]) + 10; x += 9) { ctx.beginPath(); ctx.moveTo(x, Y(b[2])); ctx.lineTo(x + (b[3] - b[2]) * s, Y(b[3])); ctx.stroke(); }
+        ctx.restore();
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.setLineDash([5, 4]); ctx.strokeRect(X(b[0]), Y(b[3]), (b[1] - b[0]) * s, (b[3] - b[2]) * s); ctx.setLineDash([]);
+        // 배
+        const bw = Math.min(3.2, (b[1] - b[0]) * 0.7), span = (b[1] - b[0]) + bw + 2, bx = b[0] - bw - 1 + ((tt * 0.8) % span);
+        const by = b[2];
+        ctx.save(); ctx.beginPath(); ctx.rect(X(0), 0, sv.L * s, Hh); ctx.clip();
+        ctx.fillStyle = '#e8e2d2'; ctx.beginPath(); ctx.moveTo(X(bx), Y(by + 0.35)); ctx.lineTo(X(bx + bw), Y(by + 0.35)); ctx.lineTo(X(bx + bw - 0.4), Y(by - 0.15)); ctx.lineTo(X(bx + 0.3), Y(by - 0.15)); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#c94a3a'; ctx.fillRect(X(bx + bw * 0.35), Y(by + 0.35 + (b[3] - b[2]) * 0.55), Math.max(2, 0.1 * s), (b[3] - b[2]) * 0.55 * s);
+        ctx.fillStyle = '#f2e9d8'; ctx.beginPath(); ctx.moveTo(X(bx + bw * 0.35 + 0.1), Y(by + 0.45 + (b[3] - b[2]) * 0.5)); ctx.lineTo(X(bx + bw * 0.8), Y(by + 0.5)); ctx.lineTo(X(bx + bw * 0.35 + 0.1), Y(by + 0.5)); ctx.closePath(); ctx.fill();
+        ctx.restore();
+        ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.font = '600 10px ' + FONT; ctx.textAlign = 'center'; ctx.fillText('배 길', X((b[0] + b[1]) / 2), Y(b[3]) + 12);
+      }
+      // 땅
+      const rockG = ctx.createLinearGradient(0, Y(0), 0, Hh);
+      rockG.addColorStop(0, th.rock); rockG.addColorStop(1, th.rock2);
+      ctx.fillStyle = rockG;
+      ctx.fillRect(-2, Y(0), X(0) + 2, Hh - Y(0) + 2);
+      ctx.fillRect(X(sv.L), Y(sv.r), Wd - X(sv.L) + 2, Hh - Y(sv.r) + 2);
+      ctx.fillRect(X(0) - 1, Y(-sv.D), sv.L * s + 2, Hh - Y(-sv.D) + 2);
+      (sv.rk || []).forEach((k) => { ctx.fillRect(X(k[0] - 0.5), Y(k[1]), s, Hh - Y(k[1]) + 2); });
+      // 바위 무늬
+      ctx.strokeStyle = 'rgba(0,0,0,.18)'; ctx.lineWidth = 1;
+      for (let i = 0; i < 14; i++) {
+        const yy = -0.8 - (i * 1.37) % (sv.D + 3);
+        ctx.beginPath(); ctx.moveTo(X(-3 + (i % 3) * 0.7), Y(yy)); ctx.lineTo(X(-0.4), Y(yy - 0.3)); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(X(sv.L + 0.4), Y(yy + sv.r * 0 - 0.2)); ctx.lineTo(X(sv.L + 2.6 - (i % 3) * 0.6), Y(yy - 0.1)); ctx.stroke();
+      }
+      // 겉흙(풀·눈)
+      ctx.fillStyle = th.top;
+      const tk = Math.max(3, 0.22 * s);
+      ctx.fillRect(-2, Y(0) - 1, X(0) + 2, tk);
+      ctx.fillRect(X(sv.L), Y(sv.r) - 1, Wd - X(sv.L) + 2, tk);
+      ctx.fillRect(X(0), Y(-sv.D) - 1, sv.L * s, tk);
+      (sv.rk || []).forEach((k) => ctx.fillRect(X(k[0] - 0.5), Y(k[1]) - 1, s, tk));
+      // 접근 도로
+      ctx.fillStyle = '#3b3640';
+      ctx.fillRect(-2, Y(0) - Math.max(3, 0.18 * s), X(0) + 2, Math.max(3, 0.18 * s));
+      ctx.fillRect(X(sv.L), Y(sv.r) - Math.max(3, 0.18 * s), Wd - X(sv.L) + 2, Math.max(3, 0.18 * s));
+      ctx.strokeStyle = 'rgba(255,230,140,.6)'; ctx.setLineDash([6, 6]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(-2, Y(0) - Math.max(1.5, 0.09 * s)); ctx.lineTo(X(0), Y(0) - Math.max(1.5, 0.09 * s));
+      ctx.moveTo(X(sv.L), Y(sv.r) - Math.max(1.5, 0.09 * s)); ctx.lineTo(Wd, Y(sv.r) - Math.max(1.5, 0.09 * s)); ctx.stroke(); ctx.setLineDash([]);
+      // 기초 자리
+      (sv.fd || []).forEach((p) => {
+        ctx.fillStyle = '#8c8a84'; ctx.fillRect(X(p[0] - 0.6), Y(p[1]) - 2, 1.2 * s, Math.max(5, 0.35 * s));
+        ctx.strokeStyle = 'rgba(0,0,0,.3)'; ctx.strokeRect(X(p[0] - 0.6), Y(p[1]) - 2, 1.2 * s, Math.max(5, 0.35 * s));
+      });
+      // 바람
+      if (sv.wd) {
+        ctx.strokeStyle = 'rgba(230,240,255,.35)'; ctx.lineWidth = 1.4;
+        const span = sv.L + 8;
+        for (let k = 0; k < 9; k++) {
+          const xx = ((tt * (1.5 + sv.wd * 0.4) + k * 3.7) % span) - 4, yy = topY(sv) - 0.6 - (k * 1.37) % Math.max(2, topY(sv) + 2);
+          ctx.beginPath(); ctx.moveTo(X(xx), Y(yy)); ctx.lineTo(X(xx + 1.2), Y(yy)); ctx.stroke();
+        }
+        ctx.fillStyle = 'rgba(220,235,255,.9)'; ctx.font = '700 11px ' + FONT; ctx.textAlign = 'left';
+        ctx.fillText('바람 → 세기 ' + sv.wd, X(-2.6), Y(topY(sv) + 0.5) + 15);
+      }
+      // 높이 제한
+      const ty = Y(topY(sv) + 0.5);
+      ctx.strokeStyle = 'rgba(255,150,120,.45)'; ctx.setLineDash([4, 5]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(X(-3), ty); ctx.lineTo(X(sv.L + 3), ty); ctx.stroke(); ctx.setLineDash([]);
+      if (sv.top <= 2) {
+        // 위 철길(천장)은 차보다 높이 그려 차와 겹치지 않게. 점선이 실제로 지을 수 있는 높이.
+        const by = Math.min(ty, Y(Math.max(0, sv.r) + 2.7)), bh = Math.max(6, 0.4 * s);
+        ctx.fillStyle = 'rgba(70,60,70,.85)'; ctx.fillRect(X(-3.2), by - bh, (sv.L + 6.4) * s, bh);
+        if (!sv.top) { ctx.fillStyle = 'rgba(40,34,44,.9)'; for (let x = -3; x <= sv.L + 3; x += 1.5) ctx.fillRect(X(x), by - bh - Math.max(2, 0.12 * s), Math.max(3, 0.5 * s), Math.max(2, 0.12 * s)); }
+        ctx.fillStyle = 'rgba(255,190,160,.85)'; ctx.font = '600 10px ' + FONT; ctx.textAlign = 'left';
+        ctx.fillText(sv.top ? '높이 제한 (점선 위로 못 지어요)' : '위는 철길 — 길보다 높게 못 지어요', X(-2.6), ty - 4);
+      }
+    }
+    function drawGrid(sv, D) {
+      const s = cam.sc, r = Math.max(1, Math.min(2.2, s * 0.06));
+      ctx.fillStyle = 'rgba(242,233,216,.33)';
+      for (let x = -3; x <= sv.L + 3; x++) for (let y = Math.ceil(-sv.D); y <= topY(sv); y++) {
+        if (jointErr(sv, x, y)) continue;
+        const px = X(x), py = Y(y);
+        if (px < -4 || px > cv.w + 4 || py < cam.top - 4 || py > cam.bot + 4) continue;
+        ctx.fillRect(px - r, py - r, r * 2, r * 2);
+      }
+      if (mirror && canMirror()) {
+        ctx.strokeStyle = 'rgba(227,174,69,.45)'; ctx.setLineDash([3, 5]); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(X(sv.L / 2), Y(topY(sv) + 0.5)); ctx.lineTo(X(sv.L / 2), Y(-sv.D)); ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    const lw = (c) => { const s = cam.sc; return c === 'R' ? Math.max(4.5, 0.3 * s) : c === 'K' ? Math.max(5, 0.32 * s) : c === 'P' ? Math.max(1.5, 0.05 * s) : c === 'C' ? Math.max(1.8, 0.07 * s) : Math.max(3, 0.16 * s); };
+    function seg(ax, ay, bx, by) { ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke(); }
+    // 부재 그리기: D(설계), PX/PY(위치), S(시뮬, 없으면 null), stress(힘 색), warn(자기 무게 미리 보기 경고 색)
+    function drawMembers(D, PX, PY, S, stress, warn) {
+      ctx.lineCap = 'round';
+      const order = 'KWSPCR', pulse = 0.5 + 0.5 * Math.sin(clock / 90);
+      let hot = -1, hotR = 0;
+      for (const c of order) {
+        for (let k = 0; k < D.m.length; k++) {
+          const m = D.m[k]; if (m[2] !== c) continue;
+          const ax = X(PX[m[0]]), ay = Y(PY[m[0]]), bx = X(PX[m[1]]), by = Y(PY[m[1]]);
+          const w = lw(c), broken = S && S.br[k] >= 0;
+          if (broken && stress) {   // 끊어진 부재: 양쪽 이음새에 부러진 토막이 매달려 처진다
+            const age = (S.f - S.br[k]) / FPS, dx = bx - ax, dy = by - ay, f = 0.3, dr = Math.min(1, age * 1.8) * Math.hypot(dx, dy) * f * 0.7;
+            ctx.strokeStyle = age < 0.35 ? '#ff7a4a' : c === 'S' || c === 'C' ? '#4c4f5a' : '#5b3a2c'; ctx.lineWidth = Math.max(2, w * 0.85);
+            seg(ax, ay, ax + dx * f, ay + dy * f + dr); seg(bx, by, bx - dx * f, by - dy * f + dr);
+            continue;
+          }
+          let colr = MAT[c].col;
+          if (stress && S) {
+            const r = S.ra[k]; colr = stressCol(r);
+            if (r > hotR) { hotR = r; hot = k; }
+            if (r > 0.85) { ctx.strokeStyle = 'rgba(255,70,50,' + (0.2 + 0.3 * pulse).toFixed(2) + ')'; ctx.lineWidth = w + 7; seg(ax, ay, bx, by); }
+          } else if (warn && S && (broken || S.ra[k] > 0.8)) colr = broken ? '#ff5a4a' : '#ffa060';
+          if (c === 'R') {
+            ctx.strokeStyle = '#2e2018'; ctx.lineWidth = w + 2.5; seg(ax, ay, bx, by);
+            ctx.strokeStyle = colr; ctx.lineWidth = w; seg(ax, ay, bx, by);
+            const o = w * 0.3;   // 위 = 포장, 아래 = 나무 밑면 빛
+            ctx.strokeStyle = 'rgba(38,34,42,.92)'; ctx.lineWidth = Math.max(1.5, w * 0.32); seg(ax, ay - o, bx, by - o);
+            if (!stress) { ctx.strokeStyle = 'rgba(255,230,180,.25)'; ctx.lineWidth = Math.max(1, w * 0.18); seg(ax, ay + o, bx, by + o); }
+          } else if (c === 'P' || c === 'C') {
+            // 느슨한 줄은 아래로 처져 보이게
+            let sag = 0;
+            if (S && !broken) { const L0 = S.L0[k], len = Math.hypot(PX[m[1]] - PX[m[0]], PY[m[1]] - PY[m[0]]); sag = Math.sqrt(Math.max(0, L0 * L0 - len * len)) * 0.5 * cam.sc; }
+            const mx = (ax + bx) / 2, my = (ay + by) / 2 + sag * 2;
+            const path = () => { ctx.beginPath(); ctx.moveTo(ax, ay); if (sag > 0.5) ctx.quadraticCurveTo(mx, my, bx, by); else ctx.lineTo(bx, by); ctx.stroke(); };
+            ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = w + 1.2; path();
+            ctx.strokeStyle = colr; ctx.lineWidth = w; if (broken) ctx.setLineDash([4, 4]); path();
+            if (!stress && !broken) {
+              if (c === 'P') { ctx.strokeStyle = 'rgba(120,85,40,.7)'; ctx.setLineDash([2, 3]); ctx.lineWidth = Math.max(1, w * 0.6); path(); }
+              else { ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = Math.max(0.8, w * 0.35); path(); }
+            }
+            ctx.setLineDash([]);
+          } else {
+            ctx.strokeStyle = 'rgba(0,0,0,.45)'; ctx.lineWidth = w + 1.8; seg(ax, ay, bx, by);
+            ctx.strokeStyle = colr; ctx.lineWidth = w;
+            if (broken) ctx.setLineDash([4, 4]);
+            seg(ax, ay, bx, by); ctx.setLineDash([]);
+            if (broken) continue;
+            if (c === 'W') { ctx.strokeStyle = stress ? 'rgba(0,0,0,.12)' : 'rgba(110,70,30,.45)'; ctx.lineWidth = Math.max(0.8, w * 0.18); seg(ax, ay, bx, by); }
+            else if (c === 'S') {
+              ctx.strokeStyle = 'rgba(255,255,255,' + (stress ? '.25' : '.4') + ')'; ctx.lineWidth = Math.max(1, w * 0.25); seg(ax, ay, bx, by);
+              if (w > 4.5 && !stress) {   // 리벳
+                ctx.fillStyle = 'rgba(30,34,44,.7)';
+                for (const t of [0.12, 0.88]) { ctx.beginPath(); ctx.arc(ax + (bx - ax) * t, ay + (by - ay) * t, Math.max(1, w * 0.16), 0, 7); ctx.fill(); }
+              }
+            } else if (c === 'K') { ctx.strokeStyle = 'rgba(0,0,0,.2)'; ctx.lineWidth = Math.max(1, w * 0.22); seg(ax, ay, bx, by); }
+          }
+        }
+      }
+      // 가장 힘든 부재에 % 꼬리표
+      if (stress && S && hot >= 0 && hotR > 0.5) {
+        const m = D.m[hot], x = X((PX[m[0]] + PX[m[1]]) / 2), y = Y((PY[m[0]] + PY[m[1]]) / 2) - 16;
+        const t = Math.round(Math.min(hotR, 1) * 100) + '%';
+        ctx.font = '700 11px ' + MONO; const tw = ctx.measureText(t).width + 10;
+        const lx = U.clamp(x - tw / 2, 4, cv.w - tw - 4), ly = U.clamp(y - 9, cam.top + 2, cam.bot - 20);
+        ctx.fillStyle = 'rgba(23,19,31,.88)'; rr(lx, ly, tw, 17, 5); ctx.fill();
+        ctx.fillStyle = stressCol(hotR); ctx.textAlign = 'center'; ctx.fillText(t, lx + tw / 2, ly + 12.5);
+      }
+      return hotR;
+    }
+    function drawJoints(D, PX, PY, sel) {
+      const sv = viewSite(), A = anchors(sv), s = cam.sc;
+      const r = Math.max(3, Math.min(7, 0.13 * s));
+      // 고정점 (빈 것도)
+      for (let i = 0; i < A.length; i++) {
+        const x = X(A[i][0]), y = Y(A[i][1]);
+        ctx.fillStyle = A[i][2] === 1 ? '#b8b2a6' : '#e3ae45';
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - r * 1.4, y + r * 1.9); ctx.lineTo(x + r * 1.4, y + r * 1.9); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.arc(x, y, r * 1.15, 0, 7); ctx.fill();
+        ctx.fillStyle = '#2a2030'; ctx.beginPath(); ctx.arc(x, y, r * 0.45, 0, 7); ctx.fill();
+      }
+      ctx.fillStyle = '#f2e9d8'; ctx.strokeStyle = '#2a2030'; ctx.lineWidth = 1.2;
+      for (let i = D.na; i < PX.length; i++) { const x = X(PX[i]), y = Y(PY[i]); ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.stroke(); }
+      if (sel >= 0 && sel < PX.length) {
+        const x = X(PX[sel]), y = Y(PY[sel]), p = 0.5 + 0.5 * Math.sin(clock / 160);
+        ctx.strokeStyle = '#ffd36a'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(x, y, r + 5 + p * 3, 0, 7); ctx.stroke();
+      }
+    }
+    function drawVehicle(S, T, vh, c0, dt) {
+      const V = VEH[vh], s = cam.sc, sv = S.site;
+      let ax = S.axx, ay = S.ay, rot = 0, dy = 0, dx = 0;
+      if (T && T.fall) {
+        let t = (S.f - T.fall.f) / FPS;
+        ax = T.fall.x; ay = T.fall.y;
+        // 바닥(물이면 물 밑바닥)에 닿으면 멈춤
+        const floor = -sv.D + 0.9, top = Math.max.apply(null, ay), mid = (ax[0] + ax[ax.length - 1]) / 2;
+        const tHit = Math.sqrt(Math.max(0, 2 * (top - floor) / GRAV));
+        if (sv.w != null && !T.fall.wet) { const tw = Math.sqrt(Math.max(0, 2 * (top - sv.w) / GRAV)); if (t >= tw) { T.fall.wet = 1; splash(mid + 0.6 * tw, sv.w, true); } }
+        if (t >= tHit) {
+          if (T.fall.hit < 0) { T.fall.hit = 1; if (sv.w == null) splash(mid + 0.6 * tHit, floor - 0.3, false); sfx('thud'); api.buzz(40); shake = Math.max(shake, 0.7 * ((typeof L.fx === 'function') ? L.fx() : 1)); }
+          t = tHit;
+        }
+        dy = -0.5 * GRAV * t * t; rot = t * 1.1; dx = 0.6 * t;
+      }
+      const n = ax.length;
+      if (!n) return;
+      const P = (k) => [ax[k] + dx, ay[k] + dy];
+      const wr = Math.max(3, 0.36 * s), spin = (S.front || 0) / 0.36;
+      const wheel = (lx) => {
+        ctx.fillStyle = '#18141c'; ctx.beginPath(); ctx.arc(lx, -wr * 0.95, wr, 0, 7); ctx.fill();
+        ctx.fillStyle = '#8a8490'; ctx.beginPath(); ctx.arc(lx, -wr * 0.95, wr * 0.45, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#18141c'; ctx.lineWidth = Math.max(1, wr * 0.16);
+        const c = Math.cos(spin) * wr * 0.45, sn = Math.sin(spin) * wr * 0.45;
+        seg(lx - c, -wr * 0.95 + sn, lx + c, -wr * 0.95 - sn);
+      };
+      const body = (k0, k1, len0, len1, hgt, fill, kind) => {
+        const [x0, y0] = P(k0), [x1, y1] = P(k1);
+        const ang = Math.atan2(y0 - y1, x0 - x1) + rot * (kind === 'loco' ? 1 : 0.8);
+        const cx = X((x0 + x1) / 2), cy = Y((y0 + y1) / 2);
+        const L0 = Math.hypot(x0 - x1, y0 - y1) * s;
+        ctx.save(); ctx.translate(cx, cy); ctx.rotate(-ang);
+        const fl = L0 / 2 + len0 * s, bl = -L0 / 2 - len1 * s, bh = hgt * s, rad = Math.max(2, 0.15 * s);
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(bl, -wr - bh - 1, fl - bl, bh, rad); ctx.fill();
+        ctx.fillStyle = fill; rr(bl, -wr - bh, fl - bl, bh, rad); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(bl + rad, -wr - bh + 1, Math.max(0, fl - bl - rad * 2), Math.max(1, bh * 0.14));   // 윗빛
+        if (kind === 'car') {
+          ctx.fillStyle = fill; rr(-L0 * 0.34, -wr - bh * 1.62, L0 * 0.72, bh * 0.75, Math.max(2, bh * 0.3)); ctx.fill();
+          ctx.fillStyle = 'rgba(200,230,255,.88)'; rr(-L0 * 0.26, -wr - bh * 1.5, L0 * 0.25, bh * 0.5, 2); ctx.fill(); rr(L0 * 0.03, -wr - bh * 1.5, L0 * 0.27, bh * 0.5, 2); ctx.fill();
+          ctx.fillStyle = '#ffe9a0'; ctx.fillRect(fl - Math.max(2, 0.12 * s), -wr - bh * 0.8, Math.max(2, 0.12 * s), bh * 0.25);
+          ctx.fillStyle = '#ff5a4a'; ctx.fillRect(bl, -wr - bh * 0.8, Math.max(2, 0.1 * s), bh * 0.25);
+        } else if (kind === 'truck') {
+          const cw = (fl - bl) * 0.72;
+          ctx.fillStyle = '#d8cfbf'; rr(bl, -wr - bh * 1.85, cw, bh * 1.2, 2); ctx.fill();
+          ctx.strokeStyle = 'rgba(0,0,0,.18)'; ctx.lineWidth = 1; for (let q = 1; q < 5; q++) seg(bl + cw * q / 5, -wr - bh * 1.8, bl + cw * q / 5, -wr - bh * 0.7);
+          ctx.fillStyle = fill; rr(fl - (fl - bl) * 0.25, -wr - bh * 1.9, (fl - bl) * 0.25, bh * 1.05, 3); ctx.fill();
+          ctx.fillStyle = 'rgba(200,230,255,.88)'; ctx.fillRect(fl - (fl - bl) * 0.12, -wr - bh * 1.75, (fl - bl) * 0.09, bh * 0.45);
+          ctx.fillStyle = '#ffe9a0'; ctx.fillRect(fl - Math.max(2, 0.1 * s), -wr - bh * 0.75, Math.max(2, 0.1 * s), bh * 0.25);
+        } else if (kind === 'loco') {
+          ctx.fillStyle = '#2a2a32'; rr(bl + (fl - bl) * 0.04, -wr - bh * 1.9, (fl - bl) * 0.34, bh * 0.95, 2); ctx.fill();
+          ctx.fillStyle = 'rgba(200,230,255,.8)'; ctx.fillRect(bl + (fl - bl) * 0.12, -wr - bh * 1.7, (fl - bl) * 0.16, bh * 0.4);
+          ctx.fillStyle = '#1e1e24'; ctx.fillRect(fl - (fl - bl) * 0.22, -wr - bh * 1.75, Math.max(3, 0.35 * s), bh * 0.8);
+          ctx.fillStyle = '#ffd36a'; ctx.beginPath(); ctx.arc(fl - 2, -wr - bh * 0.6, Math.max(1.5, 0.12 * s), 0, 7); ctx.fill();
+          ctx.fillStyle = '#c94a3a'; ctx.beginPath(); ctx.moveTo(fl, -wr - bh * 0.05); ctx.lineTo(fl + Math.max(3, 0.3 * s), -wr * 0.2); ctx.lineTo(fl, -wr * 0.2); ctx.closePath(); ctx.fill();
+        } else if (kind === 'wagon') {
+          ctx.fillStyle = 'rgba(0,0,0,.18)'; for (let q = 1; q < 4; q++) ctx.fillRect(bl + (fl - bl) * q / 4 - 1, -wr - bh, 2, bh);
+        }
+        for (const k of [k0, k1]) { const [xk, yk] = P(k); wheel(((xk - (x0 + x1) / 2) * Math.cos(ang) + (yk - (y0 + y1) / 2) * Math.sin(ang)) * s); }
+        ctx.restore();
+        if (kind === 'loco' && T && dt > 0 && !(T.fall && T.fall.hit > 0)) {   // 굴뚝 연기
+          T.smk = (T.smk || 0) + dt * spd();
+          if (T.smk > 0.14) {
+            T.smk = 0;
+            const ca = Math.cos(ang), sa = Math.sin(ang), lx = (fl - (fl - bl) * 0.22 + 0.17 * s) / s, ly = (wr + bh * 1.8) / s;
+            parts.push({ k: 4, x: (x0 + x1) / 2 + lx * ca - ly * sa, y: (y0 + y1) / 2 + lx * sa + ly * ca, vx: -0.6, vy: 1.2, t: 1.1, c: 'rgba(225,220,215,', R: 0.25 });
+            if (parts.length > 160) parts.splice(0, parts.length - 160);
+          }
+        }
+      };
+      if (vh === 0) body(0, 1, 0.5, 0.5, 0.75, c0, 'car');
+      else if (vh === 1) body(0, 2, 0.6, 0.5, 0.6, c0, 'truck');
+      else {
+        for (let k = n - 2; k >= 0; k -= 2) body(k, k + 1, 0.8, 0.8, k === 0 ? 1.1 : 1.0, k === 0 ? c0 : k % 4 === 2 ? '#7a5a3e' : '#5e6a4a', k === 0 ? 'loco' : 'wagon');
+      }
+    }
+    function splash(x, y, wet) {
+      for (let i = 0; i < 14; i++) {
+        const a = Math.PI * (0.15 + 0.7 * i / 13), sp = 2 + (i * 7 % 5) * 0.8;
+        parts.push(wet ? { k: 3, x: x + (i - 7) * 0.15, y, vx: Math.cos(a) * sp * 0.8, vy: Math.sin(a) * sp * 1.4, t: 1.0, c: '#bfe6ff' }
+          : { k: 2, x: x + (i - 7) * 0.2, y, vx: Math.cos(a) * sp * 0.4, vy: Math.sin(a) * 0.6, t: 1.2, c: 'rgba(200,180,150,', R: 0.3 });
+      }
+      if (wet) sfx('whoosh');
+      if (parts.length > 160) parts.splice(0, parts.length - 160);
+    }
+    function drawParts(dt) {
+      const sc = cam.sc, d = dt * spd();
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const p = parts[i];
+        p.t -= d; if (p.t <= 0) { parts.splice(i, 1); continue; }
+        if (p.k === 1 || p.k === 3 || !p.k) p.vy -= 9.8 * d;
+        p.x += p.vx * d; p.y += p.vy * d;
+        const a = Math.min(1, p.t * 1.5);
+        if (p.k === 1) {   // 부러진 조각
+          p.r += p.vr * d;
+          const l = Math.max(4, p.L * sc) / 2, c = Math.cos(p.r) * l, s2 = Math.sin(p.r) * l;
+          ctx.globalAlpha = a; ctx.strokeStyle = p.c; ctx.lineWidth = Math.max(2, 0.07 * sc); ctx.lineCap = 'round';
+          seg(X(p.x) - c, Y(p.y) - s2, X(p.x) + c, Y(p.y) + s2);
+        } else if (p.k === 2 || p.k === 4) {   // 먼지·연기
+          p.R += d * 0.6; ctx.globalAlpha = 1; ctx.fillStyle = p.c + (0.45 * Math.min(1, p.t)).toFixed(2) + ')';
+          ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), Math.max(2, p.R * sc), 0, 7); ctx.fill();
+        } else {   // 물방울
+          ctx.globalAlpha = a; ctx.fillStyle = p.c; ctx.fillRect(X(p.x) - 2, Y(p.y) - 2, 4, 4);
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+    function drawGhost() {
+      if (!ghost) return;
+      const ok = !ghost.err;
+      ctx.strokeStyle = ok ? 'rgba(255,211,106,.95)' : 'rgba(255,110,90,.9)'; ctx.lineWidth = Math.max(3, lw(mat) * 0.8); ctx.setLineDash([6, 5]); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(X(ghost.x1), Y(ghost.y1)); ctx.lineTo(X(ghost.x2), Y(ghost.y2)); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = ok ? '#ffd36a' : '#ff6e5a'; ctx.beginPath(); ctx.arc(X(ghost.x2), Y(ghost.y2), Math.max(5, 0.16 * cam.sc), 0, 7); ctx.fill();
+      // 길이 꼬리표 (손가락에 가리지 않게 위쪽)
+      const t = ok ? ghost.len.toFixed(1) + 'm' : '✗';
+      ctx.font = '700 12px ' + MONO; const tw = ctx.measureText(t).width + 12;
+      const lx = U.clamp(X(ghost.x2) - tw / 2, 4, cv.w - tw - 4), ly = Math.max(cam.top + 2, Y(ghost.y2) - 46);
+      ctx.fillStyle = 'rgba(23,19,31,.9)'; rr(lx, ly, tw, 20, 6); ctx.fill();
+      ctx.fillStyle = ok ? '#ffd36a' : '#ff8a78'; ctx.textAlign = 'center'; ctx.fillText(t, lx + tw / 2, ly + 14);
+    }
+    function label(x, y, t, c, size) {
+      ctx.font = '600 ' + (size || 12) + 'px ' + FONT; const tw = ctx.measureText(t).width + 16;
+      ctx.fillStyle = 'rgba(23,19,31,.88)'; rr(x - tw / 2, y - 14, tw, 26, 8); ctx.fill();
+      ctx.fillStyle = c || '#f2e9d8'; ctx.textAlign = 'center'; ctx.fillText(t, x, y + 4);
+    }
+    function drawEdit(dt, tt) {
+      const sv = site(), D = curD(); if (!D) return;
+      drawTerrain(sv, tt);
+      if (test) {
+        const done = stepSim(test, dt, 1);
+        const S = test.S;
+        drawMembers(D, S.x, S.y, S, true, false);
+        drawJoints(D, S.x, S.y, -1);
+        drawVehicle(S, test, st.vh, col(editSeat()), dt);
+        if (!S.done) { test.creak = (test.creak || 0) - dt * spd(); let mx = 0; for (let k = 0; k < S.nM; k++) if (S.br[k] < 0 && S.ra[k] > mx) mx = S.ra[k]; if (mx > 0.9 && test.creak <= 0) { test.creak = 0.5; sfx('tick'); } }
+        drawParts(dt);
+        if (done && !test.hold) {
+          test.hold = 1;
+          testRes = evaluate(sv, st.vh, serialize(D), budgetOf(st));
+          const pn = testRes[0] ? defPen(sv.L, testRes[6] / 100) : 0;
+          api.toast(testRes[0] ? '✓ 건넜어요! 예상 ' + testRes[1] + '점' + (pn ? ' (처짐 ' + testRes[6] + 'cm −' + pn + ')' : '') : '✗ ' + FAIL[FCODE[testRes[4]]]);
+          sfx(testRes[0] ? 'win' : 'lose'); syncStat();
+        }
+        if (test.hold) { test.hold += dt * spd(); if (test.hold > 2.6) stopTest(); }
+        return;
+      }
+      drawGrid(sv, D);
+      const se = D.m.length ? ensureSettle() : null;
+      drawMembers(D, D.x, D.y, se ? se.S : null, false, true);
+      drawJoints(D, D.x, D.y, W(editSeat()).sel);
+      drawGhost();
+      drawParts(dt);
+    }
+    function drawWait(tt) {
+      const sv = site();
+      drawTerrain(sv, tt);
+      const s = mySeatShown();
+      const D = s >= 0 && work[s] && work[s].D.m.length ? work[s].D : s >= 0 && st.d[s] ? parse(sv, st.d[s]) : null;
+      if (D) { drawMembers(D, D.x, D.y, null, false, false); drawJoints(D, D.x, D.y, -1); }
+      else drawJoints(parse(sv, ''), anchors(sv).map((p) => p[0]), anchors(sv).map((p) => p[1]), -1);
+    }
+    function drawRev(dt, tt) {
+      const last = st.last, sv = SITE(st, last.si);
+      drawTerrain(sv, tt);
+      const B = last.B;
+      if (rv.ph === 'board') { drawBoard(); return; }
+      rv.t += dt * spd();
+      const i = rv.i, T = rv.T, S = T.S, r = last.res[i], P = rp(i);
+      if (rv.ph === 'ride' || rv.ph === 'card') {
+        if (rv.ph === 'ride' && stepSim(T, dt, P.rate)) { rv.ph = 'card'; rv.t = 0; sfx(r[0] ? 'win' : 'lose'); syncRev(); }
+      } else if (rv.ph === 'intro' && rv.t > P.intro) { rv.ph = 'ride'; rv.t = 0; sfx('whoosh'); syncRev(); }
+      drawMembers(S.D, S.x, S.y, S, rv.ph !== 'intro', false);
+      drawJoints(S.D, S.x, S.y, -1);
+      drawVehicle(S, T, last.vh, col(i), rv.ph === 'ride' ? dt : 0);
+      drawParts(dt);
+      // 머리글
+      const x = cv.w / 2;
+      ctx.fillStyle = 'rgba(23,19,31,.88)'; rr(8, 6, cv.w - 16, 42, 12); ctx.fill();
+      ctx.fillStyle = col(i); ctx.beginPath(); ctx.arc(26, 27, 7, 0, 7); ctx.fill();
+      ctx.textAlign = 'left'; ctx.fillStyle = '#f2e9d8'; ctx.font = '400 17px ' + DISP; ctx.fillText(nm(i) + '의 다리', 40, 25);
+      ctx.font = '600 11px ' + FONT; ctx.fillStyle = '#ab9fb8';
+      ctx.fillText(sv.e + ' ' + sv.n + ' · ' + VEH[last.vh].e + ' ' + VEH[last.vh].n + ' · 비용 ' + fmt(r[2]) + '/' + fmt(B), 40, 40);
+      ctx.textAlign = 'right'; ctx.font = '600 12px ' + MONO; ctx.fillStyle = '#e3ae45'; ctx.fillText((i + 1) + '/' + st.n, cv.w - 18, 25);
+      if (P === RIDE.fast) { ctx.font = '600 10.5px ' + FONT; ctx.fillStyle = '#8fd0ff'; ctx.fillText('⏩ 빠르게', cv.w - 18, 40); }
+      // 시험 중 큰 힘: 삐걱 소리 (0.5초에 한 번까지)
+      if (rv.ph === 'ride' && !S.done) { T.creak -= dt * spd(); let mx = 0; for (let k = 0; k < S.nM; k++) if (S.br[k] < 0 && S.ra[k] > mx) mx = S.ra[k]; if (mx > 0.9 && T.creak <= 0) { T.creak = 0.5; sfx('tick'); } }
+      if (rv.ph === 'intro') label(x, (cam.top + cam.bot) / 2 - 40, last.d[i] ? '곧 ' + VEH[last.vh].n + '가 건너요!' : '빈 설계예요…', '#ffd36a', 15);
+      if (rv.ph === 'card') {
+        const a = Math.min(1, rv.t * 3);
+        ctx.globalAlpha = a;
+        const w = Math.min(300, cv.w - 40), hh = 128, cx = x - w / 2, cy = cam.bot - hh - 10;
+        ctx.fillStyle = 'rgba(23,19,31,.94)'; rr(cx, cy, w, hh, 14); ctx.fill();
+        ctx.strokeStyle = r[0] ? '#4fc08a' : '#ee6a55'; ctx.lineWidth = 2; rr(cx, cy, w, hh, 14); ctx.stroke();
+        ctx.textAlign = 'center'; ctx.font = '400 22px ' + DISP; ctx.fillStyle = r[0] ? '#8fe3b0' : '#ff8a78';
+        ctx.fillText(r[0] ? '성공! ' + r[1] + '점' : '실패 — ' + FAIL[FCODE[r[4]]], x, cy + 32);
+        const [a0, b0, c0, p0] = scoreParts(r, B, sv.L);
+        ctx.font = '600 13px ' + FONT; ctx.fillStyle = '#f2e9d8';
+        if (r[0]) {
+          ctx.fillText('건넘 ' + a0 + ' + 예산 ' + b0 + ' + 여유 ' + c0 + (p0 ? ' − 처짐 ' + p0 : ''), x, cy + 60);
+          ctx.fillStyle = p0 ? '#ffc46a' : '#ab9fb8'; ctx.font = '500 12px ' + FONT;
+          ctx.fillText(p0 ? '길이 ' + (r[6] || 0) + 'cm 처졌어요 · 세모로 받쳐 봐요' : '비용 ' + fmt(r[2]) + ' (예산 ' + fmt(B) + ') · 가장 힘든 부재 ' + r[3] + '%', x, cy + 84);
+        } else {
+          ctx.fillText('0점', x, cy + 60);
+          ctx.fillStyle = '#ab9fb8'; ctx.font = '500 12px ' + FONT; ctx.fillText(r[4] === 6 ? '비용 ' + fmt(r[2]) + ' > 예산 ' + fmt(B) : '다음엔 빨간 부재를 튼튼하게!', x, cy + 84);
+        }
+        if (!st.solo) { ctx.fillStyle = '#e3ae45'; ctx.font = '600 12px ' + MONO; ctx.fillText('합계 ' + st.sc[i] + '점', x, cy + 108); }
+        ctx.globalAlpha = 1;
+        if (rv.t > P.card) setRide(i + 1);
+      }
+    }
+    function drawBoard() {
+      const last = st.last, w = Math.min(330, cv.w - 24), x = (cv.w - w) / 2;
+      const nx = !st.solo && last.r + 1 < st.R ? last.r + 1 : -1;
+      const rows = st.n, hh = 64 + rows * 38 + (st.solo ? 34 : 0) + (nx >= 0 ? 30 : 0), y = Math.max(cam.top, (cam.top + cam.bot) / 2 - hh / 2);
+      ctx.fillStyle = 'rgba(23,19,31,.94)'; rr(x, y, w, hh, 16); ctx.fill();
+      ctx.strokeStyle = 'rgba(227,174,69,.5)'; ctx.lineWidth = 1.5; rr(x, y, w, hh, 16); ctx.stroke();
+      ctx.textAlign = 'left'; ctx.fillStyle = '#f2e9d8'; ctx.font = '400 19px ' + DISP;
+      ctx.fillText(st.solo ? '시험 결과' : (last.r + 1) + '/' + st.R + '판 결과', x + 14, y + 28);
+      ctx.textAlign = 'right'; ctx.font = '600 11px ' + FONT; ctx.fillStyle = '#ab9fb8'; ctx.fillText(st.solo ? '' : '이번 판 · 합계', x + w - 14, y + 28);
+      const ord = st.sc.map((_, i) => i).sort((a, b) => st.sc[b] - st.sc[a] || a - b);
+      ord.forEach((i, k) => {
+        const yy = y + 48 + k * 38, r = last.res[i];
+        ctx.fillStyle = 'rgba(255,255,255,.05)'; rr(x + 8, yy, w - 16, 32, 8); ctx.fill();
+        ctx.fillStyle = col(i); ctx.beginPath(); ctx.arc(x + 24, yy + 16, 6, 0, 7); ctx.fill();
+        ctx.textAlign = 'left'; ctx.fillStyle = '#f2e9d8'; ctx.font = '600 14px ' + FONT;
+        let nmv = nm(i); while (ctx.measureText(nmv).width > w * 0.38 && nmv.length > 2) nmv = nmv.slice(0, -1);
+        ctx.fillText(nmv, x + 38, yy + 21);
+        ctx.font = '600 12px ' + FONT; ctx.fillStyle = r[0] ? '#8fe3b0' : '#ff8a78'; ctx.fillText(r[0] ? '성공' : '실패', x + 38 + w * 0.38 + 6, yy + 21);
+        ctx.textAlign = 'right'; ctx.font = '600 14px ' + MONO; ctx.fillStyle = '#e3ae45';
+        ctx.fillText(st.solo ? String(r[1]) : r[1] + ' · ' + st.sc[i], x + w - 18, yy + 21);
+      });
+      if (nx >= 0 && st.ss[nx] != null) {
+        const ns = SITES[st.ss[nx]], nv = VEH[st.vs[nx]];
+        ctx.textAlign = 'center'; ctx.font = '600 12px ' + FONT; ctx.fillStyle = '#ab9fb8';
+        ctx.fillText('다음 판: ' + ns.e + ' ' + ns.n + ' · ' + nv.e + ' ' + nv.n, cv.w / 2, y + hh - 14);
+      }
+      if (st.solo) {
+        const v = last.res[0][1], n = st.si === GEN ? chalStars(last.res[0], last.B) : STARS.filter((q) => v >= q).length;
+        ctx.textAlign = 'center'; ctx.font = '600 22px ' + MONO; ctx.fillStyle = '#e3ae45';
+        ctx.fillText('★'.repeat(n) + '☆'.repeat(3 - n), cv.w / 2, y + hh - 14);
+      }
+    }
+
+    /* ---- 입력 ---- */
+    function nearestJoint(D, px, py) {
+      const R = Math.max(22, cam.sc * 0.45);
+      let best = -1, bd = R;
+      for (let i = 0; i < D.x.length; i++) { const d = Math.hypot(X(D.x[i]) - px, Y(D.y[i]) - py); if (d < bd) { bd = d; best = i; } }
+      return best;
+    }
+    function nearestMember(D, px, py) {
+      let best = -1, bd = Math.max(14, cam.sc * 0.3);
+      for (let k = 0; k < D.m.length; k++) {
+        const m = D.m[k], ax = X(D.x[m[0]]), ay = Y(D.y[m[0]]), bx = X(D.x[m[1]]), by = Y(D.y[m[1]]);
+        const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy || 1;
+        const t = U.clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1);
+        const d = Math.hypot(ax + dx * t - px, ay + dy * t - py);
+        if (d < bd) { bd = d; best = k; }
+      }
+      return best;
+    }
+    function ghostTo(D, a, px, py) {
+      const gx = Math.round(WX(px)), gy = Math.round(WY(py)), x1 = D.x[a], y1 = D.y[a];
+      const j = nearestJoint(D, px, py);
+      const x2 = j >= 0 ? D.x[j] : gx, y2 = j >= 0 ? D.y[j] : gy;
+      if (x2 === x1 && y2 === y1) return null;
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      const err = placeErr(D, x1, y1, x2, y2, mat);
+      return { x1, y1, x2, y2, len, err, cost: len * MAT[mat].cost + (jIdx(D, x2, y2) < 0 ? J_COST : 0) };
+    }
+    function onDown(e) {
+      if (dead || !st) return;
+      const p = cv.local(e);
+      ptrs.set(e.pointerId, p);
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      if (curMode !== 'edit') return;
+      if (test) { stopTest(); return; }
+      if (ptrs.size === 2) {
+        const [a, b] = [...ptrs.values()];
+        pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), sc: cam.sc, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, ox: cam.ox, oy: cam.oy };
+        drag = null; ghost = null; syncInfo(); return;
+      }
+      if (p.y < cam.top - 4 || p.y > cam.bot + 4) return;
+      const D = curD(); if (!D) return;
+      const j = delMode ? -1 : nearestJoint(D, p.x, p.y);
+      drag = { x: p.x, y: p.y, ox: cam.ox, oy: cam.oy, moved: false, j, id: e.pointerId };
+    }
+    function onMove(e) {
+      const p = cv.local(e);
+      if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, p);
+      if (pinch && ptrs.size >= 2) {
+        const [a, b] = [...ptrs.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y), cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+        const wx = (pinch.cx - pinch.ox) / pinch.sc, wy = (pinch.oy - pinch.cy) / pinch.sc;
+        cam.sc = U.clamp(pinch.sc * d / Math.max(20, pinch.d), cam.fit, cam.fit * 4.5);
+        cam.ox = cx - wx * cam.sc; cam.oy = cy + wy * cam.sc; clampCam();
+        return;
+      }
+      if (!drag || drag.id !== e.pointerId) return;
+      if (!drag.moved && Math.abs(p.x - drag.x) + Math.abs(p.y - drag.y) > 8) drag.moved = true;
+      if (!drag.moved) return;
+      const D = curD(); if (!D) return;
+      if (drag.j >= 0) { ghost = ghostTo(D, drag.j, p.x, p.y); syncInfo(); }
+      else { cam.ox = drag.ox + (p.x - drag.x); cam.oy = drag.oy + (p.y - drag.y); clampCam(); }
+    }
+    function onUp(e) {
+      ptrs.delete(e.pointerId);
+      if (pinch) { if (ptrs.size < 2) pinch = null; drag = null; return; }
+      if (!drag || drag.id !== e.pointerId) return;
+      const d = drag; drag = null;
+      if (curMode !== 'edit' || test) return;
+      const s = editSeat(); if (s < 0) return;
+      const w = W(s), D = w.D, p = cv.local(e);
+      if (d.moved) {
+        if (d.j >= 0 && ghost) { const g = ghost; ghost = null; if (!g.err) place(g.x1, g.y1, g.x2, g.y2); else { api.toast(g.err); sfx('thud'); } syncInfo(); }
+        ghost = null; return;
+      }
+      // 탭
+      if (delMode) {
+        const j = nearestJoint(D, p.x, p.y);
+        if (j >= D.na) { delJoint(j); return; }
+        const k = nearestMember(D, p.x, p.y);
+        if (k >= 0) delMember(k); else api.toast('지울 부재를 눌러요');
+        return;
+      }
+      const j = nearestJoint(D, p.x, p.y);
+      if (w.sel >= 0) {
+        if (j === w.sel) { w.sel = -1; sfx('click'); syncInfo(); return; }
+        const gx = j >= 0 ? D.x[j] : Math.round(WX(p.x)), gy = j >= 0 ? D.y[j] : Math.round(WY(p.y));
+        place(D.x[w.sel], D.y[w.sel], gx, gy); syncInfo(); return;
+      }
+      if (j >= 0) { w.sel = j; sfx('click'); api.buzz(6); syncInfo(); return; }
+      const k = nearestMember(D, p.x, p.y);
+      if (k >= 0) {
+        const m = D.m[k];
+        if (m[2] !== mat) {
+          if (memberErr(site(), D.x[m[0]], D.y[m[0]], D.x[m[1]], D.y[m[1]], mat)) { api.toast(memberErr(site(), D.x[m[0]], D.y[m[0]], D.x[m[1]], D.y[m[1]], mat)); return; }
+          place(D.x[m[0]], D.y[m[0]], D.x[m[1]], D.y[m[1]]); w.sel = -1; syncInfo(); return;
+        }
+      }
+      api.toast('먼저 점(이음새)이나 금색 고정점을 눌러요');
+    }
+    function onWheel(e) { if (!st || curMode !== 'edit') return; const p = cv.local(e); zoomAt(p.x, p.y, e.deltaY < 0 ? 1.15 : 1 / 1.15); e.preventDefault(); }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', (e) => { ptrs.delete(e.pointerId); drag = null; pinch = null; ghost = null; });
+    cv.cv.addEventListener('wheel', onWheel, { passive: false });
+    cv.cv.addEventListener('pointerdown', (e) => {   // 공개 화면: 탭하면 넘기기
+      if (curMode === 'rev' && rv && !rv.done) { const p = cv.local(e); if (p.y > 52 && p.y < cam.bot) pressRev(); }
+    });
+
+    /* ---- 키보드 · 패드 ---- */
+    const offInput = api.input ? api.input.on((type, id) => {
+      if (type !== 'down' || dead) return;
+      if (curMode === 'rev' || curMode === 'wait') { if (id === 'done') pressRev(); else if (id === 'skip') skipAll(); return; }
+      if (curMode !== 'edit') return;
+      if (/^m[1-6]$/.test(id)) { setMat(MATS[+id[1] - 1]); return; }
+      const pan = { left: [1, 0], right: [-1, 0], up: [0, 1], down: [0, -1] }[id];
+      if (pan) { cam.ox += pan[0] * cv.w * 0.25; cam.oy += pan[1] * (cam.bot - cam.top) * 0.25; clampCam(); return; }
+      if (id === 'undo') undo(); else if (id === 'del') toggleDel(); else if (id === 'mirror') toggleMir(); else if (id === 'test') toggleTest();
+      else if (id === 'done') pressDone(); else if (id === 'zin') zoomBy(1.6); else if (id === 'zout') zoomBy(1 / 1.6);
+      else if (id === 'brief') { if (sheetEl) closeSheet(); else openBrief(); }
+      else if (id === 'cancel') { const s = editSeat(); if (s >= 0) { W(s).sel = -1; ghost = null; syncInfo(); } }
+    }) : null;
+    function onEsc(e) {
+      if (e.key !== 'Escape') return;
+      if (sheetEl) { e.preventDefault(); e.stopPropagation(); closeSheet(); return; }
+      const s = editSeat();
+      if (curMode === 'edit' && s >= 0 && (W(s).sel >= 0 || delMode || test)) {
+        e.preventDefault(); e.stopPropagation();
+        if (test) stopTest(); else if (delMode) toggleDel(); else { W(s).sel = -1; syncInfo(); }
+      }
+    }
+    addEventListener('keydown', onEsc, true);
+
+    // 시험 도구용(tools/shot.py --js): 화면 좌표·보기 상태
+    const dbg = { cv: cv.cv, scr: (x, y) => [X(x), Y(y)], info: () => ({ mode: curMode, test: !!test, testRes, D: curD() ? serialize(curD()) : null, cost: curD() ? costOf(site(), curD()) : 0,
+      rv: rv && { i: rv.i, ph: rv.ph, done: rv.done }, autoT, sel: editSeat() >= 0 ? W(editSeat()).sel : -1, mirror, delMode, undo: editSeat() >= 0 ? W(editSeat()).undo.length : 0,
+      rev: revBtn.classList.contains('bg-hid') ? '' : revBtn.textContent, skip: !skipBtn.classList.contains('bg-hid'), msg: revMsg.classList.contains('bg-hid') ? '' : revMsg.textContent }) };
+    if (L.debug) L.debug.bridgeView = dbg;
+
+    /* ---- 매 프레임 ---- */
+    let tt = 0;
+    const stop = U.loop((dt, now) => {
+      if (dead) return;
+      clock = now; tt += dt;
+      if (!st) return;
+      let m = mode();
+      if (m !== curMode) sync();
+      if (m === 'edit') {
+        const s = editSeat();
+        if (paused() || sheetEl) tPause[s] = (tPause[s] || 0) + dt * 1000;
+        if (st.tl) {
+          const left = st.tl - elapsed(s);
+          const mm = Math.max(0, Math.ceil(left));
+          bTime.textContent = Math.floor(mm / 60) + ':' + String(mm % 60).padStart(2, '0');
+          bTime.classList.toggle('low', left < 30);
+          if (left <= 10.5 && left > 0 && Math.ceil(left) !== lastTick) { lastTick = Math.ceil(left); sfx('tick'); if (lastTick <= 3) api.buzz(8); }
+          if (left <= 0 && !paused()) { closeSheet(); submit(s, true); m = mode(); }
+        } else bTime.textContent = '';
+      } else bTime.textContent = '';
+      if (armedT && now - armedT > 2600) resetDone();
+      if (m === 'rev' && rv && rv.done && st.ph === 'v' && autoT >= 0) {
+        const before = Math.ceil(autoT); autoT -= dt * spd();
+        if (Math.ceil(autoT) !== before) syncRev();
+        if (autoT <= 0) { autoT = -1; if (api.mySeats().some((i) => !st.rd[i])) pressNext(); }
+      }
+      const vk = cv.w + 'x' + cv.h + ':' + m + ':' + (brief.classList.contains('bg-hid') ? 0 : brief.offsetTop + brief.offsetHeight) + ':' + bot.offsetHeight + ':' + viewSite().n;
+      if (vk !== cam.key) layoutView();
+      const sv = viewSite();
+      const sk = cv.w + 'x' + cv.h + ':' + cv.dpr + ':' + sv.n + ':' + Math.round(Y(0) / 4);
+      if (sk !== skyKey) { buildSky(sv); skyKey = sk; }
+      try {
+        ctx.drawImage(skyC, 0, 0, cv.w, cv.h);
+        const sh = shake > 0.01 && m !== 'pick';
+        if (sh) { ctx.save(); ctx.translate(Math.sin(tt * 93) * shake * 6, Math.cos(tt * 71) * shake * 5); }
+        shake = Math.max(0, shake - dt * spd() * 1.8);
+        if (m === 'rev' && rv) drawRev(dt, tt);
+        else if (m === 'edit') drawEdit(dt, tt);
+        else if (m === 'pick' || m === 'hand' || m === 'none') drawTerrain(st.si >= 0 ? SITE(st, st.si) : SITES[0], tt);
+        else drawWait(tt);
+        if (sh) ctx.restore();
+      } catch (e) { if (!drawErr) { drawErr = 1; console.error(e); } }
+    });
+
+    return {
+      update(s, prev) {
+        st = s;
+        if (!s) return;
+        const k = rKey();
+        if (s.ph === 'b' && k !== roundKey) {
+          roundKey = k; work = {}; tStart = {}; tPause = {}; active = -1; sent = {};
+          parts.length = 0; shake = 0;
+          closeSheet(); rv = null; settle = null; setKey = ''; testRes = null; delMode = false; delBtn.classList.remove('on');
+          if (test) stopTest();
+          mat = 'R';
+          if (prev && prev.ph !== 'b') sfx('chip');
+        }
+        if ((s.ph === 'v' || s.ph === 'end') && s.last && s.last.id !== revId) {
+          closeSheet(); startRev(s);
+          if (s.ph === 'end' && (!prev || prev.ph === 'end')) setRide(s.n);
+        }
+        if (s.ph === 'end' && s.solo && s.last && api.canAct(0)) {
+          const v = s.last.res[0][1];
+          if (s.last.si === GEN) { if (chalKey !== s.last.id) { chalKey = s.last.id; saveChal(s); } }
+          else saveBest(s.last.si, STARS.filter((q) => v >= q).length, v);
+        }
+        if (s.ph === 'b') roundKey = k;
+        sync();
+      },
+      destroy() {
+        dead = true; stop(); if (offInput) offInput();
+        if (L.debug && L.debug.bridgeView === dbg) delete L.debug.bridgeView;
+        removeEventListener('keydown', onEsc, true);
+        closeSheet(); if (handEl) handEl.remove(); if (pickEl) pickEl.remove();
+        cv.destroy(); root.innerHTML = '';
+      },
+    };
+  }
+
+  L.register({
+    id: 'bridge', name: '다리 건설 시험', tag: '설계 · 물리 시험', cat: '파티',
+    blurb: '예산 안에서 나무·쇠·밧줄 재료로 다리를 설계하고, 트럭·기차가 실제로 건너가면 성공. 버티는 힘이 모자라면 무너져요!',
+    tint: '#2f4a6b',
+    icon: '<path d="M2 40h12M42 40h12" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><path d="M2 42v10M54 42v10" stroke="currentColor" stroke-width="4" opacity=".55"/><path d="M14 40h28" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M14 40l7-12 7 12 7-12 7 12M21 28h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/><circle cx="14" cy="40" r="2.6" fill="currentColor"/><circle cx="42" cy="40" r="2.6" fill="currentColor"/><rect x="18" y="31" width="11" height="6" rx="1.5" fill="currentColor" opacity=".85"/><circle cx="20.5" cy="38.5" r="1.6" fill="currentColor"/><circle cx="26.5" cy="38.5" r="1.6" fill="currentColor"/>',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2, hidden: true, aiDelay: 3000,
+    options: [
+      { id: 'site', label: '현장 (여럿이 할 때)', tip: '여럿이 할 때 다리를 놓을 현장.', choices: [{ v: -1, label: '무작위' }].concat(VS.map((i) => ({ v: i, label: SITES[i].n }))), def: -1 },
+      { id: 'rounds', label: '판 수 (여럿이 할 때)', tip: '여럿이 할 때 판 수. 판마다 더 무거운 탈것이 지나가요.', choices: [{ v: 2, label: '2판 (차·트럭)' }, { v: 3, label: '3판 (+기차)' }, { v: 4, label: '4판 (+긴 기차)' }], def: 3 },
+      { id: 'time', label: '설계 시간', tip: '다리를 설계할 수 있는 시간.', choices: [{ v: 180, label: '3분' }, { v: 300, label: '5분' }, { v: 0, label: '제한 없음' }], def: 300 },
+    ],
+    quick: [
+      '모두 같은 현장·예산을 받고, 점을 이어 나무 길과 들보로 다리를 설계해요.',
+      '「완성!」하면 자동차 → 트럭 → 기차가 판마다 실제 물리로 건너요. 끊어지고 떨어지면 0점!',
+      '건너면 60점 + 남은 예산 + 버팀 여유 − 처짐 감점(길만 놓으면 크게 깎여요). 판마다 더해 가장 높으면 우승!',
+    ],
+    undo: false,
+    tutorial: [
+      { sel: '.bg-brief', text: '현장 정보예요. 예산과 남은 시간을 보고, 누르면 자세히 보여요.' },
+      { sel: '.bg-mats', text: '재료를 골라요. 그다음 금색 고정점이나 흰 점을 누르고, 이을 격자 점을 누르면 부재가 놓여요.' },
+      { sel: '.bg-tools', text: '↶ 되돌리기 · ✕ 지우기 · ⇋ 좌우 대칭 · ▶ 시험으로 미리 건너 보기. 다 되면 「완성!」을 두 번 눌러요.' },
+    ],
+    rules: [
+      { h: '목표', p: [
+        '골짜기·강 위에 다리를 지어 차가 건너가게 해요. 모두 같은 현장에서 동시에 설계하고, 다 내면 한 명씩 시험 운행을 봐요.',
+        '기본 3판: 1판 자동차, 2판 트럭, 3판 기차(옵션으로 4판 긴 화물 기차). 판마다 현장이 바뀌어요(옵션에서 고정 가능).'] },
+      { h: '짓는 법', p: [
+        '① 아래에서 재료를 골라요. ② 금색 고정점이나 흰 점을 누르고, ③ 이을 곳(격자 점)을 누르면 부재가 놓여요. 점에서 끌어다 놓아도 돼요.',
+        '놓은 뒤에는 그 끝점이 골라진 채라, 계속 눌러 이어 갈 수 있어요. 같은 점을 다시 누르면 고르기 취소.',
+        '이미 있는 부재를 누르면 지금 재료로 바뀌어요. ✕ 지우기 모드에선 누른 부재·점이 지워져요. ↶ 되돌리기.',
+        '⇋ 좌우 대칭을 켜면 반대쪽에도 똑같이 지어져요. 두 손가락(또는 +/−, 휠)으로 확대, 빈 곳을 끌면 화면 이동.'] },
+      { h: '재료', p: [
+        '나무 길(100/m): 차가 달리는 곳. 꼭 왼쪽 길 끝에서 오른쪽 길 끝까지 이어져야 해요. 최대 3m, 2칸에 1칸보다 가파르면 안 돼요.',
+        '나무 들보(70/m): 싸고 기본. 쇠 들보(200/m): 3배 넘게 튼튼. 받침(110/m): 콘크리트, 누르는 힘에 아주 강하지만 무거워요.',
+        '밧줄(20/m)·케이블(120/m): 당기는 힘만 버텨요(누르면 접혀요). 멀리 매달 때 좋아요.',
+        '들보는 길수록 누르는 힘에 약해져요(휘어서). 점 하나에 25원. 기초 자리(회색 받침대)는 쓰면 300원.'] },
+      { h: '물리 (쉽게)', p: [
+        '부재는 당기거나 누르는 힘만 받아요. 그래서 세모(삼각형)를 이어야 모양이 안 무너져요. 네모는 찌그러져요!',
+        '시험 중 색 = 힘: 초록은 여유, 노랑은 힘듦, 빨강은 곧 끊어짐. 한계를 넘으면 뚝 끊어지고 다리가 무너져요.',
+        '「▶ 시험」으로 내기 전에 마음껏 미리 시험해 볼 수 있어요(점수 안 들어감).'] },
+      { h: '실패 (0점)', p: [
+        '차가 떨어짐 · 다리가 1.5m 넘게 처짐 · 길이 너무 기울어짐 · 배 길로 다리가 내려와 배와 부딪힘 · 예산 초과.'] },
+      { h: '점수 (100점)', p: [
+        '성공 60 + 남은 예산 25(예산의 절반 넘게 남기면 다 받아요) + 버팀 여유 15(가장 힘든 부재가 50% 밑이면 다 받아요).',
+        '− 처짐 감점: 차가 지날 때 길이 처지면 깎여요(최대 −' + DEF_MAX + '). 다리 너비 1m마다 1cm까지는 괜찮아요(10m 다리면 10cm). 길만 놓으면 많이 처져서 크게 깎여요!',
+        '싸게 지으면 예산 점수, 튼튼하게 지으면 여유 점수! 둘 사이에서 고르는 게 재미예요.'] },
+      { h: '예시', p: [
+        '6m 개울, 자동차: 나무 길 2m × 3개(0→2→4→6)만 놓으면 건너기는 해도 가운데가 축 처져서 처짐 감점을 크게 받아요.',
+        '→ 길 위 (2,2)·(4,2)에 점을 두고 나무 들보로 세모들을 만들면(0,0→2,2→4,2→6,0 + 비스듬한 들보) 튼튼해져요.',
+        '→ 트럭이면 빨갛게 되는 부재만 쇠 들보로 바꿔요. 다 쇠로 하면 튼튼하지만 예산 점수가 줄어요.'] },
+      { h: '여럿이 · 혼자', p: [
+        '한 폰에서 여럿이 하면 이름이 뜰 때 폰을 넘겨 한 명씩 몰래 설계해요. 온라인·LAN이면 각자 폰에서 동시에.',
+        '봇은 설계를 바로 내요. 시험 공개 때 봇 다리는 빠르게 지나가고, 「▶▶ 건너뛰기」로 한 대씩, 「⏭ 결과로」로 한 번에 넘길 수 있어요. 결과판은 몇 초 뒤 저절로 다음 판으로 가요.',
+        '혼자 하기: 현장 ' + SITES.length + '곳을 골라 도전(아래로 갈수록 어려워요). 성공 ★ · ' + STARS[1] + '점 ★★ · ' + STARS[2] + '점 ★★★.',
+        '혼자 「도전」: 매번 새로 만든 현장이 나와요(어려움 AI가 실제로 건너 보고 풀 수 있는지 확인한 현장). 성공하면 다음 단계, 단계가 오를수록 넓고 깊고 무거운 차가 와요. 별은 재료비로: 성공 ★ · 예산의 80% 이하 ★★ · 65% 이하 ★★★. 최고 단계가 기록돼요.',
+        '바람 현장: 옆바람(→)이 다리를 옆으로 밀어요. 바람은 세졌다 약해졌다 해요. 세모(트러스)로 묶으면 잘 버텨요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 대충 지어서 자주 무너지고, 어려움은 시험해 보며 꼼꼼히 다듬어요.'] },
+      { h: 'PC 조작', p: [
+        '마우스로 누르고 끌어요(휠 = 확대). 1~6 재료, Z 되돌리기, X 지우기 모드, M 대칭, T 시험, +/− 확대, 화살표 화면 이동, B 현장 정보, Enter 완성(두 번)·넘기기, N 시험 모두 건너뛰기.'] },
+    ],
+    tutorial: [
+      { sel: '.bg-brief', text: '현장 정보예요. 이름·판·시험 차, 예산(쓴 돈/예산)과 지금 다리 상태가 보여요. 누르면 자세히!' },
+      { sel: '.bg-view', text: '금색 세모 점이 고정점이에요. 점을 누르고 이을 곳을 누르면 부재가 놓여요(끌어서 놓아도 돼요). 먼저 나무 길로 양쪽을 이어 보세요.' },
+      { sel: '.bg-mats', text: '재료를 골라요. 길은 차가 달리는 곳, 들보로 세모를 만들어 받쳐요. 밧줄·케이블은 당기는 힘만!' },
+      { sel: '.bg-tools', text: '↶ 되돌리기, ✕ 지우기 모드, ⇋ 좌우 대칭. 오른쪽 위 +/−로 확대해요.' },
+      { sel: '.bg-test', text: '「▶ 시험」으로 미리 건너 보세요. 초록 = 여유, 빨강 = 곧 끊어짐. 빨간 부재를 튼튼하게 바꿔요.' },
+      { sel: '.bg-done', text: '다 되면 「완성!」 두 번. 모두 내면 한 명씩 시험 운행을 보고 점수를 받아요!' },
+    ],
+    controls: [
+      { id: 'm1', label: '나무 길', keys: ['Digit1'], pad: [] },
+      { id: 'm2', label: '나무 들보', keys: ['Digit2'], pad: [] },
+      { id: 'm3', label: '쇠 들보', keys: ['Digit3'], pad: [] },
+      { id: 'm4', label: '밧줄', keys: ['Digit4'], pad: [] },
+      { id: 'm5', label: '케이블', keys: ['Digit5'], pad: [] },
+      { id: 'm6', label: '받침', keys: ['Digit6'], pad: [] },
+      { id: 'undo', label: '되돌리기', keys: ['KeyZ', 'Backspace'], pad: ['b'] },
+      { id: 'del', label: '지우기 모드', keys: ['KeyX', 'Delete'], pad: ['x'] },
+      { id: 'mirror', label: '좌우 대칭', keys: ['KeyM'], pad: ['lb'] },
+      { id: 'test', label: '시험 운행', keys: ['KeyT'], pad: ['y'] },
+      { id: 'zin', label: '크게', keys: ['Equal', 'NumpadAdd'], pad: ['rt'] },
+      { id: 'zout', label: '작게', keys: ['Minus', 'NumpadSubtract'], pad: ['lt'] },
+      { id: 'left', label: '화면 왼쪽', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '화면 오른쪽', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'up', label: '화면 위', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '화면 아래', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'brief', label: '현장 정보', keys: ['KeyB'], pad: ['back'] },
+      { id: 'done', label: '완성 / 넘기기', keys: ['Enter', 'Space'], pad: ['a'] },
+      { id: 'skip', label: '시험 모두 건너뛰기', keys: ['KeyN'], pad: ['start'] },
+    ],
+    init, actor, apply, ai, aiDelayFor, result, mount,
+    _t: { genSiteG, okGen, genSite, siteShape, chalStars, CSTAR, GEN, SITE, topY, refit, AIP, MAT, VEH, SITES, VS, anchors, parse, serialize, compact, designErr, memberErr, jointErr, costOf, makeSim, evaluate, aiDesign, genStyle, bStr, styleList, budgetOf, STARS, FAIL, FCODE },
+  });
+})();

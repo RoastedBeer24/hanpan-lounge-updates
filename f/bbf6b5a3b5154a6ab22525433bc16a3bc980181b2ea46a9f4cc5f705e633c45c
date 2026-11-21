@@ -1,0 +1,991 @@
+/* 탁구 — realtime 2-player table tennis, top-down 2.5D (ball height z drawn as lift + shadow).
+   Hit speed / direction / spin come from the paddle's velocity at contact; the vertical angle is auto-solved
+   on the real flight model so a controlled swing lands, an over-hit flies long.
+   Local: one person per phone vs AI (friends play via online / LAN rooms, one per phone).
+   Online: host-authoritative ball + referee. Guests publish their paddle (~30 Hz) and, for responsiveness,
+   a predicted hit/serve claim the host validates; the host streams the ball, guests interpolate + predict. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ---------- world (metres). x across, y along; seat 0 at y = TLN (bottom), seat 1 at y = 0 (top) ---------- */
+  const TWD = 1.525, TLN = 2.74, MID = TLN / 2, NETH = 0.1525, NETX = 0.1525, BR = 0.02;
+  const G = 9.8, DRAG = 0.11, KM = 0.012, KS = 0.03, E_TABLE = 0.88;
+  const PR = 0.19, REACH_Z = 0.95, SUB = 1 / 240, ZK = 0.6, PMAXV = 30;
+  const CD_PT = 0.95, CD_NUM = 1.2;
+  const DIFF = {
+    easy: { spd: 2.6, react: 0.3, pos: 0.16, miss: 0.16, vh: [3.4, 5.4], wide: 0.22, long: 0.1, spin: 0.3 },
+    normal: { spd: 4.2, react: 0.17, pos: 0.08, miss: 0.06, vh: [4.4, 7.2], wide: 0.1, long: 0.06, spin: 0.6 },
+    hard: { spd: 6.5, react: 0.08, pos: 0.04, miss: 0.03, vh: [5.4, 9.2], wide: 0.05, long: 0.045, spin: 1 },
+  };
+  const DIFF_KO = { easy: '쉬움', normal: '보통', hard: '어려움' };
+  /* per-seat AI level (api.players[seat].lv: 1 쉬움 / 2 보통 / 3 어려움) → tier */
+  const LVD = { 1: 'easy', 2: 'normal', 3: 'hard' };
+  const diffOf = (lv) => LVD[lv] || 'normal';
+  const WHY = ['', '네트', '아웃', '못 받음', '서브 실패', '두 번 튐', '내 쪽에 떨어짐'];
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const sideOf = (y) => (y > MID ? 0 : 1);       // which half of the table a point is on
+  const fwd = (seat) => (seat === 0 ? -1 : 1);    // forward (toward the opponent) along y
+  const onTable = (x, y) => x >= -BR * 0.5 && x <= TWD + BR * 0.5 && y >= -BR * 0.5 && y <= TLN + BR * 0.5;
+
+  /* ---------- scoring (pure) ---------- */
+  function server(s) {
+    const a = (s.sc && s.sc[0]) | 0, b = (s.sc && s.sc[1]) | 0, n = a + b, to = s.to || 11, s0 = s.s0 === 1 ? 1 : 0;
+    if (a >= to - 1 && b >= to - 1) return s0 ^ (n % 2);
+    return s0 ^ (Math.floor(n / 2) % 2);
+  }
+  function winnerOf(s) {
+    const a = s.sc[0] | 0, b = s.sc[1] | 0, to = s.to || 11;
+    if (a >= to && a - b >= 2) return 0;
+    if (b >= to && b - a >= 2) return 1;
+    return -1;
+  }
+  function point(s, w, why, rl) {
+    const n = Object.assign({}, s, { sc: [(s.sc && s.sc[0]) | 0, (s.sc && s.sc[1]) | 0] });
+    // stats per seat: points, points on own serve, winners (opponent could not return); longest rally
+    const k = s.k ? s.k.map((r) => r.slice()) : [[0, 0, 0], [0, 0, 0]];
+    k[w][0]++; if (server(s) === w) k[w][1]++; if ((why | 0) === 3) k[w][2]++;
+    n.k = k; n.mx = Math.max(s.mx | 0, rl | 0);
+    n.sc[w]++;
+    n.seq = (s.seq | 0) + 1; n.lg = w; n.why = why | 0;
+    const ww = winnerOf(n);
+    if (ww >= 0) { n.ph = 'done'; n.w = ww; }
+    return n;
+  }
+  const isDeuce = (s) => { const to = s.to || 11; return s.sc[0] >= to - 1 && s.sc[1] >= to - 1; };
+
+  /* ---------- referee (pure): R = {ph:'wait'|'fly'|'dead', srv, hit, sb, el, nb:[n0,n1], net} ---------- */
+  function newRef(srv) { return { ph: 'wait', srv, hit: srv, sb: 0, el: -1, nb: [0, 0], net: 0, sv: true }; }
+  const canHit = (R, seat) => R.ph === 'fly' && R.el === seat;
+  /* returns null or {w, why} */
+  function refBounce(R, side) {
+    if (R.ph !== 'fly') return null;
+    const H = R.hit, O = 1 - H;
+    if (R.sv) {
+      if (R.sb === 0) {
+        if (side === H) { R.sb = 1; return null; }
+        return { w: O, why: 4 };            // serve must bounce on the server's side first
+      }
+      if (R.sb === 1) {
+        if (side === O) { R.sb = 2; R.nb[O] = 1; R.el = O; return null; }
+        return { w: O, why: R.net ? 1 : 4 };   // second bounce on the server's side again
+      }
+    }
+    R.nb[side]++;
+    if (side === H) return { w: O, why: R.net ? 1 : 6 };   // landed on your own side
+    if (R.nb[O] === 1) { R.el = O; return null; }          // good return
+    return { w: H, why: 3 };                                // opponent let it bounce twice
+  }
+  function refHit(R, seat) {
+    if (R.ph === 'wait') { if (seat !== R.srv) return false; R.ph = 'fly'; R.hit = seat; R.sv = true; R.sb = 0; R.el = -1; R.nb = [0, 0]; R.net = 0; return true; }
+    if (!canHit(R, seat)) return false;
+    R.hit = seat; R.sv = false; R.el = -1; R.nb = [0, 0]; R.net = 0;
+    return true;
+  }
+  function refDead(R) {
+    if (R.ph !== 'fly') return null;
+    const H = R.hit, O = 1 - H;
+    if (R.el === O) return { w: H, why: 3 };            // landed fine, the receiver didn't return it
+    if (R.sv) return { w: O, why: R.net ? 1 : 4 };
+    return { w: O, why: R.net ? 1 : 2 };
+  }
+
+  /* ---------- ball flight ---------- */
+  /* one substep. ev(type, a): 'table' (side, speed), 'net' (cord?), 'dead' */
+  function stepBall(b, h, ev) {
+    const vh = Math.hypot(b.vx, b.vy), v = Math.hypot(vh, b.vz);
+    const dir = b.vy >= 0 ? 1 : -1;
+    // drag, gravity, magnus (topspin dives, backspin floats, sidespin curves)
+    const ax = -DRAG * v * b.vx + KS * (b.sd || 0) * vh * dir;
+    const ay = -DRAG * v * b.vy;
+    const az = -G - DRAG * v * b.vz - KM * (b.tp || 0) * vh;
+    b.vx += ax * h; b.vy += ay * h; b.vz += az * h;
+    const py = b.y;
+    b.x += b.vx * h; b.y += b.vy * h; b.z += b.vz * h;
+    // net (plane y = MID, a little wider than the table)
+    if ((py - MID) * (b.y - MID) <= 0 && py !== b.y && b.x > -NETX && b.x < TWD + NETX && b.z < NETH + BR && b.z > -0.02) {
+      if (b.z < NETH - BR * 0.6) { // into the mesh: drop dead on the hitter's side
+        b.y = MID - Math.sign(b.vy) * (BR + 0.002); b.vy = -b.vy * 0.12; b.vx *= 0.3; b.vz = Math.min(b.vz, 0) * 0.3; b.tp = 0; b.sd = 0;
+        if (ev) ev('net', 0);
+      } else { // clips the tape: carries on, slowed and popped up
+        b.vy *= 0.55; b.vx *= 0.8; b.vz = Math.abs(b.vz) * 0.35 + 0.35; b.z = NETH + BR;
+        if (ev) ev('net', 1);
+      }
+    }
+    // table bounce
+    if (b.z < BR && b.vz < 0 && onTable(b.x, b.y) && b.z > -0.03) {
+      b.z = BR;
+      const e = clamp(E_TABLE - 0.003 * (b.tp || 0), 0.74, 0.95);
+      const spd = -b.vz;
+      b.vz = spd * e;
+      const dy = b.vy >= 0 ? 1 : -1;
+      b.vy += dy * clamp((b.tp || 0) * 0.025, -0.6, 0.7);
+      b.vx += (b.sd || 0) * 0.012 * dy;
+      b.tp = (b.tp || 0) * 0.5; b.sd = (b.sd || 0) * 0.7;
+      if (ev) ev('table', sideOf(b.y), spd);
+    }
+    if (b.z < -0.32 || b.y < -3 || b.y > TLN + 3 || b.x < -2.5 || b.x > TWD + 2.5) { if (ev) ev('dead'); return true; }
+    return false;
+  }
+  /* flight preview: first event after leaving the paddle → {y, x, net, ok, t} */
+  function preview(b0, maxT) {
+    const b = Object.assign({}, b0); let net = 0, out = null, t = 0;
+    for (; t < (maxT || 2); t += SUB) {
+      let stop = false;
+      stepBall(b, SUB, (k, a) => { if (k === 'net') { net = a ? 1 : 2; if (!a) { out = { x: b.x, y: b.y, net: 2, table: false }; stop = true; } } else if (k === 'table') { out = { x: b.x, y: b.y, net, table: true, side: a }; stop = true; } else if (k === 'dead') { out = { x: b.x, y: b.y, net, table: false }; stop = true; } });
+      if (stop) break;
+    }
+    if (!out) out = { x: b.x, y: b.y, net, table: false };
+    out.t = t;
+    return out;
+  }
+  /* full flight of a serve: first two table bounces */
+  function preview2(b0) {
+    const b = Object.assign({}, b0), hits = []; let net = 0;
+    for (let t = 0; t < 3 && hits.length < 2; t += SUB) {
+      let dead = false;
+      stepBall(b, SUB, (k, a) => { if (k === 'table') hits.push({ x: b.x, y: b.y, side: a }); else if (k === 'net') { net = a ? 1 : 2; if (!a) dead = true; } else if (k === 'dead') dead = true; });
+      if (dead) break;
+    }
+    return { hits, net };
+  }
+
+  /* Shot from the paddle's velocity. pad: {x,y,vx,vy,shot?}. Mutates b. Returns description. */
+  function shotParams(b, seat, pad) {
+    const f = fwd(seat);
+    if (pad.shot) return Object.assign({}, pad.shot);
+    const vin = Math.hypot(b.vx, b.vy);
+    const pf = (pad.vy || 0) * f, pl = pad.vx || 0;
+    let vh, tp;
+    if (pf < -0.6) { vh = clamp(0.45 * vin + 0.25 * -pf, 2.2, 5.5); tp = -clamp(-pf * 2.2, 3, 16); } // pull back = chop (backspin)
+    else { vh = clamp(0.42 * vin + 0.5 * Math.max(0, pf), 2.3, 14); tp = clamp((pf - 1.2) * 1.6, 0, 24); }
+    const sd = clamp(pl * 1.6, -14, 14);
+    let vx = 0.22 * pl + (b.x - pad.x) * 2.2 + 0.12 * (b.vx || 0);
+    const depth = 0.32 + (vh - 2.3) * 0.13;          // harder = deeper; ≳ 10.5 m/s flies long
+    return { vh, vx, tp, sd, depth };
+  }
+  function applyShot(b, seat, sp) {
+    const f = fwd(seat);
+    const vh = clamp(sp.vh, 1.5, 16), vx = clamp(sp.vx, -0.7 * vh, 0.7 * vh);
+    b.vx = vx; b.vy = f * Math.sqrt(Math.max(0.1, vh * vh - vx * vx));
+    b.tp = sp.tp || 0; b.sd = sp.sd || 0;
+    // landing target along y on the far half
+    const ty = seat === 0 ? MID - sp.depth : MID + sp.depth;
+    let best = null;
+    for (let i = 0; i <= 26; i++) {
+      const vz = -2.5 + i * 0.25;
+      const t = Object.assign({}, b, { vz });
+      const r = preview(t, 2);
+      const land = r.table && r.side === 1 - seat;
+      const err = Math.abs(r.y - ty) + (r.net === 2 ? 3 : 0) + (r.table && !land ? 2 : 0) + (r.net === 1 ? 0.3 : 0);
+      if (!best || err < best.err) best = { vz, err };
+    }
+    b.vz = best.vz;
+  }
+  function serveParams(b, seat, pad) {
+    if (pad.shot) return Object.assign({}, pad.shot);
+    const pf = Math.max(0, (pad.vy || 0) * fwd(seat)), pl = pad.vx || 0;
+    const vh = clamp(2.4 + 0.24 * pf, 2.4, 9);
+    return { vh, vx: clamp(0.18 * pl, -0.3 * vh, 0.3 * vh), tp: clamp((pf - 2) * 1.2, -4, 14), sd: clamp(pl * 1.4, -12, 12), depth: 0.35 + (vh - 2.4) * 0.17 };
+  }
+  function applyServe(b, seat, sp) {
+    const f = fwd(seat), vh = clamp(sp.vh, 1.5, 12), vx = clamp(sp.vx, -0.4 * vh, 0.4 * vh);
+    b.vx = vx; b.vy = f * Math.sqrt(Math.max(0.1, vh * vh - vx * vx)); b.tp = sp.tp || 0; b.sd = sp.sd || 0;
+    const ty = seat === 0 ? MID - sp.depth : MID + sp.depth;
+    let best = null;
+    for (let i = 0; i <= 30; i++) {
+      const vz = -4.5 + i * 0.18;
+      const r = preview2(Object.assign({}, b, { vz }));
+      const h0 = r.hits[0], h1 = r.hits[1];
+      let err = 9;
+      if (h0 && h0.side === seat) {
+        err = 3;
+        if (h1 && h1.side === 1 - seat && r.net !== 2) err = Math.abs(h1.y - ty) + (r.net ? 0.3 : 0);
+        else if (h1) err = 2 + Math.abs(h1.y - ty) * 0.1;
+        else err = 2.5;
+      }
+      if (!best || err < best.err) best = { vz, err };
+    }
+    b.vz = best.vz;
+  }
+
+  /* ---------- world ---------- */
+  function padBounds(seat, serving) {
+    const y0 = seat === 0 ? (serving ? TLN + 0.06 : MID + 0.3) : -1.15;
+    const y1 = seat === 0 ? TLN + 1.15 : (serving ? -0.06 : MID - 0.3);
+    return { x0: -0.6, x1: TWD + 0.6, y0, y1 };
+  }
+  function newWorld(srv) {
+    const pd = [0, 1].map((s) => { const y = s === 0 ? TLN + 0.35 : -0.35; return { x: TWD / 2, y, vx: 0, vy: 0, tx: TWD / 2, ty: y, ptx: TWD / 2, pty: y, max: PMAXV, cool: 0, shot: null }; });
+    const W = { b: { x: TWD / 2, y: 0, z: 0.25, vx: 0, vy: 0, vz: 0, tp: 0, sd: 0 }, pd, R: newRef(srv), t: 0, hits: [0, 0] };
+    holdBall(W);
+    return W;
+  }
+  function holdBall(W) {
+    const s = W.R.srv, p = W.pd[s];
+    W.b.x = clamp(p.x + 0.08 * (s === 0 ? -1 : 1), -0.3, TWD + 0.3); W.b.y = p.y + fwd(s) * 0.1; W.b.z = 0.22 + 0.04 * Math.sin(W.t * 5);
+    W.b.vx = 0; W.b.vy = 0; W.b.vz = 0; W.b.tp = 0; W.b.sd = 0;
+  }
+  /* advance dt. hooks: {hit(seat, b), table(side, speed), net(cord), point({w,why}), canHitOverride} */
+  function simulate(W, dt, hooks, opts) {
+    if (!(dt > 0)) return;
+    const n = Math.min(400, Math.max(1, Math.ceil(dt / SUB))), h = dt / n;
+    const live = !opts || opts.live !== false;
+    for (const p of W.pd) { if (!fin(p.tx)) { p.tx = p.x; p.ty = p.y; } if (!fin(p.ptx)) { p.ptx = p.tx; p.pty = p.ty; } }
+    for (let i = 0; i < n; i++) {
+      const k = (i + 1) / n;
+      for (let s = 0; s < 2; s++) {
+        const p = W.pd[s], bd = padBounds(s, W.R.ph === 'wait' && W.R.srv === s);
+        const gx = clamp(p.ptx + (p.tx - p.ptx) * k, bd.x0, bd.x1), gy = clamp(p.pty + (p.ty - p.pty) * k, bd.y0, bd.y1);
+        let dx = gx - p.x, dy = gy - p.y; const d = Math.hypot(dx, dy), mx = (p.max || PMAXV) * h;
+        if (d > mx) { dx *= mx / d; dy *= mx / d; }
+        p.x += dx; p.y += dy;
+        if (p.cool > 0) p.cool -= h;
+      }
+      W.t += h;
+      if (W.R.ph === 'wait') { holdBall(W); continue; }
+      if (W.R.ph !== 'fly') continue;
+      const res = stepBall(W.b, h, (kind, a, c) => {
+        if (kind === 'table') { if (hooks && hooks.table) hooks.table(a, c); if (live) { const r = refBounce(W.R, a); if (r) endPoint(W, r, hooks); } }
+        else if (kind === 'net') { W.R.net = 1; if (hooks && hooks.net) hooks.net(a); }
+      });
+      if (res && W.R.ph === 'fly') { if (live) endPoint(W, refDead(W.R) || { w: 1 - W.R.hit, why: 2 }, hooks); else W.R.ph = 'dead'; }
+      if (W.R.ph !== 'fly') continue;
+      // paddle contact
+      for (let s = 0; s < 2; s++) {
+        const p = W.pd[s];
+        if (p.off || p.cool > 0 || !canHit(W.R, s)) continue;
+        const b = W.b;
+        if (b.z > REACH_Z || b.z < -0.12) continue;
+        // reachable at the ball's ground spot or where it is drawn (lifted by its height, either screen orientation)
+        const ex = b.x - p.x, lift = Math.max(0, b.z) * ZK;
+        const dd = Math.min(Math.hypot(ex, b.y - p.y), Math.hypot(ex, b.y - lift - p.y), Math.hypot(ex, b.y + lift - p.y));
+        if (dd > PR) continue;
+        if (hooks && hooks.allowHit && !hooks.allowHit(s)) continue;
+        doHit(W, s, hooks);
+        break;
+      }
+    }
+    for (const p of W.pd) { p.ptx = p.tx; p.pty = p.ty; }
+  }
+  function doHit(W, s, hooks) {
+    const p = W.pd[s];
+    if (!refHit(W.R, s)) return false;
+    const b = W.b;
+    if (W.R.sv && W.R.sb === 0) { const sp = serveParams(b, s, p); b.z = Math.max(b.z, 0.12); applyServe(b, s, sp); }
+    else { const sp = shotParams(b, s, p); applyShot(b, s, sp); }
+    p.cool = 0.25; p.shot = null;
+    W.hits[s] = (W.hits[s] + 1) % 1000;
+    if (hooks && hooks.hit) hooks.hit(s, b);
+    return true;
+  }
+  function endPoint(W, r, hooks) {
+    W.R.ph = 'dead';
+    if (hooks && hooks.point) hooks.point(r);
+  }
+
+  /* ---------- AI ---------- */
+  /* where will the ball be good to hit for seat s? Simulate ahead on a copy (no paddles). */
+  function intercept(W, s) {
+    const b = Object.assign({}, W.b), R = Object.assign({}, W.R, { nb: W.R.nb.slice() });
+    let el = canHit(R, s), best = null, t = 0, peakZ = -1, done = false;
+    const endY = s === 0 ? TLN : 0;
+    for (; t < 2.2 && !done; t += SUB * 2) {
+      stepBall(b, SUB * 2, (k, a) => { if (k === 'table') { const r = refBounce(R, a); if (r) done = true; else if (R.el === s) el = true; } else if (k === 'dead') done = true; });
+      if (done) break;
+      if (!el) continue;
+      // first good spot: just past the top of the bounce, or crossing the end line, whatever comes first
+      if (b.z > peakZ) { peakZ = b.z; continue; }
+      const beyond = s === 0 ? b.y > endY + 0.15 : b.y < endY - 0.15;
+      if (b.vz < 0 || beyond) { best = { x: b.x, y: b.y, z: b.z, t, vx: b.vx, vy: b.vy }; break; }
+    }
+    return best;
+  }
+  function aiThink(W, s, mem, D, dt) {
+    const p = W.pd[s], R = W.R;
+    mem.rt = (mem.rt || 0) - dt;
+    p.max = D.spd;
+    const home = { x: TWD / 2, y: s === 0 ? TLN + 0.45 : -0.45 };
+    if (R.ph === 'wait') {
+      if (R.srv !== s) { p.tx = home.x; p.ty = home.y; mem.plan = null; mem.sw = 0; return; }
+      // serve: line up, pause, then push forward
+      if (!mem.serveT) { mem.serveT = 0.7 + Math.random() * 0.8; mem.sx = TWD * (0.2 + Math.random() * 0.6); }
+      mem.serveT -= dt;
+      p.tx = mem.sx; p.ty = s === 0 ? TLN + 0.3 : -0.3;
+      if (mem.serveT <= 0) {
+        mem.serveT = 0;
+        const vh = 2.8 + Math.random() * (1.4 + D.spin * 1.6);
+        const aimX = TWD * (0.15 + Math.random() * 0.7);
+        const sp = { vh, vx: clamp((aimX - W.b.x) * vh / 2.6, -0.35 * vh, 0.35 * vh), tp: (Math.random() - 0.3) * 10 * D.spin, sd: (Math.random() - 0.5) * 12 * D.spin, depth: 0.45 + Math.random() * 0.6 };
+        if (Math.random() < D.miss * 0.6) sp.depth = 1.5 + Math.random() * 0.4; // long serve fault
+        p.shot = sp;
+        doHit(W, s, mem.hooks);
+        mem.serveT = null;
+      }
+      return;
+    }
+    if (R.ph !== 'fly') { p.tx = home.x; p.ty = home.y; return; }
+    const incoming = R.hit !== s; // opponent hit last → coming to me
+    if (!incoming) { mem.plan = null; p.tx = home.x + (W.b.x - home.x) * 0.3; p.ty = home.y; return; }
+    if (!mem.plan || mem.rt <= 0) {
+      mem.rt = D.react;
+      const it = intercept(W, s);
+      if (it) {
+        const press = 1 + Math.max(0, Math.hypot(it.vx, it.vy) - 4) * 0.35 + Math.abs(W.b.sd || 0) * 0.03; // fast / spinning balls are harder
+        const errX = (Math.random() - 0.5) * 2 * D.pos * press, whiff = Math.random() < D.miss * press;
+        mem.plan = { x: it.x + errX + (whiff ? (Math.random() < 0.5 ? -1 : 1) * PR * 1.6 : 0), y: it.y + (whiff ? fwd(s) * -0.25 : 0), whiff };
+        if (!mem.aim || mem.aimHit !== W.hits[1 - s]) {
+          mem.aimHit = W.hits[1 - s];
+          const vh = D.vh[0] + Math.random() * (D.vh[1] - D.vh[0]);
+          const aimX = clamp(TWD * (0.12 + Math.random() * 0.76) + (Math.random() < D.wide * press ? (Math.random() < 0.5 ? -1 : 1) * 0.55 : 0), -0.6, TWD + 0.6);
+          const depth = Math.random() < D.long * press ? 1.45 + Math.random() * 0.3 : 0.45 + Math.random() * 0.75;
+          const ty = s === 0 ? MID - depth : MID + depth;
+          const dy = Math.abs(ty - it.y) || 1;
+          mem.aim = { vh, vx: clamp((aimX - it.x) / dy * vh, -0.6 * vh, 0.6 * vh), tp: (Math.random() * 1.2 - 0.2) * 14 * D.spin, sd: (Math.random() - 0.5) * 8 * D.spin, depth };
+        }
+      }
+    }
+    if (mem.plan) {
+      p.tx = mem.plan.x; p.ty = mem.plan.y;
+      if (!mem.plan.whiff && mem.aim) p.shot = Object.assign({}, mem.aim);
+    }
+  }
+
+  /* ---------- pure game interface ---------- */
+  function init(players, opts) {
+    const o = opts || {};
+    return {
+      rid: 1 + U.rand(99999), n: players.map((p) => String((p && p.name) || '').slice(0, 10)),
+      to: o.to === 7 ? 7 : 11, sc: [0, 0], s0: U.rand(2), seq: 1, lg: -1, why: 0, ph: 'play', w: -1,
+    };
+  }
+  function result(s) {
+    const r = result0(s);
+    if (r) try {
+      const K = s.k || [[0, 0, 0], [0, 0, 0]], P = [0, 1];
+      r.stats = [
+        { label: '득점', values: P.map((i) => String(K[i][0])) },
+        { label: '서브 때 득점', values: P.map((i) => String(K[i][1])) },
+        { label: '위닝샷', values: P.map((i) => String(K[i][2])) },
+        { label: '최장 랠리 (경기)', values: P.map(() => (s.mx | 0) + '타') },
+      ];
+    } catch (e) {}
+    return r;
+  }
+  function result0(s) {
+    if (!s || s.ph !== 'done' || !(s.w === 0 || s.w === 1)) return null;
+    const nm = (i) => (s.n && s.n[i]) || (i + 1) + '번';
+    const sc = Array.isArray(s.sc) ? s.sc : [0, 0];
+    return { winners: [s.w], title: nm(s.w) + ' 승리!', text: nm(0) + ' ' + sc[0] + ' : ' + sc[1] + ' ' + nm(1) };
+  }
+
+  /* ---------- view ---------- */
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    let st = null, key = null, W = newWorld(0), phase = 'wait', cd = 0, bg = null, lay = null, flip = false;
+    const aiMem = [{}, {}], ptr = new Map(), fx = [], trail = [];
+    let banner = null, hintT = 7, lastSfx = 0, pubT = 0, q = 0, shake = 0, pendingPt = null;
+    const remS = {}, hostHit = [0, 0];
+    let held = null; // host: a point decided right after a remote hit, held until that player's own hit report arrives
+    let snap = null, lastQ = -1, pred = null, peerH = [0, 0], claimN = 0, lastClaim = {};
+    const P = (s) => api.players[s] || { name: '?', color: '#888', ai: true };
+    const D = (s) => DIFF[diffOf(P(s).lv)];
+    const name = (s) => (st && st.n && st.n[s]) || P(s).name || (s + 1) + '번';
+    const local = (s) => { const p = api.players[s]; return !!p && !p.ai && !!p.local; };
+    const host = () => !api.online || api.isHost;
+    const simHere = (s) => { const p = api.players[s]; if (!p) return false; if (!api.online) return true; if (api.isHost) return !!p.ai || !!p.local; return !p.ai && !!p.local; };
+    const aiCtl = (s) => simHere(s) && (P(s).ai || !!(L.debug && L.debug.autoplay));
+    const humansHere = () => [0, 1].filter(local).slice(0, 1); // one driver per phone
+    const computeFlip = () => { const hs = humansHere(); return hs.length > 0 && !hs.includes(0); };
+
+    /* ----- layout: visible world x ∈ [-0.72, TWD+0.72], y ∈ [-1.25, TLN+1.25] ----- */
+    const VX0 = -0.72, VX1 = TWD + 0.72, VY0 = -1.25, VY1 = TLN + 1.25;
+    function layout() {
+      const w = cv.w, h = cv.h;
+      const s = Math.min(w / (VX1 - VX0), (h - 8) / (VY1 - VY0));
+      lay = { s, ox: (w - (VX1 - VX0) * s) / 2 - VX0 * s, oy: (h - (VY1 - VY0) * s) / 2 - VY0 * s };
+      flip = computeFlip();
+      buildBg();
+    }
+    const toS = (x, y, z) => { const fx2 = flip ? TWD - x : x, fy = flip ? TLN - y : y; return { x: lay.ox + fx2 * lay.s, y: lay.oy + fy * lay.s - (z || 0) * ZK * lay.s }; };
+    const toW = (sx, sy) => { let x = (sx - lay.ox) / lay.s, y = (sy - lay.oy) / lay.s; if (flip) { x = TWD - x; y = TLN - y; } return { x, y }; };
+
+    function buildBg() {
+      const c = document.createElement('canvas');
+      c.width = Math.round(cv.w * cv.dpr); c.height = Math.round(cv.h * cv.dpr);
+      const g = c.getContext('2d'); g.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+      // floor: warm boards
+      g.fillStyle = '#1d1622'; g.fillRect(0, 0, cv.w, cv.h);
+      const pw = Math.max(18, lay.s * 0.22);
+      for (let x = 0, i = 0; x < cv.w; x += pw, i++) { g.fillStyle = i % 2 ? 'rgba(255,230,200,.025)' : 'rgba(0,0,0,.06)'; g.fillRect(x, 0, pw - 1, cv.h); }
+      const vg = g.createRadialGradient(cv.w / 2, cv.h / 2, 20, cv.w / 2, cv.h / 2, Math.max(cv.w, cv.h) * 0.7);
+      vg.addColorStop(0, 'rgba(227,174,69,.08)'); vg.addColorStop(1, 'rgba(0,0,0,.45)');
+      g.fillStyle = vg; g.fillRect(0, 0, cv.w, cv.h);
+      const a = toS(0, 0), b = toS(TWD, TLN), x0 = Math.min(a.x, b.x), y0 = Math.min(a.y, b.y), tw = Math.abs(b.x - a.x), tl = Math.abs(b.y - a.y);
+      // shadow + apron (front edge toward the viewer)
+      g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 26; g.shadowOffsetY = 14;
+      g.fillStyle = '#0b2a22'; g.fillRect(x0, y0, tw, tl + lay.s * 0.05); g.restore();
+      g.fillStyle = '#0a241d'; g.fillRect(x0, y0 + tl, tw, lay.s * 0.05);
+      // surface
+      const sg = g.createLinearGradient(0, y0, 0, y0 + tl);
+      sg.addColorStop(0, '#1a5d49'); sg.addColorStop(0.5, '#1f6c55'); sg.addColorStop(1, '#185642');
+      g.fillStyle = sg; g.fillRect(x0, y0, tw, tl);
+      // fine grain
+      g.globalAlpha = 0.05; g.fillStyle = '#fff';
+      for (let i = 0; i < 260; i++) g.fillRect(x0 + Math.random() * tw, y0 + Math.random() * tl, 1, 1);
+      g.globalAlpha = 1;
+      // white lines
+      const lw = Math.max(1.5, lay.s * 0.02);
+      g.strokeStyle = '#f2ece0'; g.lineWidth = lw;
+      g.strokeRect(x0 + lw / 2, y0 + lw / 2, tw - lw, tl - lw);
+      g.lineWidth = Math.max(1, lay.s * 0.003 * 2);
+      g.beginPath(); g.moveTo(x0 + tw / 2, y0); g.lineTo(x0 + tw / 2, y0 + tl); g.stroke();
+      // net posts' shadow on the table
+      const n0 = toS(-NETX, MID), n1 = toS(TWD + NETX, MID);
+      g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(Math.min(n0.x, n1.x), n0.y - 1, Math.abs(n1.x - n0.x), lay.s * 0.03);
+      bg = c;
+    }
+
+    /* ----- input ----- */
+    const OFFS = 0.3; // paddle sits a little ahead of the finger so the finger doesn't hide it
+    function setTarget(seat, sx, sy) {
+      const w = toW(sx, sy), p = W.pd[seat];
+      p.tx = w.x; p.ty = w.y + fwd(seat) * OFFS;
+    }
+    function onDown(e) {
+      if (!lay) return;
+      const pt = cv.local(e), w = toW(pt.x, pt.y), hs = humansHere().filter((s) => !aiCtl(s));
+      if (!hs.length) return;
+      const seat = hs[0]; void w;
+      ptr.clear(); // newest finger drives the paddle
+      ptr.set(e.pointerId, seat);
+      setTarget(seat, pt.x, pt.y);
+      e.preventDefault();
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+    }
+    function onMove(e) { if (!ptr.has(e.pointerId) || !lay) return; const pt = cv.local(e); setTarget(ptr.get(e.pointerId), pt.x, pt.y); }
+    function onUp(e) { ptr.delete(e.pointerId); }
+    /* keyboard / gamepad (declared in `controls`, rebindable). Arrows / stick move the paddle (screen-relative);
+       「스윙」 drives it forward fast for a moment (= a drive / a serve) and then it eases back. Holding ↓ while the
+       ball meets the paddle pulls it back = backspin chop, ←/→ add direction + side spin — same physics as a finger. */
+    const KEY_V = 3, SWING_V = 6, SWING_T = 0.15, BACK_V = 1.8;
+    const kb = { on: false, sw: 0, y0: null };
+    const offIn = api.input ? api.input.on((type, id) => {
+      if (id !== 'swing' || type !== 'down') return;
+      const s = humansHere().filter((x) => !aiCtl(x))[0];
+      if (s == null) return;
+      const p = W.pd[s];
+      if (kb.y0 == null) kb.y0 = fin(p.ty) ? p.ty : p.y;
+      kb.sw = SWING_T; ptr.clear(); hintT = Math.min(hintT, 1);
+    }) : null;
+    function padMove(dt) {
+      const inp = api.input, s = humansHere().filter((x) => !aiCtl(x))[0];
+      kb.on = false;
+      if (!inp || s == null || !(dt > 0)) return;
+      let ax = inp.axis('left', 'right'), ay = inp.axis('up', 'down');
+      const n = Math.hypot(ax, ay); if (n > 1) { ax /= n; ay /= n; }
+      if (flip) { ax = -ax; ay = -ay; }
+      if (!ax && !ay && kb.sw <= 0 && kb.y0 == null) return;
+      const p = W.pd[s], f = fwd(s), bd = padBounds(s, W.R.ph === 'wait' && W.R.srv === s);
+      let tx = fin(p.tx) ? p.tx : p.x, ty = fin(p.ty) ? p.ty : p.y;
+      tx += ax * KEY_V * dt; ty += ay * KEY_V * dt;
+      if (kb.sw > 0) { ty += f * SWING_V * Math.min(dt, kb.sw); kb.sw -= dt; }
+      else if (kb.y0 != null) { // ease back to where the swing started (moving ↑/↓ yourself ends that)
+        if (ay) kb.y0 = null;
+        else { const d = kb.y0 - ty, st2 = BACK_V * dt; if (Math.abs(d) <= st2) { ty = kb.y0; kb.y0 = null; } else ty += Math.sign(d) * st2; }
+      }
+      if (ay && kb.sw <= 0) kb.y0 = null;
+      p.tx = clamp(tx, bd.x0, bd.x1); p.ty = clamp(ty, bd.y0, bd.y1);
+      if (kb.y0 != null) kb.y0 = clamp(kb.y0, bd.y0, bd.y1);
+      kb.on = true; ptr.clear();
+    }
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    cv.cv.addEventListener('lostpointercapture', onUp);
+    cv.cv.addEventListener('contextmenu', noCtx);
+
+    /* paddle velocity (smoothed) — what a swing transfers to the ball */
+    const pv = [{ x: 0, y: 0, lx: null, ly: null }, { x: 0, y: 0, lx: null, ly: null }];
+    function trackVel(rdt) {
+      for (let s = 0; s < 2; s++) {
+        const p = W.pd[s], v = pv[s];
+        if (v.lx != null && rdt > 0) {
+          const vx = (p.x - v.lx) / rdt, vy = (p.y - v.ly) / rdt, k = 0.55;
+          v.x += (vx - v.x) * k; v.y += (vy - v.y) * k;
+        }
+        v.lx = p.x; v.ly = p.y;
+        const pf = v.y * fwd(s); pk[s] = Math.max(pk[s] * Math.pow(0.02, rdt), pf);
+        if (!P(s).ai || !simHere(s)) { p.vx = v.x; p.vy = v.y; }
+      }
+    }
+
+    /* ----- feedback ----- */
+    let rallyN = 0, stopT = 0;
+    const pk = [0, 0], pdF = [0, 0];
+    function sfx(n, gap) { const t = performance.now(); if (t - lastSfx < (gap || 40)) return; lastSfx = t; api.sfx(n); }
+    const hooks = {
+      hit(s, b) {
+        rallyN++;
+        const sp = Math.hypot(b.vx, b.vy);
+        sfx(sp > 8 ? 'hit' : sp < 3.5 ? 'chip' : 'pop');
+        if (local(s)) api.buzz(sp > 9.5 ? [22, 25, 15] : sp > 8 ? 20 : sp < 3.5 ? 7 : 12);
+        fx.push({ x: b.x, y: b.y, z: b.z, t: 0.3, col: P(s).color, big: sp > 8 });
+        if (sp > 9.5) shake = 0.5;
+        pdF[s] = 0.15;
+        if (!api.online) stopT = (sp > 9.5 ? 0.06 : sp > 8 ? 0.04 : 0.02) * L.fx();
+        // 스윙 타이밍 판정(내 손, 서브 제외): 앞으로 휘두르는 속도가 정점 근처 = 정확, 이미 느려지는 중 = 빠름, 거의 안 휘두름 = 늦음
+        if (local(s) && !P(s).ai && !(W.R.sv && W.R.sb === 0)) {
+          const pf = pv[s].y * fwd(s), peak = pk[s];
+          const tag = pf > 1.5 && pf >= peak * 0.75 ? 0 : peak > 2.2 && pf < peak * 0.75 ? 1 : 2;
+          fx.push({ x: b.x, y: b.y, z: b.z + 0.25, t: 0.7, T: 0.7, s: ['정확!', '빠름', '늦음'][tag], col: tag ? '#f0b27a' : '#bfe9a8' });
+        }
+        if (api.online && api.isHost && !simHere(s)) hostHit[s] = performance.now(); // may be refined by the guest's own claim
+        if (api.online && !api.isHost && local(s)) {
+          claimN = (claimN + 1) % 1000;
+          lastClaim = { n: claimN, b: [r2(b.x), r2(b.y), r2(b.z), r2(b.vx), r2(b.vy), r2(b.vz), Math.round(b.tp || 0), Math.round(b.sd || 0)] };
+          pred = { until: performance.now() + 450, c: peerH[s] };
+          pubT = 0;
+        }
+      },
+      table(side, spd) { if (spd > 0.6) sfx('bounce', 50); },
+      net(cord) { sfx(cord ? 'chip' : 'thud', 60); },
+      point(r) { pendingPt = r; },
+      allowHit(s) { return host() || simHere(s); },
+    };
+    aiMem[0].hooks = hooks; aiMem[1].hooks = hooks;
+
+    function doPoint(r) {
+      if (!st || st.ph === 'done' || !host()) return;
+      api.setState(point(st, r.w, r.why, rallyN));
+    }
+
+    function startPoint(next) {
+      rallyN = 0;
+      const srv = server(next);
+      const keep = W.pd.map((p) => ({ x: p.x, y: p.y }));
+      W = newWorld(srv);
+      keep.forEach((k, i) => { if (fin(k.x)) { W.pd[i].x = k.x; W.pd[i].y = k.y; } });
+      aiMem.forEach((m) => { m.plan = null; m.aim = null; m.serveT = null; });
+      snap = null; pred = null; trail.length = 0; pendingPt = null; held = null;
+      if (next.ph === 'done') { phase = 'done'; W.R.ph = 'dead'; return; }
+      phase = 'count'; cd = (next.lg >= 0 ? CD_PT : 0) + CD_NUM;
+      banner = next.lg >= 0 ? { w: next.lg, why: next.why | 0 } : null;
+      if (next.lg >= 0) {
+        const me = humansHere()[0];
+        if (me == null) api.sfx('chip');
+        else if (me === next.lg) { api.sfx('chip'); api.buzz(20); } else { api.sfx('thud'); api.buzz(40); }
+      }
+      if (next.lg >= 0 && isDeuce(next) && next.sc[0] === next.sc[1]) api.toast('듀스');
+    }
+
+    /* ----- online ----- */
+    const curKey = () => (st ? st.rid + '.' + st.seq : null);
+    function pollNet(now) {
+      if (!api.online) return;
+      if (api.isHost) {
+        let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+        if (rem && typeof rem === 'object') for (const k in rem) {
+          const s = +k, o = rem[k];
+          if (!(s === 0 || s === 1) || simHere(s) || !o || typeof o !== 'object') continue;
+          if (Array.isArray(o.m) && fin(+o.m[0]) && fin(+o.m[1])) {
+            const r = remS[s] || (remS[s] = { q: -1 });
+            if (o.q !== r.q) {
+              const x = +o.m[0], y = +o.m[1], t = fin(o.t) ? o.t : now;
+              if (r.q >= 0 && fin(r.t)) { let dt = (t - r.t) / 1000; if (dt < 0) dt += 60; if (dt > 0.004 && dt < 0.5) { r.vx = (x - r.x) / dt; r.vy = (y - r.y) / dt; } }
+              Object.assign(r, { q: o.q, x, y, t, at: now }); if (!fin(r.vx)) { r.vx = 0; r.vy = 0; }
+            }
+          }
+          // a guest's hit/serve claim: accept when it is that seat's ball to play
+          const c = o.c;
+          if (c && o.k === curKey() && Array.isArray(c.b) && c.b.length >= 8 && c.b.every(fin)) {
+            const r = remS[s] || (remS[s] = { q: -1 });
+            if (c.n !== r.cn) {
+              r.cn = c.n;
+              const ok = (W.R.ph === 'wait' && W.R.srv === s) || canHit(W.R, s);
+              const near = Math.hypot(c.b[0] - W.b.x, c.b[1] - W.b.y) < 1.2;
+              // the host already registered this same hit from the delayed paddle: the guest's exact contact wins
+              const refine = !ok && W.R.hit === s && now - hostHit[s] < 500 && (W.R.ph === 'fly' || held);
+              if (refine) {
+                held = null; W.R.ph = 'fly'; W.R.el = -1;
+                if (W.R.sv) W.R.sb = 0;
+                W.R.nb = [0, 0]; W.R.net = 0;
+                Object.assign(W.b, { x: c.b[0], y: c.b[1], z: c.b[2], vx: c.b[3], vy: c.b[4], vz: c.b[5], tp: c.b[6], sd: c.b[7] });
+                // catch the claimed flight up to now (≈ the time since the host saw the same hit), refereed
+                const lag = Math.min(0.3, (now - hostHit[s]) / 1000) * SPD(); hostHit[s] = 0;
+                for (let t = 0; t < lag && W.R.ph === 'fly'; t += SUB) {
+                  const dead = stepBall(W.b, SUB, (kd, a2, c2) => { if (kd === 'table') { hooks.table(a2, c2); const r = refBounce(W.R, a2); if (r) endPoint(W, r, hooks); } else if (kd === 'net') { W.R.net = 1; hooks.net(a2); } });
+                  if (dead && W.R.ph === 'fly') endPoint(W, refDead(W.R) || { w: 1 - W.R.hit, why: 2 }, hooks);
+                }
+              } else if (ok && (near || W.R.ph === 'wait') && refHit(W.R, s)) {
+                Object.assign(W.b, { x: c.b[0], y: c.b[1], z: c.b[2], vx: c.b[3], vy: c.b[4], vz: c.b[5], tp: c.b[6], sd: c.b[7] });
+                W.hits[s] = (W.hits[s] + 1) % 1000; W.pd[s].cool = 0.25;
+                sfx(Math.hypot(c.b[3], c.b[4]) > 8 ? 'hit' : 'pop');
+                fx.push({ x: W.b.x, y: W.b.y, z: W.b.z, t: 0.3, col: P(s).color });
+              }
+            }
+          }
+        }
+      } else {
+        let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+        if (!hs || typeof hs !== 'object' || hs.k !== curKey() || hs.q === lastQ) return;
+        lastQ = hs.q;
+        if (Array.isArray(hs.b) && hs.b.length >= 8 && hs.b.every(fin)) snap = { b: hs.b, at: now, ph: hs.e | 0, el: fin(hs.l) ? hs.l : -1, hit: fin(hs.w) ? hs.w : 0, sb: hs.sb | 0 };
+        if (Array.isArray(hs.h)) peerH = [hs.h[0] | 0, hs.h[1] | 0];
+        if (hs.m && typeof hs.m === 'object') for (const k in hs.m) {
+          const s = +k, a = hs.m[k];
+          if ((s === 0 || s === 1) && !simHere(s) && Array.isArray(a) && fin(a[0]) && fin(a[1])) {
+            const r = remS[s] || (remS[s] = {});
+            if (fin(r.x) && r.at) { const dt = (now - r.at) / 1000; if (dt > 0.01 && dt < 0.5) { r.vx = (a[0] - r.x) / dt; r.vy = (a[1] - r.y) / dt; } }
+            r.x = a[0]; r.y = a[1]; r.at = now; if (!fin(r.vx)) { r.vx = 0; r.vy = 0; }
+          }
+        }
+      }
+    }
+    function applyRemotePaddles(now) {
+      for (let s = 0; s < 2; s++) {
+        if (simHere(s)) { W.pd[s].off = false; continue; }
+        const r = remS[s], p = W.pd[s];
+        p.off = !api.isHost; // guests never detect the opponent's hits; the host does (claims are faster)
+        p.max = PMAXV * 1.5;
+        if (!r || !fin(r.x)) continue;
+        const age = Math.min(0.08, (now - r.at) / 1000);
+        p.tx = r.x + (r.vx || 0) * age; p.ty = r.y + (r.vy || 0) * age;
+        p.vx = r.vx || 0; p.vy = r.vy || 0;
+      }
+    }
+    function reconcile(rdt, now) {
+      if (api.isHost || !api.online || !snap) return;
+      const mine = humansHere()[0];
+      if (pred) {
+        if (mine != null && peerH[mine] !== pred.c) pred = null;
+        else if (now > pred.until) pred = null;
+        else return;
+      }
+      const R = W.R, ph = ['wait', 'fly', 'dead'][snap.ph] || 'dead';
+      if (R.ph !== ph || R.el !== snap.el) { R.ph = ph; R.el = snap.el; R.hit = snap.hit; R.sv = snap.sb < 2 && ph === 'fly' && R.sv; }
+      if (ph === 'wait') return; // the server's device places the ball
+      const b = snap.b, age = Math.min(0.12, (now - snap.at) / 1000 + 0.03) * SPD();
+      const t = { x: b[0], y: b[1], z: b[2], vx: b[3], vy: b[4], vz: b[5], tp: b[6], sd: b[7] };
+      for (let a = 0; a < age; a += SUB * 2) stepBall(t, SUB * 2, null);
+      const d = Math.hypot(t.x - W.b.x, t.y - W.b.y, t.z - W.b.z), k = 1 - Math.exp(-rdt * 16);
+      if (d > 0.5) Object.assign(W.b, t);
+      else { W.b.x += (t.x - W.b.x) * k; W.b.y += (t.y - W.b.y) * k; W.b.z += (t.z - W.b.z) * k; W.b.vx = t.vx; W.b.vy = t.vy; W.b.vz = t.vz; W.b.tp = t.tp; W.b.sd = t.sd; }
+    }
+    function publish(rdt) {
+      if (!api.online) return;
+      pubT -= rdt; if (pubT > 0) return; pubT = 1 / 30;
+      const k = curKey();
+      try {
+        q = (q + 1) % 1000;
+        if (api.isHost) {
+          const m = {};
+          for (let s = 0; s < 2; s++) if (simHere(s)) m[s] = [r2(W.pd[s].x), r2(W.pd[s].y)];
+          const b = W.b;
+          api.net.hostSend({ k, q, b: [r2(b.x), r2(b.y), r2(b.z), r2(b.vx), r2(b.vy), r2(b.vz), Math.round(b.tp || 0), Math.round(b.sd || 0)], m, h: W.hits.slice(), e: ['wait', 'fly', 'dead'].indexOf(W.R.ph), l: W.R.el, w: W.R.hit, sb: W.R.sv ? W.R.sb : 2 });
+        } else {
+          const s = humansHere()[0];
+          if (s == null) return;
+          const o = { k, q, m: [r2(W.pd[s].x), r2(W.pd[s].y)], t: Math.round(performance.now()) % 60000 };
+          if (lastClaim.n) o.c = lastClaim;
+          api.net.publish(o);
+        }
+      } catch (e) {}
+    }
+
+    /* ----- serve trigger for humans: a forward push while holding the ball ----- */
+    function humanServe() {
+      const R = W.R; if (R.ph !== 'wait' || phase !== 'play') return;
+      const s = R.srv; if (!simHere(s) || aiCtl(s)) return;
+      const v = pv[s], pf = v.y * fwd(s);
+      if (([...ptr.values()].includes(s) || kb.on) && pf > 1.4) doHit(W, s, hooks);
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      if (!st) return;
+      const hstop = stopT > 0; stopT = Math.max(0, stopT - rdt);
+      pdF[0] = Math.max(0, pdF[0] - rdt); pdF[1] = Math.max(0, pdF[1] - rdt);
+      const dt = hstop ? 0 : rdt * SPD();
+      pendingPt = null;
+      pollNet(now);
+      if (held && now - held.at > 380) { const r = held.r; held = null; doPoint(r); }
+      if (phase === 'count') {
+        const before = cd; cd -= dt;
+        const tk = CD_NUM / 3, nb = Math.ceil(before / tk), na = Math.ceil(cd / tk);
+        if ((before <= CD_NUM && na !== nb && na > 0) || (before > CD_NUM && cd <= CD_NUM)) api.sfx('tick');
+        if (cd <= 0) { phase = 'play'; banner = null; api.buzz(10); }
+      }
+      if (hintT > 0 && phase === 'play' && W.R.ph === 'fly') hintT -= rdt;
+      for (let s = 0; s < 2; s++) if (aiCtl(s) && (phase === 'play' || W.R.ph !== 'wait')) aiThink(W, s, aiMem[s], P(s).ai ? D(s) : DIFF.normal, dt);
+      else if (aiCtl(s)) { const p = W.pd[s]; p.tx = TWD / 2; p.ty = s === 0 ? TLN + 0.35 : -0.35; }
+      applyRemotePaddles(now);
+      padMove(dt);
+      if (dt > 0) { trackVel(Math.max(1e-3, dt)); humanServe(); }
+      const guest = api.online && !api.isHost;
+      if (phase === 'done') W.R.ph = 'dead';
+      simulate(W, Math.min(dt, 0.25), hooks, { live: !guest });
+      if (guest) reconcile(rdt, now);
+      else if (pendingPt) {
+        const r = pendingPt, hs = W.R.hit; pendingPt = null;
+        if (api.online && !simHere(hs) && now - hostHit[hs] < 450) held = { r, at: now };
+        else doPoint(r);
+      }
+      if (W.R.ph === 'fly') { trail.push({ x: W.b.x, y: W.b.y, z: W.b.z }); if (trail.length > 7) trail.shift(); } else trail.length = 0;
+      for (let i = fx.length - 1; i >= 0; i--) { fx[i].t -= rdt; if (fx[i].t <= 0) fx.splice(i, 1); }
+      shake = Math.max(0, shake - rdt * 3);
+      publish(rdt);
+    }
+
+    /* ----- drawing ----- */
+    function drawPaddle(s) {
+      const p = W.pd[s], col = P(s).color || '#ccc', R = PR * lay.s * 0.62;
+      const sh = toS(p.x, p.y, 0), c = toS(p.x, p.y, 0.1);
+      const atBottom = (s === 0) !== flip;
+      const hd = atBottom ? 1 : -1;
+      ctx.save(); ctx.globalAlpha = 0.28; ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(sh.x + 3, sh.y + 4, R, R * 0.8, 0, 0, 7); ctx.fill(); ctx.restore();
+      // handle
+      ctx.save(); ctx.translate(c.x, c.y);
+      const tilt = clamp((pv[s].x || 0) * 0.03, -0.5, 0.5) * hd;
+      ctx.rotate(tilt);
+      ctx.fillStyle = '#c99a5b'; rr(ctx, -R * 0.2, hd > 0 ? R * 0.75 : -R * 1.75, R * 0.4, R, R * 0.12); ctx.fill();
+      ctx.fillStyle = 'rgba(80,50,20,.4)'; ctx.fillRect(-R * 0.2, hd > 0 ? R * 0.75 : -R * 0.8, R * 0.4, R * 0.05);
+      // blade: wood rim + coloured rubber
+      ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.fillStyle = '#d9b27a'; ctx.fill();
+      const g = ctx.createRadialGradient(-R * 0.3, -R * 0.3, 1, 0, 0, R);
+      g.addColorStop(0, shade(col, 0.25)); g.addColorStop(1, shade(col, -0.25));
+      ctx.beginPath(); ctx.arc(0, 0, R * 0.88, 0, 7); ctx.fillStyle = g; ctx.fill();
+      if (pdF[s] > 0) { ctx.beginPath(); ctx.arc(0, 0, R * 1.05, 0, 7); ctx.fillStyle = 'rgba(255,246,220,' + (pdF[s] / 0.15 * 0.7) + ')'; ctx.fill(); }
+      if (local(s) && [...ptr.values()].includes(s)) { ctx.beginPath(); ctx.arc(0, 0, R + 4, 0, 7); ctx.strokeStyle = 'rgba(242,233,216,.35)'; ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.restore();
+    }
+    function drawNet() {
+      const a = toS(-NETX, MID, 0), b = toS(TWD + NETX, MID, 0), top = NETH * ZK * lay.s;
+      const x0 = Math.min(a.x, b.x), x1 = Math.max(a.x, b.x);
+      ctx.fillStyle = 'rgba(20,20,26,.45)'; ctx.fillRect(x0, a.y - top, x1 - x0, top);
+      ctx.strokeStyle = 'rgba(242,236,224,.18)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = x0; x <= x1; x += 5) { ctx.moveTo(x, a.y - top); ctx.lineTo(x, a.y); }
+      for (let y = a.y - top; y <= a.y; y += 4) { ctx.moveTo(x0, y); ctx.lineTo(x1, y); }
+      ctx.stroke();
+      ctx.fillStyle = '#f2ece0'; ctx.fillRect(x0, a.y - top - 2, x1 - x0, 3);
+      ctx.fillStyle = '#3a3340'; ctx.fillRect(x0 - 4, a.y - top - 3, 5, top + 5); ctx.fillRect(x1 - 1, a.y - top - 3, 5, top + 5);
+    }
+    function drawBall() {
+      const b = W.b;
+      const over = onTable(b.x, b.y);
+      const shZ = over ? 0 : -0.76;
+      const sh = toS(b.x, b.y, 0);
+      const hgt = Math.max(0, b.z - shZ);
+      const rad = Math.max(3.5, BR * 1.6 * lay.s) * (1 + Math.min(0.6, b.z * 0.35));
+      ctx.save(); ctx.globalAlpha = clamp(0.5 - hgt * 0.35, 0.12, 0.5) * (over ? 1 : 0.6); ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(sh.x + (over ? 0 : 6), sh.y + (over ? 0 : 10), rad * (1 + hgt * 0.6), rad * 0.7 * (1 + hgt * 0.6), 0, 0, 7); ctx.fill(); ctx.restore();
+      for (let i = 0; i < trail.length; i++) { const t = trail[i], c = toS(t.x, t.y, t.z), a2 = (i + 1) / trail.length; ctx.beginPath(); ctx.arc(c.x, c.y, rad * 0.8 * a2, 0, 7); ctx.fillStyle = 'rgba(255,240,215,' + (0.14 * a2) + ')'; ctx.fill(); }
+      const c = toS(b.x, b.y, b.z);
+      const g = ctx.createRadialGradient(c.x - rad * 0.35, c.y - rad * 0.35, 0.5, c.x, c.y, rad);
+      g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#f2c38a');
+      ctx.beginPath(); ctx.arc(c.x, c.y, rad, 0, 7); ctx.fillStyle = g; ctx.fill();
+      ctx.strokeStyle = 'rgba(120,70,30,.35)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    function drawScore() {
+      if (!st) return;
+      const sc = st.sc || [0, 0], srv = W.R.ph === 'wait' || W.R.sv ? W.R.srv : server(st);
+      for (let s = 0; s < 2; s++) {
+        const atBottom = (s === 0) !== flip;
+        const c = toS(-0.5, s === 0 ? MID + 0.42 : MID - 0.42, 0);
+        const left = Math.min(toS(0, 0).x, toS(TWD, 0).x), w = Math.min(64, lay.s * 0.62, left - 10), h = w * 0.85;
+        ctx.save(); ctx.translate(left / 2, c.y);
+        rr(ctx, -w / 2, -h / 2, w, h, 10); ctx.fillStyle = 'rgba(23,19,31,.82)'; ctx.fill();
+        ctx.strokeStyle = hexA(P(s).color, 0.8); ctx.lineWidth = 2; ctx.stroke();
+        ctx.font = '700 ' + Math.round(h * 0.55) + 'px "IBM Plex Mono", ui-monospace, monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#f2e9d8';
+        ctx.fillText(String(sc[s] | 0), 0, 1);
+        if (srv === s && phase !== 'done') { ctx.beginPath(); ctx.arc(w / 2 - 7, -h / 2 + 7, 4, 0, 7); ctx.fillStyle = '#f7f2e6'; ctx.fill(); }
+        ctx.font = '600 11px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.fillStyle = hexA(P(s).color, 0.95);
+        const nm = name(s) + (P(s).ai ? ' · ' + DIFF_KO[diffOf(P(s).lv)] : '');
+        // name sits outside the box, toward that player's end
+        ctx.fillText(nm.length > 9 ? nm.slice(0, 9) + '…' : nm, 0, (h / 2 + 10) * (atBottom ? 1 : -1));
+        ctx.restore();
+      }
+      const lab = toS(TWD + 0.5, MID, 0);
+      const right = Math.max(toS(0, 0).x, toS(TWD, 0).x), lx = (right + cv.w) / 2;
+      ctx.font = '600 11px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(227,174,69,.85)';
+      ctx.fillText((st.to || 11) + '점', lx, lab.y - 8);
+      ctx.fillText(isDeuce(st) ? '듀스' : '2점 차', lx, lab.y + 8);
+    }
+    function centerText(lines) {
+      const cx = cv.w / 2, cy = toS(TWD / 2, MID, 0).y;
+      ctx.save(); ctx.translate(cx, cy);
+      for (const ln of lines) {
+        ctx.font = ln.f; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(10,8,16,.8)'; ctx.strokeText(ln.t, 0, ln.y); ctx.fillStyle = ln.c || '#f2e9d8'; ctx.fillText(ln.t, 0, ln.y);
+      }
+      ctx.restore();
+    }
+    function draw() {
+      if (!lay) return;
+      cv.clear();
+      ctx.save();
+      if (shake > 0) ctx.translate((Math.random() - 0.5) * shake * 5 * L.fx(), (Math.random() - 0.5) * shake * 5 * L.fx());
+      ctx.drawImage(bg, 0, 0, cv.w, cv.h);
+      // far paddle, ball / net ordering by screen depth
+      const farSeat = flip ? 0 : 1, nearSeat = 1 - farSeat;
+      drawPaddle(farSeat);
+      const ballFar = flip ? W.b.y > MID : W.b.y < MID;
+      if (ballFar) { drawBall(); drawNet(); } else { drawNet(); drawBall(); }
+      drawPaddle(nearSeat);
+      for (const f of fx) { if (f.s) { const c = toS(f.x, f.y, f.z), k = 1 - f.t / f.T; ctx.save(); ctx.globalAlpha = Math.min(1, f.t / 0.25); ctx.font = '800 14px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.strokeText(f.s, c.x, c.y - 18 - k * 14); ctx.fillStyle = f.col; ctx.fillText(f.s, c.x, c.y - 18 - k * 14); ctx.restore(); continue; } const c = toS(f.x, f.y, f.z), k = 1 - f.t / 0.3; ctx.beginPath(); ctx.arc(c.x, c.y, (6 + k * (f.big ? 22 : 14)), 0, 7); ctx.strokeStyle = hexA(f.col || '#fff', 0.7 * (1 - k)); ctx.lineWidth = 2; ctx.stroke(); }
+      ctx.restore();
+      drawScore();
+      const fz = Math.round(Math.min(56, lay.s * 0.5));
+      if (phase === 'count' && st) {
+        if (banner && cd > CD_NUM) centerText([{ t: name(banner.w) + ' 득점', f: fz * 0.6 + 'px "Black Han Sans", sans-serif', y: -fz * 0.2, c: P(banner.w).color }, { t: WHY[banner.why] || '', f: '600 ' + Math.round(fz * 0.32) + 'px "IBM Plex Sans KR", sans-serif', y: fz * 0.38 }]);
+        else {
+          // who serves next (the hint at the bottom only appears once play starts)
+          const sv = W.R.srv, mine = humansHere()[0] === sv && !aiCtl(sv);
+          centerText([{ t: String(Math.max(1, Math.ceil(cd / (CD_NUM / 3)))), f: fz + 'px "Black Han Sans", sans-serif', y: -fz * 0.12 },
+            { t: mine ? '내 서브' : name(sv) + ' 서브', f: '700 ' + Math.round(Math.max(13, fz * 0.3)) + 'px "IBM Plex Sans KR", sans-serif', y: fz * 0.6, c: P(sv).color }]);
+        }
+      }
+      // hint for the person on this phone (their end is always at the bottom)
+      if (phase === 'play' && st) {
+        for (const s of humansHere()) {
+          if (aiCtl(s)) continue;
+          let t = null;
+          if (W.R.ph === 'wait' && W.R.srv === s) t = '라켓을 앞으로 밀어 서브';
+          else if (W.R.ph === 'wait') t = name(W.R.srv) + ' 서브';
+          else if (hintT > 0) t = '공 그림자에 라켓을 대고 앞으로 휘둘러요';
+          if (!t) continue;
+          ctx.save(); ctx.translate(cv.w / 2, cv.h - 22);
+          ctx.font = '600 13px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          const w = ctx.measureText(t).width + 24; rr(ctx, -w / 2, -15, w, 30, 15); ctx.fillStyle = 'rgba(23,19,31,.82)'; ctx.fill();
+          ctx.fillStyle = '#f2e9d8'; ctx.fillText(t, 0, 1); if (t !== name(W.R.srv) + ' 서브') { const kl = L.ui.keyLabel('pingpong', 'swing'); if (kl) { ctx.font = '700 10px monospace'; L.ui.drawKeyBadge(ctx, w / 2 + 6 + Math.max(14, ctx.measureText(kl).width + 6), 8, kl); } } ctx.restore();
+        }
+      }
+    }
+
+    const stopLoop = U.loop((rdt, now) => {
+      // fast-forward (Lounge.debug.speed) in ≤ 1/30 s game-time slices so AI and physics stay fine-grained
+      const n = Math.min(12, Math.max(1, Math.ceil(rdt * SPD() * 30)));
+      try { for (let i = 0; i < n; i++) frame(rdt / n, now); } catch (e) { console.error(e); }
+      try { draw(); } catch (e) { console.error(e); }
+    });
+    cv.onresize = layout;
+    layout();
+
+    return {
+      update(next) {
+        if (!next) return;
+        st = next;
+        if (computeFlip() !== flip) layout();
+        const k = curKey();
+        if (k !== key) { key = k; startPoint(next); }
+        if (next.ph === 'done') { phase = 'done'; W.R.ph = 'dead'; }
+      },
+      destroy() {
+        stopLoop();
+        if (offIn) offIn();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('lostpointercapture', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        cv.destroy();
+      },
+      _dbg: () => ({ W, phase, cd, flip, lay, toS, toW, st, ptr, snap, pred, pv }),
+    };
+  }
+
+  /* ---------- drawing helpers ---------- */
+  function rr(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+  function hexA(hex, a) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return 'rgba(220,220,220,' + a + ')';
+    const n = parseInt(m[1], 16);
+    return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  }
+  function shade(hex, k) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    const f = (c) => Math.round(k >= 0 ? c + (255 - c) * k : c * (1 + k));
+    return 'rgb(' + f(n >> 16) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  L.register({
+    id: 'pingpong', name: '탁구', tag: '실시간 대결', cat: '스포츠',
+    blurb: '라켓을 휘두르는 속도와 방향이 그대로 공에 실려요. 11점(또는 7점) 먼저, 2점 차로 이기기. 혼자면 AI와, 친구와는 온라인·LAN 방으로(한 폰에 한 명).',
+    tint: '#1d5a48',
+    icon: '<rect x="6" y="14" width="44" height="28" rx="3" fill="none" stroke="currentColor" stroke-width="3"/><path d="M28 10v36" stroke="currentColor" stroke-width="3"/><circle cx="18" cy="26" r="7" fill="currentColor"/><path d="M14 32l-6 8" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><circle cx="38" cy="22" r="3" fill="currentColor"/>',
+    minPlayers: 2, maxPlayers: 2, defaultPlayers: 2, hidden: false, realtime: true, aiDelay: 0,
+    options: [
+      { id: 'to', label: '목표 점수', choices: [{ v: 7, label: '7점' }, { v: 11, label: '11점' }], def: 11 },
+    ],
+    controls: [
+      { id: 'up', label: '앞으로', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '뒤로 (커트)', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'left', label: '왼쪽', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '오른쪽', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'swing', label: '스윙 (서브)', keys: ['Space', 'ShiftLeft'], pad: ['a', 'rt'] },
+    ],
+    quick: [
+      '공을 쳐서 네트 너머 상대 쪽 테이블에 넣어요. 상대가 못 받아 넘기면 내 점수예요.',
+      '화면을 누르고 끌면 라켓이 따라와요. 공 그림자에 라켓을 대고 앞으로 휘둘러요.',
+      '11점(또는 7점)을 먼저 따고 2점 이상 앞서면 이겨요.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '탁구 한 판이에요. 내 라켓은 항상 화면 아래쪽, 상대는 위쪽이에요.',
+        '공을 쳐서 네트를 넘겨 상대 쪽 테이블에 떨어뜨려요. 상대가 받아 넘기지 못하면 내 점수예요.',
+        '정한 점수(11점, 또는 7점)를 먼저 따고 상대보다 2점 이상 앞서면 이겨요.',
+      ] },
+      { h: '조작 (터치)', p: [
+        '움직이기: 화면 아무 데나 누르고 끌면 라켓이 손가락 조금 앞에서 따라와요(손가락이 라켓을 가리지 않게).',
+        '맞히기: 공의 그림자(테이블에 비친 점)에 라켓을 갖다 대요. 공이 높이 뜰수록 그림자와 멀어 보여요.',
+        '세기: 맞는 순간 앞으로 휘두른 속도만큼 세게 날아가요. 가만히 대면 막기, 너무 세면 길게 나가 아웃.',
+        '방향: 옆으로 휘두르면 그쪽으로 가고 옆회전이 걸려 휘어져요. 라켓 가장자리로 맞히면 각도가 더 벌어져요.',
+        '회전: 앞으로 빠르게 휘두르면 탑스핀(낮게 깔리고 튄 뒤 쭉 뻗어요). 맞는 순간 몸 쪽으로 당기면 백스핀 커트(느리고, 튄 뒤 멈칫해요).',
+        '서브: 공이 라켓 위에 올라가 있을 때 라켓을 앞(상대 쪽)으로 밀어요. 서브는 엔드라인 뒤에서만 칠 수 있어요.',
+        'PC: 마우스로 누른 채 끌어도 되고, 방향키·WASD·왼스틱으로 라켓을 옮긴 뒤 스페이스·Ⓐ·RT로 「스윙」(서브도 스윙). 스윙하며 ←/→ = 방향·옆회전, 공이 닿을 때 ↓ 를 누르고 있으면 커트. 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '점수 · 승리', p: [
+        '이럴 때 상대 점수: 내 공이 네트에 걸림 · 내 쪽 테이블에 떨어짐 · 테이블 밖으로 나감 · 내 쪽에서 두 번 튈 때까지 못 넘김 · 서브 실패.',
+        '서브는 2점마다 상대와 번갈아 넣어요.',
+        '듀스: 10:10(7점 경기는 6:6)이 되면 2점 차가 날 때까지 계속해요. 이때부터 서브는 1점마다 바뀌어요.',
+      ] },
+      { h: '서브 · 랠리 규칙', p: [
+        '서브는 먼저 내 쪽 테이블에 한 번, 네트를 넘어 상대 쪽에 한 번 튀어야 해요. 아니면 서브 실패예요.',
+        '렛(네트에 맞은 서브를 다시 하기)은 없어요. 네트를 스치고 들어가면 그대로 진행해요.',
+        '상대가 친 공은 내 쪽에 한 번 튄 뒤에만 칠 수 있어요(튀기 전에는 라켓에 맞지 않아요).',
+        '내가 친 공은 곧바로 상대 쪽 테이블에 떨어져야 해요.',
+      ] },
+      { h: '팁', p: [
+        '세게보다 정확하게! 중간 속도로 앞으로 밀기만 해도 대부분 들어가요.',
+        '공이 튄 뒤 내려올 곳(그림자)에 라켓을 미리 가져다 두면 받기 쉬워요.',
+        '상대가 한쪽에 있으면 옆으로 휘둘러 반대쪽 구석을 노려요. 커트로 느린 공을 섞으면 상대 타이밍이 흐트러져요.',
+      ] },
+      { h: '예시', p: [
+        '11점 경기에서 10:10 듀스 → 내가 1점(11:10) → 상대가 1점(11:11) → 내가 2점 연속(13:11) → 2점 차가 났으니 내 승리!',
+      ] },
+      { h: '함께 하기 · AI', p: [
+        '한 폰에는 한 명만: 혼자 하면 상대는 AI예요. 친구와는 온라인·LAN 방에서 각자 자기 폰으로 해요.',
+        '온라인·LAN: 각자 폰에서 내 라켓이 항상 아래쪽에 보여요. 공과 판정은 호스트 폰이 맡아요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(움직임 속도, 반응, 실수 확률과 공의 세기가 달라요).',
+      ] },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { server, point, winnerOf, isDeuce, newRef, refBounce, refHit, refDead, canHit, stepBall, preview, preview2, shotParams, applyShot, serveParams, applyServe, newWorld, simulate, aiThink, intercept, DIFF, TWD, TLN, MID, NETH, PR },
+  });
+})();

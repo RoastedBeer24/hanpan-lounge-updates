@@ -1,0 +1,368 @@
+/* 열두 파수 (bossrun) — 스테이지 없이 보스만 연달아 상대하는 옆에서 본 사격 액션. 패턴을 읽고, 청록빛 탄은 받아친다.
+   구조만 참고(보스 연전 · 받아치기 · 필살 게이지). 이름 · 세계 · 그림 · 글은 모두 독자.
+
+   파일 구성
+   - 이 파일: 자료(무기 · 부적 · 파수 12종의 이름/체력/패턴 요령) · 판 상태(pick → play → done) · 결과 · 규칙 · 도감 · 표지 · L.register · 입구(조각 불러오기).
+   - assets/bossrun/sim.js: 순수 시뮬(초당 60걸음 — 주인공 물리 · 무기 · 탄 · 예고 구역 · 파수 패턴 · 봇 · 네트워크 묶기). node에서도 돎.
+   - assets/bossrun/view.js: 캔버스 화면(걸음 사이 보간) · 조작 · HUD · 장비 고르기 · 소리 · 온라인.
+   온라인: 파수 · 탄 · 판정은 호스트가 돌려 hostSend(초당 15회). 손님은 자기 사수의 이동만 먼저 그리고(예측) 위치 · 행동을 publish. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'bossrun';
+  const TITLE = '열두 파수';
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  /* 글 문체: 화면 글은 짧은 명사형 · 평서(느낌표 · 이모지 아이콘 없음), 규칙은 합니다체. */
+
+  /* ======================= 무기 ======================= */
+  /* dmg 한 발 피해 · cd 발사 간격(걸음, 60 = 1초) · spd 탄속(px/초) */
+  const WEAPONS = [
+    { id: 'line', nm: '직사탄', kd: '직사', dmg: 4, cd: 7, spd: 640, col: '#ffe9a8', d: '곧게 멀리 나감. 어디서든 고르게 통함.' },
+    { id: 'fan', nm: '확산탄', kd: '확산', dmg: 2.5, n: 3, cd: 11, spd: 520, rng: 190, col: '#ffc08a', d: '세 갈래로 퍼지고 가까이서만 닿음. 붙을수록 강함.' },
+    { id: 'seek', nm: '추적탄', kd: '유도', dmg: 2.9, cd: 9, spd: 380, col: '#c8f0a0', d: '가장 가까운 적을 따라감. 약하지만 방패 뒤와 소환물에 닿음.' },
+    { id: 'lob', nm: '곡사포', kd: '포물선', dmg: 12, cd: 19, col: '#ffd070', d: '포물선으로 떨어짐. 방패를 넘어가지만 움직이는 적은 놓치기 쉬움.' },
+    { id: 'maul', nm: '파쇄 강타', kd: '근접', dmg: 14, cd: 17, rng: 62, col: '#ffffff', d: '코앞에서만 닿는 강타. 가장 세지만 가장 위험함.' },
+    { id: 'chg', nm: '집속포', kd: '충전', dmg: 38, cd: 58, spd: 800, col: '#a8e8ff', d: '1초쯤 모았다가 꿰뚫는 한 발. 소환물과 파수를 함께 뚫음.' },
+    { id: 'beam', nm: '관통 광선', kd: '광선', dmg: 1.5, cd: 3, rng: 330, col: '#f0b8ff', d: '닿는 즉시 피해. 중간 거리까지, 소환물을 꿰뚫음.' },
+  ];
+  const WI = {}; WEAPONS.forEach((w, i) => { WI[w.id] = i; });
+  const dps = (w) => Math.round((w.dmg * (w.n || 1) * 60) / w.cd);
+
+  /* ======================= 부적 ======================= */
+  const CHARMS = [
+    { id: 'veil', nm: '잔상 부적', d: '대시 무적 +0.12초 · 대시 재사용 15% 빠름' },
+    { id: 'heart', nm: '굳은 심장', d: '체력 +1 · 화력 −8%' },
+    { id: 'focus', nm: '날 선 집중', d: '체력 −1 · 화력 +15%' },
+    { id: 'reach', nm: '긴 손', d: '받아치기 범위 +40% · 유지 +0.08초' },
+    { id: 'spark', nm: '불씨', d: '필살 게이지가 1초에 2씩 저절로 참' },
+    { id: 'ward', nm: '방패 부적', d: '파수마다 첫 피격 한 번 무효' },
+    { id: 'air', nm: '깃털', d: '공중 점프 1회 · 공중 대시 2회' },
+    { id: 'echo', nm: '되울림', d: '받아치기에 성공하면 둘레의 탄이 사라짐' },
+  ];
+  const CI = {}; CHARMS.forEach((c, i) => { CI[c.id] = i; });
+
+  /* 주인공 수치(도감 · 규칙에 그대로 쓰임) */
+  const HERO = { nm: '잿빛 사수', nm2: '푸른 사수', hp: 3, inv: 1.4, dash: 0.22, parry: 0.23, gauge: 100, gParry: 25, sp: 60 };
+
+  /* ======================= 파수(보스) ======================= */
+  /* hp: 단계별 체력 · lv: 어려운 정도(1~5) · ty: 유형 · pats: 단계별 [패턴 이름, 요령] */
+  const BOSSES = [
+    { id: 'gate', nm: '녹슨 문지기', ty: '돌진형', lv: 1, col: '#c8733a', bg: 'ruin', hp: [720, 830], d: '무너진 성문을 등에 진 갑주. 느리게 움츠렸다가 단숨에 가로지름.',
+      pats: [[['돌진', '몸을 낮추면 곧 바닥을 가로지름. 발판 위로 오르거나 대시로 통과.'], ['도약 내려찍기', '바닥의 원이 떨어질 자리. 착지 때 좌우로 퍼지는 물결은 점프.'], ['쇠못 던지기', '포물선 셋 가운데 청록빛 하나는 받아칠 수 있음.']],
+        [['왕복 돌진', '문을 버리고 빨라짐. 돌아오는 두 번째 돌진까지 대비.'], ['세 번 도약', '원이 뜨는 자리를 차례로 피하고 물결은 점프.'], ['파편 고리', '고리 사이 빈틈으로. 청록빛 파편은 받아치기.']]] },
+    { id: 'bloom', nm: '가시 화원', ty: '탄막형', lv: 2, col: '#c8507a', bg: 'garden', hp: [680, 760, 540], d: '폐온실을 뒤덮은 한 송이. 자리에서 움직이지 않고 씨앗과 덩굴로 몰아붙임.',
+      pats: [[['씨앗 부채', '고개를 젖히면 부채꼴 세 번. 사이 틈에 서거나 발판으로.'], ['덩굴 기둥', '발밑이 갈라지면 곧 솟음. 계속 걸어서 벗어남.']],
+        [['꽃잎 소용돌이', '두 줄기가 돌면서 나옴. 도는 방향으로 같이 움직임.'], ['꽃가루 포격', '떨어진 자리에 잠깐 불길이 남음. 표시 밖으로.'], ['덩굴 기둥', '더 빠르게 네 번.']],
+        [['가시 물결', '낮은 물결은 점프, 높은 가시 줄은 바닥에 붙어서. 예고 줄의 높이를 봄.'], ['씨앗 부채', '물결 사이에 섞여 나옴.']]] },
+    { id: 'tide', nm: '밀물 고래', ty: '바닥 변화형', lv: 2, col: '#3f8fb8', bg: 'sky', hp: [720, 860], d: '가라앉은 항구에 드나드는 큰 고래. 물이 차오르면 바닥은 믿을 수 없음.',
+      pats: [[['물기둥', '바닥에 물그림자가 생긴 자리에서 솟음. 틈으로 옮겨 섬.'], ['거품', '느린 거품 여섯. 청록빛 거품은 받아치기.'], ['밀물', '수면이 반짝이면 곧 바닥이 잠김. 발판 위로.']],
+        [['도약', '한쪽에서 솟아 반대쪽으로 넘어감. 가운데 바닥이 안전. 착지 물결은 점프.'], ['낙수', '위에서 떨어지는 물방울. 표시 사이로.'], ['밀물과 물기둥', '잠긴 동안 발판을 하나씩 노림. 표시를 보고 옆 발판으로.']]] },
+    { id: 'kiln', nm: '가마 거인', ty: '바닥 변화형', lv: 3, col: '#e0662e', bg: 'forge', hp: [760, 790, 540], d: '식지 않는 가마를 품은 거인. 바닥을 달구고 주먹으로 줄을 쓸어 냄.',
+      pats: [[['달군 바닥', '붉어지는 칸은 곧 타오름. 식은 칸이나 발판으로.'], ['쇳물 던지기', '떨어진 자리에 불기둥이 잠깐 남음.']],
+        [['주먹', '아랫줄 예고면 발판 위로, 윗줄 예고면 바닥으로.'], ['달군 바닥', '다섯 칸 가운데 네 칸.'], ['분출', '가슴에서 퍼지는 고리 둘. 청록빛은 받아치기.']],
+        [['쇳물 바다', '바닥 전체가 쇳물. 발판 위에서만 싸움. 예고가 뜬 발판에서 옆으로.'], ['쇳물 던지기', '발판을 노려 떨어짐.']]] },
+    { id: 'rail', nm: '폭주 화차', ty: '움직이는 무대', lv: 3, col: '#a04848', bg: 'forge', hp: [720, 790, 540], d: '멈추지 않는 기관차. 지붕은 뒤로 흘러가고 선로 바닥은 밟을 수 없음.',
+      pats: [[['연기 고리', '크고 느린 고리 셋. 가운데 청록빛은 받아치기.'], ['석탄과 연기', '포물선으로 지붕에 떨어지는 석탄 사이로 고리가 옴.'], ['기적 광선', '머리 위를 훑음. 뛰지 않고 지붕에 서 있으면 안전.']],
+        [['지붕 폭탄', '표시가 지붕과 함께 움직임. 옆 지붕으로 건너감. 고리가 함께 옴.'], ['연기 고리와 광선', '광선이 지나가는 동안에는 뛰지 않고 걸어서 고리를 피함.']],
+        [['전속력', '지붕이 더 빨리 흐름. 석탄과 고리가 함께 옴.'], ['파편 고리와 광선', '기관실에서 퍼지는 고리. 광선이 지나갈 때는 뛰지 않음.']]] },
+    { id: 'swarm', nm: '벌집 여왕', ty: '소환형', lv: 3, col: '#e0b040', bg: 'garden', hp: [400, 480, 330], d: '천장에 매달린 벌집과 그 주인. 병정을 먼저 치울지, 본체를 노릴지 고름.',
+      pats: [[['병정벌', '벌집에서 나와 따라붙음. 쏘면 떨어지고, 청록빛 벌은 받아치기.'], ['꿀 방울', '벌집 아래로 흩어져 떨어짐.']],
+        [['침 연사', '붉은 선이 겨눈 자리로 침이 꽂힘. 선이 뜨면 바로 비켜남.'], ['급강하', '원이 뜬 바닥 가운데를 훑고 지나감. 양쪽 발판이 안전.'], ['병정벌', '여왕이 나온 뒤에도 벌집은 계속 내보냄.']],
+        [['분노', '날아다니며 고리를 뿌림. 청록빛을 받아쳐 게이지를 채움.'], ['급강하', '더 자주.']]] },
+    { id: 'mirror', nm: '거울 기사', ty: '받아치기형', lv: 4, col: '#b8c4d8', bg: 'ruin', hp: [380, 420, 300], d: '거울 방패를 든 기사. 앞에서 쏜 탄은 튕겨 나감. 청록빛 구슬을 되받아치면 방패가 깨짐.',
+      pats: [[['찌르기', '창끝 앞 바닥에 예고. 점프하거나 등 뒤로. 찌른 직후에는 방패가 내려감.'], ['구슬 던지기', '청록빛 구슬을 받아치면 방패가 깨지고 잠깐 멈춤.'], ['자리 잡기', '거리를 벌림.']],
+        [['잔상 베기', '원이 뜨는 자리에 나타나 벰. 한자리에 머물지 않음.'], ['검기', '바닥 물결은 점프, 사이에 낀 높은 검기는 바닥에서.'], ['구슬 던지기', '청록빛이 둘.']],
+        [['난무', '방패 없이 연달아 나타나며 고리를 뿌림.'], ['연속 찌르기', '두 번 이어서. 찌른 뒤 양쪽으로 물결.'], ['구슬 던지기', '구슬마다 바닥 물결이 함께 옴.']]] },
+    { id: 'storm', nm: '뇌운 까마귀', ty: '비행 무대', lv: 4, col: '#7a6ae0', bg: 'sky', fly: 1, hp: [720, 790, 540], d: '폭풍 속을 나는 큰 까마귀. 이 무대에서는 사수도 날아다님.',
+      pats: [[['깃 부채', '일곱 갈래 깃이 세 번. 갈래 사이로.'], ['벼락 기둥', '밝아지는 세로 칸에 떨어짐. 어두운 칸으로.']],
+        [['가로 벼락', '세 줄 가운데 두 줄. 남는 줄로.'], ['급습', '가는 선이 그어진 높이를 가로지름. 위아래로 비켜남.'], ['깃 장벽', '세로로 늘어선 깃 사이 빈칸으로. 청록빛은 받아치기.']],
+        [['폭풍의 눈', '가운데에서 세 줄기 소용돌이. 도는 방향으로 돌며 벼락 칸을 피함.'], ['벼락 기둥', '두 칸씩. 까마귀 몸에 닿지 않게 거리를 둠.']]] },
+    { id: 'clock', nm: '태엽 시계탑', ty: '암기형', lv: 4, col: '#c9a45a', bg: 'ruin', hp: [680, 760, 540], d: '멈추지 않는 시계탑. 예고한 차례 그대로 떨어지므로 차례를 외움.',
+      pats: [[['바늘 쓸기', '바늘 아래 가운데가 위험. 바깥쪽 바닥에 붙어 있음.'], ['종 떨구기', '표시가 진한 칸부터 차례로 떨어짐. 차례를 보고 옮겨 감.'], ['종소리 고리', '시계에서 퍼지는 고리.']],
+        [['두 바늘과 종소리', '서로 반대로 도는 두 바늘, 이어서 고리.'], ['시계추와 종', '바닥을 훑는 추가 갔다가 돌아옴(두 번 점프). 그 사이 종이 차례로 떨어짐.'], ['종 떨구기', '다섯 번, 더 빠르게.']],
+        [['되감기', '퍼져 나간 고리가 되돌아옴. 같은 틈을 다시 지남. 종 셋이 함께 떨어짐.'], ['두 바늘과 종소리', '바늘이 도는 동안 고리가 퍼짐.']]] },
+    { id: 'puppet', nm: '줄 끊긴 인형사', ty: '양손형', lv: 4, col: '#b05a80', bg: 'ruin', hp: [680, 790, 540], d: '가면 하나와 큰 손 둘. 손은 맞아도 끄떡없으니 가면을 노림.',
+      pats: [[['내려찍기', '손 그림자가 따라오다 멈춘 자리에 떨어짐.'], ['쓸기', '손이 바닥 끝에 붙으면 곧 가로질러 쓺. 점프나 발판.']],
+        [['손뼉', '윗줄 예고면 바닥으로, 아랫줄 예고면 발판 위로.'], ['가면 연사', '내려찍기 사이로 세 갈래 탄. 가운데 청록빛은 받아치기.'], ['줄 내리기', '세로 줄이 내려오는 자리를 피함.']],
+        [['외손', '남은 손이 따라와 찍고, 찍은 자리에서 물결이 퍼짐.'], ['가면 고리', '가면이 내려와 고리를 뿌림.'], ['쓸기', '남은 손이 바닥을 가로질러 쓺.']]] },
+    { id: 'deep', nm: '심해 등불', ty: '비행 무대', lv: 5, col: '#2aa6a0', bg: 'sky', fly: 1, hp: [720, 790, 580], d: '깊은 물속의 큰 아귀. 등불이 깜박이면 무언가가 옴.',
+      pats: [[['등불 고리', '등불이 깜박인 뒤 고리 셋. 청록빛은 받아치기.'], ['물어뜯기', '띠가 그어진 높이로 두 번 달려듦. 위아래로 비켜남.']],
+        [['해파리 기뢰', '깜박이다 터짐. 쏴서 미리 없애거나 청록빛은 받아쳐 끔. 등불 고리가 함께 옴.'], ['빨아들이기', '입 쪽으로 끌려감. 반대로 헤엄치며 입 앞 원을 피함.'], ['물어뜯기와 등불 고리', '달려든 뒤 고리 셋.']],
+        [['광란', '위아래로 따라오며 다섯 갈래 탄, 이어서 물어뜯기.'], ['해파리 기뢰', '셋. 등불 고리와 함께.']]] },
+    { id: 'core', nm: '공허 심장', ty: '최종', lv: 5, col: '#8a5ae8', bg: 'ruin', hp: [760, 830, 420], d: '열두 번째 파수. 앞선 파수들의 수법을 섞어 쓰고, 마지막에는 받아치기로만 껍질이 열림.',
+      pats: [[['회전 가지', '다섯 갈래가 돌며 나옴. 갈래 사이에서 같이 돎.'], ['교차 광선', '세로 둘 · 가로 하나. 밝아진 줄 밖으로.']],
+        [['붕괴', '바닥이 사라짐. 깜박이는 발판은 곧 꺼지니 옆으로 건너감. 두 갈래 가지가 함께 옴.'], ['회전 가지', '세 갈래, 더 빠르게.'], ['세로 광선', '발판을 하나 걸러 하나씩 내리침. 밝아지지 않은 옆 발판으로.']],
+        [['껍질과 교차 광선', '쏴도 닿지 않음. 광선을 피하면서 청록빛 구슬 셋을 받아치면 껍질이 열림(오래 버텨도 잠깐 열림).'], ['회전 가지', '세 갈래.']]] },
+  ];
+  const BI = {}; BOSSES.forEach((b, i) => { b.i = i; BI[b.id] = b; });
+  const BOSS_IDS = BOSSES.map((b) => b.id);
+  /* 그림이 있는 것(app/assets/bossrun/<이름>.webp) — 없으면 코드 그림만 */
+  /* fy: 그림에서 얼굴(눈)이 있는 높이(0~1) — 작게 잘라 보일 때의 중심 */
+  const ART = { boss: ['gate', 'bloom', 'tide', 'kiln', 'rail', 'swarm', 'mirror', 'storm', 'clock', 'puppet', 'deep', 'core'], bg: ['ruin', 'garden', 'sky', 'forge'], hero: 1, fy: { gate: 0.22, bloom: 0.25, tide: 0.33, kiln: 0.21, rail: 0.47, swarm: 0.23, mirror: 0.27, storm: 0.2, clock: 0.57, puppet: 0.5, deep: 0.22, core: 0.47 } };   // 자리 목록 · 프롬프트는 assets/bossrun/PROMPTS.md
+
+  /* ======================= 기록(이 기기) ======================= */
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('bossrun.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem('bossrun.' + k, JSON.stringify(v)); } catch (e) {} },
+  };
+  const GRADES = ['S', 'A', 'B', 'C'];
+  /* 등급: 맞은 횟수와 시간(기준 = 체력 합 ÷ 9초) */
+  function gradeOf(b, t, hits) { const par = b.hp.reduce((a, c) => a + c, 0) / 9; return hits === 0 && t <= par * 1.25 ? 0 : hits <= 1 ? 1 : hits <= 2 ? 2 : 3; }
+  function saveRec(id, t, hits, hard) {
+    const b = BI[id]; if (!b) return null;
+    const rec = store.get('rec', {}), g = gradeOf(b, t, hits), k = id + (hard ? '+' : ''), o = rec[k];
+    const n = { t: o ? Math.min(o.t, Math.round(t * 10) / 10) : Math.round(t * 10) / 10, h: o ? Math.min(o.h, hits) : hits, g: o ? Math.min(o.g, g) : g, n: (o ? o.n : 0) + 1 };
+    rec[k] = n; store.set('rec', rec); return { g, best: !o || t < o.t };
+  }
+  function markSeen(id) { const s = store.get('seen', []); if (s.indexOf(id) < 0) { s.push(id); store.set('seen', s); } }
+  const fmtT = (t) => Math.floor(t / 60) + ':' + ('0' + Math.floor(t % 60)).slice(-2);
+
+  /* ======================= 판 상태 ======================= */
+  const MODES = { one: { nm: '파수 하나', n: 1 }, r3: { nm: '연전 3', n: 3 }, r5: { nm: '연전 5', n: 5 } };
+  function aiLoadout(R) {
+    const a = Math.floor(R() * WEAPONS.length); let b = Math.floor(R() * (WEAPONS.length - 1)); if (b >= a) b++;
+    return [a, b, Math.floor(R() * CHARMS.length)];
+  }
+  function init(players, opts) {
+    opts = opts || {};
+    const R = Math.random, n = clamp(players.length, 1, 2);
+    const mode = MODES[opts.mode] ? opts.mode : 'one';
+    let list;
+    if (mode === 'one') list = [BI[opts.boss] ? opts.boss : BOSS_IDS[Math.floor(R() * BOSS_IDS.length)]];
+    else {
+      /* 연전: 쉬운 파수부터 어려운 파수 순으로 무작위(고른 파수가 있으면 마지막에 둠) */
+      const pool = BOSS_IDS.filter((id) => id !== opts.boss); for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+      list = pool.slice(0, MODES[mode].n - (BI[opts.boss] ? 1 : 0)); if (BI[opts.boss]) list.push(opts.boss);
+      list.sort((a, b) => BI[a].i - BI[b].i);
+    }
+    return {
+      v: 1, rid: 1 + Math.floor(R() * 1e6), seed: 1 + Math.floor(R() * 2e9), n, mode, hard: opts.diff === 'hard' ? 1 : 0, list, bi: 0, try: 0,
+      nm: players.slice(0, n).map((p) => String(p.name || '').slice(0, 12)), ai: players.slice(0, n).map((p) => !!p.ai), lv: players.slice(0, n).map((p) => (p.ai ? p.lv || 2 : 0)),
+      ld: players.slice(0, n).map((p) => (p.ai ? aiLoadout(R) : null)), carry: null, log: [],
+      ph: 'pick', seq: 1, res: null,
+    };
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.res) return null;
+    const r = s.res, st = r.st || [], all = []; for (let i = 0; i < s.n; i++) all.push(i);
+    const col = (k) => all.map((i) => String(st[i] ? st[i][k] || 0 : 0));
+    const hl = [];
+    (s.log || []).slice(-3).forEach((q) => { if (BI[q[0]]) hl.push(BI[q[0]].nm + ' 격파 — ' + fmtT(q[1]) + ' · 피격 ' + q[2] + ' · 등급 ' + GRADES[q[3]]); });
+    if (!r.win && BI[s.list[s.bi]]) hl.push(BI[s.list[s.bi]].nm + ' ' + (r.bph + 1) + '단계에서 쓰러짐 (남은 체력 ' + Math.round((r.left || 0) * 100) + '%)');
+    if (s.try) hl.push('다시 도전 ' + s.try + '회');
+    return {
+      winners: r.win ? all : [], title: r.win ? (s.list.length > 1 ? '연전 돌파' : BI[s.list[0]].nm + ' 격파') : '쓰러짐', text: (s.hard ? '어려움 · ' : '') + MODES[s.mode].nm,
+      highlights: hl.slice(0, 4),
+      stats: [
+        { label: '준 피해', values: col('d') },
+        { label: '받아치기', values: col('p') },
+        { label: '맞은 횟수', values: col('h'), low: true },
+        { label: '되살림', values: col('r') },
+      ],
+    };
+  }
+  function hint(st, seat) {
+    if (!st) return null;
+    const b = BI[st.list[st.bi]]; if (!b) return null;
+    const o = [b.nm + ' · ' + b.ty + (st.list.length > 1 ? ' (' + (st.bi + 1) + '/' + st.list.length + ')' : '')];
+    if (st.ph === 'pick') { o.push('무기 둘과 부적 하나를 고르고 「시작」.'); return o; }
+    b.pats.forEach((ph, i) => { o.push((i + 1) + '단계: ' + ph.map((p) => p[0]).join(' · ')); });
+    o.push('청록빛 탄 · 적은 받아칠 수 있음. 게이지가 차면 필살.');
+    void seat; return o.slice(0, 6);
+  }
+
+  /* ======================= 아이콘(56×56 SVG 안쪽) ======================= */
+  const svgW = (inner) => '<svg viewBox="0 0 56 56" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">' + inner + '</svg>';
+  const WIC = {
+    line: (c) => '<path d="M6 28h30" stroke="' + c + '" stroke-width="5" stroke-linecap="round"/><path d="M38 20l12 8-12 8z" fill="' + c + '"/>',
+    fan: (c) => '<path d="M8 28l36-16M8 28h40M8 28l36 16" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/><circle cx="8" cy="28" r="5" fill="' + c + '"/>',
+    seek: (c) => '<path d="M6 44c14 0 8-30 26-30 8 0 12 6 12 12" stroke="' + c + '" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="44" cy="30" r="6" fill="none" stroke="' + c + '" stroke-width="3"/><circle cx="44" cy="30" r="2" fill="' + c + '"/>',
+    lob: (c) => '<path d="M6 46C14 6 38 6 48 40" stroke="' + c + '" stroke-width="3" fill="none" stroke-dasharray="5 4"/><circle cx="48" cy="42" r="7" fill="' + c + '"/>',
+    maul: (c) => '<rect x="26" y="8" width="24" height="16" rx="3" fill="' + c + '"/><path d="M34 22L10 48" stroke="' + c + '" stroke-width="6" stroke-linecap="round" opacity=".7"/>',
+    chg: (c) => '<circle cx="18" cy="28" r="11" fill="none" stroke="' + c + '" stroke-width="3"/><circle cx="18" cy="28" r="5" fill="' + c + '"/><path d="M30 28h22" stroke="' + c + '" stroke-width="7" stroke-linecap="round"/>',
+    beam: (c) => '<path d="M6 28h44" stroke="' + c + '" stroke-width="8" opacity=".45"/><path d="M6 28h44" stroke="' + c + '" stroke-width="3"/><path d="M10 14l4 8M24 12v9M38 14l-4 8" stroke="' + c + '" stroke-width="2"/>',
+  };
+  const CIC = {
+    veil: '<path d="M30 10l12 8-4 26H22l-4-26z" fill="#9fd6d8"/><path d="M18 14l8 5-3 22H13l-3-20z" fill="#9fd6d8" opacity=".4"/>',
+    heart: '<path d="M28 46C8 32 10 14 20 14c4 0 7 3 8 6 1-3 4-6 8-6 10 0 12 18-8 32z" fill="#d86a6a"/>',
+    focus: '<path d="M28 6l6 16 16 6-16 6-6 16-6-16-16-6 16-6z" fill="#f0c860"/>',
+    reach: '<path d="M10 40c6-18 30-18 36 0" stroke="#62d8d0" stroke-width="5" fill="none" stroke-linecap="round"/><path d="M4 46c8-30 40-30 48 0" stroke="#62d8d0" stroke-width="2.5" fill="none" stroke-dasharray="4 4"/>',
+    spark: '<path d="M30 6L14 30h10l-4 20 18-26H28z" fill="#f0a850"/>',
+    ward: '<path d="M28 6l18 7v14c0 12-8 19-18 23C18 46 10 39 10 27V13z" fill="#8fb0e0"/><path d="M28 14v28" stroke="#fff6" stroke-width="3"/>',
+    air: '<path d="M44 8C22 10 12 24 10 48c6-10 12-14 20-16-4 0-6-1-8-2 8-2 16-8 22-22z" fill="#e8e0f8"/>',
+    echo: '<circle cx="28" cy="28" r="6" fill="#62d8d0"/><circle cx="28" cy="28" r="13" fill="none" stroke="#62d8d0" stroke-width="3" opacity=".7"/><circle cx="28" cy="28" r="21" fill="none" stroke="#62d8d0" stroke-width="2" opacity=".4"/>',
+  };
+  const bossGlyph = (b) => '<circle cx="28" cy="28" r="22" fill="' + b.col + '" opacity=".28"/><circle cx="28" cy="28" r="13" fill="' + b.col + '"/><path d="M19 26l7 3M37 26l-7 3" stroke="#17131f" stroke-width="3" stroke-linecap="round"/>';
+  const bossIcon = (b) => (ART.boss.indexOf(b.id) >= 0 ? '<img src="assets/bossrun/b_' + b.id + '.webp" alt="" style="width:100%;height:100%;object-fit:cover;object-position:50% ' + Math.round((ART.fy[b.id] || 0.2) * 100) + '%;border-radius:6px">' : svgW(bossGlyph(b)));
+
+  /* ======================= 규칙 · 도감 ======================= */
+  const RULES = [
+    { h: '목표', p: ['발판 몇 개가 놓인 한 화면에서 파수와 맞섭니다. 파수의 체력을 모두 깎으면 이깁니다.', '파수는 2~3단계로 모습과 수법이 바뀝니다. 모든 공격은 먼저 예고(몸짓 · 바닥 표시 · 소리)가 나오고, 같은 예고 뒤에는 늘 같은 공격이 옵니다.', '혼자 하거나 AI 동료와 둘이, 또는 온라인 · LAN으로 친구와 둘이 협동합니다. 한 기기에는 한 명입니다.'] },
+    { h: '사수', p: ['체력은 ' + HERO.hp + '칸. 맞으면 한 칸이 줄고 ' + HERO.inv + '초 동안 무적입니다.', '사격은 기본으로 자동 연사이고 가장 가까운 적을 저절로 겨눕니다(설정 화면에서 끌 수 있음). 무기 둘을 들고 바꿔 가며 씁니다.', '대시: 짧게 미끄러지며 그동안(' + HERO.dash + '초) 탄과 몸을 통과합니다. 공중에서는 착지 전까지 한 번.', '발판 위에서 아래 방향을 누르면 발판 밑으로 내려옵니다.'] },
+    { h: '받아치기 · 필살', p: ['청록빛으로 빛나는 마름모 탄 · 적은 「받아치기」로 튕겨 낼 수 있습니다. 닿기 직전에 누릅니다(유지 ' + HERO.parry + '초).', '받아치면 탄이 파수에게 되돌아가 피해를 주고, 필살 게이지가 ' + HERO.gParry + ' 찹니다. 공중에서 받아치면 살짝 튀어 오릅니다.', '게이지는 피해를 줄 때도 조금씩 찹니다. ' + HERO.gauge + '이 되면 「필살」: 큰 피해(' + HERO.sp + ')를 주고 둘레의 탄을 지우며 잠깐 무적입니다.', '붉은 탄 · 주황 탄은 받아칠 수 없습니다. 피하거나 대시로 통과합니다.'] },
+    { h: '둘이 할 때', p: ['파수의 체력이 1.7배가 됩니다.', '쓰러진 동료 자리에서 혼이 천천히 떠오릅니다. 혼이 화면 밖으로 나가기 전에 받아치면 체력 1로 되살아납니다.', '둘 다 쓰러지면 집니다.'] },
+    { h: '판 구성', p: ['파수 하나: 고른 파수(기본 무작위) 하나와 싸웁니다.', '연전 3 · 5: 무작위 파수를 쉬운 것부터 이어서 상대합니다. 체력은 다음 파수로 그대로 넘어가고, 넘어갈 때 한 칸 회복합니다.', '쓰러지면 바로 「다시 도전」을 누를 수 있습니다(연전은 처음부터).', '난이도 「어려움」: 파수 체력 +15%, 탄이 15% 빠르고 많아지며 쉬는 틈이 짧아집니다.', '파수마다 가장 빠른 시간 · 가장 적게 맞은 횟수 · 등급(S~C)이 이 기기에 남습니다. S는 한 번도 맞지 않고 기준 시간 안에 잡았을 때.'] },
+    { h: '무기 · 부적', p: ['무기 ' + WEAPONS.length + '종 가운데 둘, 부적 ' + CHARMS.length + '종 가운데 하나를 판마다 고릅니다. 모두 처음부터 쓸 수 있고, 판 밖에서 수치가 오르는 것은 없습니다.'].concat(WEAPONS.map((w) => w.nm + '(' + w.kd + ') — ' + w.d)) },
+    { h: '조작', p: ['PC: 방향키/WASD 이동 · Space/Z 점프(위 방향키도 점프) · Shift/X 대시 · C/J 받아치기 · V/K 필살 · Q 무기 바꾸기 · F 사격(자동 연사를 껐을 때).', '터치(가로 화면): 왼쪽 아무 곳이나 누르고 끌면 이동(아래로 끌면 발판에서 내려옴), 오른쪽 단추로 점프 · 대시 · 받아치기 · 필살 · 무기 바꾸기.', '비행 무대에서는 위아래로도 움직이고, 점프 단추는 쓰지 않습니다.', '게임패드: 왼쪽 스틱 이동 · A 점프 · RB/B 대시 · X 받아치기 · Y 필살 · LB 무기 바꾸기. 키는 「⌨ 조작 설정」에서 바꿉니다.'] },
+    { h: 'AI 동료', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움. 쉬움은 예고를 늦게 알아채고 받아치기를 거의 하지 않습니다. 어려움은 탄의 길을 미리 읽고 받아치기와 필살을 제때 씁니다.', 'AI마다 버릇(거리 두기 · 받아치기 욕심 · 점프와 대시 가운데 무엇을 더 쓰는지)이 판마다 달라 같은 난이도라도 움직임이 다릅니다.'] },
+    { h: '그림 · 만든 것', p: ['싸우는 사수 · 파수 · 탄은 코드로 그린 그림이고, 파수 소개 그림 · 무대 배경 · 사수 그림은 이 PC에서 생성한 그림입니다. 효과음은 앱 합성음입니다.', '구조 참고: 보스만 이어지는 사격 액션. 이름 · 세계 · 그림 · 글은 이 게임만의 것입니다.'] },
+  ];
+  function codexData() {
+    const seen = store.get('seen', []), rec = store.get('rec', {});
+    const r = (icon, name, tag, desc) => ({ icon, name, tag, desc });
+    const bossRows = BOSSES.map((b, i) => {
+      if (seen.indexOf(b.id) < 0) return r(svgW('<circle cx="28" cy="28" r="20" fill="#3a3348"/><path d="M22 22c0-8 12-8 12 0 0 5-6 5-6 10" stroke="#8a80a0" stroke-width="3.5" fill="none" stroke-linecap="round"/><circle cx="28" cy="39" r="2.2" fill="#8a80a0"/>'), (i + 1) + '번째 파수', '미확인', '아직 만나지 않음. 한 번 맞서면 기록됨.');
+      const q = rec[b.id], q2 = rec[b.id + '+'];
+      const recT = (q ? ' · 기록 ' + fmtT(q.t) + ' / 피격 ' + q.h + ' / 등급 ' + GRADES[q.g] : ' · 기록 없음') + (q2 ? ' · 어려움 ' + fmtT(q2.t) + ' / 등급 ' + GRADES[q2.g] : '');
+      return r(bossIcon(b), b.nm, b.ty + ' · ' + '★'.repeat(b.lv), b.d + ' 단계 ' + b.hp.length + ' · 체력 ' + b.hp.join(' → ') + recT);
+    });
+    const tipRows = [];
+    BOSSES.forEach((b) => { if (seen.indexOf(b.id) < 0) return; b.pats.forEach((ph, pi) => ph.forEach((p) => tipRows.push(r(svgW(bossGlyph(b)), p[0], b.nm + ' ' + (pi + 1) + '단계', p[1])))); });
+    return [
+      { h: '파수', p: ['열두 파수. 만나기 전에는 가려져 있습니다. 체력은 혼자 · 보통 기준(둘이면 1.7배, 어려움 +15%).'], rows: bossRows },
+      { h: '패턴 요령', p: [tipRows.length ? '만난 파수의 패턴만 보입니다.' : '아직 만난 파수가 없습니다. 한 번 맞서면 그 파수의 패턴 요령이 여기에 적힙니다.'], rows: tipRows },
+      { h: '무기', p: ['둘을 골라 들고 바꿔 가며 씁니다. 초당 피해는 모두 맞았을 때의 값.'], rows: WEAPONS.map((w) => r(svgW(WIC[w.id](w.col)), w.nm, w.kd + ' · 초당 ' + dps(w), '한 발 ' + w.dmg + (w.n ? ' ×' + w.n : '') + ' · 간격 ' + (w.cd / 60).toFixed(2) + '초' + (w.rng ? ' · 거리 ' + w.rng : ' · 거리 끝까지') + '. ' + w.d)) },
+      { h: '부적', p: ['하나만 고릅니다. 판이 끝나면 사라지고, 쌓이는 강화는 없습니다.'], rows: CHARMS.map((c) => r(svgW(CIC[c.id]), c.nm, '부적', c.d)) },
+      { h: '사수', p: ['수치는 실제 판과 같습니다.'], rows: [
+        r(ART.hero ? '<img src="assets/bossrun/hero_face.webp" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:6px">' : svgW('<circle cx="28" cy="18" r="9" fill="#d8d0c4"/><path d="M14 50l6-22h16l6 22z" fill="#8a8698"/>'), HERO.nm, '주인공', '체력 ' + HERO.hp + ' · 피격 뒤 무적 ' + HERO.inv + '초 · 대시 무적 ' + HERO.dash + '초 · 받아치기 유지 ' + HERO.parry + '초'),
+        r(svgW(CIC.echo), '받아치기', '기술', '청록빛 마름모 탄 · 적 · 동료의 혼. 성공하면 게이지 +' + HERO.gParry + ', 되돌아간 탄이 피해 16.'),
+        r(svgW(CIC.focus), '필살', '기술', '게이지 ' + HERO.gauge + ' 소모 · 피해 ' + HERO.sp + ' · 둘레의 탄 소거 · 0.7초 무적. 방패와 껍질을 무시함.'),
+      ] },
+    ];
+  }
+
+  /* ======================= 표지 (640×360) ======================= */
+  function preview(cv) {
+    previewBase(cv);
+    if (typeof Image === 'undefined' || !ART.hero) return;
+    /* 그림 셋이 모두 오면 표지를 그림으로 다시 그림(하나라도 안 오면 코드 그림 그대로) */
+    const ims = []; let left = 3, bad = 0;
+    ['bg_ruin', 'b_gate', 'hero'].forEach((n, i) => { const im = new Image(); im.onload = () => { if (!--left && !bad) { try { previewArt(cv, ims); } catch (e) { previewBase(cv); } } }; im.onerror = () => { bad = 1; }; im.src = 'assets/bossrun/' + n + '.webp'; ims[i] = im; });
+  }
+  function previewTitle(g, w, h) {
+    g.fillStyle = 'rgba(12,10,16,.62)'; g.fillRect(0, h - 58, w, 58);
+    g.fillStyle = '#f2e9d8'; g.font = '30px "Black Han Sans","IBM Plex Sans KR",sans-serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 24, h - 29);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(242,233,216,.75)'; g.fillText('패턴을 읽고, 청록빛은 받아친다', 170, h - 28);
+  }
+  function previewArt(cv, ims) {
+    /* 표지 캔버스를 2배로 키워 그림(그림이 뭉개지지 않게) — 좌표는 640×360 그대로 */
+    const w = 640, h = 360, bg = ims[0], bo = ims[1], he = ims[2]; cv.width = w * 2; cv.height = h * 2;
+    const g = cv.getContext('2d'); g.setTransform(2, 0, 0, 2, 0, 0); g.imageSmoothingQuality = 'high';
+    const k = Math.max(w / bg.width, h / bg.height); g.drawImage(bg, (w - bg.width * k) / 2, (h - bg.height * k) / 2, bg.width * k, bg.height * k);
+    g.fillStyle = 'rgba(12,10,20,.2)'; g.fillRect(0, 0, w, h);
+    /* 파수: 가장자리를 둥글게 지워 배경에 녹임 */
+    const bw = 300, bh = bw * bo.height / bo.width, c = document.createElement('canvas'); c.width = bw * 2; c.height = Math.round(bh * 2);
+    const q = c.getContext('2d'); q.scale(2, 2); q.imageSmoothingQuality = 'high'; q.drawImage(bo, 0, 0, bw, bh); q.globalCompositeOperation = 'destination-in';
+    q.translate(bw / 2, bh * 0.4); q.scale(1, 1.3); const m = q.createRadialGradient(0, 0, bw * 0.24, 0, 0, bw * 0.5); m.addColorStop(0, '#000'); m.addColorStop(1, 'rgba(0,0,0,0)'); q.fillStyle = m; q.fillRect(-bw, -bh, bw * 2, bh * 2);
+    g.drawImage(c, w - bw - 6, -22, bw, bh);
+    /* 사수 */
+    const hh = 430, hw = hh * he.width / he.height; g.drawImage(he, 136 - hw / 2, 18, hw, hh);
+    const dots = [[330, 190, 0], [286, 232, 1], [352, 252, 0], [308, 150, 0]];
+    for (const d of dots) { g.fillStyle = d[2] ? '#62e8dc' : '#ff7a5a'; g.beginPath(); if (d[2]) { g.moveTo(d[0], d[1] - 11); g.lineTo(d[0] + 11, d[1]); g.lineTo(d[0], d[1] + 11); g.lineTo(d[0] - 11, d[1]); } else g.arc(d[0], d[1], 8, 0, 7); g.fill(); }
+    previewTitle(g, w, h);
+  }
+  function previewBase(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#161226'); sky.addColorStop(0.6, '#2c2748'); sky.addColorStop(1, '#4a3550');
+    g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#1b1830'; for (let i = 0; i < 7; i++) g.fillRect(40 + i * 95, 120 + ((i * 37) % 60), 46, 200);
+    g.fillStyle = '#221d33'; g.fillRect(0, 296, w, 64); g.fillStyle = '#5a4a6a'; g.fillRect(0, 294, w, 3);
+    /* 파수(문지기) 윤곽 */
+    g.fillStyle = '#7a4424'; g.beginPath(); g.ellipse(480, 230, 78, 70, 0, 0, 7); g.fill();
+    g.fillStyle = '#c8733a'; g.beginPath(); g.ellipse(474, 222, 62, 56, 0, 0, 7); g.fill();
+    g.fillStyle = '#ffd9a0'; g.fillRect(440, 204, 30, 7);
+    /* 탄 */
+    const dots = [[330, 200, 0], [280, 236, 1], [360, 250, 0], [300, 170, 0], [240, 210, 0]];
+    for (const d of dots) { g.fillStyle = d[2] ? '#62e8dc' : '#ff7a5a'; g.beginPath(); if (d[2]) { g.moveTo(d[0], d[1] - 11); g.lineTo(d[0] + 11, d[1]); g.lineTo(d[0], d[1] + 11); g.lineTo(d[0] - 11, d[1]); } else g.arc(d[0], d[1], 8, 0, 7); g.fill(); }
+    /* 사수 */
+    g.fillStyle = '#8a8698'; g.beginPath(); g.moveTo(138, 294); g.lineTo(146, 262); g.lineTo(164, 262); g.lineTo(172, 294); g.fill();
+    g.fillStyle = '#e8dccc'; g.beginPath(); g.arc(155, 252, 11, 0, 7); g.fill();
+    g.strokeStyle = '#ffe9a8'; g.lineWidth = 3; for (let i = 0; i < 4; i++) { g.beginPath(); g.moveTo(190 + i * 42, 262 - i * 6); g.lineTo(206 + i * 42, 260 - i * 6); g.stroke(); }
+    previewTitle(g, w, h);
+  }
+
+  /* ======================= 입구 (조각 불러오기) ======================= */
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  const loadCore = () => (API.sim ? Promise.resolve() : loadScript('assets/bossrun/sim.js')).then(() => (G.BOSSRUN_VIEW ? null : loadScript('assets/bossrun/view.js')));
+  const CONTROLS = [
+    { id: 'left', label: '왼쪽', keys: ['ArrowLeft', 'KeyA'], pad: ['lx-', 'left'] },
+    { id: 'right', label: '오른쪽', keys: ['ArrowRight', 'KeyD'], pad: ['lx+', 'right'] },
+    { id: 'up', label: '위(비행 무대) · 점프', keys: ['ArrowUp', 'KeyW'], pad: ['ly-', 'up'] },
+    { id: 'down', label: '아래 · 발판에서 내려오기', keys: ['ArrowDown', 'KeyS'], pad: ['ly+', 'down'] },
+    { id: 'jump', label: '점프', keys: ['Space', 'KeyZ'], pad: ['a'] },
+    { id: 'dash', label: '대시', keys: ['ShiftLeft', 'KeyX'], pad: ['rb', 'b'] },
+    { id: 'parry', label: '받아치기', keys: ['KeyC', 'KeyJ'], pad: ['x'] },
+    { id: 'special', label: '필살', keys: ['KeyV', 'KeyK'], pad: ['y'] },
+    { id: 'swap', label: '무기 바꾸기', keys: ['KeyQ', 'KeyE'], pad: ['lb'] },
+    { id: 'fire', label: '사격(자동 연사를 껐을 때)', keys: ['KeyF', 'KeyL'], pad: ['rt'] },
+  ];
+
+  const API = { ID, TITLE, WEAPONS, WI, CHARMS, CI, HERO, BOSSES, BI, BOSS_IDS, ART, MODES, GRADES, WIC, CIC, svgW, bossGlyph, dps, store, gradeOf, saveRec, markSeen, fmtT, clamp, init, result, aiLoadout };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 40%,#2c2748,#100e18)', color: '#f2e9d8', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '무대를 여는 중' });
+    box.append(h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '30px', letterSpacing: '2px' }, text: TITLE }), t2);
+    root.append(box);
+    loadCore().then(() => {
+      if (dead) return;
+      view = G.BOSSRUN_VIEW.mount(root, api, API);
+      box.remove();
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { t2.textContent = '게임 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'; });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+    };
+  }
+
+  const ICON = '<circle cx="38" cy="24" r="14" fill="currentColor" opacity=".55"/><path d="M31 21l6 3M45 21l-6 3" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><path d="M8 46l4-14h8l4 14z" fill="currentColor"/><circle cx="16" cy="27" r="5" fill="currentColor"/><path d="M22 34h6" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><path d="M27 40l5-5 5 5-5 5z" fill="currentColor"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '보스전 런앤건', cat: '아케이드', icon: ICON, tint: '#2b2350',
+    blurb: '스테이지 없이 파수(보스)만 연달아 상대합니다. 예고를 읽어 피하고, 청록빛 탄은 받아쳐 필살 게이지를 채웁니다. 파수 12종 · 무기 7종 · 부적 8종. 혼자 또는 둘이 협동.',
+    time: '2–10분', landscape: true, realtime: true, coop: true, aiDelay: 0, mood: 'drums', ambient: false, sidePanel: false, menuCorner: 'tr',
+    minPlayers: 1, maxPlayers: 2, defaultPlayers: 1,
+    options: [
+      { id: 'mode', label: '판 구성', tip: '연전은 무작위 파수를 쉬운 것부터 이어서. 체력이 다음 파수로 넘어감.', choices: Object.keys(MODES).map((k) => ({ v: k, label: MODES[k].nm })), def: 'one' },
+      { id: 'boss', label: '파수', tip: '연전에서 파수를 고르면 그 파수가 반드시 포함됨.', choices: [{ v: 'rnd', label: '무작위' }].concat(BOSSES.map((b) => ({ v: b.id, label: b.nm, tip: b.ty + ' · ' + '★'.repeat(b.lv) }))), def: 'rnd' },
+      { id: 'diff', label: '난이도', tip: '어려움: 파수 체력 +15%, 탄이 빠르고 많아지며 쉬는 틈이 짧아짐. AI 동료의 난이도와는 별개.', choices: [{ v: 'norm', label: '보통' }, { v: 'hard', label: '어려움' }], def: 'norm' },
+    ],
+    setupExtra() {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 2px' }, text: '자동 연사(이 기기)' }));
+        const on = store.get('auto', 1) ? 1 : 0;
+        for (const [v, nm] of [[1, '켬'], [0, '끔']]) wrap.append(h('button', { class: 'btn sm' + (on === v ? ' primary' : ''), style: { minHeight: '44px' }, text: nm, onclick() { store.set('auto', v); draw(); } }));
+      };
+      draw(); return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['예고(몸짓 · 바닥 표시)를 보고 점프 · 대시로 피함. 사격은 자동', '청록빛 마름모 탄은 「받아치기」 — 게이지가 차면 「필살」', '파수의 체력을 모두 깎으면 승리. 쓰러지면 바로 다시 도전'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.BOSSRUN = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

@@ -1,0 +1,805 @@
+/* 도시 예선 — 순수 시뮬(브라우저 · node 공용). 자료는 games/citytrial.js(G.CITYTRIAL).
+   세계(W): 도시 또는 종목 경기장 — 씨앗에서 결정적으로 만듦(호스트 · 손님이 같은 것을 만듦).
+   호스트(H): 기체 · 조각 · 상자 · 사건 · 종목 판정. 손님은 자기 기체만 stepCraft로 예측하고 나머지는 packHost → applyHost로 받음.
+   좌표: x 동, z 남, y 위. 방향 h: 앞 = (sin h, cos h). 고정 걸음 DT = 1/60. sim 안에서는 Math.random을 쓰지 않음(H.rnd). */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const CT = G.CITYTRIAL;
+  const { STATS, STAT_MAX, STAT_CH, ITEMS, CRAFTS, CI, EVENTS, EI, FINALS, FI, DISTRICTS } = CT;
+  const DT = 1 / 60, STEP_UP = 1.3, CH = 1.8, CR = 2.2, GRAV = 26;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const wrap = (a) => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+  function rng(seed) { let a = (seed >>> 0) || 1; return function () { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const pick = (r, a) => a[(r() * a.length) | 0];
+  function shuffle(r, a) { for (let i = a.length - 1; i > 0; i--) { const j = (r() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+
+  /* ======================= 세계 ======================= */
+  const BL = 120, RD = 28, NB = 5, PITCH = BL + RD, HALF = (NB * BL + (NB + 1) * RD) / 2;   // 384
+  const roadC = (i) => -HALF + RD / 2 + i * PITCH;
+  function newWorld(kind, seed) {
+    return { kind, seed, sol: [], pits: [], pads: [], vents: [], slots: [], crates: [], parks: [], spawn: [], deco: [], vias: [], gates: [], blocks: [],
+      bx0: -HALF, bx1: HALF, bz0: -HALF, bz1: HALF, wall: 1, cell: 20, grid: null, gw: 0, gx: 0, gz: 0, prof: null, R: 0, R0: 0, pw: 0, tgt: null, fin: 0, rampZ: 0 };
+  }
+  function addBox(W, x0, z0, x1, z1, y1, y0, tag) { W.sol.push({ x0: Math.min(x0, x1), z0: Math.min(z0, z1), x1: Math.max(x0, x1), z1: Math.max(z0, z1), y0: y0 == null ? -60 : y0, y1, r: 0, ha: 0, hb: 0, tag: tag || 'conc' }); }
+  function addRamp(W, x0, z0, x1, z1, ax, ha, hb, y0, tag) { W.sol.push({ x0, z0, x1, z1, y0: y0 == null ? -60 : y0, y1: Math.max(ha, hb), r: ax === 'x' ? 1 : 2, ha, hb, tag: tag || 'ramp' }); }
+  function indexWorld(W) {
+    const c = W.cell; W.gx = W.bx0; W.gz = W.bz0; W.gw = Math.ceil((W.bx1 - W.bx0) / c) + 1; const gh = Math.ceil((W.bz1 - W.bz0) / c) + 1;
+    W.gh = gh; W.grid = new Array(W.gw * gh);
+    W.sol.forEach((s, i) => {
+      const a0 = clamp(Math.floor((s.x0 - W.gx) / c), 0, W.gw - 1), a1 = clamp(Math.floor((s.x1 - W.gx) / c), 0, W.gw - 1), b0 = clamp(Math.floor((s.z0 - W.gz) / c), 0, gh - 1), b1 = clamp(Math.floor((s.z1 - W.gz) / c), 0, gh - 1);
+      for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) { const k = b * W.gw + a; (W.grid[k] || (W.grid[k] = [])).push(i); }
+    });
+    // 조각 자리 찾기용 칸(16m)
+    W.sc = 16; W.sw = Math.ceil((W.bx1 - W.bx0) / 16) + 1; W.sg = {};
+    W.slots.forEach((s, i) => { const k = Math.floor((s.z - W.bz0) / 16) * W.sw + Math.floor((s.x - W.bx0) / 16); (W.sg[k] || (W.sg[k] = [])).push(i); });
+  }
+  function baseH(W, x, z) {
+    if (W.prof) { const p = W.prof; if (z <= p[0][0]) return p[0][1]; for (let i = 1; i < p.length; i++) if (z <= p[i][0]) { const a = p[i - 1], b = p[i]; return a[1] + (b[1] - a[1]) * (z - a[0]) / (b[0] - a[0] || 1); } return p[p.length - 1][1]; }
+    if (W.R0) return x * x + z * z < W.R * W.R ? 0 : -40;
+    for (let i = 0; i < W.pits.length; i++) {
+      const p = W.pits[i];
+      if (x > p.x0 && x < p.x1 && z > p.z0 && z < p.z1) { const u = p.ax === 'x' ? Math.min(x - p.x0, p.x1 - x) : Math.min(z - p.z0, p.z1 - z); return u >= p.rl ? -p.d : -p.d * u / p.rl; }
+    }
+    return 0;
+  }
+  const PR = { f: 0, b: false, c: 1e9, bt: 0 };
+  function solTop(s, x, z) { return s.r === 0 ? s.y1 : s.r === 1 ? s.ha + (s.hb - s.ha) * (x - s.x0) / (s.x1 - s.x0) : s.ha + (s.hb - s.ha) * (z - s.z0) / (s.z1 - s.z0); }
+  function probe(W, x, z, y) {
+    let f = baseH(W, x, z), b = f > y + STEP_UP, c = 1e9, bt = b ? f : 0;
+    if (W.grid) {
+      const a = Math.floor((x - W.gx) / W.cell), d = Math.floor((z - W.gz) / W.cell);
+      if (a >= 0 && d >= 0 && a < W.gw && d < W.gh) {
+        const l = W.grid[d * W.gw + a];
+        if (l) for (let i = 0; i < l.length; i++) {
+          const s = W.sol[l[i]];
+          if (x < s.x0 || x > s.x1 || z < s.z0 || z > s.z1) continue;
+          const top = solTop(s, x, z);
+          if (y + STEP_UP >= top) { if (top > f) f = top; }
+          else if (y + CH > s.y0) { b = true; if (top > bt) bt = top; }
+          else if (s.y0 < c) c = s.y0;
+        }
+      }
+    }
+    PR.f = f; PR.b = b; PR.c = c; PR.bt = bt; return PR;
+  }
+  function freeAt(W, x, z, y) { if (W.wall && (x < W.bx0 + CR - 0.6 || x > W.bx1 - CR + 0.6 || z < W.bz0 + CR - 0.6 || z > W.bz1 - CR + 0.6)) return false; return !probe(W, x, z, y + 1.4).b; }
+  function blockedAt(W, x, z, y) { if (W.wall && (x < W.bx0 + 1 || x > W.bx1 - 1 || z < W.bz0 + 1 || z > W.bz1 - 1)) return true; return probe(W, x, z, y).b; }
+
+  /* ---------- 도시 ---------- */
+  function makeCity(seed) {
+    const W = newWorld('city', seed), r = rng(seed ^ 0x51ed27);
+    const types = []; DISTRICTS.forEach((d) => { for (let i = 0; i < d.n; i++) types.push(d.id); }); shuffle(r, types);
+    for (let bj = 0; bj < NB; bj++) for (let bi = 0; bi < NB; bi++) {
+      const x0 = -HALF + RD + bi * PITCH, z0 = -HALF + RD + bj * PITCH, ty = types[bj * NB + bi];
+      // 방향: 중심 쪽을 보는 회전 가운데 하나
+      const cx = x0 + 60, cz = z0 + 60; const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]]; const ok = [0, 1, 2, 3].filter((k) => dirs[k][0] * -cx + dirs[k][1] * -cz >= -1);
+      const rot = pick(r, ok.length ? ok : [0]);
+      W.blocks.push({ x0, z0, ty, rot });
+      genBlock(W, r, x0, z0, ty, rot);
+    }
+    // 큰길: 조각 줄 · 발판 · 상자
+    for (let i = 0; i <= NB; i++) for (let j = 0; j < NB; j++) {
+      const rc = roadC(i), s0 = -HALF + RD + j * PITCH;
+      for (let k = 0; k < 2; k++) { const t = s0 + 30 + k * 60, o = ((i + j + k) % 3 - 1) * 7; W.slots.push({ x: rc + o, y: 0, z: t, via: -1 }); W.slots.push({ x: t, y: 0, z: rc + o, via: -1 }); }
+    }
+    for (let k = 0; k < 10; k++) { const i = 1 + ((r() * (NB - 1)) | 0), j = (r() * NB) | 0, t = -HALF + RD + j * PITCH + 60, rc = roadC(i), d = r() < 0.5 ? 0 : Math.PI; if (r() < 0.5) W.pads.push({ x: rc, z: t, h: d }); else W.pads.push({ x: t, z: rc, h: d + Math.PI / 2 }); }
+    for (let i = 0; i <= NB; i++) for (let j = 0; j <= NB; j++) if (r() < 0.45) W.crates.push({ x: roadC(i) + (r() < 0.5 ? -9 : 9), y: 0, z: roadC(j) + (r() < 0.5 ? -9 : 9), kd: r() < 0.25 ? 2 : 1 });
+    // 황금 상자 자리(사건) · 출발 자리 · 관문(관문 경주)
+    const inner = []; for (let i = 1; i < NB; i++) for (let j = 1; j < NB; j++) inner.push([i, j]); shuffle(r, inner);
+    W.gold0 = W.crates.length; for (let k = 0; k < 5; k++) W.crates.push({ x: roadC(inner[k][0]), y: 0, z: roadC(inner[k][1]), kd: 4 });
+    for (let k = 0; k < 8; k++) { const q = inner[5 + k]; W.spawn.push({ x: roadC(q[0]) + (k % 2 ? 6 : -6), y: 0, z: roadC(q[1]) + 16, h: 0 }); }
+    for (let k = 0; k < 5; k++) { const q = inner[13 + (k % 3)]; W.parks.push({ x: roadC(q[0]) + (k < 3 ? -9 : 9), y: 0, z: roadC(q[1]) - 30 - k * 9, h: r() * 6.28 }); }
+    // 관문: 교차로를 따라 한 칸씩(같은 줄) 이동, 되돌아가지 않음
+    { let gi = 1 + ((r() * (NB - 1)) | 0), gj = 1 + ((r() * (NB - 1)) | 0), pd = -1; W.gates.push({ x: roadC(gi), z: roadC(gj) });
+      for (let k = 0; k < 8; k++) { const opts = []; [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach((d, di) => { const a = gi + d[0], b = gj + d[1]; if (a < 0 || b < 0 || a > NB || b > NB) return; if (pd >= 0 && (di ^ 1) === pd) return; if (W.gates.some((g) => g.x === roadC(a) && g.z === roadC(b))) return; opts.push(di); });
+        if (!opts.length) break; const di = pick(r, opts), d = [[1, 0], [-1, 0], [0, 1], [0, -1]][di]; gi += d[0]; gj += d[1]; pd = di; W.gates.push({ x: roadC(gi), z: roadC(gj) }); } }
+    indexWorld(W);
+    // 건물 속에 묻힌 조각 자리는 뺌
+    W.slots = W.slots.filter((s) => !probe(W, s.x, s.z, s.y + 0.2).b && Math.abs(s.x) < HALF - 3 && Math.abs(s.z) < HALF - 3);
+    W.vias.forEach((v) => { v.slots = []; }); W.slots.forEach((s, i) => { if (s.via >= 0) W.vias[s.via].slots.push(i); });
+    indexWorld(W);
+    return W;
+  }
+  function genBlock(W, r, bx, bz, ty, rot) {
+    const P = (u, v) => (rot === 0 ? [bx + u, bz + v] : rot === 1 ? [bx + BL - v, bz + u] : rot === 2 ? [bx + BL - u, bz + BL - v] : [bx + v, bz + BL - u]);
+    const hd = (a) => a - rot * Math.PI / 2;   // 지역 방향(0 = +v) → 세계 방향
+    const box = (u0, v0, u1, v1, h, y0, tag) => { const a = P(u0, v0), b = P(u1, v1); addBox(W, a[0], a[1], b[0], b[1], h, y0, tag); };
+    // 경사로: axis 'u'|'v', ha = 작은 쪽 끝 높이, hb = 큰 쪽 끝 높이(지역 좌표 기준)
+    const ramp = (u0, v0, u1, v1, axis, ha, hb, y0, tag) => {
+      const a = P(u0, v0), b = P(u1, v1); const x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]), z0 = Math.min(a[1], b[1]), z1 = Math.max(a[1], b[1]);
+      let ax, flip;
+      if (axis === 'u') { ax = rot % 2 === 0 ? 'x' : 'z'; flip = rot === 2 || rot === 3; } else { ax = rot % 2 === 0 ? 'z' : 'x'; flip = rot === 1 || rot === 2; }
+      addRamp(W, x0, z0, x1, z1, ax, flip ? hb : ha, flip ? ha : hb, y0, tag);
+    };
+    const slot = (u, v, y, via) => { const a = P(u, v); W.slots.push({ x: a[0], y: y || 0, z: a[1], via: via == null ? -1 : via }); };
+    const crate = (u, v, kd, y) => { const a = P(u, v); W.crates.push({ x: a[0], y: y || 0, z: a[1], kd: kd || 1 }); };
+    const park = (u, v, y) => { const a = P(u, v); W.parks.push({ x: a[0], y: y || 0, z: a[1], h: r() * 6.28 }); };
+    const deco = (t, u, v, p) => { const a = P(u, v); W.deco.push(Object.assign({ t, x: a[0], z: a[1], rot }, p || {})); };
+    const via = (u, v, lh) => { const a = P(u, v); W.vias.push({ x: a[0], z: a[1], h: hd(lh), slots: [] }); return W.vias.length - 1; };   // lh: 지역 진행 방향(0 = +v, π/2 = +u)
+    const vent = (u, v, top) => { const a = P(u, v); W.vents.push({ x: a[0], z: a[1], r: 7, top }); };
+    const pad = (u, v, lh) => { const a = P(u, v); W.pads.push({ x: a[0], z: a[1], h: hd(lh) }); };
+    const rh = (a, b) => Math.round(a + r() * (b - a));
+    if (ty === 'tower') {
+      const low = (r() * 4) | 0, lots = [[6, 6], [66, 6], [6, 66], [66, 66]];
+      lots.forEach((q, i) => {
+        if (i === low) {   // 낮은 건물: 골목에서 경사로로 옥상에
+          const u0 = q[0], v0 = q[1], mir = v0 > 60;   // 경사로는 가운데 골목(u 54~66) 쪽에서 시작하도록 u가 작은 구획만 그대로, 큰 구획은 거울
+          if (u0 < 60) { const va = mir ? v0 : v0 + 34, vb = va + 14, ra = mir ? vb : v0, rb = mir ? v0 + 48 : va;
+            box(u0, ra, 54, rb, 12, null, 'conc'); box(u0, va, u0 + 18, vb, 12, null, 'conc'); ramp(u0 + 18, va, 54, vb, 'u', 12, 0);
+            const vi = via(60, va + 7, -Math.PI / 2); for (let k = 0; k < 5; k++) slot(u0 + 8 + k * 9, (ra + rb) / 2, 12, vi); slot(u0 + 9, va + 7, 12, vi);
+          } else { const va = mir ? v0 : v0 + 34, vb = va + 14, ra = mir ? vb : v0, rb = mir ? v0 + 48 : va;
+            box(66, ra, 114, rb, 12, null, 'conc'); box(96, va, 114, vb, 12, null, 'conc'); ramp(66, va, 96, vb, 'u', 0, 12);
+            const vi = via(60, va + 7, Math.PI / 2); for (let k = 0; k < 5; k++) slot(74 + k * 9, (ra + rb) / 2, 12, vi); slot(105, va + 7, 12, vi); }
+        } else { const ins = rh(1, 5); box(q[0] + ins, q[1] + ins, q[0] + 48 - ins, q[1] + 48 - ins, rh(55, 150), null, r() < 0.7 ? 'glass' : 'conc'); }
+      });
+      for (let k = 0; k < 4; k++) { slot(60, 14 + k * 30); slot(14 + k * 30, 60); }
+      crate(60, 60, 2); vent(60, 96, 45);
+    } else if (ty === 'mid') {
+      box(6, 6, 38, 54, rh(18, 30), null, 'brick'); box(6, 66, 38, 114, rh(14, 26), null, 'conc'); box(44, 66, 76, 114, rh(14, 30), null, 'brick'); box(82, 66, 114, 114, rh(16, 28), null, 'glass');
+      // 가운데 골목(v 54~66)에서 올라가는 옥상 둘(사이 6m는 뛰어넘음)
+      box(44, 6, 76, 30, 10, null, 'conc'); box(56, 30, 76, 54, 10, null, 'conc'); ramp(44, 30, 56, 54, 'v', 10, 0);
+      box(82, 6, 114, 54, 10, null, 'brick');
+      const vi = via(50, 60, Math.PI);
+      slot(50, 22, 10, vi); slot(60, 14, 10, vi); slot(70, 22, 10, vi); slot(66, 42, 10, vi); slot(90, 20, 10, vi); slot(100, 30, 10, vi); slot(106, 14, 10, vi); slot(98, 46, 10, vi);
+      for (let k = 0; k < 4; k++) slot(14 + k * 30, 60); slot(41, 20); slot(41, 90); slot(79, 90);
+      crate(79, 60, 1); vent(22, 60, 40);
+    } else if (ty === 'res') {
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) { if (a === 1 && b === 1) continue; box(8 + a * 38, 8 + b * 38, 32 + a * 38, 32 + b * 38, rh(7, 11), null, 'house'); }
+      for (let a = 0; a < 2; a++) for (let b = 0; b < 3; b++) { slot(39 + a * 38, 20 + b * 38); slot(20 + b * 38, 39 + a * 38); }
+      slot(60, 60); crate(52, 52, 1); crate(68, 68, 1); crate(52, 68, 3); deco('tree', 66, 54); park(60, 46);
+    } else if (ty === 'park') {
+      box(50, 50, 70, 70, 5, null, 'grass'); ramp(30, 50, 50, 70, 'u', 0, 5, null, 'grass'); ramp(70, 50, 90, 70, 'u', 5, 0, null, 'grass'); ramp(50, 30, 70, 50, 'v', 0, 5, null, 'grass'); ramp(50, 70, 70, 90, 'v', 5, 0, null, 'grass');
+      for (let k = 0; k < 12; k++) { const a = k / 12 * 6.283; slot(60 + Math.sin(a) * 44, 60 + Math.cos(a) * 44); }
+      slot(60, 60, 5); slot(55, 55, 5); slot(65, 65, 5);
+      for (let k = 0; k < 14; k++) { const u = rh(8, 112), v = rh(8, 112); if (Math.abs(u - 60) < 34 && Math.abs(v - 60) < 34) continue; deco('tree', u, v, { s: 0.8 + r() * 0.7 }); }
+      crate(20, 100, 1); crate(100, 20, 3); park(100, 100);
+    } else if (ty === 'plaza') {
+      box(52, 52, 68, 68, 170, null, 'mast'); deco('mast', 60, 60);
+      for (let k = 0; k < 10; k++) { const a = k / 10 * 6.283; slot(60 + Math.sin(a) * 28, 60 + Math.cos(a) * 28); }
+      crate(26, 26, 1); crate(94, 26, 2); crate(26, 94, 3); crate(94, 94, 1); park(60, 20); const a = P(60, 100); W.rare = { x: a[0], y: 0, z: a[1], h: 0 };
+      for (let k = 0; k < 4; k++) deco('lamp', 12 + (k % 2) * 96, 12 + ((k / 2) | 0) * 96);
+    } else if (ty === 'dock') {
+      const cols = ['#b5483a', '#3f6f9a', '#c9a23a', '#4d8a5a', '#8a8f96'];
+      for (let row = 0; row < 4; row++) { const v0 = 10 + row * 26;
+        if (row === 1) {   // 올라탈 수 있는 한 줄(높이 3)
+          ramp(8, v0, 22, v0 + 10, 'u', 0, 4, null, 'ramp'); box(22, v0, 106, v0 + 10, 4, null, 'cont'); const vi = via(2, v0 + 5, Math.PI / 2); for (let k = 0; k < 6; k++) slot(30 + k * 13, v0 + 5, 4, vi);
+        } else for (let k = 0; k < 6; k++) { if (r() < 0.25) continue; const u0 = 10 + k * 17; box(u0, v0, u0 + 13, v0 + 6, r() < 0.4 ? 8 : 4, null, 'cont'); W.sol[W.sol.length - 1].col = pick(r, cols); }
+        for (let k = 0; k < 3; k++) slot(20 + k * 40, v0 + 15);
+      }
+      box(100, 96, 104, 100, 34, null, 'steel'); box(100, 108, 104, 112, 34, null, 'steel'); deco('crane', 102, 104, { h: 34 });
+      crate(60, 104, 2); crate(30, 104, 1); crate(84, 104, 3); park(14, 104);
+    } else if (ty === 'plant') {
+      box(8, 8, 62, 50, 18, null, 'metal'); box(8, 64, 50, 112, 22, null, 'metal');
+      for (let k = 0; k < 3; k++) { box(72, 8 + k * 20, 88, 24 + k * 20, 16, null, 'tank'); }
+      box(84, 76, 112, 104, 46, null, 'cool'); deco('cool', 98, 90);
+      for (let k = 0; k < 5; k++) slot(14 + k * 11, 57); for (let k = 0; k < 4; k++) slot(66, 14 + k * 14); for (let k = 0; k < 3; k++) slot(62 + k * 8, 108); slot(100, 60); slot(100, 40);
+      crate(96, 16, 2); crate(60, 90, 1); crate(72, 72, 3); pad(34, 57, Math.PI / 2); vent(104, 68, 60);
+    } else if (ty === 'arena') {
+      const w = (u0, v0, u1, v1) => box(u0, v0, u1, v1, 8, null, 'wall');
+      w(10, 10, 48, 13); w(72, 10, 110, 13); w(10, 107, 48, 110); w(72, 107, 110, 110); w(10, 13, 13, 48); w(10, 72, 13, 107); w(107, 13, 110, 48); w(107, 72, 110, 107);
+      ramp(36, 54, 48, 66, 'u', 0, 4, null, 'ramp'); ramp(72, 54, 84, 66, 'u', 4, 0, null, 'ramp');
+      slot(54, 60, 6); slot(60, 60, 7); slot(66, 60, 6);
+      for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) { if ((a === 1 || a === 2) && (b === 1 || b === 2)) continue; slot(24 + a * 24, 24 + b * 24); }
+      crate(40, 30, 1); crate(80, 30, 1); crate(40, 90, 2); crate(80, 90, 1); crate(60, 36, 3); crate(60, 84, 2);
+      for (let k = 0; k < 4; k++) deco('lamp', 14 + (k % 2) * 92, 14 + ((k / 2) | 0) * 92, { tall: 1 });
+      park(60, 96);
+    } else if (ty === 'strip') {
+      ramp(84, 48, 112, 72, 'u', 0, 11, null, 'ramp'); pad(24, 60, Math.PI / 2); pad(56, 60, Math.PI / 2);
+      const vi = via(74, 60, Math.PI / 2);
+      for (let k = 0; k < 5; k++) slot(10 + k * 16, 60 + (k % 2 ? 5 : -5));
+      slot(124, 60, 15, vi); slot(136, 60, 17, vi); slot(146, 60, 15, vi);
+      box(8, 8, 60, 34, rh(10, 16), null, 'metal'); box(8, 86, 44, 112, rh(8, 14), null, 'conc'); deco('lamp', 70, 40); deco('lamp', 70, 80);
+      slot(80, 20); slot(96, 20); slot(70, 100); slot(96, 100); crate(100, 34, 1); crate(60, 100, 3); park(76, 22);
+    } else if (ty === 'under') {
+      const a = P(8, 46), b = P(112, 74); W.pits.push({ x0: Math.min(a[0], b[0]), z0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), z1: Math.max(a[1], b[1]), ax: rot % 2 === 0 ? 'x' : 'z', d: 7, rl: 26 });
+      box(40, 44, 80, 76, 0, -1.5, 'deck');
+      const v1 = via(2, 60, Math.PI / 2);
+      for (let k = 0; k < 9; k++) slot(38 + k * 5.5, 60 + (k % 2 ? 6 : -6), -7, v1);
+      crate(60, 60, 3, -7); crate(48, 52, 1, -7); crate(72, 68, 2, -7);
+      box(8, 8, 56, 38, rh(14, 20), null, 'brick'); box(64, 8, 112, 38, rh(16, 26), null, 'glass'); box(8, 82, 56, 112, rh(14, 24), null, 'conc'); box(64, 82, 112, 112, rh(12, 18), null, 'brick');
+      slot(60, 20); slot(60, 100); slot(20, 42); slot(100, 42); slot(20, 78); slot(100, 78);
+    } else if (ty === 'site') {
+      ramp(6, 20, 26, 32, 'u', 0, 7, null, 'ramp'); box(26, 20, 100, 32, 7, 6.2, 'girder'); box(88, 32, 100, 100, 7, 6.2, 'girder');
+      const vi = via(0, 26, Math.PI / 2);
+      for (let k = 0; k < 6; k++) slot(34 + k * 11, 26, 7, vi); for (let k = 0; k < 5; k++) slot(94, 42 + k * 13, 7, vi);
+      box(40, 50, 76, 100, rh(20, 30), null, 'frame'); box(110, 8, 114, 12, 38, null, 'steel'); deco('crane', 112, 10, { h: 38 });
+      crate(20, 50, 1); crate(20, 70, 2); crate(20, 90, 1); crate(60, 42, 1); crate(82, 60, 3); crate(60, 108, 2);
+      slot(30, 60); slot(30, 80); slot(30, 104); slot(82, 80); slot(82, 104); park(104, 108);
+    } else if (ty === 'garage') {
+      box(20, 30, 100, 90, 20, null, 'garage');
+      ramp(20, 18, 70, 30, 'u', 0, 10, null, 'ramp'); box(70, 18, 112, 30, 10, null, 'garage'); ramp(100, 30, 112, 80, 'v', 10, 20, null, 'ramp'); box(100, 80, 112, 90, 20, null, 'garage');
+      ramp(30, 54, 44, 66, 'u', 24, 20, 20, 'ramp');
+      const vi = via(12, 24, Math.PI / 2);
+      for (let k = 0; k < 4; k++) slot(30 + k * 12, 24 - 0 + 0, k * 2.4 + 1, vi);
+      for (let k = 0; k < 4; k++) slot(106, 36 + k * 12, 11 + k * 2.4, vi);
+      for (let k = 0; k < 6; k++) slot(50 + (k % 3) * 16, 40 + ((k / 3) | 0) * 38, 20, vi);
+      slot(22, 60, 27, vi); slot(12, 60, 26, vi); pad(60, 60, -Math.PI / 2);
+      { const a = P(84, 60); W.parks.push({ x: a[0], y: 20, z: a[1], h: r() * 6.28, hi: 1 }); }
+      slot(60, 102); slot(30, 102); slot(90, 102); crate(60, 10, 1); crate(10, 60, 2);
+    }
+  }
+
+  /* ---------- 종목 경기장 ---------- */
+  function makeArena(fi, seed, n) {
+    const id = FINALS[fi].id;
+    if (id === 'sprint') { const W = makeCity(seed); W.kind = 'sprint'; W.fin = fi; const g0 = W.gates[0], g1 = W.gates[1] || g0; const h = Math.atan2(g1.x - g0.x, g1.z - g0.z); W.spawn = [];
+      for (let i = 0; i < 8; i++) { const row = (i / 4) | 0, col = i % 4 - 1.5; W.spawn.push({ x: g0.x + Math.cos(h) * col * 6 - Math.sin(h) * row * 7, y: 0, z: g0.z - Math.sin(h) * col * 6 - Math.cos(h) * row * 7, h }); } return W; }
+    const W = newWorld(id, seed), r = rng(seed ^ (0x7a11 + fi * 977)); W.fin = fi;
+    const lanes = (z, y, gap) => { for (let i = 0; i < 8; i++) W.spawn.push({ x: (i - (n - 1) / 2) * gap, y, z, h: 0 }); };
+    if (id === 'drag') { W.bx0 = -(n * 6 + 10); W.bx1 = n * 6 + 10; W.bz0 = -30; W.bz1 = 740; lanes(0, 0, 12); }
+    else if (id === 'far') { W.bx0 = -(n * 5 + 60); W.bx1 = n * 5 + 60; W.bz0 = 0; W.bz1 = 2700; W.prof = [[0, 50], [40, 50], [260, 8], [300, 8], [330, 20], [330.01, 0], [2700, 0]]; W.rampZ = 330; W.cell = 60; lanes(14, 50, 10); }
+    else if (id === 'high') { W.bx0 = -(n * 5 + 40); W.bx1 = n * 5 + 40; W.bz0 = 0; W.bz1 = 760; W.prof = [[0, 0], [220, 0], [250, 5], [272, 17], [286, 32], [286.01, 0], [760, 0]]; W.rampZ = 286; W.cell = 60; lanes(14, 0, 10); }
+    else if (id === 'land') { W.bx0 = -(n * 5 + 70); W.bx1 = n * 5 + 70; W.bz0 = 0; W.bz1 = 800; W.prof = [[0, 30], [40, 30], [200, 6], [240, 6], [262, 14], [262.01, 0], [800, 0]]; W.rampZ = 262; W.cell = 60; W.tgt = { x: Math.round((r() - 0.5) * 50), z: 262 + 95 + Math.round(r() * 60) }; lanes(14, 30, 10); }
+    else if (id === 'sumo') { W.R0 = W.R = 44 + 4 * n; W.wall = 0; W.bx0 = W.bz0 = -200; W.bx1 = W.bz1 = 200; W.cell = 100; for (let i = 0; i < 8; i++) { const a = i / n * 6.283, d = W.R0 * 0.62; W.spawn.push({ x: Math.sin(a) * d, y: 0, z: Math.cos(a) * d, h: a + Math.PI }); } }
+    else {
+      const hw = id === 'survive' ? 64 : id === 'derby' ? 72 : 100; W.bx0 = W.bz0 = -hw; W.bx1 = W.bz1 = hw;
+      for (let i = 0; i < 8; i++) { const a = i / n * 6.283 + 0.4, d = hw * 0.72; W.spawn.push({ x: Math.sin(a) * d, y: 0, z: Math.cos(a) * d, h: a + Math.PI }); }
+      if (id === 'smash') for (let k = 0; k < 40; k++) { const q = r(); W.crates.push({ x: Math.round((r() - 0.5) * 170), y: 0, z: Math.round((r() - 0.5) * 170), kd: q < 0.55 ? 5 : q < 0.85 ? 6 : 7 }); }
+      if (id === 'derby') { addBox(W, -6, -6, 6, 6, 9, null, 'wall'); for (let k = 0; k < 4; k++) { const a = k * 1.5708 + 0.785; addBox(W, Math.sin(a) * 42 - 4, Math.cos(a) * 42 - 4, Math.sin(a) * 42 + 4, Math.cos(a) * 42 + 4, 7, null, 'wall'); } }
+    }
+    indexWorld(W);
+    return W;
+  }
+
+  /* ======================= 기체 ======================= */
+  function calcEff(c) {
+    const K = CRAFTS[c.k], b = K.b, st = c.st, q = K.q, wl = st[5];
+    const e = c.e || (c.e = {});
+    e.vmax = 34 * b[0] * (1 + 0.045 * st[0]);
+    e.acc = 15 * b[1] * (1 + 0.07 * st[1]) * (1 - 0.01 * wl) * (q.thr || 1);
+    e.turn = 1.75 * b[2] * (1 + 0.04 * st[2]);
+    e.chg = 0.75 * b[3] * (1 + 0.06 * st[3]);
+    e.bst = 15 * Math.sqrt(b[3]) * (1 + 0.05 * st[3]) * (q.bst || 1);
+    e.gl = Math.min(0.9, 0.42 * b[4] * (1 + 0.07 * st[4]) * (1 - 0.015 * wl));
+    e.m = b[5] * (1 + 0.08 * st[5]);
+    e.hp = Math.round(100 * b[6] * (1 + 0.08 * st[6]));
+    e.atk = 10 * b[7] * (1 + 0.1 * st[7]);
+    e.grip = q.grip || 6; e.keep = q.keep || 1; e.regen = q.regen || 0; e.mag = q.mag || 1; e.crush = q.crush || 0;
+    return e;
+  }
+  function newCraft(seat, k, st) {
+    const c = { s: seat, k, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, h: 0, si: 0, ch: 0, bt: 0, air: 0, st: st ? st.slice() : [0, 0, 0, 0, 0, 0, 0, 0], hp: 100, dead: 0, fl: 0, bf: [0, 0, 0], e: null,
+      wc: 0, pd: 0, hitv: 0, land: 0, bo: 0, rem: 0, kq: [0, 0, 0, 0], rs: 1, tot: 0, dmg: 0, inv: 0, cd: 0, ccd: 0, swcd: 0, swn: 0, wt: 0, wh: 0, px: 0, py: 0, pz: 0, ph: 0 };
+    calcEff(c); c.hp = c.e.hp; c.tot = c.st.reduce((a, b) => a + b, 0); return c;
+  }
+  function place(c, p) { c.x = c.px = p.x; c.y = c.py = p.y || 0; c.z = c.pz = p.z; c.h = c.ph = p.h || 0; c.vx = c.vy = c.vz = 0; c.air = 0; c.ch = 0; c.bt = 0; c.si = 0; c.wc = 0; c.rs++; }
+  const ENV0 = { g: 1, spd: 1, chg: 1, up: 0, hold: 0 };
+  function envOf(evk) { const e = { g: 1, spd: 1, chg: 1, up: 0, hold: 0 }; if (evk < 0 || evk == null) return e; const id = EVENTS[evk].id; if (id === 'lowg') e.g = 0.42; if (id === 'surge') { e.spd = 1.25; e.chg = 2; } if (id === 'updraft') e.up = 1; return e; }
+
+  /* 기체 한 걸음. inp = {s: −1..1(오른쪽 +), c: 모으기}. 자기 기체 예측 · 호스트 공용. */
+  function stepCraft(W, c, inp, env) {
+    const e = c.e, dt = DT;
+    c.hitv = 0; c.land = 0; c.bo = 0;
+    if (c.fl & 8) { c.vx *= 0.94; c.vz *= 0.94; inp = { s: 0, c: 0 }; }
+    const tgt = clamp(inp.s || 0, -1, 1); c.si += (tgt - c.si) * Math.min(1, dt * (tgt === 0 ? 12 : 9));
+    const chg = !!inp.c && !(c.fl & 8);
+    const sp = Math.hypot(c.vx, c.vz), air = c.air > 0;
+    let tr = e.turn * (0.6 + 0.4 * Math.min(1, sp / 12)) / (1 + sp / 120);
+    if (chg && !air) tr *= 1.6; if (air) tr *= 0.75;
+    if (c.wt > 0) { c.wt -= dt; c.h += clamp(wrap(c.wh - c.h), -5.5 * dt, 5.5 * dt); }
+    c.h -= c.si * tr * dt; if (c.h > Math.PI) c.h -= 2 * Math.PI; else if (c.h < -Math.PI) c.h += 2 * Math.PI;
+    const fx = Math.sin(c.h), fz = Math.cos(c.h);
+    let vf = c.vx * fx + c.vz * fz, vl = -c.vx * fz + c.vz * fx;
+    const sm = env.spd * (c.fl & 1 ? 1.3 : 1), vmax = e.vmax * sm;
+    if (env.hold) { vf = 0; vl = 0; if (chg) c.ch = Math.min(1, c.ch + e.chg * dt); else if (c.wc) c.ch = 0; }
+    else if (!air) {
+      if (chg) { if (vf > 0) vf -= (4 + vf * 0.7) * e.keep * dt; c.ch = Math.min(1, c.ch + e.chg * env.chg * dt); vl *= Math.exp(-e.grip * 0.35 * dt); }
+      else {
+        if (c.wc) { if (c.ch > 0.12) { vf = Math.max(Math.max(vf, 0) + e.bst * c.ch * 0.5, (vmax * 0.72 + e.bst * 0.9) * c.ch); c.bt = 0.45 + 0.9 * c.ch; c.bo = c.ch; } c.ch = 0; }
+        if (vf < vmax) vf = Math.min(vmax, vf + e.acc * sm * dt * clamp(1.2 - vf / vmax, 0.12, 1));
+        else vf -= (vf - vmax) * (c.bt > 0 ? 0.35 : 1.3) * dt;
+        vl *= Math.exp(-e.grip * (c.wt > 0 ? 0.12 : 1) * dt);
+      }
+      if (c.fl & 8) vf *= 0.96;
+    } else {
+      if (!chg && c.wc && c.ch > 0.12) { vf += e.bst * c.ch * 0.6; c.bt = 0.4; c.bo = c.ch; c.ch = 0; }
+      if (vf < vmax * 0.9) vf += e.acc * 0.22 * dt; else if (vf > vmax) vf -= (vf - vmax) * 0.25 * dt;
+      vl *= Math.exp(-1.6 * dt);
+      const g = GRAV * env.g, hs = Math.abs(vf);
+      if (chg) c.vy -= g * 1.7 * dt;
+      else {
+        const lift = e.gl * Math.min(1, hs / 28);
+        if (c.vy > 0) c.vy -= g * (1 - 0.35 * lift) * dt;
+        else { c.vy -= g * (1 - lift) * dt; const term = -(5 + 40 * (1 - lift)); if (c.vy < term) c.vy += (term - c.vy) * Math.min(1, 3 * dt); }
+        if (env.up && c.vy < 12) c.vy += 34 * dt;
+      }
+      for (let i = 0; i < W.vents.length; i++) { const v = W.vents[i], dx = c.x - v.x, dz = c.z - v.z; if (dx * dx + dz * dz < v.r * v.r && c.y < v.top && c.vy < 24) c.vy += 90 * dt; }
+    }
+    c.wc = chg ? 1 : 0;
+    if (c.bt > 0) c.bt -= dt; if (c.pd > 0) c.pd -= dt;
+    // 발판 · 환풍구(땅에서)
+    if (!air && !env.hold) {
+      if (c.pd <= 0) for (let i = 0; i < W.pads.length; i++) { const p = W.pads[i], dx = c.x - p.x, dz = c.z - p.z; if (dx * dx + dz * dz < 49 && Math.abs(c.y) < 30) { vf = Math.max(vf, vmax) + 13; c.bt = 1; c.pd = 0.8; c.bo = 0.6; break; } }
+      for (let i = 0; i < W.vents.length; i++) { const v = W.vents[i], dx = c.x - v.x, dz = c.z - v.z; if (dx * dx + dz * dz < v.r * v.r && c.y < 3) { c.vy = 20; c.air = dt; c.y += 0.3; } }
+    }
+    c.vx = fx * vf - fz * vl; c.vz = fz * vf + fx * vl;
+    // 이동(축별) · 벽
+    const ly = c.y + 1.4 + Math.min(1, Math.hypot(c.vx, c.vz) * dt * 1.3);   // 앞쪽 검사 높이: 가파른 도약대는 오르고 벽은 막힘
+    let nx = c.x + c.vx * dt, sx = c.vx > 0 ? 1 : -1;
+    if ((W.wall && (nx < W.bx0 + CR || nx > W.bx1 - CR)) || probe(W, nx + sx * CR, c.z - 1.3, ly).b || probe(W, nx + sx * CR, c.z + 1.3, ly).b) { c.hitv = Math.max(c.hitv, Math.abs(c.vx)); const ks = 0.42 * Math.hypot(c.vx, c.vz); c.vx = -c.vx * 0.15; c.vz *= 0.985; nx = c.x; const hb = c.si ? Math.cos(c.h - Math.sign(c.si) * 1.2) : fz; const fa = freeAt(W, c.x, c.z + 7, c.y), fb = freeAt(W, c.x, c.z - 7, c.y); c.wh = (fa !== fb ? fa : (Math.abs(fz) < 0.25 ? hb : fz) >= 0) ? 0 : Math.PI; c.wt = 0.3; const dr = c.wh === 0 ? 1 : -1; if (c.vz * dr < ks) c.vz = dr * ks; }   // 벽을 따라 미끄러지도록 기수를 벽 방향으로 돌림(멈춰 서지 않게)
+    c.x = nx;
+    let nz = c.z + c.vz * dt, sz = c.vz > 0 ? 1 : -1;
+    if ((W.wall && (nz < W.bz0 + CR || nz > W.bz1 - CR)) || probe(W, c.x - 1.3, nz + sz * CR, ly).b || probe(W, c.x + 1.3, nz + sz * CR, ly).b) { c.hitv = Math.max(c.hitv, Math.abs(c.vz)); const ks = 0.42 * Math.hypot(c.vx, c.vz); c.vz = -c.vz * 0.15; c.vx *= 0.985; nz = c.z; const hb = c.si ? Math.sin(c.h - Math.sign(c.si) * 1.2) : fx; const fa = freeAt(W, c.x + 7, c.z, c.y), fb = freeAt(W, c.x - 7, c.z, c.y); c.wh = (fa !== fb ? fa : (Math.abs(fx) < 0.25 ? hb : fx) >= 0) ? Math.PI / 2 : -Math.PI / 2; c.wt = 0.3; const dr = c.wh > 0 ? 1 : -1; if (c.vx * dr < ks) c.vx = dr * ks; }
+    c.z = nz;
+    // 바닥
+    const p = probe(W, c.x, c.z, c.y);
+    if (p.b) { if (p.bt - c.y < 8) { c.y = p.bt; c.vy = 0; c.air = 0; } return; }
+    if (c.air <= 0) {
+      const hs = Math.hypot(c.vx, c.vz);
+      if (p.f >= c.y - (0.35 + hs * dt * 1.3)) {
+        const vy = clamp((p.f - c.y) / dt, -45, 72); c.vy = vy; c.y = p.f;
+        if (hs > 4 && !env.hold) { const k = 1 - clamp(GRAV * 0.3 * (vy / hs) * dt / hs, -0.02, 0.03); c.vx *= k; c.vz *= k; }
+      } else { c.air = dt; if (c.vy < 0) c.vy *= 0.5; c.y += c.vy * dt; }
+    } else {
+      c.y += c.vy * dt;
+      if (c.y > p.c - CH) { c.y = p.c - CH; if (c.vy > 0) c.vy = 0; }
+      if (c.y <= p.f) { c.y = p.f; c.land = -c.vy; c.vy = 0; c.air = 0; } else c.air += dt;
+    }
+  }
+  /* 남의 기체(받은 자세): 속도로 이어 그리기 */
+  function stepRemote(c) { c.x += c.vx * DT; c.y += c.vy * DT; c.z += c.vz * DT; if (c.bt > 0) c.bt -= DT; }
+
+  /* ======================= 호스트 ======================= */
+  function makeHost(st, players) {
+    const n = st.n, fin = st.ph !== 'city';
+    const H = { st, n, ph: fin ? 'fin' : 'city', t: fin ? 0 : -4, c: [], sl: [], slT: [], cr: [], crT: [], dy: [], dyId: 1, pk: [], ev: null, evk: -1, pre: -1, evi: 0, met: [], metId: 1, wr: null, pl: null,
+      fx: [], fxId: 0, env: envOf(-1), rnd: rng((st.seed ^ (fin ? 0x3c3c : 0x1717)) + st.seq * 131), bots: [], f: null, res: null, endCity: false, mono: -1, tk: 0, W: null };
+    H.W = fin ? makeArena(st.fin, st.seed, n) : makeCity(st.seed);
+    const W = H.W;
+    for (let i = 0; i < n; i++) {
+      const car = fin && st.car ? st.car[i] : null;
+      const c = newCraft(i, car ? car.k : 0, car ? car.st : null); place(c, W.spawn[i % W.spawn.length]); c.rs = 1; H.c.push(c);
+      const p = players[i] || {}; H.bots.push(p.ai ? newBot(H, i, p.lv || 2) : null);
+    }
+    H.cr = W.crates.map((q) => crateHP(q.kd)); H.crT = W.crates.map(() => 0);
+    if (!fin) {
+      H.sl = W.slots.map(() => (H.rnd() < 0.05 + 0.012 * n ? slotChar(H) : '0')); H.slT = W.slots.map(() => 0); H.bud = 0;
+      for (let i = W.gold0; i < W.gold0 + 5; i++) H.cr[i] = 0;
+      for (let i = 0; i < W.gold0; i++) if (H.rnd() > 0.08 + 0.07 * n) { H.cr[i] = 0; H.crT[i] = 60 + H.rnd() * 240; }
+      const pool = shuffle(H.rnd, CRAFTS.map((_, i) => i).filter((i) => i > 0 && !CRAFTS[i].q.rare));
+      W.parks.forEach((p, i) => { H.pk.push({ k: p.hi ? pick(H.rnd, [CI.sail, CI.dart, CI.feather, CI.twin]) : pool[i % pool.length], x: p.x, y: p.y, z: p.z, h: p.h, hr: 1, on: 1 }); });
+      if (W.rare) H.pk.push({ k: CI.proto, x: W.rare.x, y: 0, z: W.rare.z, h: 0, hr: 1, on: 0, rare: 1 });
+    } else {
+      H.sl = W.slots.map(() => '0'); H.slT = W.slots.map(() => 1e9);
+      const id = FINALS[st.fin].id;
+      if (id === 'sprint') { H.cr = H.cr.map(() => 0); H.crT = H.crT.map(() => 1e9); }
+      H.f = { k: st.fin, id, t: -5, sc: new Array(n).fill(0), out: new Array(n).fill(0), fn: new Array(n).fill(0), gi: new Array(n).fill(1), mx: new Array(n).fill(0), ar: new Array(n).fill(0), nm: 0, done: 0, endT: 0 };
+    }
+    return H;
+  }
+  const crateHP = (kd) => (kd === 2 || kd === 4 || kd === 6 ? 2 : kd === 7 ? 4 : 1);
+  function slotChar(H) { const q = H.rnd(); if (q < 0.9) return H.mono >= 0 ? STAT_CH[H.mono] : STAT_CH[(H.rnd() * 8) | 0]; if (q < 0.94) return 'r'; if (q < 0.96) return 'S'; if (q < 0.98) return 'B'; if (q < 0.998) return 'M'; return 'A'; }
+  function fx(H, t, a, b, c, d) { H.fx.push([++H.fxId, t, a | 0, b == null ? 0 : b, c == null ? 0 : Math.round(c), d == null ? 0 : Math.round(d)]); if (H.fx.length > 14) H.fx.shift(); }
+  function kick(c, dvx, dvy, dvz) { if (c.rem) { c.kq[0]++; c.kq[1] = dvx; c.kq[2] = dvy; c.kq[3] = dvz; } c.vx += dvx; c.vz += dvz; if (dvy) { c.vy = Math.max(c.vy, 0) + dvy; if (!c.rem) { c.air = Math.max(c.air, DT); c.y += 0.2; } } }
+  function addDyn(H, t, x, y, z, vx, vy, vz, no) { if (H.dy.length >= 70) H.dy.shift(); H.dy.push({ id: H.dyId++, t, x, y, z, vx, vy, vz, mv: 1, life: H.f ? 12 : 26, no: no == null ? -1 : no, nt: 1.2 }); if (H.dyId > 9000) H.dyId = 1; }
+  function scatter(H, x, y, z, list, no) { list.forEach((t, i) => { const a = H.rnd() * 6.283, v = 7 + H.rnd() * 7; addDyn(H, t, x, y + 1.5, z, Math.sin(a) * v, 9 + H.rnd() * 5, Math.cos(a) * v, no); void i; }); }
+  function dropShards(H, c, n) {
+    const out = [];
+    for (let k = 0; k < n; k++) { const own = []; for (let i = 0; i < 8; i++) if (c.st[i] > 0) own.push(i); if (!own.length) break; const i = pick(H.rnd, own); c.st[i]--; c.tot--; out.push(STAT_CH[i]); }
+    if (out.length) { const r = c.hp / c.e.hp; calcEff(c); c.hp = Math.max(1, r * c.e.hp); scatter(H, c.x, c.y, c.z, out, c.s); }
+  }
+  function give(H, c, ch) {
+    if (H.f) { H.f.sc[c.s] += ch === 'g' ? 3 : 1; fx(H, 'p', c.s, ch); return; }
+    const i = STAT_CH.indexOf(ch), r = c.hp / c.e.hp;
+    if (i >= 0) { if (c.st[i] < STAT_MAX) { c.st[i]++; c.tot++; } }
+    else if (ch === 'A') { for (let k = 0; k < 8; k++) if (c.st[k] < STAT_MAX) { c.st[k]++; c.tot++; } }
+    else if (ch === 'r') { c.hp = Math.min(c.e.hp, c.hp + c.e.hp * 0.5); fx(H, 'p', c.s, ch); return; }
+    else if (ch === 'S') c.bf[0] = ITEMS[2].dur; else if (ch === 'B') c.bf[1] = ITEMS[3].dur; else if (ch === 'M') c.bf[2] = ITEMS[4].dur;
+    calcEff(c); c.hp = r * c.e.hp; fx(H, 'p', c.s, ch);
+  }
+  function damage(H, c, amt, src) {
+    if (c.dead > 0 || (c.fl & 8) || c.inv > 0 || c.bf[1] > 0 || (H.f && H.f.t < 0)) return;
+    const id = H.f ? H.f.id : 'city';
+    if (H.f && id !== 'survive' && id !== 'derby') return;
+    c.hp -= amt; if (src) src.dmg += amt; fx(H, 'h', c.s, Math.round(amt));
+    if (id === 'derby' && src) H.f.sc[src.s] += amt;
+    if (id === 'city' && amt >= 8 && H.rnd() < 0.5) dropShards(H, c, 1);
+    if (c.hp <= 0) {
+      c.hp = 0; fx(H, 'x', c.s, 0, c.x, c.z);
+      if (id === 'city') { dropShards(H, c, 4); c.dead = 2.5; }
+      else if (id === 'derby') { if (src) H.f.sc[src.s] += 50; c.dead = 2; }
+      else { H.f.out[c.s] = H.f.t; c.fl |= 8; c.dead = 1e9; }
+    }
+  }
+  function respawn(H, c) {
+    const W = H.W; let best = W.spawn[0], bd = 1e18;
+    if (H.f) best = W.spawn[(c.s + ((H.rnd() * 3) | 0)) % Math.max(1, H.n)];
+    else W.spawn.forEach((p) => { const d = (p.x - c.x) ** 2 + (p.z - c.z) ** 2; if (d < bd) { bd = d; best = p; } });
+    if (!H.f) c.k = 0; calcEff(c); c.hp = c.e.hp; c.dead = 0; c.inv = 3; place(c, best);
+  }
+
+  function hostStep(H, inputs) {
+    const W = H.W, C = H.c, n = H.n, F = H.f;
+    H.tk++;
+    if (F) { F.t += DT; H.env = ENV0_HOLD(F.t < 0, F.id); if (W.R0) W.R = F.t < 20 ? W.R0 : Math.max(9, W.R0 - (F.t - 20) * (W.R0 - 9) / 50); }
+    else { H.t += DT; cityEvents(H); H.env.hold = H.t < 0 ? 1 : 0; if (H.t >= H.st.dur) H.endCity = true; }
+    const env = H.env, now = F ? F.t : H.t;
+    // 기체
+    for (let i = 0; i < n; i++) {
+      const c = C[i];
+      c.px = c.x; c.py = c.y; c.pz = c.z; c.ph = c.h;
+      if (c.dead > 0) { if (c.dead < 1e8) { c.dead -= DT; if (c.dead <= 0) respawn(H, c); } continue; }
+      c.fl = (c.fl & 8) | (c.bf[0] > 0 ? 1 : 0) | (c.bf[1] > 0 ? 2 : 0) | (c.bf[2] > 0 ? 4 : 0);
+      for (let k = 0; k < 3; k++) if (c.bf[k] > 0) c.bf[k] -= DT;
+      if (c.inv > 0) c.inv -= DT; if (c.cd > 0) c.cd -= DT; if (c.ccd > 0) c.ccd -= DT; if (c.swcd > 0) c.swcd -= DT;
+      if (c.e.regen && c.hp < c.e.hp) c.hp = Math.min(c.e.hp, c.hp + c.e.hp * c.e.regen * DT);
+      const inp = inputs[i] || IDLE;
+      if (c.rem) stepRemote(c); else stepCraft(W, c, inp, env);
+      if (inp.sw && c.swcd <= 0 && !F) trySwap(H, c);
+    }
+    // 기체끼리
+    for (let i = 0; i < n; i++) { const a = C[i]; if (a.dead > 0 || (a.fl & 8)) continue;
+      for (let j = i + 1; j < n; j++) { const b = C[j]; if (b.dead > 0 || (b.fl & 8)) continue;
+        const dx = b.x - a.x, dz = b.z - a.z, d2 = dx * dx + dz * dz; if (d2 > 4 * CR * CR || d2 < 1e-6 || Math.abs(a.y - b.y) > 2.6) continue;
+        const d = Math.sqrt(d2), nx = dx / d, nz = dz / d, ov = 2 * CR - d, ma = a.e.m, mb = b.e.m;
+        if (!a.rem) { a.x -= nx * ov * mb / (ma + mb); a.z -= nz * ov * mb / (ma + mb); } if (!b.rem) { b.x += nx * ov * ma / (ma + mb); b.z += nz * ov * ma / (ma + mb); }
+        const sa = a.vx * nx + a.vz * nz, sb = -(b.vx * nx + b.vz * nz), rv = sa + sb;
+        if (rv <= 0 || env.hold) continue;
+        const sumo = F && F.id === 'sumo', rest = sumo ? 0.8 : 0.6;
+        let j0 = (1 + rest) * rv / (1 / ma + 1 / mb);
+        const ka = (1 + (a.e.atk - 10) / 60) * (a.bt > 0 ? 1.35 : 1), kb = (1 + (b.e.atk - 10) / 60) * (b.bt > 0 ? 1.35 : 1);
+        const fa = sa > sb ? ka : 1, fb = sb > sa ? kb : 1;   // 더 세게 들이받은 쪽의 밀어내는 힘
+        const da = Math.min(26, j0 / ma * fb), db = Math.min(26, j0 / mb * fa);   // 한 번에 밀리는 속도 상한
+        kick(a, -nx * da, 0, -nz * da); kick(b, nx * db, 0, nz * db);
+        if (rv > 9 && a.cd <= 0 && b.cd <= 0) {
+          a.cd = b.cd = 0.45; fx(H, 'c', a.s, b.s, (a.x + b.x) / 2, (a.z + b.z) / 2);
+          damage(H, b, a.e.atk * Math.max(0, sa) / 26 * (a.bt > 0 ? 1.5 : 1) * Math.sqrt(ma), a);
+          damage(H, a, b.e.atk * Math.max(0, sb) / 26 * (b.bt > 0 ? 1.5 : 1) * Math.sqrt(mb), b);
+        }
+      } }
+    // 줍기 · 상자
+    for (let i = 0; i < n; i++) {
+      const c = C[i]; if (c.dead > 0 || (c.fl & 8)) continue;
+      const pr = 4 * c.e.mag * (c.bf[2] > 0 ? 3 : 1), pr2 = pr * pr;
+      if (!F) {
+        const cs = W.sc, a0 = Math.floor((c.x - pr - W.bx0) / cs), a1 = Math.floor((c.x + pr - W.bx0) / cs), b0 = Math.floor((c.z - pr - W.bz0) / cs), b1 = Math.floor((c.z + pr - W.bz0) / cs);
+        for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) { const l = W.sg[b * W.sw + a]; if (!l) continue;
+          for (let q = 0; q < l.length; q++) { const si = l[q]; if (H.sl[si] === '0') continue; const s = W.slots[si], dx = s.x - c.x, dz = s.z - c.z; if (dx * dx + dz * dz < pr2 && Math.abs(s.y - c.y) < 3.6) { give(H, c, H.sl[si]); H.sl[si] = '0'; H.slT[si] = H.t + 25; } } }
+      }
+      for (let q = H.dy.length - 1; q >= 0; q--) { const s = H.dy[q]; if (s.no === c.s && s.nt > 0) continue; const dx = s.x - c.x, dz = s.z - c.z; if (dx * dx + dz * dz < pr2 && Math.abs(s.y - c.y) < 3.6) { give(H, c, s.t); H.dy.splice(q, 1); } }
+      if (c.ccd <= 0) for (let q = 0; q < W.crates.length; q++) {
+        if (H.cr[q] <= 0) continue; const k = W.crates[q], dx = k.x - c.x, dz = k.z - c.z, d2 = dx * dx + dz * dz; if (d2 > 14.5 || Math.abs(k.y - c.y) > 3) continue;
+        const sp = Math.hypot(c.vx, c.vz), pw = c.e.crush ? Math.max(3, c.e.atk / 10 * sp / 20) : c.e.atk / 10 * sp / 20;
+        c.ccd = 0.3;
+        if (sp < 7 && !c.e.crush) { const d = Math.sqrt(d2) || 1; kick(c, -dx / d * (sp + 3), 0, -dz / d * (sp + 3)); break; }
+        H.cr[q] -= Math.max(1, Math.floor(pw));
+        if (H.cr[q] <= 0) { H.cr[q] = 0; H.crT[q] = k.kd === 4 || F ? 1e9 : now + 300 + H.rnd() * 180; fx(H, 'b', c.s, k.kd, k.x, k.z); breakCrate(H, c, k); }
+        else { const d = Math.sqrt(d2) || 1, dot = (c.vx * dx + c.vz * dz) / d; kick(c, -dx / d * dot * 1.4, 0, -dz / d * dot * 1.4); fx(H, 'k', c.s, k.kd, k.x, k.z); }
+        break;
+      }
+    }
+    // 떨어진 조각
+    for (let q = H.dy.length - 1; q >= 0; q--) { const s = H.dy[q]; s.life -= DT; if (s.nt > 0) s.nt -= DT; if (s.life <= 0) { H.dy.splice(q, 1); continue; }
+      if (s.mv) { s.vy -= 30 * DT; let nx = s.x + s.vx * DT, nz = s.z + s.vz * DT; if (blockedAt(W, nx, nz, s.y)) { s.vx = -s.vx * 0.4; s.vz = -s.vz * 0.4; nx = s.x; nz = s.z; } s.x = nx; s.z = nz; s.y += s.vy * DT; const f = probe(W, s.x, s.z, s.y).f; if (s.y <= f) { s.y = f; if (s.vy < -6) { s.vy = -s.vy * 0.35; s.vx *= 0.5; s.vz *= 0.5; } else { s.mv = 0; s.vx = s.vy = s.vz = 0; } } if (s.y < -30) s.life = 0; } }
+    // 다시 채우기(0.5초마다)
+    if (!F && H.tk % 30 === 0) { H.bud = Math.min(6, H.bud + (0.065 * n + 0.05) * 0.5); for (let tr = 0; tr < 12 && H.bud >= 1; tr++) { const i = (H.rnd() * H.sl.length) | 0; if (H.sl[i] === '0' && H.t >= H.slT[i]) { H.sl[i] = slotChar(H); H.bud--; } } for (let i = 0; i < W.gold0; i++) if (H.cr[i] <= 0 && H.t >= H.crT[i]) H.cr[i] = crateHP(W.crates[i].kd); }
+    // 운석 · 쇠공
+    stepHazards(H, now);
+    if (F) finalStep(H);
+  }
+  const IDLE = { s: 0, c: 0, sw: 0 };
+  const EH0 = { g: 1, spd: 1, chg: 1, up: 0, hold: 0 }, EH1 = { g: 1, spd: 1, chg: 1, up: 0, hold: 1 };
+  const ES0 = { g: 1, spd: 0.6, chg: 1, up: 0, hold: 0 }, ES1 = { g: 1, spd: 0.6, chg: 1, up: 0, hold: 1 };   // 밀어내기: 판이 좁아 출력 60%
+  function ENV0_HOLD(h, id) { return id === 'sumo' ? (h ? ES1 : ES0) : h ? EH1 : EH0; }
+  function breakCrate(H, c, k) {
+    if (H.f) { H.f.sc[c.s] += k.kd === 5 ? 10 : k.kd === 6 ? 25 : 50; return; }
+    const list = []; const nn = k.kd === 1 ? 2 : k.kd === 2 ? 3 : k.kd === 4 ? 6 : 1;
+    for (let i = 0; i < nn; i++) list.push(H.mono >= 0 ? STAT_CH[H.mono] : STAT_CH[(H.rnd() * 8) | 0]);
+    if (k.kd === 3) list.push(pick(H.rnd, ['r', 'r', 'r', 'S', 'S', 'S', 'B', 'B', 'M', 'M', 'M', 'A']));
+    scatter(H, k.x, k.y, k.z, list, -1);
+  }
+  function trySwap(H, c) {
+    let best = null, bd = 81;
+    H.pk.forEach((p) => { if (!p.on) return; const d = (p.x - c.x) ** 2 + (p.z - c.z) ** 2; if (d < bd && Math.abs(p.y - c.y) < 4) { bd = d; best = p; } });
+    if (!best) return false;
+    const k = c.k, hr = c.hp / c.e.hp; c.k = best.k; calcEff(c); c.hp = Math.max(1, best.hr * c.e.hp); best.k = k; best.hr = hr; best.rare = 0; c.swcd = 1; c.swn++; fx(H, 's', c.s, c.k);
+    return true;
+  }
+
+  /* ---------- 사건 ---------- */
+  function cityEvents(H) {
+    const st = H.st, W = H.W, evs = st.evs || [];
+    if (H.ev && H.t >= H.ev.t1) endEvent(H);
+    if (!H.ev && H.evi < evs.length) {
+      const e = evs[H.evi];
+      if (H.t >= e[0] - 4 && H.pre !== e[1]) { H.pre = e[1]; fx(H, 'w', e[1]); }
+      if (H.t >= e[0]) { H.evi++; H.pre = -1; startEvent(H, e[1]); }
+    }
+    const ev = H.ev; if (!ev) return;
+    const id = EVENTS[ev.k].id;
+    if (id === 'meteor') { if (H.t >= ev.nx) { ev.nx = H.t + 0.9; spawnMeteor(H, 0.6, 26); } }
+    else if (id === 'cargo') { const u = (H.t - ev.t0) / (ev.t1 - ev.t0); H.pl = { x: ev.ax + (ev.bx - ev.ax) * u, z: ev.az + (ev.bz - ev.az) * u, h: Math.atan2(ev.bx - ev.ax, ev.bz - ev.az) };
+      if (H.t >= ev.nx) { ev.nx = H.t + 0.6; addDyn(H, H.mono >= 0 ? STAT_CH[H.mono] : STAT_CH[(H.rnd() * 8) | 0], H.pl.x, 78, H.pl.z, (H.rnd() - 0.5) * 16, 0, (H.rnd() - 0.5) * 16, -1); } }
+    else if (id === 'wreck') { const w = H.wr, sp = 24 * DT; let dx = w.tx - w.x, dz = w.tz - w.z, d = Math.hypot(dx, dz);
+      if (d < sp) { w.x = w.tx; w.z = w.tz; const i = Math.round((w.x + HALF - RD / 2) / PITCH), j = Math.round((w.z + HALF - RD / 2) / PITCH); const o = [[1, 0], [-1, 0], [0, 1], [0, -1]].filter((q, k) => (k ^ 1) !== w.pd && i + q[0] >= 0 && i + q[0] <= NB && j + q[1] >= 0 && j + q[1] <= NB); const q = pick(H.rnd, o); w.pd = [[1, 0], [-1, 0], [0, 1], [0, -1]].indexOf(q); w.tx = roadC(i + q[0]); w.tz = roadC(j + q[1]); }
+      else { w.x += dx / d * sp; w.z += dz / d * sp; } }
+    void W;
+  }
+  function startEvent(H, k) {
+    const E = EVENTS[k], id = E.id, W = H.W;
+    H.ev = { k, t0: H.t, t1: H.t + E.dur, nx: H.t }; H.evk = k; H.env = envOf(k); fx(H, 'e', k);
+    if (id === 'mono') { H.mono = (H.rnd() * 8) | 0; H.ev.m = H.mono; for (let i = 0; i < H.sl.length; i++) if (STAT_CH.indexOf(H.sl[i]) >= 0) H.sl[i] = STAT_CH[H.mono]; }
+    else if (id === 'surplus') { for (let q = 0; q < 45; q++) { const i = (H.rnd() * H.sl.length) | 0; if (H.sl[i] === '0') H.sl[i] = slotChar(H); } for (let i = 0; i < W.gold0; i++) if (H.cr[i] <= 0) H.cr[i] = crateHP(W.crates[i].kd); }
+    else if (id === 'gold') { for (let i = W.gold0; i < W.gold0 + 5; i++) H.cr[i] = 2; }
+    else if (id === 'rare') { const p = H.pk[H.pk.length - 1]; if (p && W.rare) { p.on = 1; p.rare = 1; p.k = H.rnd() < 0.5 ? CI.proto : CI.titan; p.hr = 1; } }
+    else if (id === 'cargo') { const a = H.rnd() * 6.283, o = (H.rnd() - 0.5) * 200; H.ev.ax = Math.sin(a) * 520 + Math.cos(a) * o; H.ev.az = Math.cos(a) * 520 - Math.sin(a) * o; H.ev.bx = -Math.sin(a) * 520 + Math.cos(a) * o; H.ev.bz = -Math.cos(a) * 520 - Math.sin(a) * o;
+      // 도시 안을 지나는 동안만 떨어뜨리도록 양 끝을 도시 가장자리로 자름
+      const cl = (v) => clamp(v, -HALF + 20, HALF - 20); H.ev.ax = cl(H.ev.ax); H.ev.az = cl(H.ev.az); H.ev.bx = cl(H.ev.bx); H.ev.bz = cl(H.ev.bz); }
+    else if (id === 'wreck') { const i = 1 + ((H.rnd() * (NB - 1)) | 0), j = 1 + ((H.rnd() * (NB - 1)) | 0); H.wr = { x: roadC(i), z: roadC(j), tx: roadC(i), tz: roadC(j), pd: -1, r: 8 }; }
+  }
+  function endEvent(H) {
+    const id = EVENTS[H.ev.k].id, W = H.W;
+    if (id === 'mono') H.mono = -1; else if (id === 'gold') { for (let i = W.gold0; i < W.gold0 + 5; i++) H.cr[i] = 0; }
+    else if (id === 'rare') { const p = H.pk[H.pk.length - 1]; if (p && p.rare) p.on = 0; }
+    else if (id === 'cargo') H.pl = null; else if (id === 'wreck') H.wr = null;
+    H.ev = null; H.evk = -1; H.env = envOf(-1);
+  }
+  function spawnMeteor(H, near, dmg) {
+    const W = H.W, alive = H.c.filter((c) => c.dead <= 0 && !(c.fl & 8)); let x, z;
+    if (alive.length && H.rnd() < near) { const c = pick(H.rnd, alive); x = c.x + c.vx * 1.6 + (H.rnd() - 0.5) * 44; z = c.z + c.vz * 1.6 + (H.rnd() - 0.5) * 44; }
+    else { x = W.bx0 + H.rnd() * (W.bx1 - W.bx0); z = W.bz0 + H.rnd() * (W.bz1 - W.bz0); }
+    x = clamp(x, W.bx0 + 6, W.bx1 - 6); z = clamp(z, W.bz0 + 6, W.bz1 - 6);
+    H.met.push({ id: H.metId++, x, z, t: (H.f ? H.f.t : H.t) + 2.3, r: 11, dmg }); if (H.metId > 9000) H.metId = 1;
+  }
+  function stepHazards(H, now) {
+    for (let q = H.met.length - 1; q >= 0; q--) { const m = H.met[q]; if (now < m.t) continue; H.met.splice(q, 1);
+      const gy = probe(H.W, m.x, m.z, 400).f; fx(H, 'm', 0, 0, m.x, m.z);
+      H.c.forEach((c) => { if (c.dead > 0) return; const dx = c.x - m.x, dz = c.z - m.z, d = Math.hypot(dx, dz); if (d < m.r && c.y - gy < 22 && c.y - gy > -4) { const k = 1 - 0.5 * d / m.r; damage(H, c, m.dmg * k, null); if (c.dead <= 0 && c.inv <= 0 && c.bf[1] <= 0) kick(c, dx / (d || 1) * 16, 11, dz / (d || 1) * 16); } });
+      if (!H.f && H.rnd() < 0.6) scatter(H, m.x, gy, m.z, [STAT_CH[(H.rnd() * 8) | 0]], -1); }
+    const w = H.wr; if (w) H.c.forEach((c) => { if (c.dead > 0 || c.inv > 0) return; const dx = c.x - w.x, dz = c.z - w.z, d = Math.hypot(dx, dz); if (d < w.r + CR && c.y < 15) { damage(H, c, 32, null); c.inv = Math.max(c.inv, 1); kick(c, dx / (d || 1) * 34, 13, dz / (d || 1) * 34); fx(H, 'c', c.s, -1, c.x, c.z); } });
+  }
+
+  /* ---------- 결판 종목 ---------- */
+  function finalStep(H) {
+    const F = H.f, W = H.W, C = H.c, n = H.n, id = F.id, t = F.t, cap = FINALS[F.k].cap;
+    if (t < 0 || F.done) { if (F.done && t >= F.endT && !H.res) H.res = finalResult(H); return; }
+    let alive = 0;
+    for (let i = 0; i < n; i++) {
+      const c = C[i]; if (F.fn[i] || F.out[i]) continue; alive++;
+      if (id === 'sprint') { const g = W.gates[F.gi[i]]; if (g && (c.x - g.x) ** 2 + (c.z - g.z) ** 2 < 18 * 18) { F.gi[i]++; fx(H, 'g', i, F.gi[i]); if (F.gi[i] >= W.gates.length) { F.fn[i] = 1; F.sc[i] = t; c.fl |= 8; } } }
+      else if (id === 'drag') { if (c.z >= 600) { F.fn[i] = 1; F.sc[i] = t; c.fl |= 8; } }
+      else if (id === 'far' || id === 'high' || id === 'land') {
+        if (c.z > W.rampZ) { if (c.y > F.mx[i]) F.mx[i] = c.y; if (id === 'high') F.sc[i] = F.mx[i];
+          if (c.air > 0 && c.y > 1) F.ar[i] = 1;   // 떴음 표시(남의 기체는 공중 여부가 늦게 올 수 있음)
+          if ((F.ar[i] && (c.air <= 0 || c.y <= 0.05)) || (c.z > W.rampZ + 14 && c.y <= 0.3)) { F.fn[i] = 1; c.fl |= 8; if (id === 'far') F.sc[i] = c.z - W.rampZ; else if (id === 'land') F.sc[i] = Math.max(0, 100 - Math.hypot(c.x - W.tgt.x, c.z - W.tgt.z) * 1.25); fx(H, 'f', i, Math.round(F.sc[i])); } }
+      }
+      else if (id === 'sumo') { if (c.y < -12) { F.out[i] = t; c.fl |= 8; c.dead = 1e9; fx(H, 'o', i); } }
+    }
+    if (id === 'survive' && t >= F.nm) { F.nm = t + Math.max(0.16, 0.6 - t * 0.011); spawnMeteor(H, 0.72, 28 + t * 0.4); }
+    if (id === 'rush' && H.tk % 7 === 0 && H.dy.length < 60) { const x = W.bx0 + 8 + H.rnd() * (W.bx1 - W.bx0 - 16), z = W.bz0 + 8 + H.rnd() * (W.bz1 - W.bz0 - 16); addDyn(H, H.rnd() < 0.08 ? 'g' : STAT_CH[(H.rnd() * 8) | 0], x, 26, z, 0, 0, 0, -1); }
+    let end = t >= cap;
+    if (id === 'sumo' || id === 'survive') { if (alive <= 1) end = true; }
+    else if (id === 'smash') { if (!H.cr.some((v) => v > 0)) end = true; }
+    else if (id !== 'derby' && id !== 'rush') { if (alive === 0) end = true; }
+    if (end) { F.done = 1; F.endT = t + 1.6; }
+  }
+  function finalResult(H) {
+    const F = H.f, W = H.W, C = H.c, n = H.n, id = F.id, Fd = FINALS[F.k], val = [], disp = [], lab = [];
+    for (let i = 0; i < n; i++) {
+      const c = C[i]; let v, d = null, l = null;
+      if (id === 'sprint') { if (F.fn[i]) { v = -F.sc[i]; d = F.sc[i]; } else { const g = W.gates[F.gi[i]] || W.gates[W.gates.length - 1]; v = -1000 + F.gi[i] * 100 - Math.hypot(c.x - g.x, c.z - g.z) / 10; l = '관문 ' + (F.gi[i] - 1) + '/' + (W.gates.length - 1); } }
+      else if (id === 'drag') { if (F.fn[i]) { v = -F.sc[i]; d = F.sc[i]; } else { v = -1000 + c.z / 10; l = Math.round(clamp(c.z, 0, 600)) + 'm 지점'; } }
+      else if (id === 'far') { v = d = F.fn[i] ? F.sc[i] : Math.max(0, c.z - W.rampZ); }
+      else if (id === 'high') { v = d = F.mx[i]; }
+      else if (id === 'land') { v = d = F.fn[i] ? F.sc[i] : 0; }
+      else if (id === 'sumo') { if (F.out[i]) { v = d = F.out[i]; } else { v = 1000 - Math.hypot(c.x, c.z) / 100; l = '끝까지 남음'; } }
+      else if (id === 'survive') { if (F.out[i]) { v = d = F.out[i]; } else { v = 1000 + c.hp / c.e.hp; l = '끝까지 · 내구 ' + Math.round(100 * c.hp / c.e.hp) + '%'; } }
+      else { v = d = F.sc[i]; }
+      val.push(v); disp.push(d); lab.push(l || CT.fmtScore(F.k, d));
+    }
+    const rk = val.map((v) => val.filter((u) => u > v + 1e-9).length);
+    void Fd;
+    return { rk, lab, k: C.map((c) => c.k), tot: C.map((c) => c.tot), top: C.map((c) => { let b = 0; for (let i = 1; i < 8; i++) if (c.st[i] > c.st[b]) b = i; return c.st[b] ? STATS[b].sh + ' ' + c.st[b] : '없음'; }) };
+  }
+
+  /* ======================= 봇 ======================= */
+  function newBot(H, seat, lv) {
+    const r = rng(H.st.seed * 31 + seat * 7919 + 13);
+    return { s: seat, lv, r, w: STATS.map(() => 0.65 + r() * 0.7), roof: r() < 0.3 + lv * 0.18, aggro: r() * (0.3 + lv * 0.2), swapy: 0.5 + r(), nt: 0, tg: null, av: 0, avT: 0, stk: 0, lx: 0, lz: 0, lt: 0, inp: { s: 0, c: 0, sw: 0 }, cg: 0, wob: r() * 6.28, via: -1, vst: 0, vt: 0, swT: 20 + r() * 30, rel: -1, cgT: 0, vcd: {} };
+  }
+  function statW(H, B, c) {
+    const st = H.st, w = B.w.slice(), frac = H.t / st.dur, k = B.lv === 1 ? 0.25 : B.lv === 2 ? 0.7 : 1.1;
+    let cand = null; if (st.fixed) cand = [st.fin]; else if (frac >= 0.7) cand = st.c2; else if (frac >= 0.35) cand = st.c3;
+    if (cand) cand.forEach((f) => FINALS[f].fav.forEach((s, j) => { w[s] += k * (j === 0 ? 1.1 : 0.6) * (3 / cand.length) * 0.5; }));
+    const b = CRAFTS[c.k].b; for (let i = 0; i < 8; i++) { if (b[i] >= 1.2) w[i] *= 1.15; if (c.st[i] >= STAT_MAX) w[i] = 0.02; }
+    return w;
+  }
+  function craftVal(H, B, c, k) { const w = statW(H, B, c), b = CRAFTS[k].b; let v = 0, s = 0, bs = 0; for (let i = 0; i < 8; i++) { const bb = Math.min(1.6, Math.max(0.5, b[i])); v += bb * w[i]; s += w[i]; bs += bb; } const q = CRAFTS[k].q; return v / s * (0.5 + 4 / bs) + (q.rare ? 0.08 : 0) - (q.grip && q.grip < 6 ? 0.1 : 0) + (k === 0 ? -0.03 : 0); }
+  function botThinkCity(H, B, c) {
+    const W = H.W, per = (B.lv === 1 ? 75 : B.lv === 2 ? 115 : 160) * (H.evk >= 0 && (EVENTS[H.evk].id === 'fog' || EVENTS[H.evk].id === 'jam') ? 0.55 : 1), per2 = per * per;
+    const w = statW(H, B, c), fxh = Math.sin(c.h), fzh = Math.cos(c.h);
+    let best = null, bs = 0;
+    const consider = (x, z, y, val, kind, ref) => {
+      const dx = x - c.x, dz = z - c.z, d2 = dx * dx + dz * dz; if (d2 > per2) return;
+      const d = Math.sqrt(d2), ahead = (dx * fxh + dz * fzh) / (d || 1);
+      let s = val / (d + 22) * (1 + 0.45 * ahead) * (0.8 + 0.4 * B.r() * (4 - B.lv) / 2);
+      if (B.tg && B.tg.kind === kind && B.tg.ref === ref) s *= 1.3;
+      if (s > bs) { bs = s; best = { x, z, y, kind, ref }; }
+    };
+    const itemV = (ch) => { const i = STAT_CH.indexOf(ch); if (i >= 0) return w[i]; if (ch === 'r') return c.hp < c.e.hp * 0.6 ? 2.2 : 0.3; if (ch === 'A') return 4; return 1.3; };
+    for (let i = 0; i < W.slots.length; i++) { const ch = H.sl[i]; if (ch === '0') continue; const s = W.slots[i]; if (Math.abs(s.y - c.y) > 2.6) continue; consider(s.x, s.z, s.y, itemV(ch), 0, i); }
+    for (let i = 0; i < H.dy.length; i++) { const s = H.dy[i]; if (Math.abs(s.y - c.y) > 3 || (s.no === c.s && s.nt > 0)) continue; consider(s.x, s.z, s.y, itemV(s.t) * 1.15, 1, s.id); }
+    for (let i = 0; i < W.crates.length; i++) { if (H.cr[i] <= 0) continue; const k = W.crates[i]; if (Math.abs(k.y - c.y) > 2.6) continue; consider(k.x, k.z, k.y, k.kd === 4 ? 5.5 : k.kd === 2 ? (c.e.atk > 13 ? 3 : 1.6) : k.kd === 3 ? 2.4 : 2.3, 2, i); }
+    if (B.roof && B.lv >= 2 && c.y < 2 && c.y > -2) for (let i = 0; i < W.vias.length; i++) { if (H.tk < (B.vcd[i] || 0)) continue; const v = W.vias[i]; let sum = 0; for (let q = 0; q < v.slots.length; q++) { const ch = H.sl[v.slots[q]]; if (ch !== '0') sum += itemV(ch); } if (sum > 4) consider(v.x - Math.sin(v.h) * 30, v.z - Math.cos(v.h) * 30, 0, sum * 0.45, 3, i); }
+    if (H.t > B.swT) for (let i = 0; i < H.pk.length; i++) { const p = H.pk[i]; if (!p.on || Math.abs(p.y - c.y) > 2.6) continue; const gain = craftVal(H, B, c, p.k) - craftVal(H, B, c, c.k) + (B.lv === 1 ? (B.r() - 0.5) * 0.25 : 0); if (gain > 0.05) consider(p.x, p.z, p.y, 3 + gain * 30, 4, i); }
+    if (B.aggro > 0.45 && H.t > 30 && H.tk > (B.agT || 0)) for (let i = 0; i < H.n; i++) { const o = H.c[i]; if (o === c || o.dead > 0 || o.tot < 4 || Math.abs(o.y - c.y) > 2) continue; consider(o.x + o.vx * 0.5, o.z + o.vz * 0.5, o.y, B.aggro * 1.1 * Math.min(1.6, c.e.atk / 10), 5, i); }
+    if (!best) { if (!B.tg || B.tg.kind !== 9 || (B.tg.x - c.x) ** 2 + (B.tg.z - c.z) ** 2 < 400) { const i = (B.r() * (NB + 1)) | 0, j = (B.r() * (NB + 1)) | 0; best = { x: roadC(i), z: roadC(j), y: 0, kind: 9, ref: 0 }; } else best = B.tg; }
+    B.tg = best;
+  }
+  /* 목표점으로 몰기: 조향 + 장애물 피하기 + 모으기 */
+  function driveTo(H, B, c, tx, tz, o) {
+    const W = H.W, inp = B.inp, sp = Math.hypot(c.vx, c.vz);
+    let ang = Math.atan2(tx - c.x, tz - c.z);
+    if (B.lv < 3) ang += Math.sin(H.tk * 0.013 + B.wob) * (B.lv === 1 ? 0.22 : 0.07);
+    let diff = wrap(ang - c.h);
+    const dist = Math.hypot(tx - c.x, tz - c.z);
+    // 목표가 바로 뒤면 도는 방향을 정해 두고 유지(좌우로 떨지 않게)
+    if (Math.abs(diff) > 2.5) { if (!B.td) B.td = diff >= 0 ? 1 : -1; diff = B.td * Math.abs(diff); } else if (Math.abs(diff) < 1.9) B.td = 0; else if (B.td) diff = B.td * Math.abs(diff);
+    let s = -clamp(diff * 2.4, -1, 1), chg = 0;
+    if (!(o && o.noAvoid) && c.air <= 0) {
+      const look = (8 + sp * (B.lv === 1 ? 0.32 : 0.5));
+      const blk = (a, d) => blockedAt(W, c.x + Math.sin(c.h + a) * d, c.z + Math.cos(c.h + a) * d, c.y) || (o && o.edge && edgeBad(H, c.x + Math.sin(c.h + a) * d, c.z + Math.cos(c.h + a) * d));
+      const near = Math.min(look, dist);
+      const cb = blk(0, near) || blk(0, near * 0.5), lb = blk(0.55, near * 0.8), rb = blk(-0.55, near * 0.8);
+      if (cb || (lb && rb)) {
+        if (H.tk > B.avT) { B.av = lb && !rb ? -1 : rb && !lb ? 1 : diff >= 0 ? 1 : -1; B.avT = H.tk + 30; }   // av: +1 = 왼쪽(h 증가)으로
+        s = -B.av; if (sp > 16 || blk(0, 5)) chg = 1;
+      } else if (lb) s = Math.max(s, 0.5); else if (rb) s = Math.min(s, -0.5);
+    }
+    if (B.lv >= 2 && c.air <= 0 && Math.abs(diff) > 1.0 && sp > 14) chg = 1;
+    if (c.air <= 0 && dist < 18 && Math.abs(diff) > (B.lv === 1 ? 1.0 : 0.6) && sp > 5 && !(o && o.noAvoid)) chg = 1;   // 가까운 목표 둘레를 맴돌지 않게 줄이며 돎
+    if (o && o.ram && B.lv >= 2 && Math.abs(diff) < 0.25 && dist < 60 && dist > 12) { if (c.ch >= 0.5) B.rcT = H.tk + 150; else if (H.tk > (B.rcT || 0)) chg = 1; }
+    // 막혀서 못 움직임 → 모으며 제자리 돌기
+    if (H.tk - B.lt > 90) { const mv = Math.hypot(c.x - B.lx, c.z - B.lz); B.lx = c.x; B.lz = c.z; B.lt = H.tk; if (mv < 5 && !H.env.hold && !(c.fl & 8)) { B.stk = H.tk + 50; B.av = B.r() < 0.5 ? 1 : -1; B.tg = null; B.nt = 0; } }
+    if (H.tk < B.stk) { s = -B.av; chg = H.tk < B.stk - 12 ? 1 : 0; }
+    inp.s = s; inp.c = chg;
+  }
+  function edgeBad(H, x, z) { const W = H.W; return W.R0 ? x * x + z * z > (W.R - 3) * (W.R - 3) : false; }
+  function botStep(H, B) {
+    const c = H.c[B.s], inp = B.inp, W = H.W, F = H.f;
+    inp.sw = 0;
+    if (c.dead > 0 || (c.fl & 8)) { inp.s = 0; inp.c = 0; return inp; }
+    if ((H.tk + B.s * 3) % 6 !== 0) return inp;   // 10Hz
+    if (F) return botFinal(H, B, c);
+    if (H.t < 0) { inp.s = 0; inp.c = B.lv >= 2 && H.t > -1.5 ? 1 : 0; return inp; }
+    // 위험 피하기
+    for (let i = 0; i < H.met.length; i++) { const m = H.met[i], dx = c.x - m.x, dz = c.z - m.z; if (B.lv >= 2 && dx * dx + dz * dz < (m.r + 3) * (m.r + 3)) { driveTo(H, B, c, c.x + dx * 4 + Math.sin(c.h) * 20, c.z + dz * 4 + Math.cos(c.h) * 20); inp.c = 0; return inp; } }
+    if (H.wr && B.lv >= 2) { const dx = c.x - H.wr.x, dz = c.z - H.wr.z; if (dx * dx + dz * dz < 900) { driveTo(H, B, c, c.x + dx * 3, c.z + dz * 3); return inp; } }
+    if (H.tk >= B.nt) { B.nt = H.tk + (B.lv === 1 ? 70 : B.lv === 2 ? 42 : 24); if (B.via < 0) botThinkCity(H, B, c); }
+    // 경사로 진입(옥상 · 지하)
+    if (B.via >= 0) { const v = W.vias[B.via]; if (H.tk > B.vt) { B.via = -1; B.nt = 0; }
+      else { driveTo(H, B, c, v.x + Math.sin(v.h) * 46, v.z + Math.cos(v.h) * 46, { noAvoid: 1 }); inp.c = 0; if (Math.abs(c.y) > 2.5 && c.air <= 0) { B.via = -1; B.nt = 0; } return inp; } }
+    const tg = B.tg; if (!tg) return inp;
+    const d2 = (tg.x - c.x) ** 2 + (tg.z - c.z) ** 2;
+    if (tg.kind === 3 && d2 < 144) { B.via = tg.ref; B.vt = H.tk + 240; B.vcd[tg.ref] = H.tk + 2400; B.tg = null; }
+    if (tg.kind === 4 && d2 < 49) { inp.sw = 1; B.swT = H.t + 35 * B.swapy; B.tg = null; B.nt = 0; }
+    if (tg.kind === 9 && d2 < 400) B.nt = 0;
+    if (tg.kind === 5) { if (!B.agS) B.agS = H.tk; if (H.tk - B.agS > 300) { B.agT = H.tk + 1200; B.agS = 0; B.tg = null; B.nt = 0; return inp; } } else B.agS = 0;
+    driveTo(H, B, c, tg.x, tg.z, { ram: tg.kind === 5 || tg.kind === 2 });
+    if (c.air > 0) inp.c = 0;
+    return inp;
+  }
+  function botFinal(H, B, c) {
+    const F = H.f, W = H.W, inp = B.inp, id = F.id, t = F.t, lv = B.lv;
+    if (t < 0) { inp.s = 0; const rel = lv === 3 ? -0.03 : lv === 2 ? -0.02 + B.wob / 6.28 * 0.25 : 0.2 + B.wob / 6.28 * 0.5; inp.c = (id === 'drag' || id === 'sprint' || id === 'far' || id === 'high' || id === 'land') && t > -2.2 && t < -rel ? 1 : 0; if (lv === 1 && id !== 'drag') inp.c = 0; return inp; }
+    if (t < 0.25 * (3 - lv) && lv < 3) { inp.c = c.ch > 0 ? 1 : 0; inp.s = 0; return inp; }
+    if (id === 'sprint') { const g = W.gates[F.gi[c.s]] || W.gates[W.gates.length - 1]; driveTo(H, B, c, g.x, g.z); }
+    else if (id === 'drag') { driveTo(H, B, c, W.spawn[c.s].x, c.z + 60, { noAvoid: 1 }); inp.c = 0; }
+    else if (id === 'far' || id === 'high') {
+      driveTo(H, B, c, W.spawn[c.s].x, c.z + 80, { noAvoid: 1 }); inp.c = 0;
+      // 도약대 앞에서 모았다가 도약대 위에서 놓기(보통 · 어려움)
+      const z1 = id === 'far' ? 300 : 220, z0 = z1 - Math.hypot(c.vx, c.vz) / c.e.chg * (lv === 3 ? 0.8 : 1.15);
+      if (lv >= 2 && c.air <= 0 && c.z < W.rampZ - 6 && (c.z > z0 || c.ch > 0) && c.ch < 0.98 && (c.wc || c.z < z1)) inp.c = 1;
+    }
+    else if (id === 'land') {
+      const T = W.tgt;
+      if (c.z < W.rampZ) { driveTo(H, B, c, W.spawn[c.s].x + (T.x - W.spawn[c.s].x) * clamp((c.z - 40) / 200, 0, 1) * 0.3, c.z + 80, { noAvoid: 1 }); inp.c = 0; }
+      else { driveTo(H, B, c, T.x, T.z, { noAvoid: 1 }); const dist = Math.hypot(T.x - c.x, T.z - c.z), hs = Math.hypot(c.vx, c.vz);
+        // 급강하하면 닿는 데 걸리는 시간 동안 나아갈 거리 ≈ 남은 거리일 때 누름
+        const tf = Math.sqrt(2 * Math.max(0, c.y) / (GRAV * 1.7)); const err = lv === 3 ? 4 : lv === 2 ? 14 : 30;
+        inp.c = (c.z > T.z - hs * tf - (B.wob - 3.14) / 3.14 * err || dist < 6) && c.air > 0 ? 1 : 0; }
+    }
+    else if (id === 'sumo') {
+      const r = Math.hypot(c.x, c.z); let tg = null, bd = 1e9;
+      for (let i = 0; i < H.n; i++) { const o = H.c[i]; if (o === c || F.out[i] || o.dead > 0) continue; const d = Math.hypot(o.x - c.x, o.z - c.z) + (Math.hypot(o.x, o.z) < W.R * 0.5 ? 12 : 0); if (d < bd) { bd = d; tg = o; } }
+      const margin = lv === 1 ? 4 : lv === 2 ? 8 : 11, sp = Math.hypot(c.vx, c.vz), la = lv === 1 ? 0.55 : lv === 2 ? 0.9 : 1.15;
+      const fr = Math.hypot(c.x + c.vx * la, c.z + c.vz * la);
+      if (r > W.R - margin || fr > W.R - margin * 0.5 || !tg) { driveTo(H, B, c, 0, 0, { noAvoid: 1 }); const vr = (c.x * c.vx + c.z * c.vz) / (r || 1); inp.c = vr > 4 && W.R - r < vr * (lv === 1 ? 0.6 : 1.25) + 5 ? 1 : 0; }
+      else { driveTo(H, B, c, tg.x + tg.vx * 0.3, tg.z + tg.vz * 0.3, { noAvoid: 1, ram: 1 }); if (inp.c && r > W.R * 0.6) inp.c = 0; }
+    }
+    else if (id === 'smash') { let best = -1, bs = 0; for (let i = 0; i < W.crates.length; i++) { if (H.cr[i] <= 0) continue; const k = W.crates[i], d = Math.hypot(k.x - c.x, k.z - c.z); const pts = k.kd === 5 ? 10 : k.kd === 6 ? 25 : 50; const can = k.kd === 5 || c.e.atk >= (k.kd === 6 ? 12 : 16) || lv === 1; const s = pts * (can ? 1 : 0.35) / (d + 25); if (s > bs) { bs = s; best = i; } }
+      if (best >= 0) driveTo(H, B, c, W.crates[best].x, W.crates[best].z, { ram: lv === 3 }); else driveTo(H, B, c, 0, 0); }
+    else if (id === 'survive') {
+      let ax = 0, az = 0; for (let i = 0; i < H.met.length; i++) { const m = H.met[i], dx = c.x + c.vx * 0.6 - m.x, dz = c.z + c.vz * 0.6 - m.z, d = Math.hypot(dx, dz); const rr = m.r + (lv === 1 ? 2 : lv === 2 ? 8 : 14); if (d < rr) { const k = (rr - d) / rr * (m.t - t < 1.4 || lv === 3 ? 1 : 0.4); ax += dx / (d || 1) * k; az += dz / (d || 1) * k; } }
+      const hw = W.bx1; const cx = -c.x / hw, cz = -c.z / hw;
+      if (ax || az) driveTo(H, B, c, c.x + ax * 40 + cx * 10 + Math.sin(c.h) * 10, c.z + az * 40 + cz * 10 + Math.cos(c.h) * 10);
+      else driveTo(H, B, c, Math.sin(t * 0.5 + B.wob) * hw * 0.5, Math.cos(t * 0.37 + B.wob) * hw * 0.5);
+      if (lv === 1 && B.r() < 0.5) inp.s *= 0.4;
+    }
+    else if (id === 'derby') { let tg = null, bs = 0; for (let i = 0; i < H.n; i++) { const o = H.c[i]; if (o === c || o.dead > 0) continue; const d = Math.hypot(o.x - c.x, o.z - c.z); const s = (1.4 - o.hp / o.e.hp) / (d + 30); if (s > bs) { bs = s; tg = o; } }
+      if (tg) driveTo(H, B, c, tg.x + tg.vx * 0.35, tg.z + tg.vz * 0.35, { ram: 1 }); else driveTo(H, B, c, 30, 30); }
+    else if (id === 'rush') { let tg = null, bs = 0; for (let i = 0; i < H.dy.length; i++) { const s = H.dy[i]; const d = Math.hypot(s.x - c.x, s.z - c.z); const dx = s.x - c.x, dz = s.z - c.z; const ah = (dx * Math.sin(c.h) + dz * Math.cos(c.h)) / (d || 1); const v = (s.t === 'g' ? 3 : 1) / (d + 18) * (1 + 0.5 * ah) * (lv === 1 ? 0.6 + B.r() * 0.8 : 1); if (v > bs) { bs = v; tg = s; } }
+      if (tg) driveTo(H, B, c, tg.x, tg.z); else driveTo(H, B, c, 0, 0); }
+    if (c.air > 0 && id !== 'land') inp.c = 0;
+    return inp;
+  }
+
+  /* ======================= 네트워크 묶기 ======================= */
+  const r1 = (v) => Math.round(v * 10) / 10;
+  function packHost(H) {
+    const F = H.f;
+    const o = { k: H.st.seq, t: Math.round((F ? F.t : H.t) * 20) / 20,
+      c: H.c.map((c) => [r1(c.x), r1(c.y), r1(c.z), Math.round(c.h * 100) / 100, r1(c.vx), r1(c.vy), r1(c.vz), c.k, Math.ceil(c.hp), r1(c.ch), (c.fl & 15) | (c.bt > 0 ? 16 : 0) | (c.air > 0 ? 32 : 0) | (c.dead > 0 ? 64 : 0) | (c.inv > 0 ? 128 : 0), c.st.map((v) => v.toString(36)).join(''), c.kq[0], r1(c.kq[1]), r1(c.kq[2]), r1(c.kq[3]), c.rs, c.tot]),
+      cr: H.cr.join(''), fx: H.fx };
+    if (!F) { o.sl = H.sl.join(''); o.pk = []; H.pk.forEach((p) => { o.pk.push(p.on ? p.k : -1); }); o.ev = H.ev ? [H.ev.k, r1(H.ev.t1 - H.t), H.ev.m == null ? -1 : H.ev.m] : null; o.pre = H.pre; if (H.wr) o.wr = [r1(H.wr.x), r1(H.wr.z)]; if (H.pl) o.pl = [Math.round(H.pl.x), Math.round(H.pl.z), Math.round(H.pl.h * 100) / 100]; }
+    else { o.f = { sc: F.sc.map((v) => r1(v)), out: F.out.map((v) => r1(v)), fn: F.fn, gi: F.gi, mx: F.mx.map((v) => Math.round(v)), done: F.done }; if (H.W.R0) o.R = r1(H.W.R); }
+    if (H.dy.length) { o.dy = []; H.dy.forEach((s) => { o.dy.push(s.id, s.t, Math.round(s.x), Math.round(s.y), Math.round(s.z)); }); }
+    if (H.met.length) { o.met = []; H.met.forEach((m) => { o.met.push(m.id, Math.round(m.x), Math.round(m.z), r1(m.t)); }); }
+    return o;
+  }
+  /* 손님 쪽 거울(M): 호스트와 같은 모양의 필드를 가짐 → 화면은 H든 M이든 같은 코드로 그림 */
+  function makeMirror(st) {
+    const fin = st.ph !== 'city', n = st.n;
+    const M = { st, n, guest: 1, ph: fin ? 'fin' : 'city', t: fin ? -5 : -4, c: [], sl: [], cr: [], dy: [], pk: [], ev: null, evk: -1, pre: -1, met: [], wr: null, pl: null, fx: [], env: envOf(-1), f: null, W: null, got: 0, kqs: [], rss: [] };
+    M.W = fin ? makeArena(st.fin, st.seed, n) : makeCity(st.seed);
+    const W = M.W;
+    for (let i = 0; i < n; i++) { const car = fin && st.car ? st.car[i] : null; const c = newCraft(i, car ? car.k : 0, car ? car.st : null); place(c, W.spawn[i % W.spawn.length]); c.rs = 0; c.rem = 1; M.c.push(c); M.kqs.push(0); M.rss.push(-1); }
+    M.sl = W.slots.map(() => '0'); M.cr = W.crates.map(() => 0);
+    if (!fin) { W.parks.forEach((p) => M.pk.push({ k: 0, x: p.x, y: p.y, z: p.z, h: p.h, on: 0 })); if (W.rare) M.pk.push({ k: 0, x: W.rare.x, y: 0, z: W.rare.z, h: 0, on: 0, rare: 1 }); }
+    else M.f = { k: st.fin, id: FINALS[st.fin].id, t: -5, sc: new Array(n).fill(0), out: new Array(n).fill(0), fn: new Array(n).fill(0), gi: new Array(n).fill(1), mx: new Array(n).fill(0), done: 0 };
+    return M;
+  }
+  /* mine: 내가 직접 모는 자리(자세는 덮어쓰지 않음 — 순간 이동 rs · 밀림 kq만 받음) */
+  function applyHost(M, o, mine) {
+    if (!o || o.k !== M.st.seq || !o.c || o.c.length !== M.n) return false;
+    M.got++; M.age = 0;
+    if (M.f) { M.f.t = o.t; if (o.f) { M.f.sc = o.f.sc; M.f.out = o.f.out; M.f.fn = o.f.fn; M.f.gi = o.f.gi; M.f.mx = o.f.mx; M.f.done = o.f.done; } if (o.R != null) M.W.R = o.R; M.env = ENV0_HOLD(o.t < 0, M.f.id); }
+    else { M.t = o.t; M.evk = o.ev ? o.ev[0] : -1; M.ev = o.ev ? { k: o.ev[0], left: o.ev[1], m: o.ev[2] } : null; M.pre = o.pre == null ? -1 : o.pre; M.env = envOf(M.evk); M.env.hold = o.t < 0 ? 1 : 0;
+      if (o.sl) M.sl = o.sl.split(''); if (o.pk) o.pk.forEach((k, i) => { const p = M.pk[i]; if (p) { p.on = k >= 0 ? 1 : 0; if (k >= 0) p.k = k; } });
+      M.wr = o.wr ? { x: o.wr[0], z: o.wr[1], r: 8 } : null; M.pl = o.pl ? { x: o.pl[0], z: o.pl[1], h: o.pl[2] } : null; }
+    if (o.cr) for (let i = 0; i < M.cr.length; i++) M.cr[i] = +o.cr[i] || 0;
+    M.fx = o.fx || [];
+    for (let i = 0; i < M.n; i++) {
+      const a = o.c[i], c = M.c[i], me = i === mine, fl = a[10];
+      const tele = a[16] !== M.rss[i]; M.rss[i] = a[16];
+      if (!me || tele) {
+        if (tele || (c.x - a[0]) ** 2 + (c.z - a[2]) ** 2 > 900) { c.x = c.px = a[0]; c.y = c.py = a[1]; c.z = c.pz = a[2]; c.h = c.ph = a[3]; }
+        else { c.x += (a[0] - c.x) * 0.45; c.y += (a[1] - c.y) * 0.45; c.z += (a[2] - c.z) * 0.45; c.h += wrap(a[3] - c.h) * 0.6; }
+        c.vx = a[4]; c.vy = a[5]; c.vz = a[6]; if (tele && me) { c.vx = c.vy = c.vz = 0; c.air = 0; c.ch = 0; c.bt = 0; c.wc = 0; }
+        if (!me) { c.ch = a[9]; c.bt = fl & 16 ? Math.max(c.bt, 0.2) : 0; c.air = fl & 32 ? 1 : 0; }
+      }
+      if (me && a[12] !== M.kqs[i]) { c.vx += a[13]; c.vz += a[15]; if (a[14]) { c.vy = Math.max(c.vy, 0) + a[14]; c.air = Math.max(c.air, DT); c.y += 0.2; } }
+      M.kqs[i] = a[12];
+      c.rs = a[16];
+      const st = a[11]; let ch = c.k !== a[7]; for (let q = 0; q < 8; q++) { const v = parseInt(st[q], 36) || 0; if (v !== c.st[q]) { c.st[q] = v; ch = true; } }
+      c.k = a[7]; if (ch) calcEff(c); c.hp = a[8]; c.tot = a[17];
+      c.fl = fl & 15; c.dead = fl & 64 ? 1 : 0; c.inv = fl & 128 ? 1 : 0;
+    }
+    // 떨어진 조각 · 운석
+    const dy = o.dy || [], old = {}; M.dy.forEach((s) => { old[s.id] = s; }); M.dy = [];
+    for (let i = 0; i < dy.length; i += 5) { const p = old[dy[i]]; if (p) { p.tx = dy[i + 2]; p.ty = dy[i + 3]; p.tz = dy[i + 4]; M.dy.push(p); } else M.dy.push({ id: dy[i], t: dy[i + 1], x: dy[i + 2], y: dy[i + 3], z: dy[i + 4], tx: dy[i + 2], ty: dy[i + 3], tz: dy[i + 4] }); }
+    const mt = o.met || []; M.met = []; for (let i = 0; i < mt.length; i += 4) M.met.push({ id: mt[i], x: mt[i + 1], z: mt[i + 2], t: mt[i + 3], r: 11 });
+    return true;
+  }
+  /* 손님 한 걸음: 내 기체는 예측, 나머지는 이어 그리기 */
+  function mirrorStep(M, mine, inp) {
+    M.age = (M.age || 0) + 1; const stale = M.age > 36;   // 호스트 소식이 0.6초 넘게 끊기면 남의 기체를 더 밀지 않음
+    if (!stale) { if (M.f) M.f.t += DT; else M.t += DT; }
+    for (let i = 0; i < M.n; i++) { const c = M.c[i]; c.px = c.x; c.py = c.y; c.pz = c.z; c.ph = c.h; if (c.dead > 0) continue; if (i === mine) stepCraft(M.W, c, inp, M.env); else if (!stale) stepRemote(c); }
+    for (let i = 0; i < M.dy.length; i++) { const s = M.dy[i]; s.x += (s.tx - s.x) * 0.2; s.y += (s.ty - s.y) * 0.2; s.z += (s.tz - s.z) * 0.2; }
+  }
+  function packGuest(M, mine, sw) { const c = M.c[mine]; return { k: M.st.seq, r: c.rs, c: [r1(c.x), r1(c.y), r1(c.z), Math.round(c.h * 100) / 100, r1(c.vx), r1(c.vy), r1(c.vz), r1(c.ch), (c.bt > 0 ? 16 : 0) | (c.air > 0 ? 32 : 0)], sw }; }
+  /* 호스트: 손님이 알린 자세 반영 */
+  function applyGuest(H, seat, o) {
+    const c = H.c[seat]; if (!c || !o || o.k !== H.st.seq || !o.c) return; c.rem = 1;
+    if (o.r !== c.rs || c.dead > 0) return;   // 순간 이동을 아직 못 받은 손님의 옛 자세는 버림
+    const a = o.c; c.x += (a[0] - c.x) * 0.5; c.y += (a[1] - c.y) * 0.5; c.z += (a[2] - c.z) * 0.5; c.h += wrap(a[3] - c.h) * 0.7; c.vx = a[4]; c.vy = a[5]; c.vz = a[6]; c.ch = a[7]; c.bt = a[8] & 16 ? Math.max(c.bt, 0.25) : 0; c.air = a[8] & 32 ? 1 : 0;
+    if (o.sw != null && o.sw !== c.gsw) { if (c.gsw != null && c.swcd <= 0 && !H.f) trySwap(H, c); c.gsw = o.sw; }
+  }
+
+  const S = { DT, CR, CH, GRAV, HALF, BL, RD, NB, PITCH, roadC, rng, clamp, wrap, makeCity, makeArena, probe, baseH, solTop, blockedAt, calcEff, newCraft, place, stepCraft, stepRemote, envOf,
+    makeHost, hostStep, botStep, newBot, finalResult, packHost, makeMirror, applyHost, mirrorStep, packGuest, applyGuest, trySwap, give, damage, startEvent, crateHP };
+  CT.sim = S;
+  if (typeof module === 'object' && module) module.exports = S;
+})();

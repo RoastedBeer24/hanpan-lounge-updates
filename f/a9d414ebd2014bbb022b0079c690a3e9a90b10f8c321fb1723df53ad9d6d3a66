@@ -1,0 +1,1619 @@
+/* 사흘 밤의 원정 — 3D 화면 · 조작 · HUD · 온라인 (three.js r170, assets/hyperrace/lib/three.min.js 공용)
+   - 지형: sim과 같은 높이 격자로 만든 한 장의 지면 + 정점 색 + 결. 나무 · 바위 · 거점 구조물은 모양마다 InstancedMesh.
+   - 인물 · 괴물: 몸 형태(사람형 · 거인 · 네발 · 다리 많은 것 · 비룡 · 떠 있는 사제)마다 관절(Group) 뼈대를 코드로 만들고, 동작은 자세 두 개(준비 · 내리침) 사이를 시간으로 보간.
+   - 빛: 낮은 해(황혼) + 반구광 + 반대쪽 차가운 테두리 빛, 재질에는 가장자리 빛(프레넬)을 더함. 밤에는 달빛 · 짙은 안개.
+   - 폭풍의 벽: 원기둥 셰이더(세로 줄무늬가 흐름). 큰 동작 예고: 바닥 표시(붉은색 = 구르기, 호박색 고리 = 뛰어넘기).
+   - 처음 불러올 때 모든 재질을 미리 굽고(compileAsync), 그래픽 낮음/보통/높음. */
+(function () {
+  'use strict';
+  const L = window.Lounge;
+  const V = {};
+  const TAU = Math.PI * 2, PI = Math.PI;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v), lerp = (a, b, t) => a + (b - a) * t;
+  const smt = (t) => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+  /* ===== 클릭 없는 마우스 시점(view3d) =====
+     · 스스로 포인터 잠금을 건다: 돌릴 수 있게 된 순간(시작 · 창 닫음 · 이어하기)과 그 뒤 모든 입력(키 · 마우스 단추 · 휠)에서. 「잠금용 클릭」이 따로 없다.
+     · 잠금이 안 걸려도(PC 앱 권한 · 창 안 미리보기 · Esc 직후) 마우스를 움직이면 바로 시점이 돈다. 화면 가장자리에 닿으면 그 방향으로 계속 돈다.
+     · o.want() = 지금 마우스로 시점을 돌려도 되는가(터치 아님 · 진행 중 · 창 안 열림 · 멈춤 아님). false가 되면 잠금을 풀어 커서를 보여 준다.
+     · o.turn(dx, dy, locked, edge): 픽셀 단위 입력량 그대로(프레임 시간에 곱하지 않음 — edge만 초당 속도). */
+  function mkFreeLook(o) {
+    const el = o.el, root = o.root || el, doc = document, now = () => performance.now();
+    let locked = false, self = false, lastReq = -1e9, fails = 0, retry = 0, wantWas = false, off = false;
+    let mx = null, my = 0, tgt = null, focused = true, focusT = -1e9, outT = 0, outDir = 0;
+    let skipT = 0, skip1 = false, curHid = false, freed = false;   // freed: Esc로 일부러 푼 뒤(멈춤 메뉴가 없는 온라인) — 다음 키 · 클릭까지 커서를 그대로 둔다
+    const want = () => { try { return !off && !freed && !!o.want(); } catch (e) { return false; } };
+    function req(force) {
+      if (locked || !el.requestPointerLock || !want()) return;
+      const t = now(); if (!force && t - lastReq < (fails > 4 ? 1500 : 250)) return; lastReq = t;
+      try { const r = el.requestPointerLock(); if (r && r.catch) r.catch(() => { fails++; }); } catch (e) { fails++; }
+    }
+    /* 풀린 직후(Esc)에는 브라우저가 1초쯤 다시 잠그기를 거절한다 → 조용히 몇 번 다시 */
+    function kick() { freed = false; req(true); clearInterval(retry); let n = 0; retry = setInterval(() => { if (locked || !want() || ++n > 6) { clearInterval(retry); retry = 0; return; } req(true); }, 400); }
+    function exit() { clearInterval(retry); retry = 0; try { if (doc.pointerLockElement === el) { self = true; doc.exitPointerLock(); } } catch (e) {} }
+    const onPL = () => { const was = locked; locked = doc.pointerLockElement === el; if (locked) { fails = 0; clearInterval(retry); retry = 0; skipT = now() + 150; skip1 = true; } mx = null; outDir = 0; const byUser = was && !locked && !self; self = false; if (byUser) freed = true; if (was !== locked && o.onLock) { try { o.onLock(locked, byUser); } catch (e) {} } };
+    const onPM = (e) => {
+      if (e.pointerType && e.pointerType !== 'mouse') return;
+      if (locked) { const dx = e.movementX || 0, dy = e.movementY || 0; if (skip1 || now() < skipT) { skip1 = false; return; } /* 잠근 직후 첫 값(커서가 가운데로 옮겨지며 튐)은 버림 — 잠기는 순간 시점이 튀지 않게 */ if (Math.abs(dx) > 400 || Math.abs(dy) > 400) return; if (want()) o.turn(dx, dy, true, false); return; }
+      outDir = 0; tgt = e.target;
+      if (!want()) { mx = null; return; }
+      if (mx != null) { const dx = e.clientX - mx, dy = e.clientY - my; if (Math.abs(dx) < 400 && Math.abs(dy) < 400 && (dx || dy)) o.turn(dx, dy, false, false); }
+      mx = e.clientX; my = e.clientY;
+    };
+    const onKey = (e) => { if (e.code === 'Escape' || e.repeat || e.altKey || e.metaKey) return; freed = false; req(false); };
+    const onPD = (e) => { if (e.pointerType === 'mouse' && root.contains(e.target)) { freed = false; req(false); } };
+    const onWh = () => req(false);
+    const onFocus = () => { focused = true; focusT = now(); mx = null; }, onBlur = () => { focused = false; mx = null; outDir = 0; };
+    /* 창 모드: 커서가 옆 가장자리로 빠져나가면 얼마 동안(4초) 그 방향으로 계속 돈다 */
+    const onLeave = (e) => { if (locked || mx == null) return; const r = root.getBoundingClientRect(), zx = Math.max(28, r.width * 0.07), x = (e.clientX != null ? e.clientX : mx) - r.left; outDir = x < zx ? -1 : x > r.width - zx ? 1 : 0; outT = now(); if (!outDir) mx = null; };
+    doc.addEventListener('pointerlockchange', onPL); doc.addEventListener('pointermove', onPM, true); doc.addEventListener('keydown', onKey, true); doc.addEventListener('pointerdown', onPD, true);
+    root.addEventListener('wheel', onWh, { passive: true }); window.addEventListener('focus', onFocus); window.addEventListener('blur', onBlur); doc.documentElement.addEventListener('mouseleave', onLeave);
+    return {
+      get locked() { return locked; },
+      /* 창에 돌아오려고 누른 클릭(포커스 직후)은 행동으로 치지 않게 */
+      focusClick() { return now() - focusT < 300; },
+      kick, exit,
+      tick(dt) {
+        const w = want(); if (w && !wantWas) kick(); else if (!w && wantWas) { exit(); mx = null; outDir = 0; } wantWas = w;
+        { const hide = w && !locked; if (hide !== curHid) { curHid = hide; try { root.style.cursor = hide ? 'none' : ''; } catch (e) {} } }   // 잠금이 안 걸린 자유 시점에서도 커서가 화면을 떠다니지 않게(창을 열면 다시 보임)
+        if (!w || locked || !focused || mx == null) return;
+        const r = root.getBoundingClientRect(), zx = Math.max(28, r.width * 0.07), zy = Math.max(18, r.height * 0.05);
+        let ex = 0, ey = 0;
+        if (outDir) { if (now() - outT > 4000) { outDir = 0; mx = null; return; } ex = outDir; }
+        else {
+          if (tgt && tgt.closest && tgt.closest('button,a,input,select,[data-action]')) return;   // 단추 위에 올려 둔 커서는 돌리지 않음
+          const x = mx - r.left, y = my - r.top; if (x < -2 || y < -2 || x > r.width + 2 || y > r.height + 2) return;
+          if (x < zx) ex = -(1 - Math.max(0, x) / zx); else if (x > r.width - zx) ex = 1 - Math.max(0, r.width - x) / zx;
+          if (y < zy) ey = -(1 - Math.max(0, y) / zy); else if (y > r.height - zy) ey = 1 - Math.max(0, r.height - y) / zy;
+        }
+        if (ex || ey) { const d = Math.min(0.1, dt > 0 ? dt : 0.016); o.turn(ex * 950 * d, ey * 520 * d, false, true); }
+      },
+      dbg() { return { locked, fails, mx, outDir, focused, want: want() }; },
+      destroy() { off = true; exit(); try { root.style.cursor = ''; } catch (e) {} doc.removeEventListener('pointerlockchange', onPL); doc.removeEventListener('pointermove', onPM, true); doc.removeEventListener('keydown', onKey, true); doc.removeEventListener('pointerdown', onPD, true);
+        root.removeEventListener('wheel', onWh); window.removeEventListener('focus', onFocus); window.removeEventListener('blur', onBlur); doc.documentElement.removeEventListener('mouseleave', onLeave); },
+    };
+  }
+  const angD = (a, b) => { let d = (b - a) % TAU; if (d > PI) d -= TAU; if (d < -PI) d += TAU; return d; };
+  const SERIF = '"Nanum Myeongjo","Noto Serif KR",Batang,serif';
+
+  V.mount = function (root, api, T, hooks) {
+    const THREE = window.THREE, S = T.sim, h = L.h;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    const testMode = !!(L.debug && L.debug.noTut);
+    const tierId = testMode && !T.store.get('gfx', '') ? 'low' : T.gfxTier();
+    const TIER = T.TIERS.find((t) => t.id === tierId) || T.TIERS[1];
+    const low = TIER.id === 'low', high = TIER.id === 'high';
+    const fxK = () => (L.fx ? L.fx() : 1);
+    const wrap = h('div', { class: 'nf-wrap', style: { position: 'absolute', inset: '0', overflow: 'hidden', background: '#0c0a0b', userSelect: 'none', touchAction: 'none', cursor: 'default' } });
+    root.append(wrap);
+    wrap.append(h('style', { text: `
+      .nf-wrap canvas.nf3d{position:absolute;inset:0;width:100%;height:100%;display:block}
+      .nf-l{position:absolute;inset:0;pointer-events:none;font-family:var(--f-body);color:#e9dfcc}
+      .nf-vit{position:absolute;left:16px;top:14px;width:min(34vw,330px);padding:6px 8px 5px;margin:-6px -8px 0;background:linear-gradient(90deg,rgba(8,6,6,.55),rgba(8,6,6,.25) 80%,rgba(8,6,6,0));border-radius:4px}
+      .nf-bar{position:relative;height:9px;background:rgba(10,8,8,.72);border:1px solid rgba(220,200,170,.22);margin-bottom:4px;overflow:hidden}
+      .nf-bar i{position:absolute;left:0;top:0;bottom:0;background:#8f2a22}.nf-bar b{position:absolute;left:0;top:0;bottom:0;background:#d8b48a;opacity:.45}
+      .nf-bar.hp{height:15px}.nf-bar.hp i{background:#a8342a}.nf-bar em{position:absolute;right:5px;top:50%;transform:translateY(-50%);font-style:normal;font-size:11.5px;font-weight:600;line-height:1;color:#fff4e4;text-shadow:0 0 3px #000,0 1px 2px #000;font-variant-numeric:tabular-nums;z-index:1}.nf-bar.st i{background:#8a9a44}.nf-bar.st{height:8px}.nf-bar.ul{height:5px}.nf-bar.ul i{background:#c9963f}.nf-bar.ul.full i{background:#f0c060;box-shadow:0 0 6px #f0c060}
+      .nf-lv{font-size:13.5px;margin-top:3px;font-variant-numeric:tabular-nums;text-shadow:0 1px 3px #000}.nf-lv em{font-style:normal;color:#e6c27a}
+      .nf-sts{display:flex;gap:4px;margin-top:4px}.nf-sts span{font-size:12px;padding:1px 6px;border-radius:3px;background:rgba(10,8,8,.75);border:1px solid rgba(220,200,170,.2)}
+      .nf-top{position:absolute;left:50%;top:8px;transform:translateX(-50%);text-align:center;white-space:nowrap;padding:4px 22px 5px;background:radial-gradient(ellipse at 50% 50%,rgba(8,6,6,.62),rgba(8,6,6,.38) 60%,rgba(8,6,6,0) 100%)}
+      .nf-top b{display:block;font-family:${SERIF};font-weight:700;font-size:19px;letter-spacing:.08em;text-shadow:0 1px 4px #000,0 0 8px #000}
+      .nf-top span{font-size:14px;font-weight:500;color:#f2e8d6;font-variant-numeric:tabular-nums;text-shadow:0 1px 3px #000,0 0 6px #000}
+      .nf-note{position:absolute;left:50%;top:66px;transform:translateX(-50%);font-size:14px;padding:4px 12px;background:rgba(12,9,9,.68);border-left:2px solid #b8743e;opacity:0;transition:opacity .15s;white-space:nowrap;pointer-events:none}
+      .nf-mini{position:absolute;right:14px;top:58px;width:150px;height:150px;border-radius:50%;overflow:hidden;border:1px solid rgba(220,200,170,.3);background:#141110;box-shadow:0 0 0 3px rgba(0,0,0,.35)}
+      .nf-mini canvas{width:100%;height:100%;display:block}
+      .nf-team{position:absolute;left:16px;bottom:16px;display:flex;flex-direction:column;gap:6px}
+      .nf-tm{width:200px;font-size:13px;padding:4px 7px;background:rgba(8,6,6,.5);border-radius:4px;text-shadow:0 1px 2px #000}.nf-tm div{display:flex;justify-content:space-between;margin-bottom:3px}.nf-tm div span{color:#d6ccba;font-size:12px}
+      .nf-tm .nf-bar{height:6px;margin:0}.nf-tm.dn{color:#e08a7a}
+      .nf-kit{position:absolute;right:16px;bottom:14px;display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+      .nf-row{display:flex;gap:5px;align-items:flex-end}
+      .nf-sl{position:relative;width:46px;height:46px;background:rgba(12,9,9,.72);border:1px solid rgba(220,200,170,.32);display:flex;align-items:center;justify-content:center}
+      .nf-sl.on{border-color:#e6c27a;background:rgba(40,30,20,.75)}.nf-sl.off{opacity:.55;border-style:dashed}.nf-sl.off svg{filter:grayscale(1)}
+      .nf-sl small{position:absolute;right:2px;bottom:1px;font-size:11.5px;font-weight:600;font-family:var(--f-mono);color:#fff4e4;text-shadow:0 0 3px #000,0 1px 2px #000}.nf-sl u{position:absolute;left:2px;top:1px;font-size:11px;font-weight:600;text-decoration:none;color:#e6d6b8;font-family:var(--f-mono);text-shadow:0 0 3px #000}.nf-sl > span{font-size:12.5px!important;font-weight:500}
+      .nf-sl s{position:absolute;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);text-decoration:none}
+      .nf-wn{font-size:14px;text-align:right;text-shadow:0 1px 3px #000,0 0 6px #000;max-width:320px;padding:4px 8px;background:linear-gradient(270deg,rgba(8,6,6,.6),rgba(8,6,6,.3) 80%,rgba(8,6,6,0));border-radius:4px}.nf-wn i{font-style:normal;font-size:12.5px;color:#e2d8c6;display:block;margin-top:1px}
+      .nf-act{position:absolute;left:50%;bottom:128px;transform:translateX(-50%);font-size:14px;padding:5px 12px;background:rgba(12,9,9,.78);border:1px solid rgba(220,200,170,.2);white-space:nowrap;text-align:center;max-width:70vw}
+      .nf-act kbd{font-family:var(--f-mono);font-size:12.5px;font-weight:600;padding:0 6px;border:1px solid rgba(230,210,180,.6);border-radius:3px;background:rgba(255,240,210,.1);margin-right:6px}
+      .nf-act small{display:block;font-size:12.5px;color:#d9cfbd;white-space:normal}
+      .nf-boss{position:absolute;left:50%;bottom:72px;transform:translateX(-50%);width:min(46vw,560px);text-align:left}
+      .nf-boss b{font-family:${SERIF};font-size:17px;letter-spacing:.06em;text-shadow:0 1px 4px #000}
+      .nf-boss .nf-bar{height:12px;margin-top:3px}.nf-boss .nf-bar i{background:#a0261e}
+      .nf-tag{position:absolute;left:0;top:0;transform:translate(-50%,-100%);font-size:12.5px;font-weight:500;white-space:nowrap;text-shadow:0 0 3px #000,0 1px 3px #000;will-change:transform;text-align:center}
+      .nf-tag .nf-bar{height:5px;width:58px;margin:2px auto 0}
+      .nf-dmg{position:absolute;left:0;top:0;transform:translate(-50%,-100%);font-family:var(--f-mono);font-size:13px;font-weight:700;color:#f0e8da;text-shadow:0 0 3px #000,0 1px 2px #000;will-change:transform,opacity}
+      .nf-dmg.c{color:#f2c460;font-size:15px}.nf-dmg.p{color:#ff8a76}
+      .nf-x{position:absolute;left:50%;top:50%;width:6px;height:6px;margin:-3px 0 0 -3px;border-radius:50%;background:rgba(250,242,226,.95);box-shadow:0 0 0 1.5px rgba(0,0,0,.7)}
+      .nf-lock{position:absolute;left:0;top:0;width:14px;height:14px;margin:-7px 0 0 -7px;border:2px solid #ffe2a8;box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 6px rgba(0,0,0,.6);transform:rotate(45deg);will-change:transform}
+      .nf-storm{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 160px 40px rgba(140,20,40,.55);opacity:0;transition:opacity .4s}
+      .nf-hurt{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 120px 30px rgba(120,10,10,.5);opacity:0}
+      .nf-dawn{position:absolute;left:50%;top:34%;transform:translate(-50%,-50%);text-align:center;font-family:${SERIF};color:#f2e6cc;text-shadow:0 2px 10px #000;opacity:0;transition:opacity .4s;pointer-events:none;white-space:nowrap}
+      .nf-dawn b{display:block;font-size:min(6vh,34px);letter-spacing:.14em;font-weight:700}.nf-dawn span{font-size:15px;letter-spacing:.08em}
+      .nf-tip{position:absolute;left:50%;bottom:150px;transform:translateX(-50%);width:min(70vw,580px);font-size:14px;line-height:1.55;background:rgba(12,9,9,.78);border:1px solid rgba(220,200,170,.25);padding:8px 12px;pointer-events:auto}
+      .nf-tip kbd{font-family:var(--f-mono);font-size:12.5px;padding:0 4px;border:1px solid rgba(220,200,170,.35)}
+      .nf-lockhint{position:absolute;left:50%;top:38%;transform:translate(-50%,-50%);font-size:15px;font-weight:500;padding:8px 16px;background:rgba(12,9,9,.78);border:1px solid rgba(230,200,150,.45);border-radius:4px;text-shadow:0 1px 2px #000;white-space:nowrap}
+      .nf-keys{position:absolute;left:50%;bottom:8px;transform:translateX(-50%);font-size:12.5px;color:#e6dccb;width:max-content;max-width:min(640px,calc(100% - 600px));text-align:center;line-height:1.75;padding:2px 10px;background:rgba(8,6,6,.6);border-radius:4px;text-shadow:0 1px 2px #000}
+      .nf-keys kbd{font-family:var(--f-mono);font-size:12px;font-weight:600;padding:0 4px;margin:0 3px 0 6px;white-space:nowrap;border:1px solid rgba(230,210,180,.5);border-radius:3px}.nf-keys kbd:first-child{margin-left:0}
+      .nf-map{position:absolute;inset:0;background:rgba(6,5,5,.72);display:none;align-items:center;justify-content:center;pointer-events:auto}
+      .nf-map canvas{width:min(78vh,78vw);height:min(78vh,78vw)}
+      .nf-pick{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:radial-gradient(circle at 50% 40%,rgba(30,20,20,.55),rgba(6,5,5,.9));pointer-events:auto;padding:12px 12px 70px;box-sizing:border-box;overflow:auto}
+      .nf-pick h2{margin:0;font-family:${SERIF};font-weight:700;letter-spacing:.12em;font-size:22px;color:#efe2c8}
+      .nf-pick p{margin:0;font-size:14px;color:#d6ccba}
+      .nf-cards{display:grid;grid-template-columns:repeat(3,minmax(180px,290px));gap:8px;max-width:100%}
+      .nf-card{background:rgba(18,14,13,.88);border:1px solid rgba(220,200,170,.2);padding:9px 11px;cursor:pointer;color:#e9dfcc;text-align:left;font-family:var(--f-body);min-height:44px}
+      .nf-card:hover{border-color:rgba(230,194,122,.6)}.nf-card.on{border-color:#e6c27a;background:rgba(40,30,22,.92)}
+      .nf-card h4{margin:0 0 4px;display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;font-family:${SERIF};font-size:16px;letter-spacing:.03em}.nf-card h4 span{white-space:nowrap}.nf-card h4 small{font-family:var(--f-body);font-size:12px;color:#c9bfae;margin-left:auto;white-space:nowrap}
+      .nf-card div{font-size:13px;line-height:1.45;color:#e2d8c6;margin-top:3px}.nf-card div b{color:#e6c27a;font-weight:600}
+      .nf-card .who{font-size:12.5px;font-weight:600;color:#a9d27e;margin-top:4px;min-height:14px}
+      .nf-keys span{white-space:nowrap}
+      @media (max-width:980px){.nf-keys{display:none!important}}
+      @media (max-width:760px){.nf-cards{grid-template-columns:repeat(2,minmax(150px,1fr))}.nf-mini{width:110px;height:110px}.nf-team{display:none}}
+      @media (max-height:520px){.nf-card div{display:none}.nf-card .who{display:block}}
+    ` }));
+
+    /* ======================= 렌더러 · 장면 ======================= */
+    let R;
+    try { R = new THREE.WebGLRenderer({ antialias: TIER.aa, powerPreference: 'high-performance' }); }
+    catch (e) { hooks.progress(1, '3D 그래픽을 켜지 못했습니다.'); return { update() {}, destroy() { wrap.remove(); } }; }
+    R.domElement.className = 'nf3d'; wrap.prepend(R.domElement);
+    R.outputColorSpace = THREE.SRGBColorSpace; R.toneMapping = THREE.ACESFilmicToneMapping; R.toneMappingExposure = 1.3;
+    R.shadowMap.enabled = TIER.shadow > 0; R.shadowMap.type = THREE.PCFSoftShadowMap;
+    R.setPixelRatio(Math.min(window.devicePixelRatio || 1, TIER.pr));
+    const scene = new THREE.Scene();
+    const cam = new THREE.PerspectiveCamera(58, 1, 0.2, 900);
+    const fog = new THREE.Fog(0x5a3f3a, 40, 230 * TIER.fog); scene.fog = fog;
+    const DBG = window.NF_DBG = { scene, R, cam };
+    const ter = S.terrain();
+
+    const hemi = new THREE.HemisphereLight(0x8a7a9a, 0x6a5650, 0.75);
+    const sun = new THREE.DirectionalLight(0xffb070, 2.4);
+    const rimL = new THREE.DirectionalLight(0x7d8ec8, 0.9);
+    scene.add(hemi, sun, sun.target, rimL, rimL.target);
+    if (TIER.shadow) { sun.castShadow = true; sun.shadow.mapSize.set(TIER.shadow, TIER.shadow); const sc = sun.shadow.camera; sc.left = -45; sc.right = 45; sc.top = 45; sc.bottom = -45; sc.near = 1; sc.far = 260; sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.04; }
+
+    /* 하늘 */
+    const skyU = { uSun: { value: new THREE.Vector3(0.3, 0.12, -1).normalize() }, uNight: { value: 0 }, uFin: { value: 0 }, uT: { value: 0 } };
+    const sky = new THREE.Mesh(new THREE.SphereGeometry(800, 32, 16), new THREE.ShaderMaterial({ uniforms: skyU, side: THREE.BackSide, depthWrite: false, fog: false,
+      vertexShader: 'varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+      fragmentShader: `uniform vec3 uSun; uniform float uNight, uFin, uT; varying vec3 vD;
+        float hs(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+        float vn(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f); return mix(mix(hs(i), hs(i+vec2(1,0)), f.x), mix(hs(i+vec2(0,1)), hs(i+vec2(1,1)), f.x), f.y); }
+        float fbm(vec2 p){ float t = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { t += a * vn(p); p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return t; }
+        void main(){ float y = vD.y; float s = max(0.0, dot(vD, uSun));
+          vec3 zen = mix(vec3(0.10,0.09,0.16), vec3(0.025,0.03,0.06), uNight); vec3 hor = mix(vec3(0.82,0.42,0.24), vec3(0.15,0.12,0.19), uNight);
+          hor = mix(hor, vec3(0.30,0.15,0.34), uFin); zen = mix(zen, vec3(0.05,0.025,0.08), uFin);
+          vec3 c = mix(hor, zen, smoothstep(-0.05, 0.55, y));
+          vec3 sunC = mix(vec3(1.0,0.55,0.25), vec3(0.55,0.62,0.8), uNight);
+          c += sunC * (pow(s, 40.0) * 1.6 + pow(s, 6.0) * 0.35) * (1.0 - uFin * 0.7);
+          if (uNight > 0.3) { vec2 q = floor(vD.xz / max(0.05, y) * 120.0); float st = step(0.997, hs(q)) * smoothstep(0.1, 0.4, y); c += vec3(st) * 0.6 * uNight; }
+          vec2 cp = vD.xz / max(0.06, y + 0.12) * 1.3 + vec2(uT * 0.006, uT * 0.002);
+          float cl = fbm(cp); float cl2 = fbm(cp * 2.6 + 4.0);
+          float cov = smoothstep(0.48, 0.78, cl * 0.75 + cl2 * 0.35) * smoothstep(-0.02, 0.2, y);
+          vec3 ccol = mix(mix(vec3(0.20,0.12,0.14), vec3(0.06,0.06,0.09), uNight), sunC * 0.9, pow(s, 3.0) * 0.7 + (1.0 - smoothstep(0.0, 0.35, y)) * 0.25 * (1.0 - uNight));
+          c = mix(c, ccol, cov * 0.82);
+          c = mix(c, hor * 0.85, smoothstep(0.02, -0.15, y));
+          gl_FragColor = vec4(c, 1.0); }` }));
+    sky.renderOrder = -10; scene.add(sky);
+
+    /* ======================= 결 · 재질 ======================= */
+    function noiseTex(sz, f, base, amp) {
+      const c = document.createElement('canvas'); c.width = c.height = sz; const g = c.getContext('2d');
+      g.fillStyle = 'rgb(' + base + ',' + base + ',' + base + ')'; g.fillRect(0, 0, sz, sz);
+      for (let i = 0; i < 900 * f; i++) { const x = Math.random() * sz, y = Math.random() * sz, r = 2 + Math.random() * sz * 0.06 / f, v = Math.round(base + (Math.random() - 0.5) * amp * 2); g.fillStyle = 'rgba(' + v + ',' + v + ',' + v + ',.18)'; for (const dx of [-sz, 0, sz]) for (const dy of [-sz, 0, sz]) { g.beginPath(); g.arc(x + dx, y + dy, r, 0, TAU); g.fill(); } }
+      for (let i = 0; i < 2600; i++) { const v = Math.round(base + (Math.random() - 0.5) * amp * 1.6); g.fillStyle = 'rgba(' + v + ',' + v + ',' + v + ',.5)'; g.fillRect(Math.random() * sz, Math.random() * sz, 1.2, 1.2); } const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = high ? 8 : 2; return t;
+    }
+    const TX = { ground: noiseTex(256, 1, 128, 120), stone: noiseTex(128, 2, 215, 70) };
+    TX.ground.repeat.set(70, 70); TX.stone.repeat.set(1, 1);
+    const RIMC = new THREE.Color(0.42, 0.34, 0.4);
+    function rimify(m, k) {
+      m.onBeforeCompile = (sh) => { sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n{ float rim = 1.0 - clamp(dot(normalize(vViewPosition), normal), 0.0, 1.0); totalEmissiveRadiance += vec3(' + RIMC.r.toFixed(3) + ',' + RIMC.g.toFixed(3) + ',' + RIMC.b.toFixed(3) + ') * pow(rim, 3.0) * ' + k.toFixed(2) + ' * nfRim; }').replace('void main() {', 'uniform float nfRim;\nvoid main() {'); sh.uniforms.nfRim = RIMU; };
+      m.customProgramCacheKey = () => 'rim' + k;
+      return m;
+    }
+    const RIMU = { value: 1 };
+    function groundMat() {
+      const m = Std({ map: TX.ground, color: 0xffffff, roughness: 0.96 });
+      m.onBeforeCompile = (sh) => {
+        sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nvarying vec3 vWP; varying vec3 vWN;').replace('#include <begin_vertex>', '#include <begin_vertex>\nvWP = (modelMatrix * vec4(transformed, 1.0)).xyz; vWN = normalize(mat3(modelMatrix) * objectNormal);');
+        sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vWP; varying vec3 vWN;').replace('#include <map_fragment>', `
+          float n1 = texture2D(map, vWP.xz * 0.011).r, n2 = texture2D(map, vWP.xz * 0.09).r, n3 = texture2D(map, vWP.zx * 0.037 + 0.31).r, n4 = texture2D(map, vWP.xz * 0.43).r;
+          vec3 grass = mix(vec3(0.085, 0.085, 0.036), vec3(0.15, 0.135, 0.06), smoothstep(0.35, 0.75, n1));
+          grass = mix(grass, vec3(0.07, 0.09, 0.04), smoothstep(0.62, 0.8, n2) * 0.6);
+          vec3 dirt = mix(vec3(0.10, 0.07, 0.045), vec3(0.15, 0.11, 0.07), n2);
+          grass = mix(grass, dirt, smoothstep(0.58, 0.72, n3));
+          vec3 rock = mix(vec3(0.11, 0.105, 0.1), vec3(0.22, 0.21, 0.19), n2) * (0.8 + 0.4 * n4);
+          float slope = 1.0 - clamp(vWN.y, 0.0, 1.0);
+          vec3 c = mix(grass, rock, smoothstep(0.1, 0.24, slope + (n2 - 0.5) * 0.1));
+          c = mix(c, rock * 1.1, smoothstep(17.0, 30.0, vWP.y + n1 * 4.0));
+          c = mix(c, vec3(0.05, 0.045, 0.04), smoothstep(${(S.WL + 1.3).toFixed(2)}, ${(S.WL - 0.4).toFixed(2)}, vWP.y));
+          c *= 0.82 + 0.36 * n4;
+          diffuseColor.rgb *= c * 1.7;`);
+      };
+      m.customProgramCacheKey = () => 'nfground';
+      return m;
+    }
+
+    const Std = (o, rim) => {
+      let m;
+      if (low) { const q = Object.assign({}, o); delete q.roughness; delete q.metalness; m = new THREE.MeshLambertMaterial(q); }
+      else m = new THREE.MeshStandardMaterial(Object.assign({ roughness: 0.85, metalness: 0.05 }, o));
+      return rim ? rimify(m, rim) : m;
+    };
+    const MC = {};
+    const matC = (hex, o) => { const k = hex + JSON.stringify(o || {}); return MC[k] || (MC[k] = Std(Object.assign({ color: new THREE.Color(hex) }, o || {}), 0.45)); };
+    const MT = {
+      ground: groundMat(),
+      inst: Std({ color: 0xffffff, map: TX.stone, roughness: 0.9 }),
+      tree: Std({ vertexColors: true, roughness: 0.9 }),
+      water: new THREE.MeshStandardMaterial({ color: 0x1d2228, roughness: 0.15, metalness: 0.6, transparent: true, opacity: 0.86 }),
+      glow: new THREE.MeshBasicMaterial({ color: 0xffd28a, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }),
+      beam: new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.32, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }),
+      flame: new THREE.MeshBasicMaterial({ color: 0xff8a3a, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }),
+      proj: new THREE.MeshBasicMaterial({ color: 0xffffff }),
+      projA: new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+      rockP: Std({ color: 0xffffff, roughness: 0.95 }),
+      chest: Std({ color: 0x5a432c, roughness: 0.8 }), chestM: Std({ color: 0x6d6a62, roughness: 0.5, metalness: 0.5 }),
+    };
+
+    /* ======================= 지형 ======================= */
+    const GN = S.GN, HALF = S.HALF;
+    const tGeo = new THREE.PlaneGeometry(HALF * 2, HALF * 2, GN - 1, GN - 1); tGeo.rotateX(-PI / 2);
+    { const pos = tGeo.attributes.position, col = new Float32Array(pos.count * 3);
+      for (let i = 0; i < pos.count; i++) pos.setY(i, ter.H[i]);
+      tGeo.computeVertexNormals();
+      const nor = tGeo.attributes.normal;
+      const cG = new THREE.Color(0x67653f), cD = new THREE.Color(0x66523c), cR = new THREE.Color(0x77726a), cM = new THREE.Color(0x3a342c), cA = new THREE.Color(0x705a48), c = new THREE.Color();
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), z = pos.getZ(i), y = pos.getY(i), ny = nor.getY(i);
+        const n1 = Math.sin(x * 0.05 + Math.sin(z * 0.04) * 2) * 0.5 + 0.5, n2 = Math.sin(z * 0.11 + x * 0.03) * 0.5 + 0.5;
+        c.copy(cG).lerp(cD, n1 * 0.6).lerp(cA, n2 * 0.25);
+        if (ny < 0.86) c.lerp(cR, smt((0.86 - ny) / 0.18));
+        if (y > 18) c.lerp(cR, smt((y - 18) / 14));
+        if (y < S.WL + 1.2) c.lerp(cM, smt((S.WL + 1.2 - y) / 1.5));
+        col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+      }
+      tGeo.setAttribute('color', new THREE.BufferAttribute(col, 3)); }
+    const terrain = new THREE.Mesh(tGeo, MT.ground); terrain.receiveShadow = !!TIER.shadow; scene.add(terrain);
+    const water = new THREE.Mesh(new THREE.CircleGeometry(95, 48).rotateX(-PI / 2), MT.water); water.position.set(-105, S.WL, 95); scene.add(water);
+    // 바깥 산 (가장자리 너머)
+    { const g = new THREE.CylinderGeometry(520, 560, 90, 48, 1, true); const pp = g.attributes.position; for (let i = 0; i < pp.count; i++) { const y = pp.getY(i); if (y > 0) { const a = Math.atan2(pp.getZ(i), pp.getX(i)); pp.setY(i, y + Math.sin(a * 9) * 18 + Math.sin(a * 23) * 9); } } g.computeVertexNormals();
+      const m = new THREE.Mesh(g, new THREE.ShaderMaterial({ uniforms: { uF: { value: fog.color } }, side: THREE.BackSide, fog: false,
+        vertexShader: 'varying float vY; varying float vA; void main(){ vY = position.y; vA = atan(position.z, position.x); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+        fragmentShader: 'uniform vec3 uF; varying float vY; varying float vA; void main(){ float h = smoothstep(-30.0, 55.0, vY); float rid = 0.5 + 0.5 * sin(vA * 61.0 + vY * 0.21) * sin(vA * 17.0 - vY * 0.09); vec3 c = mix(uF, uF * (0.36 + 0.1 * rid) + vec3(0.012, 0.008, 0.016), h * 0.9); gl_FragColor = vec4(c, 1.0);\n#include <tonemapping_fragment>\n#include <colorspace_fragment>\n}' })); m.position.y = 20; scene.add(m); }
+
+    /* ======================= 모양 도우미 ======================= */
+    const M4 = (x, y, z, rx, ry, rz, sx, sy, sz) => { const m = new THREE.Matrix4(); m.compose(new THREE.Vector3(x || 0, y || 0, z || 0), new THREE.Quaternion().setFromEuler(new THREE.Euler(rx || 0, ry || 0, rz || 0)), new THREE.Vector3(sx || 1, sy || 1, sz || 1)); return m; };
+    function prep(g, m, col) {
+      const q = g.index ? g.toNonIndexed() : g.clone(); if (m) q.applyMatrix4(m);
+      for (const k of Object.keys(q.attributes)) if (k !== 'position' && k !== 'normal' && k !== 'uv') q.deleteAttribute(k);
+      if (!q.attributes.uv) q.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(q.attributes.position.count * 2), 2));
+      if (col != null) { const c = new THREE.Color(col), a = new Float32Array(q.attributes.position.count * 3); for (let i = 0; i < a.length; i += 3) { a[i] = c.r; a[i + 1] = c.g; a[i + 2] = c.b; } q.setAttribute('color', new THREE.BufferAttribute(a, 3)); }
+      return q;
+    }
+    const merge = (list) => THREE.BufferGeometryUtils.mergeGeometries(list.map(([g, m, c]) => prep(g, m, c)), false);
+    const IM = (geo, mat, n, shadow) => { const im = new THREE.InstancedMesh(geo, mat, Math.max(1, n)); im.count = 0; im.castShadow = !!(shadow && TIER.shadow); im.receiveShadow = !!TIER.shadow; im.frustumCulled = false; scene.add(im); return im; };
+    const tmpM = new THREE.Matrix4(), tmpC = new THREE.Color();
+
+    /* ======================= 정적 세계 (판마다 한 번) ======================= */
+    const staticG = [];
+    let built = '';
+    function buildStatic(W) {
+      const key = String(W.seed);
+      if (built === key) return; built = key;
+      for (const o of staticG) { scene.remove(o); if (o.isInstancedMesh) o.dispose(); }
+      staticG.length = 0;
+      const add = (o) => { staticG.push(o); return o; };
+      // 나무 2종
+      const pineG = merge([[new THREE.CylinderGeometry(0.16, 0.3, 3.2, 6), M4(0, 1.6, 0), 0x4c3b2c], [new THREE.ConeGeometry(1.6, 3.2, 8), M4(0, 3.6, 0, 0, 0.3, 0), 0x3b4a2f], [new THREE.ConeGeometry(1.25, 2.8, 8), M4(0, 5.0, 0, 0, 0.9, 0), 0x435335], [new THREE.ConeGeometry(0.85, 2.2, 8), M4(0, 6.3, 0, 0, 1.6, 0), 0x4b5a3a]]);
+      const deadG = merge([[new THREE.CylinderGeometry(0.14, 0.32, 5, 6), M4(0, 2.5, 0), 0x574839], [new THREE.CylinderGeometry(0.05, 0.11, 2.2, 5), M4(0.6, 3.6, 0, 0, 0, -0.9), 0x574839], [new THREE.CylinderGeometry(0.05, 0.1, 1.9, 5), M4(-0.5, 4.1, 0.2, 0.3, 0, 0.8), 0x574839], [new THREE.CylinderGeometry(0.04, 0.08, 1.5, 5), M4(0.1, 4.6, -0.5, -0.8, 0, 0), 0x574839]]);
+      const trees = ter.trees.filter((t, i) => S.treeOn(W, t) && (i % 10) / 10 < TIER.trees);
+      const tp = trees.filter((t) => t[3] === 1), td = trees.filter((t) => t[3] !== 1);
+      for (const [geo, list] of [[pineG, tp], [deadG, td]]) {
+        const im = add(IM(geo, MT.tree, list.length, true));
+        list.forEach((t, i) => { const y = S.Hat(t[0], t[1]); im.setMatrixAt(i, M4(t[0], y - 0.2, t[1], 0, t[4], 0, t[2], t[2], t[2])); });
+        im.count = list.length; im.instanceMatrix.needsUpdate = true;
+      }
+      // 바위
+      // 면마다 꼭짓점이 따로 있는 도형이라, 같은 자리의 꼭짓점은 똑같이 밀어야 틈이 안 벌어진다(번호로 밀면 바위에 구멍이 남).
+      const ph3 = (x, y, z, k) => { const v = Math.sin(Math.round(x * 50) * 12.9898 + Math.round(y * 50) * 78.233 + Math.round(z * 50) * 37.719 + k * 4.31) * 43758.5453; return v - Math.floor(v); };
+      const rg = new THREE.IcosahedronGeometry(1, 1); { const p = rg.attributes.position; for (let i = 0; i < p.count; i++) { const x = p.getX(i), y = p.getY(i), z = p.getZ(i); const k = 0.8 + ph3(x, y, z, 1) * 0.34, fl = y < -0.25 ? 0.55 : 1; p.setXYZ(i, x * k * (1 + (ph3(x, y, z, 2) - 0.5) * 0.16), Math.max(-0.42, y * k * 0.82 * fl), z * k * (1 + (ph3(x, y, z, 3) - 0.5) * 0.16)); } rg.computeVertexNormals(); }
+      const rocks = ter.rocks.filter((r) => S.treeOn(W, r));
+      const rim = add(IM(rg, MT.rockP, rocks.length + 1400, true));
+      let rn = 0;
+      rocks.forEach((r) => { rim.setMatrixAt(rn, M4(r[0], S.Hat(r[0], r[1]) + r[2] * 0.2, r[1], 0.2, r[3], 0.1, r[2], r[2] * 0.75, r[2] * 1.1)); rim.setColorAt(rn++, tmpC.setHSL(0.07, 0.06, 0.24 + r[4] * 0.08)); });
+      // 거점 구조물
+      const PAL = [0x6c675e, 0x868073, 0x9c9486, 0x6e553c, 0x57504c, 0x6e6a62, 0x0b0a0a];
+      const boxG = new THREE.BoxGeometry(1, 1, 1), cylG = new THREE.CylinderGeometry(0.5, 0.55, 1, 10), coneG = new THREE.ConeGeometry(0.5, 1, 6);
+      const prism = new THREE.BufferGeometry(); { const v = [-0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0, 0.5, -0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0, 0.5, 0.5]; const ix = [0, 2, 1, 3, 4, 5, 0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4, 2, 0, 3, 2, 3, 5]; prism.setAttribute('position', new THREE.Float32BufferAttribute(v, 3)); prism.setIndex(ix); prism.computeVertexNormals(); }
+      const byK = { box: [], cyl: [], tent: [], roof: [], fire: [] };
+      for (const pt of W.parts) {
+        const k = pt[0];
+        if (k === 'chest') continue;
+        if (k === 'rock') { rim.setMatrixAt(rn, M4(pt[1], pt[2], pt[3], 0.15, pt[7], 0, pt[4] * 0.5, pt[5] * 0.5, pt[6] * 0.5)); rim.setColorAt(rn++, tmpC.set(PAL[5]).multiplyScalar(0.9)); continue; }
+        (byK[k === 'plinth' || k === 'altar' ? 'box' : k] || byK.box).push(pt);
+      }
+      const mk = (geo, list, yoff) => { const im = add(IM(geo, MT.inst, list.length, true)); list.forEach((pt, i) => { im.setMatrixAt(i, M4(pt[1], pt[2] + (yoff || 0), pt[3], 0, pt[7], 0, pt[4], pt[5], pt[6])); im.setColorAt(i, tmpC.set(PAL[pt[8]] || PAL[0])); }); im.count = list.length; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; return im; };
+      // 무너진 벽 · 부러진 기둥(모양 넷씩, 꼭대기가 들쭉날쭉) + 밑동 잔해
+      const hsh = (a2, b2) => { const v = Math.sin(a2 * 12.9898 + b2 * 78.233) * 43758.5453; return v - Math.floor(v); };
+      const brokenBox = (v) => { const g = new THREE.BoxGeometry(1, 1, 1, 8, 3, 2); const q = g.attributes.position; for (let i = 0; i < q.count; i++) { const x = q.getX(i), y = q.getY(i); if (y > 0.49) q.setY(i, 0.5 - (0.15 + 0.85 * hsh(Math.round(x * 8) + v * 3.1, v)) * (Math.abs(x) > 0.3 ? 0.7 : 0.35) * (v ? 1 : 0.4)); else if (y > -0.2) q.setX(i, x + (hsh(Math.round(x * 16) + Math.round(y * 6) * 31 + Math.round(q.getZ(i) * 4) * 57, v) - 0.5) * 0.04); } g.computeVertexNormals(); return g; };
+      const brokenCyl = (v) => { const g = new THREE.CylinderGeometry(0.46, 0.55, 1, 10, 3); const q = g.attributes.position; for (let i = 0; i < q.count; i++) { const y = q.getY(i); if (y > 0.49) q.setY(i, 0.5 - 0.25 * hsh(Math.atan2(q.getZ(i), q.getX(i)) * 3 + v, v) - (q.getX(i) > 0 ? 0.12 * v : 0)); } g.computeVertexNormals(); return g; };
+      const walls = [[], [], [], []], plain = [], pils = [[], [], [], []], cyls = [];
+      byK.box.forEach((pt, i) => { if (pt[5] > 1.6 && (pt[4] > 1.8 || pt[6] > 1.8)) walls[i % 4].push(pt); else plain.push(pt); });
+      byK.cyl.forEach((pt, i) => { if (pt[5] > 1.5 && pt[4] < 1.5) pils[i % 4].push(pt); else cyls.push(pt); });
+      walls.forEach((L_, v) => mk(brokenBox(v), L_)); pils.forEach((L_, v) => mk(brokenCyl(v), L_));
+      mk(boxG, plain); mk(cylG, cyls); mk(prism, byK.roof);
+      // 천막: 용마루가 있는 천막(입구 · 버팀대) / 모닥불: 돌 두른 장작
+      const triG = (v) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(v, 3)); g.computeVertexNormals(); return g; };
+      const propM = Std({ vertexColors: true, map: TX.stone, roughness: 1, side: THREE.DoubleSide });
+      if (byK.tent.length) {
+        const A = [-0.5, -0.5, -0.5], B = [0.5, -0.5, -0.5], C = [0.5, -0.5, 0.5], Dp = [-0.5, -0.5, 0.5], E = [0, 0.42, -0.4], F = [0, 0.42, 0.4];
+        const tentG = merge([
+          [triG([].concat(Dp, C, F, A, E, B)), null, 0xa08d70],
+          [triG([].concat(A, Dp, F, A, F, E)), null, 0xb09c7c], [triG([].concat(C, B, E, C, E, F)), null, 0x94826a],
+          [triG([-0.2, -0.5, 0.505, 0.2, -0.5, 0.505, 0, 0.12, 0.42]), null, 0x14100e],
+          [new THREE.BoxGeometry(0.035, 0.035, 1.06), M4(0, 0.43, 0), 0x4a3a2a],
+          [new THREE.CylinderGeometry(0.02, 0.025, 1.0, 5), M4(0, -0.03, 0.42), 0x4a3a2a], [new THREE.CylinderGeometry(0.02, 0.025, 1.0, 5), M4(0, -0.03, -0.42), 0x4a3a2a],
+        ]);
+        const im = add(IM(tentG, propM, byK.tent.length, true));
+        byK.tent.forEach((pt, i) => { im.setMatrixAt(i, M4(pt[1], pt[2], pt[3], 0, pt[7], 0, pt[4] * 1.15, pt[5], pt[6] * 1.25)); im.setColorAt(i, tmpC.setHSL(0.09, 0.1, 0.78 + hsh(pt[1], pt[3]) * 0.2)); });
+        im.count = byK.tent.length; im.instanceMatrix.needsUpdate = true; im.instanceColor.needsUpdate = true;
+      }
+      if (byK.fire.length) {
+        const L0 = [];
+        for (let k = 0; k < 8; k++) { const a2 = k / 8 * TAU + 0.2, r2 = 0.13 + hsh(k, 5) * 0.05; L0.push([new THREE.IcosahedronGeometry(1, 0), M4(Math.sin(a2) * 0.52, r2 * 0.4, Math.cos(a2) * 0.52, k, k * 2, 0, r2 * 1.2, r2 * 0.8, r2), k % 3 ? 0x6a665e : 0x57534d]); }
+        for (let k = 0; k < 4; k++) { const a2 = k / 4 * PI + 0.3; L0.push([new THREE.CylinderGeometry(0.055, 0.065, 0.78, 6), M4(Math.sin(a2) * 0.05, 0.16, Math.cos(a2) * 0.05, PI / 2 - 0.42, a2, 0), k % 2 ? 0x2a1d14 : 0x35261a]); }
+        L0.push([new THREE.CylinderGeometry(0.4, 0.44, 0.04, 10), M4(0, 0.02, 0), 0x1a1614]);
+        const im = add(IM(merge(L0), propM, byK.fire.length, true));
+        byK.fire.forEach((pt, i) => { im.setMatrixAt(i, M4(pt[1], S.Hat(pt[1], pt[3]), pt[3], 0, pt[7], 0)); im.setColorAt(i, tmpC.set(0xffffff)); });
+        im.count = byK.fire.length; im.instanceMatrix.needsUpdate = true; im.instanceColor.needsUpdate = true;
+      }
+      for (const pt of byK.box.concat(byK.cyl)) { if (pt[5] < 1.5) continue; const n = 2 + ((pt[1] * 7) | 0) % 3; for (let k = 0; k < n && rn < rim.instanceMatrix.count - 720; k++) { const a2 = hsh(pt[1] + k, pt[3]) * TAU, d2 = Math.max(pt[4], pt[6]) * 0.5 + 0.4 + hsh(k, pt[1]) * 1.2, x = pt[1] + Math.sin(a2) * d2, z = pt[3] + Math.cos(a2) * d2, rr = 0.18 + hsh(pt[3], k) * 0.35; rim.setMatrixAt(rn, M4(x, S.Hat(x, z) + rr * 0.25, z, a2, a2 * 2, 0, rr * 1.3, rr * 0.8, rr)); rim.setColorAt(rn++, tmpC.set(PAL[pt[8]] || PAL[1]).multiplyScalar(0.85)); } }
+      // 흩어진 돌
+      const capR = rim.instanceMatrix.count;
+      for (let k = 0; k < (low ? 250 : 700) && rn < capR; k++) { const x = (hsh(k, 1) * 2 - 1) * 190, z = (hsh(k, 2) * 2 - 1) * 190; if (S.wet(x, z)) continue; const rr = 0.1 + hsh(k, 3) * 0.3; rim.setMatrixAt(rn, M4(x, S.Hat(x, z) + rr * 0.2, z, k, k * 1.7, 0, rr * 1.2, rr * 0.7, rr)); rim.setColorAt(rn++, tmpC.setHSL(0.07, 0.05, 0.22 + hsh(k, 4) * 0.1)); }
+      rim.count = rn; rim.instanceMatrix.needsUpdate = true; if (rim.instanceColor) rim.instanceColor.needsUpdate = true;
+      // 풀포기
+      const gN = low ? 0 : high ? 9000 : 4500;
+      if (gN) {
+        const blade = (ang, h, lean) => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([-0.035, 0, 0, 0.035, 0, 0, lean, h * 1.15, 0.02], 3)); g.computeVertexNormals(); g.rotateY(ang); return g; };
+        const tuft = merge([[blade(0, 0.34, 0.06), null, 0x8a8648], [blade(1.1, 0.28, -0.08), null, 0x9a8a50], [blade(2.2, 0.38, 0.04), null, 0x7a7c40], [blade(3.0, 0.25, 0.09), null, 0xa08a56], [blade(4.1, 0.31, -0.05), null, 0x868246], [blade(5.0, 0.22, 0.07), null, 0x928648], [blade(0.6, 0.3, -0.07), M4(0.09, 0, 0.05), 0x8c8446], [blade(2.7, 0.26, 0.06), M4(-0.08, 0, 0.07), 0x96884c], [blade(4.6, 0.33, 0.05), M4(0.02, 0, -0.1), 0x82803f]]);
+        { const nA = tuft.attributes.normal; for (let i = 0; i < nA.count; i++) nA.setXYZ(i, 0, 1, 0); }
+        { const cA = tuft.attributes.color, pA = tuft.attributes.position; for (let i = 0; i < pA.count; i++) { const k2 = pA.getY(i) > 0.1 ? 0.62 : 0.4; cA.setXYZ(i, cA.getX(i) * k2, cA.getY(i) * k2, cA.getZ(i) * k2); } }
+        const gm2 = Std({ vertexColors: true, side: THREE.DoubleSide, roughness: 1 });
+        const gim = add(IM(tuft, gm2, gN, false)); let gc = 0;
+        for (let k = 0; k < gN * 2 && gc < gN; k++) { const x = (hsh(k, 7) * 2 - 1) * 188, z = (hsh(k, 8) * 2 - 1) * 188, y = S.Hat(x, z); if (y < S.WL + 0.6 || y > 22) continue; const sl = Math.abs(S.Hat(x + 1.5, z) - S.Hat(x - 1.5, z)) + Math.abs(S.Hat(x, z + 1.5) - S.Hat(x, z - 1.5)); if (sl > 1.2) continue; const sc2 = 0.6 + hsh(k, 9) * 0.7; gim.setMatrixAt(gc++, M4(x, y - 0.03, z, 0, hsh(k, 10) * TAU, 0, sc2, sc2 * (0.8 + hsh(k, 11) * 0.6), sc2)); }
+        gim.count = gc; gim.instanceMatrix.needsUpdate = true; gim.receiveShadow = false;
+      }
+      const fires = byK.fire;
+      if (fires.length) { const fl = add(IM(merge([[new THREE.ConeGeometry(0.26, 0.85, 7), M4(0, 0.425, 0)], [new THREE.ConeGeometry(0.15, 0.5, 6), M4(0.03, 0.25, 0.02)], [new THREE.ConeGeometry(0.1, 0.42, 5), M4(-0.11, 0.21, -0.06)]]), MT.flame, fires.length)); fires.forEach((pt, i) => fl.setMatrixAt(i, M4(pt[1], S.Hat(pt[1], pt[3]) + 0.1, pt[3]))); fl.count = fires.length; fl.instanceMatrix.needsUpdate = true; fireIM = fl; fireL = fires; }
+      // 상자
+      chestIM = add(IM(new THREE.BoxGeometry(1.1, 0.55, 0.7), MT.chest, W.CH.length, true));
+      lidIM = add(IM(merge([[new THREE.BoxGeometry(1.14, 0.18, 0.74), M4(0, 0.09, 0.37)], [new THREE.BoxGeometry(1.16, 0.06, 0.06), M4(0, 0.1, 0.72)]]), MT.chestM, W.CH.length, true));
+      // 지도 바탕
+      buildMapBase(W);
+      DBG.static = { trees: trees.length, rocks: rn, parts: W.parts.length };
+    }
+    let fireIM = null, fireL = [], chestIM = null, lidIM = null;
+
+    /* 은총 · 떨어진 것 · 빛기둥 (매 프레임) */
+    const graceIM = IM(new THREE.SphereGeometry(0.2, 10, 8), MT.glow, 20);
+    const beamIM = IM(new THREE.CylinderGeometry(0.12, 0.12, 1, 6, 1, true), MT.beam, 120);
+    const dropIM = IM(new THREE.BoxGeometry(0.12, 0.05, 1.1), Std({ color: 0x9a948a, roughness: 0.5, metalness: 0.6 }), 90);
+    const itemIM = IM(new THREE.SphereGeometry(0.18, 8, 6), MT.projA, 90);
+
+    /* 폭풍의 벽 */
+    const stormU = { uT: { value: 0 }, uC: { value: new THREE.Color(0.62, 0.12, 0.2) }, uA: { value: 1 } };
+    const stormM = new THREE.ShaderMaterial({ uniforms: stormU, transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false,
+      vertexShader: 'varying vec2 vU; varying float vY; void main(){ vU = uv; vY = position.y; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+      fragmentShader: `uniform float uT, uA; uniform vec3 uC; varying vec2 vU; varying float vY;
+        float hs(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+        float vn(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f); return mix(mix(hs(i), hs(i+vec2(1,0)), f.x), mix(hs(i+vec2(0,1)), hs(i+vec2(1,1)), f.x), f.y); }
+        float fbm(vec2 p){ float t = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { t += a * vn(p); p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return t; }
+        void main(){ vec2 p = vec2(vU.x * 140.0, vU.y * 16.0);
+          float f = fbm(p * 0.35 + vec2(uT * 0.22, -uT * 0.35));
+          float g = fbm(p * 0.7 + vec2(-uT * 0.4, uT * 0.12) + f * 2.4);
+          float streak = sin(vU.x * 1400.0 + g * 7.0 + uT * 0.9) * 0.5 + 0.5;
+          float a = (0.12 + 0.55 * g * g + 0.1 * streak) * smoothstep(1.0, 0.3, vU.y) * smoothstep(0.0, 0.06, vU.y);
+          vec3 c = mix(uC * 0.55, uC * 1.7 + vec3(0.25, 0.06, 0.12), g) + vec3(0.6, 0.3, 0.4) * pow(g, 6.0);
+          gl_FragColor = vec4(c, a * uA); }` });
+    const storm = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 96, 1, true), stormM); storm.renderOrder = 5; scene.add(storm);
+    const stormFloor = new THREE.Mesh(new THREE.RingGeometry(0.985, 1, 128).rotateX(-PI / 2), new THREE.MeshBasicMaterial({ color: 0xc03040, transparent: true, opacity: 0.55, depthWrite: false, fog: false })); scene.add(stormFloor);
+
+    /* 예고 표시 · 폭발 */
+    const decalM = (c) => new THREE.ShaderMaterial({ uniforms: { uC: { value: new THREE.Color(c) }, uA: { value: 0.3 }, uR: { value: 0 } }, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, fog: false,
+      vertexShader: 'varying vec2 vU; void main(){ vU = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+      fragmentShader: 'uniform vec3 uC; uniform float uA, uR; varying vec2 vU; void main(){ gl_FragColor = vec4(uC, uA); }' });
+    const decals = [];
+    function decal() {
+      for (const d of decals) if (!d.on) { d.on = 1; d.m.visible = true; return d; }
+      const m = new THREE.Mesh(new THREE.BufferGeometry(), decalM(0xa02a22)); m.renderOrder = 6; scene.add(m);
+      const d = { m, on: 1, key: '' }; decals.push(d); return d;
+    }
+    const geoCache = {};
+    function shapeGeo(sh) {
+      const k = sh.join(',');
+      if (geoCache[k]) return geoCache[k];
+      let g;
+      if (sh[0] === 'arc') { const a = sh[2] * PI / 180; g = new THREE.CircleGeometry(sh[1], 32, (sh[3] || 0) * PI / 180 - PI / 2 - a, a * 2); g.rotateX(-PI / 2); }
+      else if (sh[0] === 'circ') { g = new THREE.CircleGeometry(sh[1], 40); g.rotateX(-PI / 2); g.translate(0, 0, sh[2]); }
+      else if (sh[0] === 'ring') { g = new THREE.RingGeometry(Math.max(0.01, sh[1]), sh[2], 48); g.rotateX(-PI / 2); }
+      else { g = new THREE.PlaneGeometry(sh[2], sh[1]); g.rotateX(-PI / 2); g.translate(0, 0, sh[1] / 2); }
+      return (geoCache[k] = g);
+    }
+    const booms = [];
+    const boomG = new THREE.RingGeometry(0.82, 1, 40).rotateX(-PI / 2), boomD = new THREE.CircleGeometry(1, 32).rotateX(-PI / 2);
+    function boom(x, z, r, kind) {
+      let b = booms.find((q) => !q.on);
+      if (!b) { const m = new THREE.Mesh(boomG, new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false })); const m2 = new THREE.Mesh(boomD, new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false })); scene.add(m, m2); b = { m, m2 }; booms.push(b); }
+      const col = [0xd9b48a, 0xff7a30, 0x9ad0ff, 0x8ab040, 0x9a6aff][kind] || 0xd9b48a;
+      b.on = 1; b.t = 0; b.r = r; b.m.material.color.set(col); b.m2.material.color.set(col); b.m.visible = b.m2.visible = true;
+      const y = S.Hat(x, z) + 0.25; b.m.position.set(x, y, z); b.m2.position.set(x, y, z);
+    }
+    /* 불티 */
+    const NP = low ? 300 : 700, pPos = new Float32Array(NP * 3), pVel = new Float32Array(NP * 3), pAge = new Float32Array(NP), pCol = new Float32Array(NP * 3);
+    const pGeo = new THREE.BufferGeometry(); pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3)); pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
+    const dotTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 32; const g = c.getContext('2d'), gr = g.createRadialGradient(16, 16, 0, 16, 16, 16); gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.45, 'rgba(255,255,255,.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = gr; g.fillRect(0, 0, 32, 32); return new THREE.CanvasTexture(c); })();
+    const ptsMat = new THREE.PointsMaterial({ size: 0.2, map: dotTex, vertexColors: true, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
+    const pts = new THREE.Points(pGeo, ptsMat); pts.frustumCulled = false; scene.add(pts);
+    for (let i = 0; i < NP; i++) { pAge[i] = 99; pPos[i * 3 + 1] = -500; }
+    let pN = 0;
+    function spark(x, y, z, n, col, sp, up) {
+      const c = new THREE.Color(col);
+      for (let k = 0; k < n; k++) { const i = pN; pN = (pN + 1) % NP; pPos[i * 3] = x; pPos[i * 3 + 1] = y; pPos[i * 3 + 2] = z; const a = Math.random() * TAU, s = sp * (0.4 + Math.random()); pVel[i * 3] = Math.cos(a) * s; pVel[i * 3 + 1] = (up || 2) * (0.4 + Math.random()); pVel[i * 3 + 2] = Math.sin(a) * s; pAge[i] = 0; pCol[i * 3] = c.r; pCol[i * 3 + 1] = c.g; pCol[i * 3 + 2] = c.b; }
+    }
+    /* 칼 궤적(가산 리본) */
+    const trailMat = new THREE.ShaderMaterial({ uniforms: {}, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, fog: false,
+      vertexShader: 'attribute float a; attribute vec3 c; varying float vA; varying vec3 vC; void main(){ vA = a; vC = c; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+      fragmentShader: 'varying float vA; varying vec3 vC; void main(){ gl_FragColor = vec4(vC * vA, vA); }' });
+    const TN = 12, trails = [];
+    function trailFor(r, col) {
+      if (r.trail) return r.trail;
+      const g = new THREE.BufferGeometry(), pos = new Float32Array(TN * 2 * 3), al = new Float32Array(TN * 2), cc = new Float32Array(TN * 2 * 3);
+      const ix = []; for (let i = 0; i < TN - 1; i++) { const a = i * 2; ix.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('a', new THREE.BufferAttribute(al, 1)); g.setAttribute('c', new THREE.BufferAttribute(cc, 3)); g.setIndex(ix);
+      const m = new THREE.Mesh(g, trailMat); m.frustumCulled = false; m.renderOrder = 7; m.visible = false; scene.add(m);
+      const t = { m, g, pos, al, cc, n: 0, fade: 0, col: new THREE.Color(col) }; trails.push(t); return (r.trail = t);
+    }
+    const tvA = new THREE.Vector3(), tvB = new THREE.Vector3();
+    function trailTick(r, dt, col) {
+      if (!r.trailOk || !r.tipA) return;
+      const on = r.atkOn && r.root.visible;
+      if (!on && !r.trail) return;
+      const t = trailFor(r, col);
+      if (on) {
+        r.tipA.getWorldPosition(tvA); r.tipB.getWorldPosition(tvB);
+        t.pos.copyWithin(6, 0, (TN - 1) * 6);
+        t.pos[0] = tvA.x; t.pos[1] = tvA.y; t.pos[2] = tvA.z; t.pos[3] = tvB.x; t.pos[4] = tvB.y; t.pos[5] = tvB.z;
+        t.n = Math.min(TN, t.n + 1); t.fade = 1;
+      } else { t.fade = Math.max(0, t.fade - dt * 7); if (t.fade <= 0) { t.n = 0; t.m.visible = false; return; } }
+      for (let i = 0; i < TN; i++) { const k = i < t.n ? (1 - i / TN) * t.fade * 0.55 : 0; t.al[i * 2] = k * 0.25; t.al[i * 2 + 1] = k; for (let j = 0; j < 2; j++) { t.cc[(i * 2 + j) * 3] = t.col.r; t.cc[(i * 2 + j) * 3 + 1] = t.col.g; t.cc[(i * 2 + j) * 3 + 2] = t.col.b; } }
+      if (t.n < TN) for (let i = t.n; i < TN; i++) for (let q = 0; q < 6; q++) t.pos[i * 6 + q] = t.pos[Math.max(0, t.n - 1) * 6 + q];
+      t.g.attributes.position.needsUpdate = true; t.g.attributes.a.needsUpdate = true; t.g.attributes.c.needsUpdate = true; t.m.visible = t.n > 1;
+    }
+    /* 타격 섬광(빌보드) */
+    const flashTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d'); const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.25, 'rgba(255,230,190,.7)'); gr.addColorStop(1, 'rgba(255,200,140,0)'); g.fillStyle = gr; g.fillRect(0, 0, 64, 64); g.strokeStyle = 'rgba(255,240,220,.8)'; g.lineWidth = 2; g.beginPath(); g.moveTo(4, 32); g.lineTo(60, 32); g.moveTo(32, 10); g.lineTo(32, 54); g.stroke(); return new THREE.CanvasTexture(c); })();
+    const flashes = [];
+    function flash(x, y, z, sz, col) {
+      let f = flashes.find((q) => !q.on);
+      if (!f) { if (flashes.length >= 14) f = flashes[0]; else { const sp2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: flashTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false })); scene.add(sp2); f = { sp: sp2 }; flashes.push(f); } }
+      f.on = 1; f.t = 0; f.sz = sz; f.sp.position.set(x, y, z); f.sp.material.color.set(col || 0xffe0b0); f.sp.material.rotation = Math.random() * PI; f.sp.visible = true;
+    }
+    function flashTick(dt) { for (const f of flashes) if (f.on) { f.t += dt; const u = f.t / 0.14; if (u >= 1) { f.on = 0; f.sp.visible = false; continue; } const s2 = f.sz * (0.6 + u * 0.8); f.sp.scale.set(s2, s2, 1); f.sp.material.opacity = 1 - u; } }
+    /* 은총의 빛(가까운 하나) */
+    const graceL = low ? null : new THREE.PointLight(0xffc070, 0, 22, 1.5);
+    if (graceL) scene.add(graceL);
+    let hitStop = 0;
+    /* 투사체 */
+    const prThin = IM(new THREE.BoxGeometry(0.06, 0.06, 1.0), MT.proj, 80), prOrb = IM(new THREE.SphereGeometry(0.3, 10, 8), MT.projA, 80), prRock = IM(new THREE.DodecahedronGeometry(0.5, 0), MT.rockP, 30);
+    const PRC = { arrow: 0xd8cfc0, knife: 0xc8c8d0, spear: 0xf0e0a0, great: 0xf0d8a0, lance: 0xb0c8ff, bolt: 0xc0a8ff, orb: 0xa890ff, orb2: 0x9a7aff, dark: 0x7a3aff, wave: 0xff9a5a, sun: 0xffb050, spit: 0x9ac040, fpot: 0x8a5a3a, ipot: 0x6a8a9a, pot: 0x7a5a3a, rock: 0x6a6258 };
+
+    /* ======================= 인물 · 괴물 뼈대 ======================= */
+    const geo = { box: new THREE.BoxGeometry(1, 1, 1), sph: new THREE.SphereGeometry(0.5, 14, 10), cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 10), cone: new THREE.ConeGeometry(0.5, 1, 10), cap: new THREE.CapsuleGeometry(0.5, 1, 4, 10) };
+    function J(par, x, y, z) { const g = new THREE.Group(); g.position.set(x, y, z); par.add(g); return g; }
+    function Mh(par, g, m, x, y, z, sx, sy, sz, rx, ry, rz) { const o = new THREE.Mesh(g, m); o.position.set(x, y, z); o.scale.set(sx, sy, sz); if (rx || ry || rz) o.rotation.set(rx || 0, ry || 0, rz || 0); o.castShadow = !!TIER.shadow; par.add(o); return o; }
+    const glowM = (c) => matC(c, { emissive: new THREE.Color(c), emissiveIntensity: 1.6 });
+    const metalM = (c) => matC(c, { roughness: 0.42, metalness: 0.65 });
+    const GC = {};
+    /* 둥근 끝 · 가늘어지는 팔다리(관절에서 아래로) */
+    function limbG(r0, r1, len) {
+      const k = 'L' + r0 + '_' + r1 + '_' + len; if (GC[k]) return GC[k];
+      const P = [[0, -len - r1 * 0.85], [r1 * 0.62, -len - r1 * 0.62], [r1 * 0.96, -len], [(r0 + r1) * 0.53, -len * 0.5], [r0, -r0 * 0.3], [r0 * 0.7, r0 * 0.55], [0, r0 * 0.8]].map((q) => new THREE.Vector2(q[0], q[1]));
+      return (GC[k] = new THREE.LatheGeometry(P, 10));
+    }
+    function latheG(k, pts, seg, zs, phi) {
+      if (GC[k]) return GC[k];
+      const g = new THREE.LatheGeometry(pts.map((q) => new THREE.Vector2(q[0], q[1])), seg || 12, phi ? phi[0] : 0, phi ? phi[1] : TAU);
+      if (zs) g.scale(1, 1, zs);
+      return (GC[k] = g);
+    }
+    const G = {
+      chest: () => latheG('chest', [[0, -0.02], [0.15, 0], [0.17, 0.08], [0.2, 0.24], [0.235, 0.4], [0.22, 0.5], [0.15, 0.56], [0.07, 0.6], [0, 0.6]], 12, 0.68),
+      plate: () => latheG('plate', [[0.165, 0.02], [0.215, 0.2], [0.25, 0.38], [0.235, 0.5], [0.16, 0.57]], 12, 0.74, [-PI / 2 - 0.15, PI + 0.3]),
+      pelvis: () => latheG('pelvis', [[0, -0.12], [0.13, -0.11], [0.18, -0.02], [0.17, 0.08], [0, 0.1]], 10, 0.75),
+      paul: () => { if (GC.paul) return GC.paul; const g = new THREE.SphereGeometry(0.5, 12, 8, 0, TAU, 0, PI * 0.55); return (GC.paul = g); },
+      head: () => latheG('head', [[0, -0.12], [0.07, -0.115], [0.1, -0.06], [0.112, 0.03], [0.1, 0.11], [0.06, 0.15], [0, 0.16]], 12, 1.05),
+      greatHelm: () => latheG('ghelm', [[0, -0.14], [0.125, -0.13], [0.13, 0.04], [0.125, 0.12], [0.09, 0.18], [0, 0.2]], 10, 1.08),
+      kettle: () => latheG('kettle', [[0, 0.18], [0.08, 0.16], [0.12, 0.08], [0.13, 0.02], [0.185, -0.03], [0.18, -0.045], [0.12, -0.01]], 14),
+      cowl: () => latheG('cowl', [[0, 0.23], [0.1, 0.21], [0.15, 0.12], [0.16, 0.0], [0.15, -0.12], [0.2, -0.22]], 12, 1.12, [PI * 0.24, PI * 1.52]),
+      robe: () => latheG('robe', [[0.16, 0.05], [0.19, -0.2], [0.26, -0.55], [0.34, -0.86], [0.3, -0.9], [0, -0.9]], 12, 0.85),
+      boot: () => latheG('boot', [[0, -0.07], [0.07, -0.07], [0.075, 0.02], [0.065, 0.1], [0, 0.11]], 8, 1.4),
+      capeP: () => { if (GC.capeP) return GC.capeP; const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, 0, 0, 0.5, 0, 0, -0.6, -1, -0.05, 0.6, -1, -0.05], 3)); g.setIndex([0, 2, 1, 1, 2, 3]); g.computeVertexNormals(); return (GC.capeP = g); },
+    };
+    /* 무기: 손잡이 원점, 날은 +y */
+    const WGEO = {};
+    const bladeG = (len, wid, th) => { const g = new THREE.CylinderGeometry(0.0, 1, 1, 4, 1); g.rotateY(PI / 4); g.scale(wid, len, th); g.translate(0, len / 2, 0); return g; };
+    function tubeG(pts, r, seg) { const c = new THREE.CatmullRomCurve3(pts.map((q) => new THREE.Vector3(q[0], q[1], q[2] || 0))); return new THREE.TubeGeometry(c, seg || 16, r, 6, false); }
+    function weaponMesh(kind, scale) {
+      const k = kind + scale; if (WGEO[k]) return WGEO[k];
+      const s = scale || 1, steel = 0x9a9894, dsteel = 0x6a6864, grip = 0x2b2018, wood = 0x4a3524, brass = 0x8a6a32;
+      const L_ = {
+        sword: [[bladeG(0.95, 0.075, 0.018), M4(0, 0.1, 0), steel], [new THREE.CylinderGeometry(0.018, 0.018, 0.3, 6), M4(0, 0.1, 0, 0, 0, PI / 2), brass], [geo.cyl, M4(0, -0.07, 0, 0, 0, 0, 0.034, 0.17, 0.034), grip], [geo.sph, M4(0, -0.17, 0, 0, 0, 0, 0.055, 0.055, 0.055), brass]],
+        great: [[bladeG(1.5, 0.13, 0.024), M4(0, 0.13, 0), steel], [new THREE.CylinderGeometry(0.026, 0.026, 0.46, 6), M4(0, 0.13, 0, 0, 0, PI / 2), dsteel], [geo.box, M4(0, 0.2, 0, 0, 0, 0, 0.09, 0.12, 0.05), dsteel], [geo.cyl, M4(0, -0.12, 0, 0, 0, 0, 0.04, 0.32, 0.04), grip], [geo.sph, M4(0, -0.3, 0, 0, 0, 0, 0.07, 0.07, 0.07), dsteel]],
+        curved: [[tubeG([[0, 0.08], [0.03, 0.4], [0.1, 0.72], [0.2, 0.98]], 0.02, 14), M4(0, 0, 0, 0, 0, 0, 1, 1, 0.45), steel], [geo.cyl, M4(0, 0.06, 0, 0, 0, PI / 2, 0.06, 0.16, 0.06), brass], [geo.cyl, M4(0, -0.06, 0, 0, 0, 0, 0.03, 0.18, 0.03), grip]],
+        dagger: [[bladeG(0.36, 0.055, 0.015), M4(0, 0.05, 0), steel], [new THREE.CylinderGeometry(0.014, 0.014, 0.16, 6), M4(0, 0.05, 0, 0, 0, PI / 2), brass], [geo.cyl, M4(0, -0.05, 0, 0, 0, 0, 0.028, 0.13, 0.028), grip]],
+        hammer: [[geo.cyl, M4(0, 0.4, 0, 0, 0, 0, 0.04, 1.05, 0.04), wood], [new THREE.CylinderGeometry(0.11, 0.11, 0.34, 8), M4(0, 0.88, 0, 0, 0, PI / 2), dsteel], [geo.cone, M4(0.22, 0.88, 0, 0, 0, -PI / 2, 0.06, 0.12, 0.06), dsteel], [geo.cyl, M4(0, 0.62, 0, 0, 0, 0, 0.05, 0.05, 0.05), brass], [geo.cyl, M4(0, -0.08, 0, 0, 0, 0, 0.05, 0.06, 0.05), brass]],
+        spear: [[geo.cyl, M4(0, 0.55, 0, 0, 0, 0, 0.032, 2.0, 0.032), wood], [bladeG(0.36, 0.09, 0.022), M4(0, 1.55, 0), steel], [geo.cyl, M4(0, 1.55, 0, 0, 0, 0, 0.045, 0.08, 0.045), brass]],
+        bow: [[tubeG([[0, -0.62, 0.0], [0, -0.42, 0.12], [0, -0.12, 0.06], [0, 0.12, 0.06], [0, 0.42, 0.12], [0, 0.62, 0.0]], 0.022, 18), null, wood], [geo.cyl, M4(0, 0, 0.06, 0, 0, 0, 0.034, 0.22, 0.034), grip], [geo.cyl, M4(0, 0, -0.02, 0, 0, 0, 0.004, 1.22, 0.004), 0xc8bca8]],
+        staff: [[tubeG([[0, -0.5], [0.02, 0.0], [-0.02, 0.6], [0.02, 1.15], [0, 1.35]], 0.03, 16), null, wood], [new THREE.OctahedronGeometry(0.11), M4(0, 1.5, 0, 0, 0, 0, 1, 1.5, 1), 0x8a7ab8], [geo.cone, M4(0.08, 1.38, 0, 0, 0, -0.5, 0.03, 0.2, 0.03), wood], [geo.cone, M4(-0.08, 1.38, 0, 0, 0, 0.5, 0.03, 0.2, 0.03), wood]],
+        torch: [[geo.cyl, M4(0, 0.3, 0, 0, 0, 0, 0.04, 0.8, 0.04), wood], [new THREE.CylinderGeometry(0.09, 0.06, 0.16, 8), M4(0, 0.72, 0), 0x2a2018]],
+        pick: [[geo.cyl, M4(0, 0.35, 0, 0, 0, 0, 0.04, 0.95, 0.04), wood], [tubeG([[-0.36, 0.7], [-0.15, 0.82], [0, 0.84], [0.15, 0.82], [0.36, 0.7]], 0.03, 10), null, dsteel]],
+        club: [[new THREE.CylinderGeometry(0.16, 0.08, 1.5, 7), M4(0, 0.6, 0), 0x4a3c30], [new THREE.DodecahedronGeometry(0.3, 0), M4(0, 1.28, 0, 0, 0, 0, 1, 1.2, 1), 0x55493a]],
+        bell: [[geo.cyl, M4(0, 0.5, 0, 0, 0, 0, 0.05, 1.2, 0.05), 0x3a3028], [latheG('bellS', [[0.06, 0.4], [0.2, 0.36], [0.27, 0.2], [0.33, 0.02], [0.44, -0.12], [0.42, -0.16]], 14), M4(0, 1.5, 0, PI), 0x7a6236]],
+      }[kind] || [];
+      const g = L_.length ? merge(L_.map(([gg, m, c]) => [gg, m, c])) : new THREE.BufferGeometry();
+      if (s !== 1) g.scale(s, s, s);
+      g.userData.len = { sword: 1.05, great: 1.63, curved: 1.0, dagger: 0.42, hammer: 1.0, spear: 1.9, staff: 1.5, torch: 0.8, pick: 0.85, club: 1.5, bell: 1.6 }[kind] * s || 0;
+      return (WGEO[k] = g);
+    }
+    const wMat = Std({ vertexColors: true, roughness: 0.45, metalness: 0.45 }, 0.4);
+    let shieldG = null;
+    function shieldGeo() {
+      if (shieldG) return shieldG;
+      const sh = new THREE.Shape(); sh.moveTo(-0.26, 0.3); sh.lineTo(0.26, 0.3); sh.quadraticCurveTo(0.27, -0.12, 0, -0.38); sh.quadraticCurveTo(-0.27, -0.12, -0.26, 0.3);
+      const g = new THREE.ExtrudeGeometry(sh, { depth: 0.035, bevelEnabled: true, bevelThickness: 0.015, bevelSize: 0.018, bevelSegments: 1, curveSegments: 8 });
+      g.translate(0, 0, -0.02);
+      return (shieldG = merge([[g, null, 0x4e463e], [geo.sph, M4(0, 0.04, 0.03, 0, 0, 0, 0.1, 0.1, 0.05), 0x8a7650], [geo.box, M4(0, 0.0, 0.035, 0, 0, 0, 0.04, 0.55, 0.012), 0x7a6236], [geo.box, M4(0, 0.12, 0.035, 0, 0, 0, 0.42, 0.04, 0.012), 0x7a6236]]));
+    }
+    /* 사람형 (거인도 같은 뼈대, 몸 비율만) — look: c 옷, a 강조, m 금속, armor 0~2, helm 0~3, hood, cape, robe, shield, eyes, spikes */
+    function rigHum(look, sc, big) {
+      const r = { root: new THREE.Group(), kind: 'hum', seed: Math.random() * 10 };
+      const cloth = matC(look.c), acc = matC(look.a || look.c), metal = metalM(look.m || 0x5e5c58), leather = matC(0x31251c), dark = matC(0x16120f);
+      const skin = look.bare ? matC(new THREE.Color(look.c).multiplyScalar(1.1).getHex()) : matC(0x4a3c34);
+      const w = big ? 1.32 : 1, armor = look.armor != null ? look.armor : look.helm ? 1 : 0;
+      r.hips = J(r.root, 0, 0.98, 0);
+      Mh(r.hips, G.pelvis(), leather, 0, 0, 0, w, 1, w);
+      Mh(r.hips, geo.cyl, matC(0x221a14), 0, 0.07, 0, 0.36 * w, 0.05, 0.27 * w);
+      if (look.robe) Mh(r.hips, G.robe(), matC(new THREE.Color(look.c).multiplyScalar(0.72).getHex()), 0, 0.06, 0, w, 1, w);
+      else if (armor) { for (const sd of [1, -1]) Mh(r.hips, geo.cap, metal, sd * 0.1 * w, -0.13, 0.12, 0.12 * w, 0.08, 0.03, -0.15, 0, 0); }
+      r.torso = J(r.hips, 0, 0.08, 0);
+      r.chest = Mh(r.torso, G.chest(), look.bare ? skin : cloth, 0, 0, 0, w, 1, w);
+      if (armor) Mh(r.torso, G.plate(), metal, 0, 0, 0.005, w * 1.03, 1, w * 1.05);
+      if (armor >= 2 || look.paul) for (const sd of [1, -1]) { const p = Mh(r.torso, G.paul(), metal, sd * 0.25 * w, 0.52, 0, 0.26 * w, 0.2, 0.26 * w); p.rotation.z = -sd * 0.35; if (look.spikes) Mh(r.torso, geo.cone, metal, sd * 0.3 * w, 0.66, 0, 0.06, 0.2, 0.06, 0, 0, -sd * 0.5); }
+      if (look.tab) { r.tab = J(r.hips, 0, 0.05, 0.13 * w); Mh(r.tab, G.capeP(), acc, 0, 0, 0, 0.22 * w, 0.48, 1, 0, PI, 0); }
+      if (look.cape) { const cm = matC(new THREE.Color(look.capeC || look.a).multiplyScalar(0.55).getHex(), { side: THREE.DoubleSide }); r.capeU = J(r.torso, 0, 0.55, -0.15 * w); Mh(r.capeU, G.capeP(), cm, 0, 0, 0, 0.44 * w, 0.55, 1); r.capeL = J(r.capeU, 0, -0.55, -0.03); Mh(r.capeL, G.capeP(), cm, 0, 0, 0, 0.58 * w, 0.6, 1); }
+      r.head = J(r.torso, 0, 0.68, 0);
+      Mh(r.head, G.head(), look.bare ? skin : matC(0x3a2e28), 0, 0.02, 0, w * 1.05, w * 1.05, w * 1.05);
+      const hm = metalM(look.hm || 0x55565a);
+      if (look.helm === 1) { Mh(r.head, G.kettle(), hm, 0, 0.04, 0, w, w, w); }
+      else if (look.helm >= 2) { Mh(r.head, G.greatHelm(), hm, 0, 0.02, 0, w, w, w); Mh(r.head, geo.box, dark, 0, 0.04, 0.125 * w, 0.17 * w, 0.022, 0.03); Mh(r.head, geo.box, dark, 0, -0.04, 0.125 * w, 0.02, 0.1, 0.03); if (look.crest) Mh(r.head, geo.box, acc, 0, 0.2, -0.02, 0.025, 0.08, 0.26); if (look.helm === 3) for (let k = 0; k < 7; k++) { const an = k / 7 * TAU; Mh(r.head, geo.cone, matC(0x2a2236, { emissive: new THREE.Color(look.a || 0x7c5cff), emissiveIntensity: 0.6 }), Math.sin(an) * 0.11 * w, 0.24, Math.cos(an) * 0.11 * w, 0.04, 0.18, 0.04); } }
+      if (look.hood) { const hc = matC(new THREE.Color(look.hoodC || look.a).multiplyScalar(0.55).getHex(), { side: THREE.DoubleSide }); Mh(r.head, G.cowl(), hc, 0, 0.0, -0.01, w, w, w); Mh(r.torso, G.paul(), hc, 0, 0.5, -0.01, 0.5 * w, 0.22, 0.4 * w); }
+      if (look.eyes) { Mh(r.head, geo.sph, glowM(look.eyes), 0.04, 0.03, 0.105 * w, 0.025, 0.018, 0.012); Mh(r.head, geo.sph, glowM(look.eyes), -0.04, 0.03, 0.105 * w, 0.025, 0.018, 0.012); }
+      for (const sd of [1, -1]) {
+        const ua = J(r.torso, 0.27 * w * sd, 0.5, 0); Mh(ua, limbG(0.085 * w, 0.068 * w, 0.28), look.bare ? skin : cloth, 0, 0, 0, 1, 1, 1);
+        const fa = J(ua, 0, -0.3, 0); Mh(fa, limbG(0.068 * w, 0.052 * w, 0.26), look.bare ? skin : leather, 0, 0, 0, 1, 1, 1);
+        if (armor) Mh(fa, limbG(0.078 * w, 0.064 * w, 0.16), metal, 0, -0.08, 0, 1, 1, 1);
+        const hd = J(fa, 0, -0.3, 0); Mh(hd, geo.sph, armor ? metal : leather, 0, 0.02, 0, 0.09 * w, 0.1 * w, 0.08 * w);
+        const th = J(r.hips, 0.115 * w * sd, -0.05, 0); Mh(th, limbG(0.105 * w, 0.078 * w, 0.42), look.bare ? skin : look.robe ? leather : acc, 0, 0, 0, 1, 1, 1);
+        if (armor) Mh(th, geo.sph, metal, 0, -0.44, 0.04, 0.09 * w, 0.08, 0.07);
+        const sh = J(th, 0, -0.45, 0); Mh(sh, limbG(0.076 * w, 0.056 * w, 0.4), dark, 0, 0, 0, 1, 1, 1); Mh(sh, G.boot(), dark, 0, -0.44, 0.05, w, w, w);
+        if (sd > 0) { r.uaR = ua; r.faR = fa; r.hdR = hd; r.thR = th; r.shR = sh; } else { r.uaL = ua; r.faL = fa; r.hdL = hd; r.thL = th; r.shL = sh; }
+      }
+      if (look.shield) { r.shield = new THREE.Mesh(shieldGeo(), wMat); r.shield.position.set(0.0, -0.12, 0.1); r.shield.rotation.set(0, -PI / 2 + 0.2, 0); r.shield.scale.setScalar(w * 1.15); r.shield.castShadow = !!TIER.shadow; r.faL.add(r.shield); }
+      r.wpn = new THREE.Mesh(new THREE.BufferGeometry(), wMat); r.wpn.rotation.x = PI / 2; r.wpn.castShadow = !!TIER.shadow; r.hdR.add(r.wpn);
+      r.tipA = new THREE.Object3D(); r.tipB = new THREE.Object3D(); r.wpn.add(r.tipA, r.tipB);
+      if (look.w) setWeapon(r, look.w, big ? 1.4 : 1);
+      if (look.w === 'torch') { r.flame = Mh(r.hdR, geo.cone, MT.flame, 0, 0, 0.84, 0.16, 0.32, 0.16, PI / 2, 0, 0); }
+      r.root.scale.setScalar(sc);
+      r.sc = sc;
+      return r;
+    }
+    function setWeapon(r, kind, s) {
+      if (r.wk === kind) return; r.wk = kind;
+      r.wpn.geometry = weaponMesh(kind, s || 1);
+      const len = r.wpn.geometry.userData.len || 0; r.tipA.position.set(0, len * 0.35, 0); r.tipB.position.set(0, len, 0); r.trailOk = len > 0.3 && kind !== 'bow' && kind !== 'staff';
+      if (kind === 'bow') { r.wpn.parent.remove(r.wpn); r.hdL.add(r.wpn); r.wpn.rotation.set(PI / 2, 0, 0); }
+      else if (r.wpn.parent !== r.hdR) { r.wpn.parent.remove(r.wpn); r.hdR.add(r.wpn); r.wpn.rotation.set(PI / 2, 0, 0); }
+    }
+    /* 네발 짐승 */
+    function rigQuad(look, sc) {
+      const r = { root: new THREE.Group(), kind: 'quad', seed: Math.random() * 10 };
+      const c = matC(look.c), a = matC(look.a), dark = matC(0x15110e);
+      r.body = J(r.root, 0, 0.78, 0);
+      r.bodyM = Mh(r.body, latheG('qbody', [[0, -0.62], [0.16, -0.58], [0.25, -0.38], [0.3, -0.05], [0.34, 0.25], [0.3, 0.5], [0.18, 0.64], [0, 0.66]], 12, 0.9), c, 0, 0, 0, 1, 1, 1, PI / 2, 0, 0);
+      for (let k = 0; k < 6; k++) Mh(r.body, geo.cone, a, 0, 0.28 - k * 0.012, 0.4 - k * 0.16, 0.06, 0.18 - k * 0.012, 0.1, -0.5, 0, 0);
+      r.neck = J(r.body, 0, 0.12, 0.52); Mh(r.neck, limbG(0.16, 0.12, 0.32), c, 0, 0, 0, 1, 1, 1, -2.2, 0, 0);
+      r.head = J(r.neck, 0, 0.24, 0.24);
+      Mh(r.head, latheG('qhead', [[0, -0.2], [0.09, -0.17], [0.13, -0.02], [0.12, 0.1], [0.07, 0.17], [0, 0.18]], 10, 0.9), c, 0, 0, 0.04, 1, 1, 1, PI / 2, 0, 0);
+      Mh(r.head, limbG(0.07, 0.05, 0.16), c, 0, -0.03, 0.18, 1, 1, 1, -PI / 2, 0, 0);
+      for (const sd of [1, -1]) { Mh(r.head, geo.cone, a, sd * 0.07, 0.15, -0.06, 0.045, 0.14, 0.04, -0.3, 0, sd * 0.2); Mh(r.head, geo.sph, glowM(look.mane ? 0xff8a3a : 0xc8a050), sd * 0.06, 0.05, 0.13, 0.03, 0.02, 0.015); }
+      r.jaw = J(r.head, 0, -0.07, 0.08); Mh(r.jaw, limbG(0.05, 0.035, 0.2), a, 0, 0, 0, 1, 1, 1, -PI / 2, 0, 0);
+      for (const sd of [1, -1]) Mh(r.jaw, geo.cone, matC(0xd8d0b8), sd * 0.03, 0.02, 0.17, 0.015, 0.05, 0.015, PI, 0, 0);
+      if (look.mane) { r.mane = new THREE.Group(); r.neck.add(r.mane); r.mane.position.set(0, 0.12, 0.08); const mm = matC(0x3a2418, { emissive: new THREE.Color(0x7a2a08), emissiveIntensity: 0.9 }); for (let k = 0; k < 22; k++) { const an = k / 22 * TAU + (k % 2) * 0.14; const ln = 0.22 + (k % 3) * 0.06; const sp = Mh(r.mane, geo.cone, mm, 0, 0, 0, 0.13, ln, 0.1); sp.position.set(Math.sin(an) * 0.19, Math.cos(an) * 0.19, -0.04 - (k % 2) * 0.1); sp.rotation.set(-0.9, 0, -an); } Mh(r.mane, geo.sph, matC(0x2a1c14), 0, 0, -0.08, 0.42, 0.42, 0.3); }
+      r.legs = [];
+      for (const [sx, sz] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+        const u = J(r.body, 0.2 * sx, -0.06, 0.4 * sz); Mh(u, limbG(0.13, 0.08, 0.36), c, 0, 0, 0, 1, 1, 1);
+        const l = J(u, 0, -0.38, 0); Mh(l, limbG(0.075, 0.055, 0.32), a, 0, 0, 0, 1, 1, 1); Mh(l, G.boot(), dark, 0, -0.35, 0.04, 1.1, 0.8, 1.1);
+        r.legs.push([u, l, sx, sz]);
+      }
+      r.tail = J(r.body, 0, 0.12, -0.6); Mh(r.tail, limbG(0.06, 0.02, 0.6), c, 0, 0, 0, 1, 1, 1, 2.2, 0, 0);
+      r.root.scale.setScalar(sc); r.sc = sc;
+      return r;
+    }
+    function rigCrawl(look, sc) {
+      const r = { root: new THREE.Group(), kind: 'crawl', seed: Math.random() * 10 };
+      const c = matC(look.c, { roughness: 0.5, metalness: 0.2 }), a = matC(look.a);
+      r.body = J(r.root, 0, 0.55, 0); Mh(r.body, latheG('cthor', [[0, -0.3], [0.2, -0.26], [0.3, -0.05], [0.28, 0.18], [0.16, 0.32], [0, 0.34]], 10, 0.7), c, 0, 0, 0.1, 1.2, 1.2, 1.2, PI / 2, 0, 0);
+      r.abd = J(r.body, 0, 0.12, -0.35);
+      for (let k = 0; k < 4; k++) Mh(r.abd, geo.sph, k % 2 ? a : c, 0, 0.06 + k * 0.02, -0.2 - k * 0.26, 0.85 - k * 0.12, 0.5 - k * 0.05, 0.4);
+      for (let k = 0; k < 5; k++) Mh(r.abd, geo.cone, a, 0, 0.32 - k * 0.02, -0.15 - k * 0.22, 0.05, 0.16, 0.05, -0.3, 0, 0);
+      r.head = J(r.body, 0, 0.05, 0.5); Mh(r.head, geo.sph, c, 0, 0, 0.08, 0.4, 0.28, 0.36);
+      for (const sd of [1, -1]) for (let k = 0; k < 2; k++) Mh(r.head, geo.sph, glowM(look.a), sd * (0.06 + k * 0.06), 0.08 - k * 0.02, 0.22, 0.035, 0.03, 0.02);
+      r.jaw = J(r.head, 0, -0.06, 0.22); for (const sd of [1, -1]) Mh(r.jaw, limbG(0.04, 0.012, 0.22), a, sd * 0.09, 0, 0, 1, 1, 1, -1.9, 0, sd * 0.3);
+      r.legs = [];
+      for (let k = 0; k < 8; k++) { const sx = k % 2 ? 1 : -1, z = 0.32 - Math.floor(k / 2) * 0.24; const u = J(r.body, 0.26 * sx, 0.05, z); u.rotation.z = sx * 1.0; Mh(u, limbG(0.06, 0.045, 0.5), c, 0, 0, 0, 1, 1, 1); const l = J(u, 0, -0.52, 0); l.rotation.z = -sx * 1.9; Mh(l, limbG(0.045, 0.012, 0.6), a, 0, 0, 0, 1, 1, 1); r.legs.push([u, l, sx, k]); }
+      r.root.scale.setScalar(sc); r.sc = sc;
+      return r;
+    }
+    function rigWyrm(look, sc) {
+      const r = { root: new THREE.Group(), kind: 'wyrm', seed: Math.random() * 10 };
+      const c = matC(look.c, { roughness: 0.6, metalness: 0.15 }), a = matC(look.a, { emissive: new THREE.Color(look.a).multiplyScalar(0.25) }), bone = matC(0xc8bca0);
+      r.body = J(r.root, 0, 1.15, 0); Mh(r.body, latheG('wbody', [[0, -0.95], [0.3, -0.85], [0.5, -0.45], [0.6, 0.0], [0.58, 0.45], [0.42, 0.8], [0, 0.92]], 12, 0.82), c, 0, 0, 0, 1, 1, 1, PI / 2, 0, 0);
+      for (let k = 0; k < 7; k++) Mh(r.body, geo.cone, bone, 0, 0.5 - Math.abs(k - 3) * 0.03, 0.75 - k * 0.25, 0.08, 0.3 - Math.abs(k - 3) * 0.03, 0.12, -0.4, 0, 0);
+      r.necks = []; let par = r.body;
+      for (let k = 0; k < 3; k++) { const n = J(par, 0, k ? 0.04 : 0.22, k ? 0.4 : 0.78); Mh(n, limbG(0.24 - k * 0.03, 0.2 - k * 0.03, 0.42), c, 0, 0, 0, 1, 1, 1, -PI / 2, 0, 0); Mh(n, geo.cone, bone, 0, 0.18, 0.15, 0.05, 0.16, 0.08, -0.5, 0, 0); r.necks.push(n); par = n; }
+      r.head = J(par, 0, 0, 0.44);
+      Mh(r.head, latheG('whead', [[0, -0.3], [0.12, -0.26], [0.17, -0.05], [0.16, 0.12], [0.1, 0.22], [0, 0.24]], 10, 0.78), c, 0, 0.04, 0.14, 1, 1, 1, PI / 2, 0, 0);
+      for (const sd of [1, -1]) { Mh(r.head, limbG(0.05, 0.01, 0.42), bone, sd * 0.1, 0.15, -0.08, 1, 1, 1, 2.4, 0, sd * 0.25); Mh(r.head, geo.sph, glowM(look.a), sd * 0.09, 0.1, 0.24, 0.035, 0.022, 0.018); }
+      r.jaw = J(r.head, 0, -0.08, 0.02); Mh(r.jaw, latheG('wjaw', [[0, -0.02], [0.1, 0.0], [0.11, 0.25], [0.04, 0.42], [0, 0.43]], 8, 0.4), c, 0, 0, 0, 1, 1, 1, PI / 2, 0, 0);
+      for (let k = 0; k < 4; k++) for (const sd of [1, -1]) Mh(r.jaw, geo.cone, bone, sd * 0.07, 0.04, 0.12 + k * 0.08, 0.015, 0.06, 0.015);
+      r.tails = []; par = r.body;
+      for (let k = 0; k < 5; k++) { const t = J(par, 0, 0, k ? -0.42 : -0.85); Mh(t, limbG(0.22 - k * 0.04, 0.18 - k * 0.04, 0.42), c, 0, 0, 0, 1, 1, 1, PI / 2, 0, 0); Mh(t, geo.cone, bone, 0, 0.14 - k * 0.025, -0.2, 0.04, 0.14, 0.06, -0.6, 0, 0); r.tails.push(t); par = t; }
+      r.wings = [];
+      const memG = new THREE.BufferGeometry(); memG.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0.3, 1.2, 0.18, 0.05, 0, 0, -0.75, 1.2, 0.18, 0.05, 2.5, 0.12, -0.25, 0, 0, -0.75, 2.5, 0.12, -0.25, 2.1, -0.15, -1.15, 0, 0, -0.75, 1.2, 0.18, 0.05, 1.3, -0.2, -1.3, 0, 0, -0.75], 3)); memG.computeVertexNormals();
+      const memM = Std({ color: new THREE.Color(look.c).multiplyScalar(0.62), side: THREE.DoubleSide, roughness: 0.9, transparent: !low, opacity: 0.94 }, 0.3);
+      for (const sd of [1, -1]) { const w = J(r.body, 0.45 * sd, 0.38, 0.25); const m = new THREE.Mesh(memG, memM); m.scale.set(sd, 1, 1); m.castShadow = !!TIER.shadow; w.add(m); Mh(w, limbG(0.06, 0.03, 1.3), c, 0, 0, 0, 1, 1, 1, 0, 0, sd * (PI / 2 - 0.15)); Mh(w, limbG(0.04, 0.015, 1.3), c, sd * 1.2, 0.18, 0.05, 1, 1, 1, 0, 0, sd * (PI / 2 - 0.05)); r.wings.push([w, sd]); }
+      r.legs = [];
+      for (const [sx, sz] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) { const u = J(r.body, 0.42 * sx, -0.25, 0.5 * sz); Mh(u, limbG(0.2, 0.13, 0.46), c, 0, 0, 0, 1, 1, 1); const l = J(u, 0, -0.48, 0); Mh(l, limbG(0.12, 0.08, 0.36), c, 0, 0, 0, 1, 1, 1); for (let k = -1; k <= 1; k++) Mh(l, geo.cone, bone, k * 0.05, -0.42, 0.1, 0.03, 0.12, 0.03, PI / 2.2, 0, 0); r.legs.push([u, l, sx, sz]); }
+      r.root.scale.setScalar(sc); r.sc = sc;
+      return r;
+    }
+    function rigFloat(look, sc) {
+      const r = { root: new THREE.Group(), kind: 'float', seed: Math.random() * 10 };
+      const c = matC(look.c, { side: THREE.DoubleSide }), a = matC(look.a, { emissive: new THREE.Color(look.a), emissiveIntensity: 0.9 });
+      r.hips = J(r.root, 0, 1.2, 0);
+      Mh(r.hips, latheG('frobe', [[0.18, 0.1], [0.24, -0.3], [0.42, -0.8], [0.6, -1.25], [0.5, -1.28], [0.3, -0.9]], 14), c, 0, 0, 0, 1, 1, 1);
+      r.torso = J(r.hips, 0, 0.12, 0); Mh(r.torso, G.chest(), c, 0, 0, 0, 1.1, 1, 1.1);
+      Mh(r.torso, new THREE.TorusGeometry(0.42, 0.02, 6, 32), a, 0, 0.75, -0.2, 1, 1, 1);
+      r.head = J(r.torso, 0, 0.68, 0); Mh(r.head, G.cowl(), c, 0, 0, 0, 1.3, 1.4, 1.3); Mh(r.head, geo.sph, matC(0x050405), 0, 0.0, 0.03, 0.2, 0.24, 0.2); Mh(r.head, geo.sph, a, 0, 0.02, 0.11, 0.09, 0.02, 0.01);
+      for (const sd of [1, -1]) { const ua = J(r.torso, 0.3 * sd, 0.48, 0); Mh(ua, limbG(0.1, 0.13, 0.32), c, 0, 0, 0, 1, 1, 1); const fa = J(ua, 0, -0.34, 0); Mh(fa, limbG(0.12, 0.16, 0.3), c, 0, 0, 0, 1, 1, 1); const hd = J(fa, 0, -0.34, 0); Mh(hd, geo.sph, a, 0, 0, 0, 0.12, 0.12, 0.12); if (sd > 0) { r.uaR = ua; r.faR = fa; r.hdR = hd; } else { r.uaL = ua; r.faL = fa; r.hdL = hd; } }
+      r.orb = Mh(r.root, new THREE.OctahedronGeometry(0.22), a, 0, 2.7, 0, 1, 1.5, 1);
+      r.root.scale.setScalar(sc); r.sc = sc;
+      return r;
+    }
+    function rigFor(type, look, sc) {
+      const d = T.ET[type] || {};
+      if (d.b === 'quad') return rigQuad(look, sc);
+      if (d.b === 'crawl') return rigCrawl(look, sc);
+      if (d.b === 'wyrm') return rigWyrm(look, sc);
+      if (d.b === 'float') return rigFloat(look, sc);
+      const lk = Object.assign({ eyes: d.boss || d.fb ? (look.a || 0xc0a060) : look.hood || look.bare ? 0x9a8a60 : null, armor: look.helm ? (d.boss || d.fb || d.elite ? 2 : 1) : 0, spikes: d.boss || d.fb, crest: d.elite || d.fb, m: d.boss ? 0x3a3840 : 0x5e5c58, tab: look.helm >= 2 }, look);
+      return rigHum(lk, sc, d.b === 'giant');
+    }
+    function rigPlayer(a) {
+      const A = T.ARCH[a], id = A.id;
+      const look = { c: A.col, a: A.ac, hoodC: A.col, capeC: A.col,
+        helm: id === 'shield' ? 2 : id === 'breaker' ? 1 : 0, armor: id === 'shield' ? 2 : id === 'breaker' ? 2 : id === 'hunter' || id === 'archer' ? 0 : 0, paul: id === 'breaker' || id === 'priest',
+        hood: id === 'hunter' || id === 'ash' || id === 'archer' || id === 'priest', cape: id === 'shield' || id === 'hunter' || id === 'archer', robe: id === 'ash' || id === 'priest',
+        shield: id === 'shield', crest: id === 'shield', tab: id === 'shield' || id === 'priest', m: id === 'breaker' ? 0x4c4842 : 0x6a6a6c };
+      return rigHum(look, 1, false);
+    }
+
+    /* ======================= 자세 · 동작 ======================= */
+    const Z3 = [0, 0, 0];
+    function setR(j, v, k) { if (!j) return; const x = v ? v[0] : 0, y = v ? v[1] : 0, z = v ? v[2] : 0; if (k == null || k >= 1) j.rotation.set(x, y, z); else { j.rotation.x = lerp(j.rotation.x, x, k); j.rotation.y = lerp(j.rotation.y, y, k); j.rotation.z = lerp(j.rotation.z, z, k); } }
+    const mixP = (a, b, t) => { const o = {}; for (const k in a) o[k] = a[k]; for (const k in b) { const x = a[k] || Z3, y = b[k]; o[k] = [lerp(x[0], y[0], t), lerp(x[1], y[1], t), lerp(x[2], y[2], t)]; } for (const k in a) if (!b[k]) { const x = a[k]; o[k] = [x[0] * (1 - t), x[1] * (1 - t), x[2] * (1 - t)]; } return o; };
+    /* 사람형 자세 [준비, 내리침] */
+    const HP = {
+      slashR: [{ torso: [0, 0.7, 0], uaR: [-1.4, 0, -1.2], faR: [-0.5, 0, 0], uaL: [-0.2, 0, 0.3] }, { torso: [0.1, -0.75, 0], uaR: [-1.5, 0, 0.5], faR: [-0.15, 0, 0], uaL: [0.1, 0, 0.3] }],
+      slashL: [{ torso: [0, -0.6, 0], uaR: [-1.5, 0, 0.6], faR: [-0.4, 0, 0] }, { torso: [0.1, 0.75, 0], uaR: [-1.35, 0, -1.1], faR: [-0.1, 0, 0] }],
+      over: [{ torso: [-0.25, 0.2, 0], uaR: [-2.9, 0, -0.2], faR: [-0.7, 0, 0], uaL: [-2.4, 0, 0.3], faL: [-0.8, 0, 0] }, { torso: [0.4, 0, 0], uaR: [-0.7, 0, 0], faR: [-0.1, 0, 0], uaL: [-0.6, 0, 0.1], hips: [0, 0, 0] }],
+      thrust: [{ torso: [0, 0.45, 0], uaR: [-0.5, 0, -0.2], faR: [-1.7, 0, 0] }, { torso: [0.2, -0.35, 0], uaR: [-1.55, 0, 0.05], faR: [0, 0, 0] }],
+      slam: [{ torso: [-0.35, 0, 0], uaR: [-3.0, 0, -0.1], uaL: [-3.0, 0, 0.1], faR: [-0.6, 0, 0], faL: [-0.6, 0, 0] }, { torso: [0.6, 0, 0], uaR: [-0.9, 0, 0], uaL: [-0.9, 0, 0], faR: [0, 0, 0], faL: [0, 0, 0], thL: [-0.6, 0, 0], shL: [0.6, 0, 0], thR: [0.3, 0, 0] }],
+      shoot: [{ torso: [0, 0.5, 0], uaL: [-1.5, 0, 0.1], faL: [0, 0, 0], uaR: [-1.4, 0, 0.3], faR: [-1.9, 0, 0] }, { torso: [0, 0.5, 0], uaL: [-1.55, 0, 0.1], uaR: [-1.2, 0, -0.4], faR: [-0.6, 0, 0] }],
+      cast: [{ torso: [-0.1, 0.2, 0], uaR: [-2.4, 0, -0.2], faR: [-0.4, 0, 0], uaL: [-0.9, 0, 0.4] }, { torso: [0.15, -0.1, 0], uaR: [-1.6, 0, 0], faR: [0, 0, 0], uaL: [-1.2, 0, 0.3] }],
+      throw: [{ torso: [-0.1, 0.6, 0], uaR: [-2.7, 0, -0.5], faR: [-1.2, 0, 0], uaL: [-0.8, 0, 0.3] }, { torso: [0.2, -0.5, 0], uaR: [-0.9, 0, 0.2], faR: [0, 0, 0] }],
+      roar: [{ torso: [-0.2, 0, 0], head: [-0.3, 0, 0], uaR: [-0.3, 0, -0.5], uaL: [-0.3, 0, 0.5] }, { torso: [-0.45, 0, 0], head: [-0.5, 0, 0], uaR: [-0.6, 0, -1.3], uaL: [-0.6, 0, 1.3] }],
+      pray: [{ torso: [0.2, 0, 0], head: [0.3, 0, 0], uaR: [-1.0, 0, 0.5], faR: [-1.3, 0, 0], uaL: [-1.0, 0, -0.5], faL: [-1.3, 0, 0] }, { torso: [-0.25, 0, 0], head: [-0.4, 0, 0], uaR: [-2.8, 0, -0.3], uaL: [-2.8, 0, 0.3], faR: [0, 0, 0], faL: [0, 0, 0] }],
+      stomp: [{ thR: [-1.3, 0, 0], shR: [1.0, 0, 0], torso: [-0.15, 0, 0], uaR: [-0.4, 0, -0.6], uaL: [-0.4, 0, 0.6] }, { thR: [-0.2, 0, 0], shR: [0.1, 0, 0], torso: [0.3, 0, 0] }],
+      spin: [{ torso: [0, 0.9, 0], uaR: [-1.5, 0, -1.3] }, { torso: [0, -0.9, 0], uaR: [-1.5, 0, -1.3] }],
+      drink: [{ uaR: [-2.4, 0, 0.5], faR: [-2.1, 0, 0], head: [-0.35, 0, 0] }, { uaR: [-2.4, 0, 0.5], faR: [-2.1, 0, 0], head: [-0.35, 0, 0] }],
+      shieldRush: [{ torso: [0.3, -0.3, 0], uaL: [-1.4, 0, 0.3], faL: [-0.6, 0, 0], thL: [-0.6, 0, 0], shL: [0.6, 0, 0] }, { torso: [0.4, -0.2, 0], uaL: [-1.6, 0, 0.1], faL: [-0.2, 0, 0], thR: [-0.8, 0, 0], shR: [0.5, 0, 0] }],
+    };
+    const HPO = { swing: 'slashR', combo: 'combo', over: 'over', thrust: 'thrust', sweep: 'slashR', slam: 'slam', leap: 'slam', spin: 'spin', throw: 'throw', shoot: 'shoot', stomp: 'stomp', roar: 'roar', nova: 'roar', cast: 'cast', beam: 'cast', summon: 'roar', blink: 'cast', bite: 'slashR', claw: 'slashR', pounce: 'slam', charge: 'shieldRush', tail: 'spin', breath: 'cast', dive: 'slam', spray: 'cast', spit: 'throw' };
+    const REST = { torso: [0.05, 0, 0], uaR: [-0.35, 0, 0.12], faR: [-0.55, 0, 0], uaL: [-0.15, 0, -0.12], faL: [-0.35, 0, 0] };
+    const REST_BOW = { torso: [0.05, 0, 0], uaR: [-0.2, 0, 0.1], faR: [-0.3, 0, 0], uaL: [-0.6, 0, -0.1], faL: [-0.4, 0, 0] };
+    /* 동작 진행 u(초), 판정 시각들 hs, 길이 d → 보간된 자세 */
+    const backOut = (x) => { x = clamp(x, 0, 1); return 1 + 2.4 * Math.pow(x - 1, 3) + 1.4 * Math.pow(x - 1, 2); };
+    function atkPose(kind, t, d, hs) {
+      const pair = kind === 'combo' ? null : HP[kind] || HP.slashR;
+      let i = 0; while (i < hs.length - 1 && t > hs[i] + 0.12) i++;
+      const h0 = hs.length ? hs[i] : d * 0.5, prev = i > 0 ? hs[i - 1] + 0.12 : 0;
+      const P = pair || (i % 2 ? HP.slashL : HP.slashR);
+      if (t < h0 - 0.08) { const u = smt((t - prev) / Math.max(0.05, h0 - 0.08 - prev)); return [i > 0 && pair ? P[1] : REST, P[0], u, 0]; }
+      if (t < h0 + 0.06) { const u = backOut((t - (h0 - 0.08)) / 0.14); return [P[0], P[1], u, 1]; }
+      if (i < hs.length - 1) return [P[1], (pair || HP[(i + 1) % 2 ? 'slashL' : 'slashR'])[0], smt((t - h0 - 0.06) / Math.max(0.05, hs[i + 1] - 0.08 - h0 - 0.06)), 0];
+      return [P[1], REST, smt((t - h0 - 0.06) / Math.max(0.1, d - h0 - 0.06)), 0];
+    }
+    function applyP(r, P, k) { for (const j of ['torso', 'head', 'uaR', 'faR', 'uaL', 'faL', 'thR', 'shR', 'thL', 'shL']) setR(r[j], P[j], k); }
+    function animHum(r, o, dt, now) {
+      // o: {an, at, ad, sp, hs, po, bow, gr, vy, big}
+      const an = o.an;
+      let P = null, k = Math.min(1, dt * 14), hipY = 1.0, rootRx = 0, rootRy = 0, sink = 0, sq = 1, act = false;
+      const sp = o.sp || 0;
+      r.ph = (r.ph || 0) + dt * (sp > 0.2 ? 2.2 + sp * 1.05 : 0);
+      const loc = () => {
+        const s = Math.min(1, sp / 6), w = Math.sin(r.ph * 1.0), bob = Math.abs(Math.cos(r.ph)) * 0.05 * s;
+        const base = Object.assign({}, o.bow ? REST_BOW : REST);
+        base.thL = [-w * 0.7 * s, 0, 0]; base.thR = [w * 0.7 * s, 0, 0];
+        base.shL = [Math.max(0, Math.sin(r.ph + 1.2)) * 1.0 * s, 0, 0]; base.shR = [Math.max(0, Math.sin(r.ph + 1.2 + PI)) * 1.0 * s, 0, 0];
+        base.uaL = [(base.uaL[0]) + w * 0.5 * s, 0, base.uaL[2]]; if (!o.bow) base.uaR = [base.uaR[0] - w * 0.3 * s, 0, base.uaR[2]];
+        base.torso = [0.05 + s * 0.22, Math.sin(r.ph) * 0.08 * s, 0];
+        hipY = 1.0 - bob * 0.5 - (sp > 0.2 ? 0 : 0.012 + Math.sin(now * 1.9 + r.seed) * 0.008);
+        return base;
+      };
+      if (an === 'idle' || an === 'walk' || an === 'run' || an === 'sprint') P = loc();
+      else if (an === 'guard') { P = loc(); P.uaL = [-1.35, 0, 0.35]; P.faL = [-1.0, 0, 0]; P.torso = [0.12, 0.2, 0]; }
+      else if (an === 'jump' || an === 'j') { P = Object.assign({}, REST, { thL: [-1.2, 0, 0], shL: [1.4, 0, 0], thR: [-0.4, 0, 0], shR: [0.8, 0, 0] }); if (an === 'j') { const q = atkPose('over', o.at, o.ad || 0.6, [0.36]); P = Object.assign(P, mixP(q[0], q[1], q[2])); } }
+      else if (an === 'roll') { const u = clamp(o.at / Math.max(0.3, o.ad), 0, 1); P = { torso: [1.2, 0, 0], head: [0.6, 0, 0], thL: [-2.0, 0, 0], shL: [2.3, 0, 0], thR: [-2.0, 0, 0], shR: [2.3, 0, 0], uaR: [-1.2, 0, 0.3], faR: [-1.5, 0, 0], uaL: [-1.2, 0, -0.3], faL: [-1.5, 0, 0] }; rootRx = u < 0.85 ? smt(u / 0.85) * TAU : 0; hipY = 0.62 + Math.abs(Math.sin(u * PI)) * 0.1; if (u > 0.8) { P = mixP(P, REST, (u - 0.8) / 0.2); hipY = lerp(hipY, 1.0, (u - 0.8) / 0.2); } k = 1; sq = u < 0.12 ? 1 - Math.sin(u / 0.12 * PI) * 0.1 : u > 0.82 ? 1 - Math.sin((u - 0.82) / 0.18 * PI) * 0.12 : 1; }
+      else if (an === 'hit' || an === 'gbrk' || an === 'stag' || an === 'brk') { const u = clamp(o.at / Math.max(0.3, o.ad || 0.6), 0, 1); const big = an !== 'hit'; P = { torso: big ? [0.7, 0, 0.1] : [-0.4, 0, 0.1], head: big ? [0.5, 0, 0] : [-0.3, 0, 0], uaR: [-0.4, 0, -0.7], uaL: [-0.4, 0, 0.7], thL: [big ? -0.6 : 0.2, 0, 0], shL: [big ? 0.9 : 0.1, 0, 0], thR: [big ? -0.3 : -0.1, 0, 0], shR: [big ? 0.6 : 0.2, 0, 0] }; if (an === 'hit') { P = mixP(P, REST, smt((u - 0.4) / 0.6)); sq = 1 - Math.max(0, 1 - u * 5) * 0.06; } hipY = big ? 0.8 : 0.95; }
+      else if (an === 'down' || an === 'dead') { P = { torso: [0, 0, 0], head: [-0.3, 0.4, 0], uaR: [-0.3, 0, -1.3], uaL: [-0.4, 0, 1.0], thL: [-0.2, 0, 0.2], thR: [0.1, 0, -0.1], shL: [0.3, 0, 0] }; rootRx = -PI / 2 * (an === 'dead' ? smt(o.at / 0.6) : 1); hipY = 0.25 + (an === 'dead' ? (1 - smt(o.at / 0.6)) * 0.75 : 0); k = an === 'dead' ? 1 : k; sink = an === 'dead' ? smt((o.at - 2.5) / 2) * 0.8 : 0; }
+      else if (an === 'roar') { const q = atkPose('roar', o.at, 1.6, [0.7]); P = mixP(q[0], q[1], q[2]); }
+      else if (an === 'item' || an === 'throw') { const q = atkPose(an === 'throw' ? 'throw' : 'drink', o.at, o.ad || 1, [o.ad ? o.ad * 0.5 : 0.5]); P = mixP(q[0], q[1], q[2]); }
+      else {
+        const q = atkPose(o.po || 'slashR', o.at, o.ad || 1, o.hs || [0.5]);
+        P = mixP(q[0], q[1], q[2]);
+        if (o.po === 'slam' && o.leap) { const u = clamp(o.at / Math.max(0.2, (o.hs && o.hs[0]) || 0.8), 0, 1); hipY = 1.0 + Math.sin(u * PI) * 1.2; }
+        else if (q[3]) hipY = 0.93; else if (q[0] !== REST && q[2] > 0.3 && o.at < (o.hs ? o.hs[0] : 0.5)) hipY = 0.96;
+        if (o.hs) for (const hh of o.hs) if (o.at > hh - 0.17 && o.at < hh + 0.1) act = true;
+        if (o.po === 'spin') rootRy = smt(clamp(o.at / Math.max(0.2, o.ad), 0, 1)) * TAU;
+        k = Math.min(1, dt * 22);
+      }
+      applyP(r, P, k);
+      r.hips.position.y = lerp(r.hips.position.y, hipY - sink, Math.min(1, dt * 16));
+      r.hips.rotation.x = rootRx; r.hips.rotation.y = rootRy;
+      // 숨 · 무게 이동 · 찌부러짐 · 망토
+      const calm = an === 'idle' || an === 'guard' || an === 'walk';
+      const br = Math.sin(now * 1.8 + r.seed) * 0.5 + 0.5;
+      if (r.chest) r.chest.scale.set(r.chest.scale.x, 1 + br * 0.018, r.chest.scale.x * (1 + br * 0.03));
+      r.hips.position.x = lerp(r.hips.position.x, calm && sp < 0.5 ? Math.sin(now * 0.55 + r.seed) * 0.025 : 0, Math.min(1, dt * 4));
+      r.hips.rotation.z = calm && sp < 0.5 ? Math.sin(now * 0.55 + r.seed) * 0.035 : 0;
+      if (r.head && calm && sp < 0.5) r.head.rotation.y = Math.sin(now * 0.37 + r.seed * 2) * 0.2;
+      const s0 = r.sc || 1; r.root.scale.set(s0 * (2 - sq) * 0.5 + s0 * 0.5, s0 * sq, s0 * (2 - sq) * 0.5 + s0 * 0.5);
+      if (r.capeU) {
+        const v = clamp(sp / 7, 0, 1), sw = Math.sin(now * 2.3 + r.seed), sw2 = Math.sin(now * 2.3 + r.seed - 0.9);
+        const roll = an === 'roll' ? 1 : 0, kk = Math.min(1, dt * 6);
+        r.capeU.rotation.x = lerp(r.capeU.rotation.x, 0.1 + v * 0.6 + sw * 0.05 * (0.4 + v) + roll * 0.9 - (P.torso ? P.torso[0] * 0.6 : 0), kk);
+        r.capeL.rotation.x = lerp(r.capeL.rotation.x, 0.05 + v * 0.4 + sw2 * 0.08 * (0.4 + v) + roll * 0.5, kk);
+        r.capeU.rotation.z = Math.sin(now * 1.3 + r.seed) * 0.04;
+      }
+      if (r.tab) r.tab.rotation.x = lerp(r.tab.rotation.x, -clamp(sp / 7, 0, 1) * 0.5 + (P.thL ? Math.min(0, P.thL[0], P.thR ? P.thR[0] : 0) * 0.5 : 0), Math.min(1, dt * 8));
+      r.atkOn = act;
+    }
+    function animQuad(r, o, dt, now) {
+      const sp = o.sp || 0, an = o.an;
+      r.ph = (r.ph || 0) + dt * (sp > 0.2 ? 3 + sp * 1.1 : 0);
+      let by = 0.75, brx = 0, nrx = 0, hrx = 0, jaw = 0, lift = 0, k = Math.min(1, dt * 12), dead = 0;
+      const s = Math.min(1, sp / 6);
+      const legs = (amp) => { for (const [u, l, sx, sz] of r.legs) { const ph = r.ph + (sx * sz > 0 ? 0 : PI); u.rotation.x = Math.sin(ph) * 0.7 * amp; l.rotation.x = Math.max(0, -Math.sin(ph + 0.6)) * 0.9 * amp; } };
+      if (an === 'idle' || an === 'walk' || an === 'run' || an === 'sprint') { legs(s); by = 0.75 + Math.abs(Math.cos(r.ph)) * 0.05 * s; nrx = Math.sin(now * 1.5) * 0.05; }
+      else if (an === 'stag' || an === 'brk') { legs(0); by = 0.5; brx = 0.15; nrx = 0.5; }
+      else if (an === 'dead') { dead = smt(o.at / 0.6); by = lerp(0.75, 0.35, dead); legs(0); }
+      else if (an === 'roar') { legs(0); nrx = -0.7; hrx = -0.3; jaw = 0.6; }
+      else {
+        const q = o.hs && o.hs.length ? o.hs : [0.5], h0 = q[0], u = o.at, pre = smt(u / Math.max(0.1, h0 - 0.05)), post = smt((u - h0) / 0.15);
+        const po = o.po;
+        if (po === 'bite' || po === 'breath' || po === 'spray') { nrx = lerp(-0.4 * pre, 0.4, post); jaw = po === 'bite' ? (1 - post) * pre * 0.8 : 0.6; legs(0.2); }
+        else if (po === 'claw' || po === 'sweep') { legs(0); r.legs[0][0].rotation.x = -1.4 * pre + post * 1.8; brx = -0.15 * pre; }
+        else if (po === 'pounce' || po === 'leap' || po === 'charge') { legs(po === 'charge' ? 1 : 0.4); by = 0.75 - 0.2 * pre * (1 - post); lift = po === 'charge' ? 0 : Math.max(0, Math.sin(clamp((u - h0 * 0.5) / (h0 * 0.6), 0, 1) * PI)) * 1.2; nrx = 0.3; jaw = 0.4; }
+        else if (po === 'tail') { legs(0); r.root.children[0].rotation.y = Math.sin(clamp(u / (o.ad || 1), 0, 1) * PI) * 1.4; }
+        else { legs(0.3); nrx = -0.5 * pre; jaw = 0.5 * pre; }
+        k = Math.min(1, dt * 20);
+      }
+      r.body.position.y = lerp(r.body.position.y, by + lift, k); r.body.rotation.x = lerp(r.body.rotation.x, brx, k); r.body.rotation.z = dead * 1.3;
+      r.neck.rotation.x = lerp(r.neck.rotation.x, nrx, k); r.head.rotation.x = lerp(r.head.rotation.x, hrx, k); r.jaw.rotation.x = lerp(r.jaw.rotation.x, jaw, k);
+      if (an !== 'm' && r.body.rotation.y && o.po !== 'tail') r.body.rotation.y *= 0.9;
+      r.tail.rotation.y = Math.sin(now * 2 + r.ph) * 0.3;
+      if (r.mane) r.mane.rotation.z = Math.sin(now * 1.7) * 0.06;
+    }
+    function animCrawl(r, o, dt, now) {
+      const sp = o.sp || 0, an = o.an;
+      r.ph = (r.ph || 0) + dt * (sp > 0.2 ? 4 + sp * 1.4 : 0);
+      const s = Math.min(1, sp / 5);
+      let by = 0.55, hrx = 0, jaw = 0, lift = 0, dead = 0;
+      for (const [u, l, sx, kk] of r.legs) { const ph = r.ph + kk * 0.8 + (sx > 0 ? PI : 0); u.rotation.x = Math.sin(ph) * 0.5 * s; u.rotation.z = sx * (1.0 + Math.max(0, Math.cos(ph)) * 0.25 * s); }
+      if (an === 'dead') { dead = smt(o.at / 0.6); by = 0.25; for (const [u, , sx] of r.legs) u.rotation.z = sx * (1.0 - dead * 0.9); }
+      else if (an === 'stag' || an === 'brk') by = 0.35;
+      else if (an[0] === 'm' || an === 'roar') { const q = o.hs && o.hs.length ? o.hs : [0.6], u = o.at, pre = smt(u / Math.max(0.1, q[0] - 0.05)); hrx = -0.5 * pre; jaw = pre; if (o.po === 'leap') lift = Math.max(0, Math.sin(clamp((u - q[0] * 0.4) / (q[0] * 0.6), 0, 1) * PI)) * 1.0; if (o.po === 'summon') { by = 0.55 + pre * 0.4; } }
+      r.body.position.y = lerp(r.body.position.y, by + lift + Math.sin(now * 3) * 0.01, Math.min(1, dt * 14));
+      r.head.rotation.x = lerp(r.head.rotation.x, hrx, Math.min(1, dt * 14)); r.jaw.rotation.y = jaw * 0.3; r.abd.rotation.x = Math.sin(now * 1.3) * 0.06;
+    }
+    function animWyrm(r, o, dt, now) {
+      const sp = o.sp || 0, an = o.an;
+      r.ph = (r.ph || 0) + dt * (sp > 0.2 ? 2.4 + sp * 0.7 : 0);
+      const s = Math.min(1, sp / 6);
+      let nx = 0, jaw = 0, wingUp = 0, flap = 0, tailY = Math.sin(now * 1.2) * 0.2, k = Math.min(1, dt * 10), by = 1.1, dead = 0;
+      for (const [u, l, sx, sz] of r.legs) { const ph = r.ph + (sx * sz > 0 ? 0 : PI); u.rotation.x = Math.sin(ph) * 0.6 * s; l.rotation.x = Math.max(0, -Math.sin(ph + 0.6)) * 0.8 * s; }
+      if (an === 'dead') { dead = smt(o.at / 0.8); by = 0.6; }
+      else if (an === 'roar') { nx = -0.8; jaw = 0.7; wingUp = 0.9; }
+      else if (an === 'stag' || an === 'brk') { nx = 0.5; by = 0.8; }
+      else if (an[0] === 'm') {
+        const q = o.hs && o.hs.length ? o.hs : [0.6], u = o.at, pre = smt(u / Math.max(0.1, q[0] - 0.05)), post = smt((u - q[0]) / 0.15), po = o.po;
+        if (po === 'bite') { nx = lerp(-0.5 * pre, 0.5, post); jaw = (1 - post) * pre; }
+        else if (po === 'breath') { nx = -0.6 * pre + 0.75 * post; jaw = 0.8; }
+        else if (po === 'tail') { tailY = Math.sin(clamp(u / (o.ad || 1), 0, 1) * PI) * 1.6; r.body.rotation.y = -tailY * 0.3; }
+        else if (po === 'dive') { flap = 1; wingUp = 0.6; nx = 0.4; }
+        else if (po === 'charge') { nx = 0.4; for (const [u2] of r.legs) u2.rotation.x = Math.sin(r.ph * 2) * 0.8; }
+        else if (po === 'nova' || po === 'roar') { nx = -0.8 * pre; jaw = pre; wingUp = 0.8 * pre; }
+        else { nx = -0.4 * pre + post * 0.4; jaw = 0.5; }
+        k = Math.min(1, dt * 16);
+      }
+      if (o.air > 0.5) { flap = 1; wingUp = 0.4; }
+      r.necks.forEach((n, i) => { n.rotation.x = lerp(n.rotation.x, nx * (i === 0 ? 0.5 : 0.35), k); });
+      r.jaw.rotation.x = lerp(r.jaw.rotation.x, jaw * 0.6, k);
+      r.tails.forEach((t, i) => { t.rotation.y = tailY * (0.25 + i * 0.12); });
+      for (const [w, sd] of r.wings) w.rotation.z = sd * (lerp(-0.35, 0.6, wingUp) + (flap ? Math.sin(now * 9) * 0.7 : Math.sin(now * 1.4) * 0.05));
+      r.body.position.y = lerp(r.body.position.y, by, k); r.body.rotation.z = dead * 1.2;
+      if (an[0] !== 'm' || o.po !== 'tail') r.body.rotation.y *= 0.92;
+    }
+    function animFloat(r, o, dt, now) {
+      const an = o.an;
+      let P = { torso: [0.05, 0, 0], uaR: [-0.4, 0, 0.3], faR: [-0.6, 0, 0], uaL: [-0.4, 0, -0.3], faL: [-0.6, 0, 0], head: [0.1, 0, 0] }, hy = 1.2 + Math.sin(now * 1.6) * 0.12, k = Math.min(1, dt * 10);
+      if (an === 'dead') { hy = lerp(1.2, 0.2, smt(o.at / 1.2)); P.torso = [0.8, 0, 0]; }
+      else if (an === 'stag' || an === 'brk') { P.torso = [0.5, 0, 0]; hy = 0.9; }
+      else if (an[0] === 'm' || an === 'roar') {
+        const po = an === 'roar' ? 'roar' : o.po; const q = atkPose(po === 'nova' || po === 'summon' || po === 'roar' ? 'roar' : 'cast', o.at, o.ad || 1, o.hs && o.hs.length ? o.hs : [0.6]); P = mixP(q[0], q[1], q[2]);
+        if (po === 'beam') P.uaR = P.uaL = [-1.6, 0, 0];
+        if (po === 'blink') { const u = clamp(o.at / (o.ad || 1), 0, 1); r.root.visible = !(u > 0.35 && u < 0.6); }
+        k = Math.min(1, dt * 18);
+      }
+      applyP(r, P, k);
+      r.hips.position.y = lerp(r.hips.position.y, hy, Math.min(1, dt * 6));
+      r.orb.position.y = 2.6 + Math.sin(now * 2.2) * 0.15; r.orb.rotation.y += dt;
+    }
+    const ANIMF = { hum: animHum, quad: animQuad, crawl: animCrawl, wyrm: animWyrm, float: animFloat };
+
+    /* ======================= 상태 · 세계 ======================= */
+    let st = null, W = null, wKey = '', dead = false, raf = 0, last = 0, paused = false, ready = false, warming = false;
+    const isHost = () => !api.online || api.isHost;
+    const testBot = () => !!(L.debug && (L.debug.autoplay || (L.debug.noTut && api.online)));
+    const mySeat = () => { try { const m = api.mySeats(); return m.length ? m[0] : -1; } catch (e) { return -1; } };
+    const humanHere = (s) => { const p = api.players[s]; return !!p && !p.ai && (!api.online || !!p.local) && !testBot(); };
+    const remoteHuman = (s) => { const p = api.players[s]; return api.online && !!p && !p.ai && !p.local && !testBot(); };
+    const lvOfSeat = (s) => (api.players[s] && api.players[s].ai ? api.players[s].lv || 2 : 2);
+    const habs = {};
+    const habOf = (s) => habs[s] || (habs[s] = S.habits(st ? st.seed : 1, s));
+    const nm = (s) => String((api.players[s] && api.players[s].name) || (st && st.nm && st.nm[s]) || (s + 1) + '번').slice(0, 10);
+    const sfxGate = {};
+    function sfx(name, vol) { const now = performance.now(); if (sfxGate[name] && now - sfxGate[name] < 70) return; sfxGate[name] = now; try { api.sfx(name, { vol: vol == null ? 1 : vol }); } catch (e) {} }
+
+    /* ======================= HUD ======================= */
+    const lay = h('div', { class: 'nf-l' }); wrap.append(lay);
+    const tagL = h('div', { class: 'nf-l' }); wrap.append(tagL);
+    const vit = h('div', { class: 'nf-vit' }); const topEl = h('div', { class: 'nf-top' }); const noteEl = h('div', { class: 'nf-note' });
+    const mini = h('div', { class: 'nf-mini' }); const miniC = h('canvas', { width: 300, height: 300 }); mini.append(miniC);
+    const teamEl = h('div', { class: 'nf-team' }); const kitEl = h('div', { class: 'nf-kit' }); const actEl = h('div', { class: 'nf-act' }); const bossEl = h('div', { class: 'nf-boss' });
+    const xh = h('div', { class: 'nf-x' }); const lockEl = h('div', { class: 'nf-lock' }); const stormV = h('div', { class: 'nf-storm' }); const hurtV = h('div', { class: 'nf-hurt' }); const dawnEl = h('div', { class: 'nf-dawn' }); const lockHint = h('div', { class: 'nf-lockhint' }); const keysEl = h('div', { class: 'nf-keys' });
+    const mapEl = h('div', { class: 'nf-map' }); const mapC = h('canvas', { width: 720, height: 720 }); mapEl.append(mapC);
+    lay.append(stormV, hurtV, vit, topEl, noteEl, mini, teamEl, kitEl, actEl, bossEl, xh, lockEl, dawnEl, lockHint, keysEl);
+    wrap.append(mapEl);
+    mapEl.addEventListener('pointerdown', () => { mapOn = false; mapEl.style.display = 'none'; });
+    let noteT = 0, dawnT = 0, hurtT = 0, mapOn = false, tipEl = null;
+    function note(t, sub) { if (!t) return; noteEl.textContent = t + (sub ? ' · ' + sub : ''); noteEl.style.opacity = '1'; noteT = 1.5; }
+    function bigNote(t, s) { dawnEl.innerHTML = '<b>' + t + '</b>' + (s ? '<span>' + s + '</span>' : ''); dawnEl.style.opacity = '1'; dawnT = 2.6; }
+    wrap.addEventListener('pointerdown', () => { if (noteT > 0) noteT = Math.min(noteT, 0.05); if (dawnT > 0.3) dawnT = 0.3; if (tipEl) { tipEl.remove(); tipEl = null; } }, true);
+    const pool = (cls, n) => { const a = []; for (let i = 0; i < n; i++) { const e = h('div', { class: cls }); e.style.display = 'none'; tagL.append(e); a.push(e); } return a; };
+    const tags = pool('nf-tag', 20), dmgs = pool('nf-dmg', 26); let dmgN = 0; const dmgA = [];
+    const v3 = new THREE.Vector3();
+    function proj(x, y, z) { v3.set(x, y, z).project(cam); if (v3.z > 1 || v3.z < -1) return null; return [(v3.x * 0.5 + 0.5) * vw, (-v3.y * 0.5 + 0.5) * vh]; }
+    function dmgNum(x, y, z, txt, cls) { const e = dmgs[dmgN]; dmgN = (dmgN + 1) % dmgs.length; e.textContent = txt; e.className = 'nf-dmg ' + (cls || ''); e.style.display = ''; const k = dmgA.findIndex((d) => d.e === e); if (k >= 0) dmgA.splice(k, 1); dmgA.push({ e, x: x + (Math.random() - 0.5) * 0.6, y, z: z + (Math.random() - 0.5) * 0.6, t: 0 }); }
+
+    /* 지도 바탕(높이 그림) */
+    let mapBase = null;
+    function buildMapBase(W0) {
+      const n = 210, c = document.createElement('canvas'); c.width = c.height = n; const g = c.getContext('2d'), im = g.createImageData(n, n);
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+        const x = -HALF + (i + 0.5) * 2, z = -HALF + (j + 0.5) * 2, y = S.Hat(x, z), dx = S.Hat(x + 2, z) - S.Hat(x - 2, z);
+        let r = 62 + y * 1.4 - dx * 6, gg = 58 + y * 1.2 - dx * 6, b = 44 + y * 0.8 - dx * 5;
+        if (y < S.WL) { r = 28; gg = 34; b = 42; }
+        const k = (j * n + i) * 4; im.data[k] = clamp(r, 0, 255); im.data[k + 1] = clamp(gg, 0, 255); im.data[k + 2] = clamp(b, 0, 255); im.data[k + 3] = 255;
+      }
+      g.putImageData(im, 0, 0);
+      g.fillStyle = 'rgba(30,26,24,.85)'; for (const pt of W0.parts) if (pt[0] === 'box' || pt[0] === 'cyl' || pt[0] === 'roof') g.fillRect((pt[1] + HALF) / 2 - 0.8, (pt[3] + HALF) / 2 - 0.8, 1.6, 1.6);
+      mapBase = c;
+    }
+    const POIC = { grace: '#e8c46a', fort: '#b9a48a', camp: '#c97a4a', church: '#d8d0b8', mine: '#9a8a70', cave: '#8a8f7a', boss: '#c05a4a', ruin: '#8a8580' };
+    function drawMap(g, cx, cz, span, size, big) {
+      const sc = size / span, X = (x) => (x - cx) * sc + size / 2, Z = (z) => (z - cz) * sc + size / 2;
+      g.fillStyle = '#121010'; g.fillRect(0, 0, size, size);
+      if (mapBase) { g.imageSmoothingEnabled = true; g.drawImage(mapBase, X(-HALF), Z(-HALF), HALF * 2 * sc, HALF * 2 * sc); }
+      const s = W.storm;
+      if (s) {
+        g.save(); g.beginPath(); g.rect(0, 0, size, size); g.arc(X(s.x), Z(s.z), Math.max(1, s.r * sc), 0, TAU, true); g.fillStyle = 'rgba(130,20,40,.35)'; g.fill('evenodd'); g.restore();
+        g.strokeStyle = 'rgba(220,70,80,.9)'; g.lineWidth = big ? 2.5 : 2; g.beginPath(); g.arc(X(s.x), Z(s.z), s.r * sc, 0, TAU); g.stroke();
+        if (s.nr < s.r - 1) { g.setLineDash([5, 4]); g.strokeStyle = 'rgba(240,230,210,.8)'; g.lineWidth = 1.5; g.beginPath(); g.arc(X(s.nx), Z(s.nz), s.nr * sc, 0, TAU); g.stroke(); g.setLineDash([]); }
+      }
+      const r0 = big ? 7 : 5.5;
+      for (const P of W.POI) {
+        if (P.ty === 'grace') continue;
+        const x = X(P.x), z = Z(P.z); if (x < -10 || z < -10 || x > size + 10 || z > size + 10) continue;
+        g.globalAlpha = P.cl ? 0.35 : 1; g.fillStyle = POIC[P.ty] || '#aaa'; g.strokeStyle = '#0c0a0a'; g.lineWidth = 1.5;
+        g.beginPath();
+        if (P.ty === 'boss' || P.ty === 'cave') { g.moveTo(x, z - r0); g.lineTo(x + r0, z); g.lineTo(x, z + r0); g.lineTo(x - r0, z); g.closePath(); }
+        else if (P.ty === 'fort') g.rect(x - r0 * 0.8, z - r0 * 0.8, r0 * 1.6, r0 * 1.6);
+        else if (P.ty === 'church') { g.moveTo(x, z - r0); g.lineTo(x + r0 * 0.8, z + r0 * 0.7); g.lineTo(x - r0 * 0.8, z + r0 * 0.7); g.closePath(); }
+        else g.arc(x, z, r0 * 0.6, 0, TAU);
+        g.fill(); g.stroke(); g.globalAlpha = 1;
+        if (big) { g.font = '600 18px sans-serif'; g.textAlign = 'center'; g.lineWidth = 3.5; g.strokeStyle = 'rgba(0,0,0,.8)'; g.strokeText(T.POI[P.ty].nm, x, z + r0 + 19); g.fillStyle = '#efe4d0'; g.fillText(T.POI[P.ty].nm, x, z + r0 + 19); }
+      }
+      for (const gr of W.gr) { const x = X(gr.x), z = Z(gr.z); g.fillStyle = '#f0cf7a'; g.beginPath(); g.arc(x, z, big ? 5 : 3.5, 0, TAU); g.fill(); g.strokeStyle = 'rgba(0,0,0,.6)'; g.lineWidth = 1; g.stroke(); }
+      for (const e of W.E) if (!e.dead && (e.aw || e.boss)) { const x = X(e.x), z = Z(e.z); g.fillStyle = e.boss ? '#ff5a4a' : 'rgba(220,90,80,.8)'; g.fillRect(x - (e.boss ? 3 : 1.5), z - (e.boss ? 3 : 1.5), e.boss ? 6 : 3, e.boss ? 6 : 3); }
+      W.P.forEach((p, i) => { const x = X(p.x), z = Z(p.z); const col = (api.players[i] && api.players[i].color) || '#ddd'; g.save(); g.translate(x, z); g.rotate(-(p.yaw) + PI); g.fillStyle = p.down ? '#666' : col; g.strokeStyle = '#000'; g.lineWidth = 1.2; g.beginPath(); g.moveTo(0, -(big ? 8 : 7)); g.lineTo(5, 5); g.lineTo(0, 2.5); g.lineTo(-5, 5); g.closePath(); g.fill(); g.stroke(); g.restore(); });
+      if (!big) { g.fillStyle = 'rgba(233,223,204,.6)'; g.font = 'bold 18px sans-serif'; g.textAlign = 'center'; g.fillText('N', size / 2, 20); }
+    }
+
+    /* ======================= 입력 ======================= */
+    const offs = [];
+    let camYaw = PI, camPitch = 0.28, camDist = 5.6, plock = false;
+    const E = { l: 0, h: 0, art: 0, jp: 0, lk: 0, use: 0, sk: 0, ul: 0, it: -1, sw: 0 };
+    let dodgeDown = -1, dodgeEdge = 0, guardHeld = false, eT = 0, jT = 0, lastPLreq = 0;
+    const SENS = (() => { const v = +T.store.get('sens', 1); return v > 0.2 && v < 5 ? v : 1; })();
+    offs.push(api.input.on((type, id) => {
+      if (!W || !st || st.ph !== 'run') return;
+      if (type === 'down') {
+        const now = performance.now();
+        if (id === 'light') { E.l = 1; eT = now; } else if (id === 'heavy') { E.h = 1; eT = now; } else if (id === 'art') { E.art = 1; eT = now; } else if (id === 'jump') { E.jp = 1; jT = now; } else if (id === 'lock') E.lk = 1; else if (id === 'use') E.use = 1;
+        else if (id === 'skill') { E.sk = 1; eT = now; } else if (id === 'ult') { E.ul = 1; eT = now; } else if (id === 'i1' || id === 'i2' || id === 'i3' || id === 'i4') { E.it = +id[1] - 1; eT = now; } else if (id === 'swap') E.sw = 1;
+        else if (id === 'dodge') dodgeDown = now;
+        else if (id === 'map') { mapOn = !mapOn; mapEl.style.display = mapOn ? 'flex' : 'none'; }
+      } else if (type === 'up' && id === 'dodge') { if (dodgeDown >= 0 && performance.now() - dodgeDown < 280) { dodgeEdge = 1; eT = performance.now(); } dodgeDown = -1; }
+    }));
+    const cvs = R.domElement;
+    /* 마우스 시점: 클릭 없이 바로(잠금은 스스로, 안 걸리면 자유 시점 + 가장자리 돌기). 지도 · 멈춤 · 끝에는 커서를 풀고, 닫으면 스스로 다시 잠근다. 누르면 곧바로 공격. */
+    const FL = mkFreeLook({ el: cvs, root: lay.parentNode || cvs,
+      want: () => { const me = mySeat(); return !paused && !mapOn && !!W && !!st && st.ph === 'run' && !W.done && me >= 0 && humanHere(me); },
+      turn: (dx, dy) => { camYaw -= dx * 0.0026 * SENS; camPitch = clamp(camPitch + dy * 0.0021 * SENS, -0.35, 1.1); },
+      onLock: (on, byUser) => { plock = on;
+        // Esc 등으로 잠금이 풀리면(로컬) 바로 멈춤 메뉴 — 브라우저가 Esc를 먼저 가져가 두 번 눌러야 하던 것
+        if (!on && byUser && W && st && st.ph === 'run' && !W.done) { try { if (api.canPause && api.canPause() && !(api.paused && api.paused())) api.pause(); } catch (e) {} } } });
+    const onMD = (e) => {
+      if (!W || !st || st.ph !== 'run' || mySeat() < 0) return;
+      if (e.pointerType && e.pointerType !== 'mouse') return;
+      if (FL.focusClick()) return;   // 창으로 돌아오려고 누른 클릭은 공격으로 치지 않음
+      const now = performance.now(); eT = now;
+      if (e.button === 0) E.l = 1; else if (e.button === 2) E.h = 1; else if (e.button === 1) { E.art = 1; e.preventDefault(); }
+    };
+    const onWheel = (e) => { if (W && st && st.ph === 'run' && !mapOn) { E.sw = 1; e.preventDefault(); } };
+    const onCtx = (e) => e.preventDefault();
+    cvs.addEventListener('pointerdown', onMD); cvs.addEventListener('wheel', onWheel, { passive: false }); cvs.addEventListener('contextmenu', onCtx);
+    DBG.inpDbg = () => ({ E: Object.assign({}, E), dodgeDown, dodgeEdge, plock, camYaw, camPitch }); DBG.fl = () => Object.assign(FL.dbg(), { cy: camYaw, cp: camPitch });
+    const unlock = () => FL.exit();
+    /* 근접 조준 보정: 표적 고정이 없을 때 누른 순간 앞쪽(카메라 · 입력 방향) 가까운 적에게 몸을 돌림 */
+    function softAim(p, fy, rng) {
+      let best = null, bs = 1e9;
+      for (const e of W.E) {
+        if (e.dead) continue; const d = Math.hypot(e.x - p.x, e.z - p.z) - (e.r || 0.5); if (d > (rng ? 0 : 4.2)) continue;
+        const ay = Math.atan2(e.x - p.x, e.z - p.z), a = Math.abs(angD(fy, ay)); if (a > 1.35) continue;
+        const sc = d + a * 2.2 - (e.boss ? 1 : 0); if (sc < bs) { bs = sc; best = ay; }
+      }
+      return best;
+    }
+    function readInp(p) {
+      const inp = S.IN0();
+      const ax = api.input.axis('left', 'right'), az = api.input.axis('up', 'down');
+      // 카메라 기준 이동
+      const fx = -Math.sin(camYaw), fz = -Math.cos(camYaw), rx = -fz, rz = fx;
+      let mx = fx * -az + rx * ax, mz = fz * -az + rz * ax; const ml = Math.hypot(mx, mz); if (ml > 1) { mx /= ml; mz /= ml; }
+      inp.mx = mx; inp.mz = mz;
+      const now = performance.now();
+      inp.run = dodgeDown >= 0 && now - dodgeDown >= 280 ? 1 : 0;
+      inp.guard = api.input.held('guard') ? 1 : 0;
+      inp.aim = Math.atan2(fx, fz);
+      // 입력 버퍼: 동작 앞부분(받지 않는 구간)에 누른 것은 0.45초까지 들고 있다가 넘김(두 번 누를 필요 없게)
+      const a = p.act, busy = !!a && !(a.t > a.d * 0.42 && a.k !== 'hit' && a.k !== 'gbrk');
+      const hold = busy && now - eT < 450 && !p.down;
+      if (!hold) {
+        if (dodgeEdge) { inp.dg = 1; inp.dgy = ml > 0.2 ? Math.atan2(mx, mz) : p.yaw + PI; }
+        if (E.l) inp.l = 1; if (E.h) inp.h = 1; if (E.art) inp.art = 1; if (E.sk) inp.sk = 1; if (E.ul) inp.ul = 1; if (E.it >= 0) inp.it = E.it;
+        if ((inp.l || inp.h || inp.art) && p.lock < 0 && !inp.dg) {
+          const C = T.CLS[T.WPN[S.curW(p)[0]].c];
+          if (!C.rng) { const sa = softAim(p, ml > 0.2 ? Math.atan2(mx, mz) : inp.aim, false); if (sa != null) inp.sa = sa; }
+        }
+        dodgeEdge = 0; E.l = E.h = E.art = E.sk = E.ul = 0; E.it = -1;
+      }
+      if (E.jp && !(a && now - jT < 300 && !p.down)) { inp.jp = 1; E.jp = 0; }
+      if (E.use) inp.use = 1; if (E.sw) inp.sw = 1;
+      if (E.lk) { if (p.lock >= 0) inp.lk = -1; else { const t = pickLock(p); inp.lk = t ? t.id : -1; } }
+      E.use = E.sw = E.lk = 0;
+      return inp;
+    }
+    function pickLock(p) {
+      let best = null, bs = 1e9; const fy = Math.atan2(-Math.sin(camYaw), -Math.cos(camYaw));
+      for (const e of W.E) { if (e.dead) continue; const d = Math.hypot(e.x - p.x, e.z - p.z); if (d > 30) continue; const a = Math.abs(angD(fy, Math.atan2(e.x - p.x, e.z - p.z))); if (a > 1.0) continue; const s = d * (1 + a * 1.5) - (e.boss ? 10 : 0); if (s < bs) { bs = s; best = e; } }
+      return best;
+    }
+
+    /* ======================= 엔티티 그리기 ======================= */
+    const rigs = new Map();   // key → rig
+    function getRig(key, make) { let r = rigs.get(key); if (!r) { r = make(); r.key = key; scene.add(r.root); rigs.set(key, r); } r.seen = frameN; return r; }
+    let frameN = 0;
+    function drawEnt(dt, now) {
+      frameN++;
+      const me = mySeat(), meP = W.P[me >= 0 ? me : 0];
+      const cx = meP ? meP.x : 0, cz = meP ? meP.z : 0;
+      // 원정자
+      W.P.forEach((p, i) => {
+        const r = getRig('p' + i + '_' + p.a, () => rigPlayer(p.a));
+        const w = S.curW(p); const c = T.WPN[w[0]].c; setWeapon(r, c, 1);
+        const x = p.rx != null ? p.rx : p.x, z = p.rz != null ? p.rz : p.z, y = p.ry != null ? p.ry : p.y;
+        r.root.position.set(x, y, z); r.root.rotation.y = p.ryaw != null ? p.ryaw : p.yaw; r.root.visible = true;
+        const sp = p.rsp != null ? p.rsp : Math.hypot(p.vx || 0, p.vz || 0);
+        const ak = p.an, A = T.ARCH[p.a].id;
+        let po = null, hs = null, ad = p.ad;
+        if (ak === 'l0' || ak === 'l1' || ak === 'l2') { const C = T.CLS[c]; const m = C.L[+ak[1]] || C.L[0]; po = C.rng ? (c === 'bow' ? 'shoot' : 'cast') : c === 'spear' || c === 'dagger' ? 'thrust' : ak === 'l2' && (c === 'great' || c === 'hammer') ? 'over' : ak === 'l1' ? 'slashL' : 'slashR'; hs = m.h; }
+        else if (ak === 'h') { const C = T.CLS[c]; po = C.rng ? (c === 'bow' ? 'shoot' : 'cast') : c === 'spear' || c === 'dagger' ? 'thrust' : 'over'; hs = C.H.h; }
+        else if (ak === 'art') { const Ar = T.wArt(w); po = { spin: 'spin', slam: 'slam', multi: 'combo', lunge: 'thrust', ring: 'slam', charge: 'thrust', rain: 'shoot', proj: c === 'bow' ? 'shoot' : 'throw', orbs: 'cast', wave: 'slashR' }[Ar.ty] || 'slashR'; hs = Ar.h; }
+        else if (ak === 'sk') { po = { shield: 'shieldRush', hunter: 'thrust', ash: 'cast', breaker: 'slam', archer: 'shoot', priest: 'pray' }[A]; hs = S.SK[A].h; }
+        else if (ak === 'ul') { po = { shield: 'roar', hunter: 'roar', ash: 'cast', breaker: 'slam', archer: 'shoot', priest: 'pray' }[A]; hs = S.UL[A].h; }
+        animHum(r, { an: ak, at: p.at, ad, sp, po, hs, bow: c === 'bow', leap: ak === 'art' && T.wArt(w).ty === 'slam' || (ak === 'sk' && A === 'breaker') }, dt, now);
+        trailTick(r, dt, 0xf2dcb0);
+        if (p.down) r.root.rotation.y = p.yaw;
+      });
+      // 적
+      for (const e of W.E) {
+        const d = T.ET[e.ty]; if (!d) continue;
+        const dd = Math.hypot(e.x - cx, e.z - cz);
+        if (dd > 170 && !e.boss) { const r0 = rigs.get('e' + e.id); if (r0) r0.root.visible = false; continue; }
+        const r = getRig('e' + e.id, () => rigFor(e.ty, d.look, d.sc));
+        const x = e.rx != null ? e.rx : e.x, z = e.rz != null ? e.rz : e.z, y = e.ry != null ? e.ry : e.y;
+        r.root.position.set(x, y, z); r.root.rotation.y = e.ryaw != null ? e.ryaw : e.yaw;
+        const deadT = e.an === 'dead' ? e.at : 0;
+        r.root.visible = !(e.dead && deadT > 4.5);
+        const sp = e.rsp || 0;
+        let po = null, hs = null, ad = 1;
+        if (e.an && e.an[0] === 'm') { const m = d.mv[+e.an.slice(1)]; if (m) { po = m.po; hs = m.h.map((q) => q[0]); if (!hs.length && m.pj) hs = m.pj.map((q) => q[0]); if (!hs.length && m.zn) hs = m.zn.map((q) => q[0]); if (!hs.length) hs = [m.d * 0.6]; ad = m.d; } }
+        const f = ANIMF[r.kind];
+        const o = { an: e.an || 'idle', at: e.at || 0, ad, sp, po: r.kind === 'hum' ? (HPO[po] || po) : po, hs, air: e.air || 0, leap: po === 'leap' || po === 'pounce' };
+        (f || animHum)(r, o, dt, now);
+        if (r.kind === 'hum') trailTick(r, dt, e.boss || e.fb ? (d.look.a || 0xc08060) : 0xb8a8a0);
+        if (r.flame) r.flame.scale.setScalar(0.16 * (1 + Math.sin(now * 13 + e.id) * 0.15));
+      }
+      for (const [k, r] of rigs) if (r.seen !== frameN) { if (r.trail) { r.trail.m.visible = false; r.trail.n = 0; } if (k[0] === 'e' && !W.em[+k.slice(1)]) { scene.remove(r.root); if (r.trail) { scene.remove(r.trail.m); r.trail.g.dispose(); trails.splice(trails.indexOf(r.trail), 1); } rigs.delete(k); } else r.root.visible = false; }
+    }
+    /* 매 프레임: 예고 · 투사체 · 떨어진 것 · 은총 · 상자 */
+    function drawFx(dt, now) {
+      for (const d of decals) { d.on = 0; d.m.visible = false; }
+      const shown = (sh, x, z, yaw, a, ring) => {
+        const d = decal(); d.m.geometry = shapeGeo(sh); d.m.position.set(x, S.Hat(x, z) + 0.22, z); d.m.rotation.y = yaw;
+        d.m.material.uniforms.uC.value.set(ring ? 0xc89a3a : 0xa82a22); d.m.material.uniforms.uA.value = a;
+      };
+      for (const e of W.E) {
+        if (e.dead || !e.act || e.act.m < 0) continue;
+        const m = (T.ET[e.ty].mv || [])[e.act.m]; if (!m) continue;
+        const t = e.at;
+        for (const hh of m.h) {
+          if (!(hh[3] && hh[3].tg) && !(e.boss && hh[0] - t < 0.6 && hh[1][0] !== 'arc')) continue;
+          const lead = hh[0] - t; if (lead < -0.05 || lead > 1.6) continue;
+          const a = 0.1 + 0.32 * smt(1 - lead / 1.6);
+          let ox = e.x, oz = e.z, yaw = e.yaw;
+          if (m.lg) { if (t < m.lg[1]) { yaw = Math.atan2(e.act.tx - e.x, e.act.tz - e.z); ox = e.act.tx - Math.sin(yaw) * (e.r + 0.6); oz = e.act.tz - Math.cos(yaw) * (e.r + 0.6); } }
+          shown(hh[1], ox, oz, yaw, a, hh[1][0] === 'ring');
+          break;
+        }
+      }
+      for (const z of W.Z) {
+        if (z.team === 'e' && z.del > 0) shown(['circ', z.r, 0], z.x, z.z, 0, 0.1 + 0.35 * smt(1 - z.del / 1.4), false);
+        else if (z.team === 'e' && z.life > 0) { const d = decal(); d.m.geometry = shapeGeo(['circ', z.r, 0]); d.m.position.set(z.x, S.Hat(z.x, z.z) + 0.2, z.z); d.m.material.uniforms.uC.value.set(z.k === 'pool' ? 0x5a7a20 : z.k === 'fire' ? 0xb8501c : 0x6a3aaa); if (z.k === 'fire' && Math.random() < dt * 8) spark(z.x + (Math.random() - 0.5) * 2, S.Hat(z.x, z.z) + 0.3, z.z + (Math.random() - 0.5) * 2, 1, 0xff7a30, 0.3, 1.5); d.m.material.uniforms.uA.value = 0.32; }
+        else if (z.team === 'p' && z.del > 0 && z.k === 'comet') { const d = decal(); d.m.geometry = shapeGeo(['circ', z.r, 0]); d.m.position.set(z.x, S.Hat(z.x, z.z) + 0.2, z.z); d.m.material.uniforms.uC.value.set(0xd07a30); d.m.material.uniforms.uA.value = 0.18; }
+        else if (z.team === 'p' && z.k === 'rain' && Math.random() < dt * 30) spark(z.x + (Math.random() - 0.5) * z.r * 1.6, S.Hat(z.x, z.z) + 6, z.z + (Math.random() - 0.5) * z.r * 1.6, 1, 0xd8cfc0, 0.1, -14);
+      }
+      // 투사체
+      let a = 0, b = 0, c = 0;
+      for (const q of W.Pr) {
+        const yaw = q.yaw != null ? q.yaw : Math.atan2(q.vx, q.vz);
+        const col = PRC[q.k] || 0xffffff;
+        if (q.k === 'arrow' || q.k === 'knife' || q.k === 'spear' || q.k === 'great' || q.k === 'lance') { prThin.setMatrixAt(a, M4(q.x, q.y, q.z, 0, yaw, 0, q.k === 'great' || q.k === 'lance' ? 3 : 1, q.k === 'great' || q.k === 'lance' ? 3 : 1, q.k === 'spear' || q.k === 'lance' ? 2.2 : 1)); prThin.setColorAt(a++, tmpC.set(col)); }
+        else if (q.k === 'rock' || q.k === 'pot' || q.k === 'fpot' || q.k === 'ipot') { const s = q.k === 'rock' ? 1.6 : 0.55; prRock.setMatrixAt(c, M4(q.x, q.y, q.z, now * 3, now * 2, 0, s, s, s)); prRock.setColorAt(c++, tmpC.set(col)); }
+        else { const s = q.k === 'wave' || q.k === 'dark' ? 1.8 : q.k === 'orb' || q.k === 'sun' ? 1.4 : 0.9; prOrb.setMatrixAt(b, M4(q.x, q.y, q.z, 0, yaw, 0, s * (q.k === 'wave' || q.k === 'dark' ? 2.2 : 1), s * (q.k === 'wave' || q.k === 'dark' ? 0.25 : 1), s)); prOrb.setColorAt(b++, tmpC.set(col)); if (Math.random() < dt * 20) spark(q.x, q.y, q.z, 1, col, 0.3, 0.3); }
+      }
+      for (const [im, n] of [[prThin, a], [prOrb, b], [prRock, c]]) { im.count = n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; }
+      // 떨어진 것
+      let bn = 0, dn = 0, inN = 0;
+      for (const d of W.D) {
+        const y = S.Hat(d.x, d.z);
+        if (d.k === 'w') { const rc = new THREE.Color(T.RAR[d.w[1]].col); dropIM.setMatrixAt(dn++, M4(d.x, y + 0.08, d.z, 0, d.id, 0)); beamIM.setMatrixAt(bn, M4(d.x, y + 2.5, d.z, 0, 0, 0, 1, 5, 1)); beamIM.setColorAt(bn++, rc.multiplyScalar(d.w[1] >= 2 ? 1 : 0.7)); }
+        else { itemIM.setMatrixAt(inN, M4(d.x, y + 0.35 + Math.sin(now * 2 + d.id) * 0.06, d.z)); itemIM.setColorAt(inN++, tmpC.set(0xd8c08a)); }
+      }
+      for (const g of W.gr) { beamIM.setMatrixAt(bn, M4(g.x, S.Hat(g.x, g.z) + 22, g.z, 0, 0, 0, 1.6, 44, 1.6)); beamIM.setColorAt(bn++, tmpC.set(0xc8962a)); }
+      let gn = 0; for (const g of W.gr) { const s = 1 + Math.sin(now * 2.4 + g.x) * 0.1; graceIM.setMatrixAt(gn++, M4(g.x, S.Hat(g.x, g.z) + 1.1, g.z, 0, 0, 0, s, s * 1.5, s)); }
+      graceIM.count = gn; graceIM.instanceMatrix.needsUpdate = true;
+      for (const [im, n] of [[beamIM, bn], [dropIM, dn], [itemIM, inN]]) { im.count = n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; }
+      if (Math.random() < dt * 4) for (const g of W.gr) if (Math.random() < 0.3) spark(g.x + (Math.random() - 0.5), S.Hat(g.x, g.z) + 0.6, g.z + (Math.random() - 0.5), 1, 0xf0c060, 0.2, 1.4);
+      // 상자
+      if (chestIM) { W.CH.forEach((c2, i) => { const y = S.Hat(c2.x, c2.z); const yaw = (W.POI[c2.poi] ? W.POI[c2.poi].a : 0); chestIM.setMatrixAt(i, M4(c2.x, y + 0.27, c2.z, 0, yaw, 0)); tmpM.copy(M4(c2.x, y + 0.55, c2.z, 0, yaw, 0)).multiply(M4(0, 0, -0.35, c2.op ? -1.9 : 0, 0, 0)); lidIM.setMatrixAt(i, tmpM); }); chestIM.count = lidIM.count = W.CH.length; chestIM.instanceMatrix.needsUpdate = lidIM.instanceMatrix.needsUpdate = true; }
+      if (fireIM) for (let i = 0; i < fireL.length; i++) if (Math.random() < dt * 6) spark(fireL[i][1], fireL[i][2] + 0.8, fireL[i][3], 1, 0xff8a3a, 0.2, 1.6);
+      // 폭발
+      for (const bb of booms) if (bb.on) { bb.t += dt; const u = bb.t / 0.55; if (u >= 1) { bb.on = 0; bb.m.visible = bb.m2.visible = false; continue; } const s = bb.r * (0.3 + 0.7 * smt(u)); bb.m.scale.set(s, 1, s); bb.m2.scale.set(s, 1, s); bb.m.material.opacity = 0.7 * (1 - u); bb.m2.material.opacity = 0.22 * (1 - u); }
+      // 불티
+      for (let i = 0; i < NP; i++) { if (pAge[i] > 1.2) continue; pAge[i] += dt; if (pAge[i] > 1.2) { pPos[i * 3 + 1] = -500; continue; } pVel[i * 3 + 1] -= 4 * dt; pPos[i * 3] += pVel[i * 3] * dt; pPos[i * 3 + 1] += pVel[i * 3 + 1] * dt; pPos[i * 3 + 2] += pVel[i * 3 + 2] * dt; }
+      pGeo.attributes.position.needsUpdate = true; pGeo.attributes.color.needsUpdate = true;
+    }
+
+    /* ======================= 효과 알림 (fx) ======================= */
+    let fxSeen = 0;
+    function onFx(f) {
+      const k = f[1], me = mySeat();
+      const ent = (id) => W.em[id];
+      if (k === 'hit' || k === 'crit' || k === 'eblk') { const e = ent(f[2]); if (e) { const y = e.y + e.hh * 0.8; if (f[4] === me || W.P.length === 1 || Math.hypot(e.x - (W.P[me >= 0 ? me : 0] || e).x, e.z - (W.P[me >= 0 ? me : 0] || e).z) < 30) { dmgNum(e.x, y + 0.3, e.z, String(f[3]), k === 'crit' ? 'c' : ''); spark(e.x, y, e.z, k === 'crit' ? 14 : 6, k === 'eblk' ? 0xbab0a0 : 0xf0b070, 3.5, 2.2); flash(e.x, y, e.z, k === 'crit' ? 2.2 : 1.3, k === 'eblk' ? 0xc8c8d0 : 0xffd8a8); } if (f[4] === me) { hitStop = Math.max(hitStop, k === 'crit' ? 0.11 : 0.055); shake(k === 'crit' ? 0.18 : 0.06); } if (f[4] === me) sfx(k === 'crit' ? 'thud' : 'hit', k === 'crit' ? 0.7 : 0.35); } }
+      else if (k === 'phit') { const p = W.P[f[2]]; if (p) { dmgNum(p.x, p.y + 2.1, p.z, String(f[3]), 'p'); spark(p.x, p.y + 1.2, p.z, 5, f[4] ? 0xbab0a0 : 0x9a2a22, 2.5, 2); flash(p.x, p.y + 1.3, p.z, f[4] ? 1.2 : 1.5, f[4] ? 0xd0d8e8 : 0xffb090); if (f[2] === me) { hurtT = 0.4; sfx(f[4] ? 'click' : 'hit', 0.6); shake(f[4] ? 0.1 : 0.2); hitStop = Math.max(hitStop, f[4] ? 0.04 : 0.08); } } }
+      else if (k === 'blk') { if (f[2] === me) sfx('click', 0.5); }
+      else if (k === 'pry') { const p = W.P[f[2]]; if (p) { spark(p.x, p.y + 1.4, p.z, 18, 0xf8e0a0, 4, 2); flash(p.x, p.y + 1.4, p.z, 2.6, 0xfff4d8); if (f[2] === me) hitStop = Math.max(hitStop, 0.14); } if (f[2] === me) { note('받아넘기기', '다음 일격 치명'); sfx('pop', 0.8); } }
+      else if (k === 'evd') { }
+      else if (k === 'die') { const e = ent(f[2]); if (e) spark(e.x, e.y + 0.6, e.z, 8, 0x8a7a6a, 1.5, 1.5); sfx('thud', 0.25); }
+      else if (k === 'down') { note(nm(f[2]) + ' 쓰러짐', '때려서 일으키기'); sfx('lose', 0.35); }
+      else if (k === 'rev') { note(nm(f[2]) + ' 일어남'); sfx('pop', 0.5); }
+      else if (k === 'resp') { if (f[2] === me) note('은총의 터에서 다시 일어남', '레벨 ' + f[3]); }
+      else if (k === 'rest') { if (f[2] === me) { note(f[4] ? '레벨 ' + f[3] + ' · ' + f[4] + '단계 오름' : '쉬었다', '성배병 다시 참'); sfx('turn', 0.6); } }
+      else if (k === 'pick') { if (f[2] === me) { if (f[3] === 0) note(T.WPN[f[4]].nm, T.RAR[f[5]].nm); else note(T.ITEM[f[4]].nm); sfx('chip', 0.5); } }
+      else if (k === 'full') { if (f[2] === me) note('소모품 칸이 가득 참'); }
+      else if (k === 'chest') { sfx('chip', 0.3); }
+      else if (k === 'smith') { if (f[2] === me) note('단련석', '든 무기 +' + f[3]); }
+      else if (k === 'altar') { if (f[2] === me) note('성배병 최대 ' + f[3] + '회'); }
+      else if (k === 'heal') { const p = W.P[f[2]]; if (p) spark(p.x, p.y + 1, p.z, 8, 0xe0c070, 1, 2); }
+      else if (k === 'boom' || k === 'pboom' || k === 'eboom') { const x = f[2] / 10, z = f[3] / 10, r = f[4] / 10; let ox = x, oz = z; if (k === 'eboom' && f[7]) { const yaw = f[6] / 100; ox = x + Math.sin(yaw) * f[7] / 10; oz = z + Math.cos(yaw) * f[7] / 10; } boom(ox, oz, r, k === 'eboom' ? (f[5] ? 0 : 1) : f[5]); for (let i = 0; i < 10; i++) spark(ox + (Math.random() - 0.5) * r, S.Hat(ox, oz) + 0.3, oz + (Math.random() - 0.5) * r, 1, k === 'eboom' ? 0xc0a080 : 0xff9a50, 1, 3); const meP = W.P[me >= 0 ? me : 0]; if (meP && Math.hypot(meP.x - ox, meP.z - oz) < r + 10) shake(k === 'eboom' ? 0.25 : 0.12); sfx('thud', 0.5); }
+      else if (k === 'brk') { const e = ent(f[2]); if (e) { note('자세 붕괴', '치명타 기회'); spark(e.x, e.y + e.hh, e.z, 20, 0xf0d0a0, 3, 3); flash(e.x, e.y + e.hh * 0.7, e.z, 4, 0xfff0c8); hitStop = Math.max(hitStop, 0.12); shake(0.25); sfx('thud', 0.8); } }
+      else if (k === 'bph') { const e = ent(f[2]); note((e ? T.ET[e.ty].nm : '') + ' — 기세가 달라졌다'); sfx('warn', 0.7); shake(0.3); }
+      else if (k === 'roar') { sfx('warn', 0.35); }
+      else if (k === 'night') { bigNote(T.NIGHT_NM[f[2] - 1], T.BOSS[f[3]].nm); sfx('warn', 0.8); }
+      else if (k === 'final') { bigNote('셋째 날', T.BOSS[f[2]].nm); sfx('warn', 0.9); }
+      else if (k === 'dawn') { bigNote('새벽', T.NIGHT_NM[f[2] - 1] + '을 넘겼다'); sfx('result', 0.7); }
+      else if (k === 'day') { bigNote(T.DAY_NM[f[2] - 1], '폭풍이 다시 일어난다'); }
+      else if (k === 'rest') { bigNote('마지막 준비', '은총의 터에서 쉬고 고원으로'); }
+      else if (k === 'ngrace') { note('마지막 원에 은총의 터가 생겼다'); }
+      else if (k === 'won') { bigNote('원정 완수', '사흘째 밤을 넘겼다'); sfx('win', 0.8); }
+      else if (k === 'lost') { bigNote('원정 실패', '모두 쓰러졌다'); sfx('lose', 0.7); }
+      else if (k === 'st') { const e = ent(f[2]); if (e) { const c = [0xb03a3a, 0xe07a2e, 0x8fc6e6, 0x7fa23a][f[3]]; spark(e.x, e.y + e.hh * 0.6, e.z, 10, c, 2, 2); if (f[4]) dmgNum(e.x, e.y + e.hh + 0.6, e.z, String(f[4]), 'c'); } }
+      else if (k === 'pst') { if (f[2] === me) note(['출혈', '화상', '서리', '독'][f[3]]); }
+      else if (k === 'ult') { const p = W.P[f[2]]; if (p) spark(p.x, p.y + 1.2, p.z, 24, 0xf0c060, 4, 3); sfx('whoosh', 0.7); }
+      else if (k === 'blink' || k === 'eblink') { sfx('whoosh', 0.4); }
+      else if (k === 'sw') { if (f[2] === me) { const p = W.P[me]; note(T.wName(S.curW(p))); } }
+      else if (k === 'poi') { }
+    }
+    let shakeA = 0;
+    function shake(a) { shakeA = Math.max(shakeA, a * fxK()); }
+
+    /* ======================= 카메라 ======================= */
+    const camPos = new THREE.Vector3(0, 30, 30), camLook = new THREE.Vector3();
+    let vw = 1, vh = 1, spinA = 0;
+    function layout() { const r = wrap.getBoundingClientRect(); vw = Math.max(1, r.width); vh = Math.max(1, r.height); R.setSize(vw, vh, false); cam.aspect = vw / vh; cam.updateProjectionMatrix(); }
+    function camTick(dt) {
+      if (!W) return;
+      const me = mySeat();
+      const p = W.P[me >= 0 ? me : 0];
+      if (!p) return;
+      if (st && st.ph === 'pick') { spinA += dt * 0.05; const cx = p.x, cz = p.z; camPos.set(cx + Math.sin(spinA) * 16, S.Hat(cx, cz) + 7, cz + Math.cos(spinA) * 16); camLook.set(cx, S.Hat(cx, cz) + 2, cz); cam.position.copy(camPos); cam.lookAt(camLook); sky.position.copy(cam.position); return; }
+      const ky = api.input.axis('camL', 'camR'), kp = api.input.axis('camU', 'camD');
+      camYaw -= ky * dt * 2.4; camPitch = clamp(camPitch + kp * dt * 1.6, -0.35, 1.1);
+      const px = p.rx != null ? p.rx : p.x, pz = p.rz != null ? p.rz : p.z, py = p.ry != null ? p.ry : p.y;
+      const lt = p.lock >= 0 ? W.em[p.lock] : null;
+      if (lt && !lt.dead && me >= 0) { const ty = Math.atan2(px - lt.x, pz - lt.z); camYaw += angD(camYaw, ty) * Math.min(1, dt * 6); const dd = Math.hypot(lt.x - px, lt.z - pz); const tp = clamp(0.22 + (lt.hh > 3 ? 0.15 : 0) - Math.min(0.15, dd * 0.004), -0.2, 0.6); camPitch += (tp - camPitch) * Math.min(1, dt * 3); }
+      else if (me < 0 || testBot() || !humanHere(me)) { camYaw += angD(camYaw, p.yaw + PI) * Math.min(1, dt * 1.2); }
+      const dist = camDist * (W.ph === 'night' || W.ph === 'final' ? 1.25 : 1) + (lt && lt.hh > 3 ? 2 : 0);
+      const ox = Math.sin(camYaw) * Math.cos(camPitch) * dist, oz = Math.cos(camYaw) * Math.cos(camPitch) * dist, oy = Math.sin(camPitch) * dist;
+      const sh = 0.55, sx = Math.cos(camYaw) * sh, sz = -Math.sin(camYaw) * sh;
+      let tx = px + ox + sx, tz = pz + oz + sz; let ty = py + 1.7 + oy;
+      { const f = S.rayOb(W, px + sx, pz + sz, tx, tz); if (f < 1) { const k = Math.max(0.25, f); tx = px + sx + (tx - px - sx) * k; tz = pz + sz + (tz - pz - sz) * k; ty = py + 1.7 + (ty - py - 1.7) * k; } }
+      ty = Math.max(ty, S.Hat(tx, tz) + 0.6);
+      camPos.x += (tx - camPos.x) * Math.min(1, dt * 14); camPos.y += (ty - camPos.y) * Math.min(1, dt * 14); camPos.z += (tz - camPos.z) * Math.min(1, dt * 14);
+      camLook.set(px + sx, py + 1.45, pz + sz);
+      if (lt && !lt.dead && me >= 0) camLook.lerp(new THREE.Vector3(lt.x, lt.y + lt.hh * 0.6, lt.z), 0.25);
+      cam.position.copy(camPos);
+      if (shakeA > 0) { cam.position.x += (Math.random() - 0.5) * shakeA; cam.position.y += (Math.random() - 0.5) * shakeA; shakeA = Math.max(0, shakeA - dt * 1.4); }
+      cam.lookAt(camLook);
+      sky.position.copy(cam.position);
+    }
+
+    /* ======================= 빛 · 하늘 (낮 → 밤) ======================= */
+    let nightK = 0, finK = 0;
+    const sdS = new THREE.Vector3(0, 1, 0), sdR = new THREE.Vector3(), sdU = new THREE.Vector3(), UPV = new THREE.Vector3(0, 1, 0);
+    function lightTick(dt, now) {
+      const ph = W ? W.ph : 'day';
+      const tN = ph === 'night' || ph === 'final' || ph === 'lost' ? 1 : ph === 'dawn' ? 0.4 : ph === 'rest' ? 0.75 : W ? smt((W.pt / W.dayLen - 0.8) / 0.2) * 0.6 : 0;
+      const tF = ph === 'final' || ph === 'rest' || ph === 'won' ? 1 : 0;
+      nightK += (tN - nightK) * Math.min(1, dt * 0.6); finK += (tF - finK) * Math.min(1, dt * 0.5);
+      const u = W && ph === 'day' ? W.pt / W.dayLen : 1;
+      const el = lerp(0.42, 0.06, u) * (1 - nightK) + 0.5 * nightK;
+      const az = -0.6 + u * 0.4;
+      const sd = new THREE.Vector3(Math.sin(az) * Math.cos(el), Math.sin(el), -Math.cos(az) * Math.cos(el)).normalize();
+      skyU.uSun.value.copy(sd); skyU.uNight.value = nightK; skyU.uFin.value = finK; skyU.uT.value = now;
+      const me = mySeat(), p = W && W.P[me >= 0 ? me : 0];
+      const cx = p ? p.x : 0, cz = p ? p.z : 0, cy = p ? p.y : 0;
+      // 그림자: 빛이 원정자를 따라 미끄러지면 그림자 가장자리가 자글거림 → 해 방향은 끊어서 바꾸고 중심은 그림자 칸에 맞춤
+      { const uq = Math.round(u * 160) / 160, el2 = lerp(0.42, 0.06, uq) * (1 - nightK) + 0.5 * nightK, elq = Math.round(el2 * 400) / 400, azq = -0.6 + uq * 0.4;
+        sdS.set(Math.sin(azq) * Math.cos(elq), Math.sin(elq), -Math.cos(azq) * Math.cos(elq)).normalize(); }
+      let lx = p ? (p.rx != null ? p.rx : p.x) : 0, ly = cy, lz = p ? (p.rz != null ? p.rz : p.z) : 0;
+      if (TIER.shadow) { const tex = 90 / TIER.shadow; sdR.crossVectors(UPV, sdS).normalize(); sdU.crossVectors(sdS, sdR).normalize(); v3.set(lx, ly, lz);
+        const a1 = v3.dot(sdR), a2 = v3.dot(sdU), a3 = v3.dot(sdS); v3.set(0, 0, 0).addScaledVector(sdR, Math.round(a1 / tex) * tex).addScaledVector(sdU, Math.round(a2 / tex) * tex).addScaledVector(sdS, Math.round(a3 / 2) * 2); lx = v3.x; ly = v3.y; lz = v3.z; }
+      sun.position.set(lx + sdS.x * 120, ly + sdS.y * 120, lz + sdS.z * 120); sun.target.position.set(lx, ly, lz);
+      sun.color.setRGB(lerp(1.0, 0.55, nightK), lerp(0.66, 0.62, nightK), lerp(0.42, 0.85, nightK));
+      sun.intensity = lerp(3.0, 1.6, nightK) * (1 - finK * 0.2);
+      rimL.position.set(cx - sd.x * 100, cy + 40, cz - sd.z * 100); rimL.target.position.set(cx, cy, cz); rimL.intensity = lerp(0.8, 1.2, nightK);
+      hemi.intensity = lerp(1.35, 1.0, nightK);
+      hemi.color.setRGB(lerp(0.55, 0.28, nightK), lerp(0.48, 0.3, nightK), lerp(0.58, 0.48, nightK));
+      const fc = new THREE.Color().setRGB(lerp(0.36, 0.08, nightK), lerp(0.25, 0.08, nightK), lerp(0.22, 0.13, nightK)).lerp(new THREE.Color(0.14, 0.08, 0.18), finK * 0.6);
+      fog.color.copy(fc); fog.far = lerp(230, 150, nightK) * TIER.fog; fog.near = lerp(40, 20, nightK);
+      R.setClearColor(fc);
+      RIMU.value = lerp(0.6, 1.1, nightK);
+      // 폭풍
+      if (W && W.storm) { const s = W.storm; storm.position.set(s.x, -30, s.z); storm.scale.set(s.r, 170, s.r); stormU.uT.value = now; stormU.uA.value = s.r > 280 ? 0.0 : 1; stormFloor.visible = false; }
+    }
+
+    /* ======================= HUD 그리기 ======================= */
+    let hudT = 0, miniT = 0;
+    const fmt = (n) => { try { return L.fmt.num(n); } catch (e) { return String(n); } };
+    const mmss = (s) => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+    function hud() {
+      if (!W || !st || st.ph !== 'run') { [vit, topEl, mini, teamEl, kitEl, actEl, bossEl, xh, lockEl, lockHint, keysEl].forEach((e) => { e.style.display = 'none'; }); return; }
+      const me = mySeat(), spect = me < 0, p = W.P[spect ? 0 : me];
+      [vit, topEl, mini, teamEl, kitEl].forEach((e) => { e.style.display = ''; });
+      // 생명
+      const hp = Math.max(0, p.hp) / p.mhp, sp = Math.max(0, p.st) / p.mst;
+      const wpx = clamp(170 + p.mhp * 0.14, 180, 330);
+      vit.style.width = wpx + 'px';
+      const cost = T.lvCost(p.lvl);
+      const stTags = [];
+      if (p.bfb & 32) stTags.push('<span style="color:#e07a2e">화상</span>'); if (p.bfb & 64) stTags.push('<span style="color:#9fc04a">독</span>'); if (p.bfb & 128) stTags.push('<span style="color:#8fc6e6">서리</span>');
+      if (p.bfb & 1) stTags.push('<span>성채</span>'); if (p.bfb & 2) stTags.push('<span>거인의 힘</span>'); if (p.bfb & 4) stTags.push('<span>전투의 향</span>'); if (p.bfb & 8) stTags.push('<span>돌 피부</span>'); if (p.bfb & 16) stTags.push('<span>성가</span>');
+      vit.innerHTML = '<div class="nf-bar hp"><b style="width:' + (p.hpLag * 100).toFixed(1) + '%"></b><i style="width:' + (hp * 100).toFixed(1) + '%"></i><em>' + Math.ceil(Math.max(0, p.hp)) + ' / ' + Math.round(p.mhp) + '</em></div>' +
+        '<div class="nf-bar st"><i style="width:' + (sp * 100).toFixed(1) + '%"></i></div>' +
+        '<div class="nf-bar ul' + (p.ult >= 100 ? ' full' : '') + '"><i style="width:' + Math.min(100, p.ult) + '%"></i></div>' +
+        '<div class="nf-lv">' + (spect ? nm(0) + ' 관전 · ' : '') + T.ARCH[p.a].nm + ' · 레벨 <em>' + p.lvl + '</em> · 룬 ' + fmt(p.runes) + (p.lvl < T.MAXLV ? ' / ' + fmt(cost) + (p.runes >= cost ? ' · 은총에서 레벨업' : '') : '') + '</div>' + (stTags.length ? '<div class="nf-sts">' + stTags.join('') + '</div>' : '');
+      // 위 띠
+      const s = W.storm, ph = W.ph;
+      let t1 = '', t2 = '';
+      if (ph === 'day') { t1 = T.DAY_NM[W.day - 1]; t2 = s.sh ? '폭풍이 좁혀 드는 중 · ' + mmss(s.tn) : (W.pt / W.dayLen > 0.86 ? '해가 진다 · ' + mmss(W.dayLen - W.pt) : '다음 수축까지 ' + mmss(s.tn)); }
+      else if (ph === 'night') { t1 = T.NIGHT_NM[W.day - 1]; t2 = W.bossNm; }
+      else if (ph === 'dawn') { t1 = '새벽'; t2 = ''; }
+      else if (ph === 'rest') { t1 = '셋째 날'; t2 = '마지막 준비 · ' + mmss(s.tn); }
+      else if (ph === 'final') { t1 = '셋째 날'; t2 = W.bossNm; }
+      else if (ph === 'won') { t1 = '원정 완수'; } else if (ph === 'lost') { t1 = '원정 실패'; }
+      topEl.innerHTML = '<b>' + t1 + '</b>' + (t2 ? '<span>' + t2 + '</span>' : '');
+      // 동료
+      teamEl.innerHTML = W.P.map((q, i) => (i === me ? '' : '<div class="nf-tm' + (q.down ? ' dn' : '') + '"><div><b style="color:' + ((api.players[i] && api.players[i].color) || '#ddd') + '">' + nm(i) + '</b><span>' + T.ARCH[q.a].nm + ' · ' + q.lvl + (q.down ? ' · 쓰러짐' : ' · ' + Math.ceil(Math.max(0, q.hp))) + '</span></div><div class="nf-bar"><i style="width:' + (Math.max(0, q.hp) / q.mhp * 100).toFixed(0) + '%"></i></div></div>')).join('');
+      // 무기 · 소모품 · 기술
+      const w = S.curW(p), WP = T.WPN[w[0]], C = T.CLS[WP.c], Ar = T.wArt(w);
+      const kb = (id) => { try { return L.ui.keyLabel(T.ID, id) || ''; } catch (e) { return ''; } };
+      const pas = T.wPas(w).map(([k2, v2]) => T.PAS[k2].f(v2));
+      let wh = '<div class="nf-wn"><b style="color:' + T.RAR[w[1]].col + '">' + T.wName(w) + '</b><i>' + C.nm + ' · ' + T.RAR[w[1]].nm + ' · 피해 ' + Math.round(T.wDmg(w) * T.lvMul(p.lvl)) + ' · 기술 「' + Ar.nm + '」' + (WP.fx ? ' · ' + T.STATUS[WP.fx].nm : '') + '</i>' + (pas.length ? '<i>' + pas.join(' · ') + '</i>' : '') + '</div>';
+      wh += '<div class="nf-row">' + p.w.map((x, i) => '<div class="nf-sl' + (i === p.wi ? ' on' : '') + '">' + T.svgW(T.CLS_IC[T.WPN[x[0]].c](T.RAR[x[1]].col), 30) + '</div>').join('') + '</div>';
+      const itS = ['<div class="nf-sl' + (p.fl ? '' : ' off') + '"><u>' + kb('i1') + '</u>' + T.svgW(T.ITEM_IC('flask', '#c9a050'), 28) + '<small>' + p.fl + '/' + p.flm + '</small></div>'];
+      p.it.forEach((x, i) => itS.push('<div class="nf-sl' + (x ? '' : ' off') + '"><u>' + kb('i' + (i + 2)) + '</u>' + (x ? T.svgW(T.ITEM_IC(T.ITEM[x[0]].id, '#b8a888'), 26) + '<small>' + x[1] + '</small>' : '') + '</div>'));
+      const A = T.ARCH[p.a];
+      const skCd = A.sk.cd, sk = p.skc > 0 ? '<s style="height:' + (p.skc / skCd * 100).toFixed(0) + '%"></s><small>' + Math.ceil(p.skc) + '</small>' : '';
+      itS.push('<div class="nf-sl" title="' + A.sk.nm + '"><u>' + (kb('skill') || 'F') + '</u><span style="font-size:12px">기술</span>' + sk + '</div>');
+      itS.push('<div class="nf-sl' + (p.ult >= 100 ? ' on' : ' off') + '" title="' + A.ul.nm + '"><u>' + (kb('ult') || 'R') + '</u><span style="font-size:12px">궁극</span>' + (p.ult < 100 ? '<small>' + Math.floor(p.ult) + '%</small>' : '') + '</div>');
+      wh += '<div class="nf-row">' + itS.join('') + '</div>';
+      kitEl.innerHTML = wh;
+      // 상호작용 안내
+      let at = '';
+      if (!spect && !p.down) {
+        let best = null, bd = 2.8, kind = '';
+        for (const g of W.gr) { const d = Math.hypot(g.x - p.x, g.z - p.z); if (d < bd) { bd = d; best = g; kind = 'g'; } }
+        for (const c2 of W.CH) if (!c2.op) { const d = Math.hypot(c2.x - p.x, c2.z - p.z); if (d < bd) { bd = d; best = c2; kind = 'c'; } }
+        for (const P of W.POI) if (P.alt && !P.used[me]) { const d = Math.hypot(P.alt.x - p.x, P.alt.z - p.z); if (d < bd) { bd = d; best = P; kind = 'a'; } }
+        for (const d0 of W.D) { const d = Math.hypot(d0.x - p.x, d0.z - p.z) - 0.4; if (d < bd) { bd = d; best = d0; kind = 'd'; } }
+        const K = '<kbd>' + (kb('use') || 'E') + '</kbd>';
+        if (kind === 'g') at = K + '은총의 터에서 쉬기' + (p.runes >= cost && p.lvl < T.MAXLV ? ' · 레벨업' : '');
+        else if (kind === 'c') at = K + (best.k === 's' ? '단련석 상자 열기' : '상자 열기');
+        else if (kind === 'a') at = K + '제단에 닿기 · 성배병 +1';
+        else if (kind === 'd') {
+          if (best.k === 'w') { const ww = best.w, cw = T.CLS[T.WPN[ww[0]].c]; const ps = T.wPas(ww).map(([k2, v2]) => T.PAS[k2].f(v2)).join(' · '); at = K + '줍기 · <b style="color:' + T.RAR[ww[1]].col + '">' + T.wName(ww) + '</b> ' + cw.nm + ' · ' + T.RAR[ww[1]].nm + (p.w.length >= 3 ? ' (든 무기와 바꿈)' : '') + '<small>피해 ' + Math.round(T.wDmg(ww) * T.lvMul(p.lvl)) + ' (지금 ' + Math.round(T.wDmg(w) * T.lvMul(p.lvl)) + ') · 기술 「' + T.wArt(ww).nm + '」' + (ps ? ' · ' + ps : '') + '</small>'; }
+          else at = K + '줍기 · ' + T.ITEM[best.it].nm + '<small>' + T.ITEM[best.it].d + '</small>';
+        }
+      } else if (!spect && p.down) at = '쓰러짐 · ' + (W.ph === 'day' && p.dT > 0 ? Math.ceil(p.dT) + '초 뒤 은총의 터에서 일어남 · ' : '') + '동료가 일으키는 중 ' + (p.rgp != null ? p.rgp : Math.round(p.rg / p.rq * 100)) + '%';
+      actEl.style.display = at ? '' : 'none'; if (at) actEl.innerHTML = at;
+      // 보스
+      const bs = W.bossE.map((id) => W.em[id]).filter(Boolean);
+      if (bs.length && (W.ph === 'night' || W.ph === 'final')) {
+        const tot = bs.reduce((a, e) => a + Math.max(0, e.hp), 0), mx = bs.reduce((a, e) => a + e.mhp, 0);
+        bossEl.style.display = ''; bossEl.innerHTML = '<b>' + W.bossNm + '</b><div class="nf-bar"><i style="width:' + (tot / Math.max(1, mx) * 100).toFixed(1) + '%"></i><em>' + Math.ceil(tot / Math.max(1, mx) * 100) + '%</em></div>';
+      } else bossEl.style.display = 'none';
+      stormV.style.opacity = p.inStorm ? '1' : '0';
+      xh.style.display = !spect && C.rng && p.lock < 0 ? '' : 'none';
+      // 마우스 잠금 안내 · 키 안내(PC) — 잠금이 풀렸을 때와 첫날 처음 1분 30초
+      const meHum = !spect && humanHere(me);
+      lockHint.style.display = 'none';   // 「화면 클릭」 안내 없음 — 마우스를 움직이면 바로 돈다(mkFreeLook)
+      const showKeys = meHum && W.day === 1 && W.ph === 'day' && W.pt < 90 && !bs.length && !tipEl && !testMode;
+      keysEl.style.display = showKeys ? '' : 'none';
+      if (showKeys) { const kk = (id, d, t) => '<span><kbd>' + (kb(id) || d) + '</kbd>' + t + '</span> '; const html = '<span><kbd>좌클릭</kbd>약공격</span> <span><kbd>우클릭</kbd>강공격</span> ' + kk('art', 'X', '무기 기술') + kk('dodge', 'Shift', '구르기 · 길게 달리기') + kk('jump', 'Space', '점프') + kk('guard', 'C', '가드') + kk('lock', 'Q', '표적') + kk('use', 'E', '상호작용') + kk('map', 'M', '지도'); if (keysEl._h !== html) { keysEl.innerHTML = html; keysEl._h = html; } }
+    }
+    function tagsTick(dt) {
+      const me = mySeat(), p0 = W.P[me >= 0 ? me : 0];
+      let n = 0;
+      const put = (x, y, z, html) => { if (n >= tags.length) return; const q = proj(x, y, z); if (!q || q[1] < 70 || (q[0] > vw - 190 && q[1] < 240)) return; const e = tags[n++]; e.style.display = ''; e.style.transform = 'translate(' + q[0].toFixed(0) + 'px,' + q[1].toFixed(0) + 'px) translate(-50%,-100%)'; if (e._h !== html) { e.innerHTML = html; e._h = html; } };
+      W.P.forEach((q, i) => { if (i === me) return; const col = (api.players[i] && api.players[i].color) || '#ddd'; put(q.rx != null ? q.rx : q.x, (q.ry != null ? q.ry : q.y) + 2.25, q.rz != null ? q.rz : q.z, '<span style="color:' + col + '">◆</span> ' + nm(i) + (q.down ? '<div style="color:#e08a7a">쓰러짐 · 때려서 일으키기 ' + (q.rgp != null ? q.rgp : Math.round(q.rg / q.rq * 100)) + '%</div>' : '')); });
+      if (p0) for (const e of W.E) {
+        if (e.dead || e.boss || !e.aw) continue; const hpf = e.hpf != null ? e.hpf : e.hp / e.mhp; if (hpf >= 0.999 && p0.lock !== e.id) continue;
+        if (Math.hypot(e.x - p0.x, e.z - p0.z) > 26) continue;
+        put(e.rx != null ? e.rx : e.x, (e.ry != null ? e.ry : e.y) + e.hh + 0.35, e.rz != null ? e.rz : e.z, '<div class="nf-bar"><i style="width:' + (hpf * 100).toFixed(0) + '%"></i></div>' + ((e.stf || 0) & 8 || e.mk > W.t ? '<span style="font-size:12px;color:#f0cc80">표식</span>' : ''));
+      }
+      for (let i = n; i < tags.length; i++) tags[i].style.display = 'none';
+      // 표적
+      const lt = p0 && p0.lock >= 0 ? W.em[p0.lock] : null;
+      if (lt && !lt.dead && me >= 0) { const q = proj(lt.rx != null ? lt.rx : lt.x, (lt.ry != null ? lt.ry : lt.y) + lt.hh * 0.6, lt.rz != null ? lt.rz : lt.z); if (q) { lockEl.style.display = ''; lockEl.style.transform = 'translate(' + q[0].toFixed(0) + 'px,' + q[1].toFixed(0) + 'px) rotate(45deg)'; } else lockEl.style.display = 'none'; } else lockEl.style.display = 'none';
+      // 피해 숫자
+      for (let i = dmgA.length - 1; i >= 0; i--) { const d = dmgA[i]; d.t += dt; if (d.t > 0.9) { d.e.style.display = 'none'; dmgA.splice(i, 1); continue; } const q = proj(d.x, d.y + d.t * 0.8, d.z); if (!q) { d.e.style.display = 'none'; continue; } d.e.style.display = ''; d.e.style.opacity = String(1 - smt((d.t - 0.5) / 0.4)); d.e.style.transform = 'translate(' + q[0].toFixed(0) + 'px,' + q[1].toFixed(0) + 'px) translate(-50%,-100%)'; }
+    }
+
+    /* ======================= 고르기 화면 ======================= */
+    let pickEl = null, pickBar = null, pickKey = '';
+    function drawPick() {
+      if (!st || st.ph !== 'pick') { if (pickEl) { pickEl.remove(); pickEl = null; } if (pickBar) { pickBar.destroy(); pickBar = null; } return; }
+      const me = mySeat(), key = st.pk.join(',') + me;
+      if (!pickEl) {
+        pickEl = h('div', { class: 'nf-pick' }); wrap.append(pickEl);
+        try { pickBar = api.pickBar({ picked: (s) => st && st.pk[s] >= 0, onForce: () => forcePick(), parent: pickEl }); } catch (e) { pickBar = null; }
+      }
+      if (key === pickKey) return; pickKey = key;
+      const kids = [...pickEl.children].filter((c) => c !== (pickBar && pickBar.el)); kids.forEach((c) => c.remove());
+      const head = h('h2', { text: '원정자를 고른다' });
+      const sub = h('p', { text: me >= 0 ? '사흘 동안 함께할 원정자. 판 밖 성장은 없음 — 모두 레벨 1에서 시작.' : '관전 중 · 원정자를 고르는 중' });
+      const grid = h('div', { class: 'nf-cards' });
+      T.ARCH.forEach((A, i) => {
+        const who = st.pk.map((v, s) => (v === i ? nm(s) : null)).filter(Boolean).join(' · ');
+        const W0 = T.WPN[T.WI[A.w0]];
+        const card = h('button', { class: 'nf-card' + (me >= 0 && st.pk[me] === i ? ' on' : ''), onclick() { if (me >= 0) choose(me, i); } });
+        card.innerHTML = '<h4>' + T.svgW(T.ARCH_IC(i, A.ac), 26) + '<span>' + A.nm + '</span><small>' + A.role + ' · ' + W0.nm + '</small></h4>' +
+          '<div><b>' + A.pas.nm + '</b> — ' + A.pas.d + '</div><div><b>' + A.sk.nm + '</b>(F · ' + A.sk.cd + '초) — ' + A.sk.d + '</div><div><b>' + A.ul.nm + '</b>(R) — ' + A.ul.d + '</div><div class="who">' + (who ? who + ' 고름' : '') + '</div>';
+        grid.append(card);
+      });
+      pickEl.prepend(head, sub, grid);
+      if (pickBar && pickBar.el.parentNode !== pickEl) pickEl.append(pickBar.el);
+    }
+    let pendPick = null;
+    function choose(s, i) {
+      if (isHost()) { const ns = JSON.parse(JSON.stringify(st)); ns.pk[s] = i; ns.seq++; api.setState(ns); }
+      else { pendPick = i; }
+      sfx('click', 0.6);
+    }
+    function forcePick() { if (!isHost()) return; const ns = JSON.parse(JSON.stringify(st)); fillAI(ns, true); startRun(ns); }
+    function fillAI(ns, all) {
+      const R0 = S.prng(ns.seed ^ 77);
+      for (let s = 0; s < ns.n; s++) {
+        if (ns.pk[s] >= 0) continue;
+        const isAI = !api.players[s] || api.players[s].ai || testBot();
+        if (!isAI && !all) continue;
+        const used = ns.pk.filter((v) => v >= 0);
+        const free = T.ARCH.map((a, i) => i).filter((i) => !used.includes(i));
+        const pool = free.length ? free : T.ARCH.map((a, i) => i);
+        // 역할 균형: 회복 · 원거리 · 근접이 고르게
+        const sc = pool.map((i) => { const id = T.ARCH[i].id; let v = R0() * 2; if (id === 'priest' && !used.some((u) => T.ARCH[u].id === 'priest')) v += 1.2; if ((id === 'archer' || id === 'ash') && !used.some((u) => ['archer', 'ash'].includes(T.ARCH[u].id))) v += 0.8; return [i, v]; });
+        sc.sort((a, b) => b[1] - a[1]); ns.pk[s] = sc[0][0];
+      }
+    }
+    function startRun(ns) { ns.ph = 'run'; ns.wph = 'day'; ns.day = 1; ns.seq++; api.setState(ns); }
+    let pickT = 0, pickT0 = 0;
+    function pickTick(dt) {
+      if (!st || st.ph !== 'pick') return;
+      pickT += dt; if (!pickT0) pickT0 = performance.now(); const pickW = (performance.now() - pickT0) / 1000;
+      const me = mySeat();
+      if (!isHost()) return;
+      // 시험 · 자동: 사람 자리도 고름
+      if ((testMode || (L.debug && L.debug.autoplay)) && pickW > (api.players.some((q) => !q.ai) && !(L.debug && L.debug.autoplay) ? 6 : 1.2)) { const ns = JSON.parse(JSON.stringify(st)); fillAI(ns, true); startRun(ns); return; }
+      const waiting = L.pick ? L.pick.waiting(api.players, (s) => st.pk[s] >= 0) : st.pk.map((v, s) => (v < 0 && !api.players[s].ai ? s : -1)).filter((s) => s >= 0);
+      if (!waiting.length) { const ns = JSON.parse(JSON.stringify(st)); fillAI(ns, false); if (ns.pk.every((v) => v >= 0)) startRun(ns); }
+      void me;
+    }
+
+    /* ======================= 온라인 ======================= */
+    let pubT = 0, eSeq = 0, pendE = [], lastHS = -1;
+    const lastSeq = {};
+    function pollNet() {
+      if (!api.online || !st) return;
+      if (isHost()) {
+        let rem = null; try { rem = api.net.remote(); } catch (e) {}
+        if (!rem) return;
+        let ns = null;
+        for (const k in rem) {
+          const s = +k, o = rem[k]; if (!o) continue;
+          if (st.ph === 'pick' && o.pk != null && o.k === 'pk' + st.rid && st.pk[s] !== o.pk && o.pk >= 0 && o.pk < T.ARCH.length) { ns = ns || JSON.parse(JSON.stringify(st)); ns.pk[s] = o.pk; ns.seq++; }
+          if (st.ph !== 'run' || !W || o.k !== st.rid || !remoteHuman(s)) continue;
+          const r = W.rm[s] || (W.rm[s] = { q: [] });
+          if (Array.isArray(o.p)) { r.pos = [o.p[0] / 10, o.p[1] / 10, o.p[2] / 10, o.p[3] / 100]; r.tp = o.p[4]; r.gr = o.p[5]; }
+          r.g = o.g; r.run = o.r; r.aim = o.a == null ? null : o.a / 100; r.lk = o.lk;
+          if (Array.isArray(o.e)) for (const e of o.e) { if (e[0] > (lastSeq[s] || 0)) { lastSeq[s] = e[0]; r.q.push(e); } }
+          W.ack[s] = lastSeq[s] || 0;
+        }
+        if (ns) api.setState(ns);
+      } else {
+        let hs = null; try { hs = api.net.hostState(); } catch (e) {}
+        if (!hs || !W || hs.k !== st.rid || !hs.w) return;
+        if (hs.w.t === lastHS) return; lastHS = hs.w.t;
+        const me = mySeat();
+        S.unpack(W, hs.w, me);
+        if (me >= 0 && W.ack[me] != null) pendE = pendE.filter((x) => x[0] > W.ack[me]);
+        if (Array.isArray(W.fxIn)) { for (const f of W.fxIn) if (f[0] > fxSeen) { fxSeen = f[0]; onFx(f); } W.fxIn = null; }
+      }
+    }
+    function publish(dt) {
+      if (!api.online || !st) return;
+      pubT -= dt; if (pubT > 0) return;
+      pubT = 1 / 15;
+      try {
+        if (!isHost()) {
+          const me = mySeat(); if (me < 0) return;
+          if (st.ph === 'pick') { if (pendPick != null) api.net.publish({ k: 'pk' + st.rid, pk: pendPick }); return; }
+          if (!W || testBot()) return;
+          const p = W.P[me]; if (!p) return;
+          api.net.publish({ k: st.rid, p: [Math.round(p.x * 10), Math.round(p.z * 10), Math.round(p.y * 10), Math.round(p.yaw * 100), p.tp, p.gr ? 1 : 0], g: p.guard ? 1 : 0, r: p.spr ? 1 : 0, a: p.aim == null ? null : Math.round(p.aim * 100), lk: p.lock, e: pendE.slice(-8) });
+        } else if (W && st.ph === 'run') api.net.hostSend({ k: st.rid, w: S.pack(W) });
+      } catch (e) {}
+    }
+
+    /* ======================= 진행 ======================= */
+    let acc = 0, lastWph = '', lastDay = 0, sentDone = false;
+    function ensureWorld() {
+      if (!st) return;
+      const key = st.seed + ':' + (st.ph === 'pick' ? 'pick' : st.pk.join(','));
+      if (key === wKey && W) return;
+      const arch = st.pk.map((v, i) => (v >= 0 ? v : i % T.ARCH.length));
+      W = S.makeWorld({ seed: st.seed, n: st.n, arch, len: st.len, fin: st.fin, host: isHost() });
+      wKey = key; DBG.W = W; fxSeen = 0;
+      buildStatic(W);
+      const me = mySeat(); const p = W.P[me >= 0 ? me : 0]; if (p) camYaw = p.yaw + PI;
+      if (st.ph === 'run' && !testMode && me >= 0 && humanHere(me) && T.store.get('tip', '') !== '1') {
+        T.store.set('tip', '1');
+        tipEl = h('div', { class: 'nf-tip' }); tipEl.innerHTML = '마우스를 움직이면 시점이 돕니다(<kbd>Esc</kbd>: 마우스 풀기). <kbd>WASD</kbd> 이동 · <kbd>왼쪽 클릭</kbd> 약공격 · <kbd>오른쪽 클릭</kbd> 강공격 · <kbd>Shift</kbd> 구르기(누르고 있으면 달리기) · <kbd>C</kbd> 가드 · <kbd>Q</kbd> 표적 고정 · <kbd>E</kbd> 줍기/은총 · <kbd>F</kbd>/<kbd>R</kbd> 기술/궁극기 · <kbd>M</kbd> 지도. 붉은 바닥 표시는 구르고, 호박색 고리는 뛰어넘습니다.';
+        lay.append(tipEl); setTimeout(() => { if (tipEl) { tipEl.remove(); tipEl = null; } }, 11000);
+      }
+    }
+    function simTick(rdt) {
+      if (!W || !st || st.ph !== 'run') return;
+      const me = mySeat(), meHum = me >= 0 && humanHere(me);
+      W.hum = W.P.map((p, i) => i).filter((i) => (i === me && meHum) || remoteHuman(i));
+      if (isHost()) {
+        acc += rdt * SPD();
+        const DT = S.DT, maxSteps = Math.ceil(2.5 / DT);
+        let n = Math.floor(acc / DT); if (n > maxSteps) { n = maxSteps; acc = 0; } else acc -= n * DT;
+        for (let i = 0; i < n && !W.done; i++) {
+          const inp0 = meHum ? readInp(W.P[me]) : null;
+          for (const q of W.P) { q.ox = q.x; q.oy = q.y; q.oz = q.z; q.oyaw = q.yaw; }
+          for (const q of W.E) { q.ox = q.x; q.oy = q.y; q.oz = q.z; q.oyaw = q.yaw; }
+          S.step(W, DT, (s) => (s === me && meHum ? inp0 : remoteHuman(s) ? 'remote' : null), (s) => ({ lv: lvOfSeat(s), hab: habOf(s) }));
+        }
+        for (const f of W.fx) if (f[0] > fxSeen) { fxSeen = f[0]; onFx(f); }
+        if (W.ph !== lastWph || W.day !== lastDay) { lastWph = W.ph; lastDay = W.day; const ns = JSON.parse(JSON.stringify(st)); ns.wph = W.ph; ns.day = W.day; ns.boss = (W.bossE[0] && W.em[W.bossE[0]] && W.em[W.bossE[0]].ty) || ''; ns.seq++; api.setState(ns); }
+        if (W.done && !sentDone) { sentDone = true; const ns = JSON.parse(JSON.stringify(st)); ns.ph = 'done'; ns.wph = W.ph; ns.res = W.done; ns.seq++; api.setState(ns); unlock(); }
+      } else {
+        // 손님: 자기 원정자만 먼저(예측), 나머지는 부드럽게 따라감
+        W.t += rdt;
+        if (meHum) {
+          const p = W.P[me]; let rem = rdt;
+          while (rem > 1e-4) { const d = Math.min(S.DT, rem); rem -= d; const inp = readInp(p); const edge = inp.l ? ['l'] : inp.h ? ['h'] : inp.art ? ['a'] : inp.dg ? ['d', inp.dgy] : inp.jp ? ['j'] : inp.sk ? ['s'] : inp.ul ? ['u'] : inp.it >= 0 ? ['i', inp.it] : inp.use ? ['e'] : inp.sw ? ['w'] : null; if (edge) { pendE.push([++eSeq].concat(edge)); pubT = 0; } if (inp.lk !== -2) { p.lock = inp.lk; } S.ctrl(W, p, inp, d, 'pred'); }
+        }
+        const k = Math.min(1, rdt * 12);
+        W.P.forEach((p, i) => { if (i === me && meHum) return; if (p.tx != null) { p.x += (p.tx - p.x) * k; p.z += (p.tz - p.z) * k; p.y += (p.ty - p.y) * k; p.yaw += angD(p.yaw, p.tyaw) * k; p.rsp = Math.hypot(p.tx - p.x, p.tz - p.z) * 12; } });
+        for (const e of W.E) if (e.tx != null) { const dx = e.tx - e.x, dz = e.tz - e.z; e.rsp = Math.hypot(dx, dz) * 12; e.x += dx * k; e.z += dz * k; e.y += ((e.ty_ != null ? e.ty_ : e.y) - e.y) * k; e.yaw += angD(e.yaw, e.tyaw) * k; if (e.an && e.an[0] === 'm') e.at += rdt; }
+      }
+    }
+    // 렌더용 부드러운 위치(호스트: 시뮬은 초당 30걸음 → 앞 걸음과 지금 걸음 사이를 보간. 안 하면 화면이 덜컹거림)
+    function lerpPose(o, a) {
+      if (a >= 1 || o.ox == null || Math.abs(o.x - o.ox) + Math.abs(o.z - o.oz) > 3) { o.rx = o.x; o.rz = o.z; o.ry = o.y; o.ryaw = o.yaw; return; }
+      o.rx = o.ox + (o.x - o.ox) * a; o.rz = o.oz + (o.z - o.oz) * a; o.ry = o.oy + (o.y - o.oy) * a; o.ryaw = o.oyaw + angD(o.oyaw, o.yaw) * a;
+    }
+    function smoothTick() {
+      const host = isHost(), ia = host && st && st.ph === 'run' && !W.done ? clamp(acc / S.DT, 0, 1) : 1;
+      if (host) for (const e of W.E) lerpPose(e, ia);
+      for (const p of W.P) { lerpPose(p, ia); if (isHost()) p.rsp = p.an === 'sprint' ? 8 : p.an === 'run' ? 5.4 : p.an === 'walk' ? 2.5 : p.sp || Math.hypot(p.vx, p.vz); p.hpLag = p.hpLag == null ? p.hp / p.mhp : Math.max(p.hp / p.mhp, p.hpLag - 0.008); }
+      if (isHost()) for (const e of W.E) { e.rsp = e.an === 'run' ? T.ET[e.ty].run : e.an === 'walk' ? T.ET[e.ty].spd : 0; }
+    }
+
+    /* ======================= 프레임 ======================= */
+    function frame(now) {
+      if (dead) return;
+      raf = requestAnimationFrame(frame);
+      const rdt = Math.min(0.1, (now - (last || now)) / 1000); last = now;
+      if (!ready || !st) return;
+      FL.tick(rdt);
+      const t = now / 1000;
+      if (!paused) {
+        pollNet();
+        pickTick(rdt);
+        if (st.ph === 'run' || st.ph === 'done') simTick(rdt);
+        publish(rdt);
+      }
+      drawPick();
+      if (W) {
+        smoothTick();
+        const adt = hitStop > 0 ? rdt * 0.06 : rdt; hitStop = Math.max(0, hitStop - rdt);
+        drawEnt(adt, t); drawFx(rdt, t); flashTick(rdt); lightTick(rdt, t); camTick(rdt);
+        if (graceL) { let gb = null, gd = 40; for (const g of W.gr) { const d2 = Math.hypot(g.x - camPos.x, g.z - camPos.z); if (d2 < gd) { gd = d2; gb = g; } } if (gb) { graceL.position.set(gb.x, S.Hat(gb.x, gb.z) + 1.6, gb.z); graceL.intensity = (6 + Math.sin(t * 7.3) * 0.8 + Math.sin(t * 13.1) * 0.5) * (1 - smt((gd - 25) / 15)); } else graceL.intensity = 0; }
+        MT.glow.opacity = 0.5 + Math.sin(t * 6.1) * 0.06 + Math.sin(t * 11.7) * 0.04;
+        hudT -= rdt; if (hudT <= 0) { hudT = 1 / 10; hud(); }
+        tagsTick(rdt);
+        miniT -= rdt; if (miniT <= 0 && st.ph === 'run') { miniT = 1 / 6; const me = mySeat(), p = W.P[me >= 0 ? me : 0]; const g = miniC.getContext('2d'); g.save(); g.beginPath(); g.arc(150, 150, 150, 0, TAU); g.clip(); drawMap(g, p.x, p.z, 220, 300, false); g.restore(); if (mapOn) drawMap(mapC.getContext('2d'), 0, 0, HALF * 2, 720, true); }
+        if (fireIM) { for (let i = 0; i < fireL.length; i++) { const pt = fireL[i], k = 1 + Math.sin(t * 9.1 + i * 2.3) * 0.12 + Math.sin(t * 15.7 + i) * 0.08; fireIM.setMatrixAt(i, M4(pt[1], S.Hat(pt[1], pt[3]) + 0.1, pt[3], 0, t * 1.7 + i, 0, 1.05 - (k - 1) * 0.5, k, 1.05 - (k - 1) * 0.5)); } fireIM.instanceMatrix.needsUpdate = true; }
+      }
+      if (noteT > 0) { noteT -= rdt; if (noteT <= 0) noteEl.style.opacity = '0'; }
+      if (dawnT > 0) { dawnT -= rdt; if (dawnT <= 0.4) dawnEl.style.opacity = '0'; }
+      if (hurtT > 0) { hurtT -= rdt; hurtV.style.opacity = String(Math.max(0, hurtT / 0.4) * 0.9); }
+      R.render(scene, cam);
+    }
+
+    /* ======================= 미리 굽기 · 시작 ======================= */
+    function warmGroup() {
+      const g = new THREE.Group(), bx = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+      const mats = Object.values(MT).concat(Object.values(MC), [wMat, ptsMat, stormM]);
+      for (const m of mats) { if (!m || m.isPointsMaterial || m.isShaderMaterial) continue; const o = new THREE.Mesh(bx, m); o.position.y = -500; g.add(o); const im = new THREE.InstancedMesh(bx, m, 1); im.setMatrixAt(0, M4(0, -500, 0)); im.setColorAt(0, new THREE.Color(1, 1, 1)); g.add(im); }
+      g.traverse((o) => { if (o.isMesh) { o.castShadow = !!TIER.shadow; o.receiveShadow = !!TIER.shadow; } o.frustumCulled = false; });
+      return g;
+    }
+    function compileBg(obj) { try { if (R.compileAsync && R.extensions.has('KHR_parallel_shader_compile')) return R.compileAsync(obj, cam).catch(() => {}); R.compile(obj, cam); } catch (e) { console.warn(e); } return Promise.resolve(); }
+    function start() {
+      if (warming || ready) return;
+      warming = true;
+      hooks.progress(0.7, '빛을 고르는 중');
+      ensureWorld();
+      // 모든 몸 형태 하나씩 미리 만들어 재질을 굽고 지움
+      const pre = []; for (const k of Object.keys(T.ET)) { const d = T.ET[k]; const r = rigFor(k, d.look, d.sc); r.root.position.set(0, -500, 0); scene.add(r.root); pre.push(r); }
+      for (let a = 0; a < T.ARCH.length; a++) { const r = rigPlayer(a); for (const c of T.CLS_IDS) setWeapon(r, c, 1); r.root.position.y = -500; scene.add(r.root); pre.push(r); }
+      const wg = warmGroup(); scene.add(wg);
+      layout(); lightTick(0.016, 0); camTick(0.016);
+      for (let i = 0; i < 4; i++) decal();
+      flash(0, -500, 0, 1); const wt = trailFor({}, 0xffffff); wt.m.visible = true;
+      const t0 = performance.now();
+      compileBg(scene).then(() => {
+        if (dead) return;
+        try { R.render(scene, cam); } catch (e) {}
+        scene.remove(wg); for (const r of pre) scene.remove(r.root);
+        for (const d of decals) { d.on = 0; d.m.visible = false; }
+        wt.m.visible = false; scene.remove(wt.m); trails.splice(trails.indexOf(wt), 1);
+        DBG.tm = { compile: Math.round(performance.now() - t0), progs: R.info.programs.length };
+        ready = true; hooks.ready();
+      });
+    }
+    const onResize = () => layout();
+    window.addEventListener('resize', onResize);
+    layout();
+    raf = requestAnimationFrame(frame);
+    const offPause = api.onPause ? api.onPause((pz) => { if (pz) unlock(); }) : null;
+
+    return {
+      update(s) {
+        if (!s) return;
+        st = s;
+        if (!ready) { start(); return; }
+        ensureWorld();
+      },
+      pause() { paused = true; unlock(); }, resume() { paused = false; last = 0; FL.kick(); },
+      destroy() {
+        dead = true; cancelAnimationFrame(raf);
+        window.removeEventListener('resize', onResize); FL.destroy();
+        unlock();
+        for (const f of offs) try { f(); } catch (e) {}
+        try { if (offPause) offPause(); } catch (e) {}
+        if (pickBar) try { pickBar.destroy(); } catch (e) {}
+        for (const k in TX) TX[k].dispose();
+        try { R.dispose(); R.forceContextLoss(); } catch (e) {}
+        wrap.remove();
+      },
+    };
+  };
+  window.NIGHTFALL_VIEW = V;
+})();

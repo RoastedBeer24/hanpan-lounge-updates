@@ -1,0 +1,2149 @@
+/* 체스 — full-rules chess with an alpha-beta engine, vector pieces, tap/drag input. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const SPD = () => ((L.debug && L.debug.speed) || 1) * (L.speed ? (L.speed() || 1) : 1);
+
+  /* =====================================================================
+   * Engine (0x88 board). Pieces: type 1..6 = P N B R Q K, +8 for black.
+   * Squares: row 0 = rank 8 (FEN order), sq88 = row*16 + file.
+   * Move int: from | to<<7 | promoType<<14 | flags<<17 (1 ep, 2 castle, 4 double push)
+   * ===================================================================== */
+  const CH = '.PNBRQK..pnbrqk';
+  const VAL = [0, 100, 320, 330, 500, 900, 0];
+  const N_D = [-33, -31, -18, -14, 14, 18, 31, 33], B_D = [-17, -15, 15, 17], R_D = [-16, -1, 1, 16];
+  const K_D = [-17, -16, -15, -1, 1, 15, 16, 17];
+  const MATE = 30000, INF = 32000, MAXPLY = 100;
+  const to88 = (i) => ((i >> 3) << 4) | (i & 7);
+  const to64 = (s) => ((s >> 4) << 3) | (s & 7);
+
+  const bd = new Int8Array(128);
+  let side = 0, castle = 0, ep = -1, hm = 0, hLo = 0, hHi = 0, gp = 0;
+  const kSq = [0, 0];
+  const HSIZE = 1400;
+  const U_CAP = new Int8Array(HSIZE), U_CAS = new Int8Array(HSIZE), U_EP = new Int16Array(HSIZE), U_HM = new Int16Array(HSIZE);
+  const U_HL = new Int32Array(HSIZE), U_HH = new Int32Array(HSIZE), HL = new Int32Array(HSIZE);
+  const MV = new Int32Array(MAXPLY * 2 * 256), SC = new Int32Array(MAXPLY * 2 * 256);
+  const CM = new Int8Array(128).fill(15);
+  CM[116] = 12; CM[119] = 14; CM[112] = 13; CM[4] = 3; CM[7] = 11; CM[0] = 7;
+
+  // zobrist (seeded so hashes are identical on every device)
+  let seed = 0x9e3779b9;
+  function rnd32() { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return (t ^ (t >>> 14)) | 0; }
+  const zL = new Int32Array(16 * 128), zH = new Int32Array(16 * 128);
+  for (let i = 0; i < zL.length; i++) { zL[i] = rnd32(); zH[i] = rnd32(); }
+  const zCL = new Int32Array(16), zCH = new Int32Array(16), zEL = new Int32Array(128), zEH = new Int32Array(128);
+  for (let i = 0; i < 16; i++) { zCL[i] = rnd32(); zCH[i] = rnd32(); }
+  for (let i = 0; i < 128; i++) { zEL[i] = rnd32(); zEH[i] = rnd32(); }
+  const zSL = rnd32(), zSH = rnd32();
+  function zx(p, s) { hLo ^= zL[(p << 7) | s]; hHi ^= zH[(p << 7) | s]; }
+
+  function computeHash() {
+    hLo = 0; hHi = 0;
+    for (let s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } if (bd[s]) zx(bd[s], s); }
+    if (side) { hLo ^= zSL; hHi ^= zSH; }
+    hLo ^= zCL[castle]; hHi ^= zCH[castle];
+    if (ep >= 0) { hLo ^= zEL[ep]; hHi ^= zEH[ep]; }
+  }
+
+  function attacked(sq, by) {
+    let a;
+    if (by === 0) { a = sq + 15; if (!(a & 0x88) && bd[a] === 1) return true; a = sq + 17; if (!(a & 0x88) && bd[a] === 1) return true; }
+    else { a = sq - 15; if (!(a & 0x88) && bd[a] === 9) return true; a = sq - 17; if (!(a & 0x88) && bd[a] === 9) return true; }
+    const c = by << 3, kn = 2 | c, kg = 6 | c, bi = 3 | c, ro = 4 | c, qu = 5 | c;
+    for (let i = 0; i < 8; i++) { a = sq + N_D[i]; if (!(a & 0x88) && bd[a] === kn) return true; }
+    for (let i = 0; i < 8; i++) { a = sq + K_D[i]; if (!(a & 0x88) && bd[a] === kg) return true; }
+    for (let i = 0; i < 4; i++) {
+      const d = B_D[i]; a = sq + d;
+      while (!(a & 0x88)) { const p = bd[a]; if (p) { if (p === bi || p === qu) return true; break; } a += d; }
+    }
+    for (let i = 0; i < 4; i++) {
+      const d = R_D[i]; a = sq + d;
+      while (!(a & 0x88)) { const p = bd[a]; if (p) { if (p === ro || p === qu) return true; break; } a += d; }
+    }
+    return false;
+  }
+  const inCheck = () => attacked(kSq[side], side ^ 1);
+
+  function gen(start, capsOnly) {
+    let n = start;
+    const us = side, them = us ^ 1;
+    const fwd = us ? 16 : -16, startRow = us ? 1 : 6, promoRow = us ? 7 : 0;
+    for (let sq = 0; sq < 128; sq++) {
+      if (sq & 0x88) { sq += 7; continue; }
+      const p = bd[sq];
+      if (!p || (p >> 3) !== us) continue;
+      const t = p & 7;
+      if (t === 1) {
+        let to = sq + fwd;
+        if (!(to & 0x88) && !bd[to]) {
+          if ((to >> 4) === promoRow) {
+            MV[n++] = sq | (to << 7) | (5 << 14);
+            if (!capsOnly) { MV[n++] = sq | (to << 7) | (4 << 14); MV[n++] = sq | (to << 7) | (3 << 14); MV[n++] = sq | (to << 7) | (2 << 14); }
+          } else if (!capsOnly) {
+            MV[n++] = sq | (to << 7);
+            if ((sq >> 4) === startRow && !bd[to + fwd]) MV[n++] = sq | ((to + fwd) << 7) | (4 << 17);
+          }
+        }
+        for (let k = -1; k <= 1; k += 2) {
+          to = sq + fwd + k;
+          if (to & 0x88) continue;
+          const q = bd[to];
+          if (q && (q >> 3) === them) {
+            if ((to >> 4) === promoRow) {
+              MV[n++] = sq | (to << 7) | (5 << 14);
+              if (!capsOnly) { MV[n++] = sq | (to << 7) | (4 << 14); MV[n++] = sq | (to << 7) | (3 << 14); MV[n++] = sq | (to << 7) | (2 << 14); }
+            } else MV[n++] = sq | (to << 7);
+          } else if (to === ep) MV[n++] = sq | (to << 7) | (1 << 17);
+        }
+      } else if (t === 2 || t === 6) {
+        const D = t === 2 ? N_D : K_D;
+        for (let i = 0; i < 8; i++) {
+          const to = sq + D[i];
+          if (to & 0x88) continue;
+          const q = bd[to];
+          if (!q) { if (!capsOnly) MV[n++] = sq | (to << 7); }
+          else if ((q >> 3) === them) MV[n++] = sq | (to << 7);
+        }
+      } else {
+        const D = t === 3 ? B_D : t === 4 ? R_D : K_D, nd = D.length;
+        for (let i = 0; i < nd; i++) {
+          const d = D[i];
+          let to = sq + d;
+          while (!(to & 0x88)) {
+            const q = bd[to];
+            if (!q) { if (!capsOnly) MV[n++] = sq | (to << 7); }
+            else { if ((q >> 3) === them) MV[n++] = sq | (to << 7); break; }
+            to += d;
+          }
+        }
+      }
+    }
+    if (!capsOnly && castle) {
+      if (us === 0 && bd[116] === 6) {
+        if ((castle & 1) && bd[119] === 4 && !bd[117] && !bd[118] && !attacked(116, 1) && !attacked(117, 1) && !attacked(118, 1)) MV[n++] = 116 | (118 << 7) | (2 << 17);
+        if ((castle & 2) && bd[112] === 4 && !bd[115] && !bd[114] && !bd[113] && !attacked(116, 1) && !attacked(115, 1) && !attacked(114, 1)) MV[n++] = 116 | (114 << 7) | (2 << 17);
+      } else if (us === 1 && bd[4] === 14) {
+        if ((castle & 4) && bd[7] === 12 && !bd[5] && !bd[6] && !attacked(4, 0) && !attacked(5, 0) && !attacked(6, 0)) MV[n++] = 4 | (6 << 7) | (2 << 17);
+        if ((castle & 8) && bd[0] === 12 && !bd[3] && !bd[2] && !bd[1] && !attacked(4, 0) && !attacked(3, 0) && !attacked(2, 0)) MV[n++] = 4 | (2 << 7) | (2 << 17);
+      }
+    }
+    return n;
+  }
+
+  function rookCastle(t) { return t === 118 ? [119, 117] : t === 114 ? [112, 115] : t === 6 ? [7, 5] : [0, 3]; }
+
+  function make(m) {
+    const f = m & 127, t = (m >> 7) & 127, pr = (m >> 14) & 7, fl = m >> 17;
+    U_CAS[gp] = castle; U_EP[gp] = ep; U_HM[gp] = hm; U_HL[gp] = hLo; U_HH[gp] = hHi;
+    const p = bd[f];
+    let cap = bd[t];
+    zx(p, f);
+    if (cap) zx(cap, t);
+    if (fl & 1) { const cs = t + (side ? -16 : 16); cap = bd[cs]; zx(cap, cs); bd[cs] = 0; }
+    U_CAP[gp] = cap;
+    const np = pr ? (pr | (side << 3)) : p;
+    bd[t] = np; bd[f] = 0; zx(np, t);
+    if (fl & 2) { const rc = rookCastle(t), r = bd[rc[0]]; bd[rc[1]] = r; bd[rc[0]] = 0; zx(r, rc[0]); zx(r, rc[1]); }
+    if ((p & 7) === 6) kSq[side] = t;
+    hLo ^= zCL[castle]; hHi ^= zCH[castle];
+    castle &= CM[f] & CM[t];
+    hLo ^= zCL[castle]; hHi ^= zCH[castle];
+    if (ep >= 0) { hLo ^= zEL[ep]; hHi ^= zEH[ep]; }
+    ep = -1;
+    if (fl & 4) {
+      const ex = side ? 1 : 9;
+      if ((!((t - 1) & 0x88) && bd[t - 1] === ex) || (!((t + 1) & 0x88) && bd[t + 1] === ex)) { ep = (f + t) >> 1; hLo ^= zEL[ep]; hHi ^= zEH[ep]; }
+    }
+    hm = ((p & 7) === 1 || cap) ? 0 : hm + 1;
+    side ^= 1; hLo ^= zSL; hHi ^= zSH;
+    gp++; HL[gp] = hLo;
+  }
+  function unmake(m) {
+    gp--; side ^= 1;
+    const f = m & 127, t = (m >> 7) & 127, pr = (m >> 14) & 7, fl = m >> 17;
+    const p = pr ? (1 | (side << 3)) : bd[t];
+    bd[f] = p;
+    if (fl & 1) { bd[t] = 0; bd[t + (side ? -16 : 16)] = U_CAP[gp]; } else bd[t] = U_CAP[gp];
+    if (fl & 2) { const rc = rookCastle(t); bd[rc[0]] = bd[rc[1]]; bd[rc[1]] = 0; }
+    if ((p & 7) === 6) kSq[side] = f;
+    castle = U_CAS[gp]; ep = U_EP[gp]; hm = U_HM[gp]; hLo = U_HL[gp]; hHi = U_HH[gp];
+  }
+
+  /* --- loading / exporting --- */
+  function setBoard(b64, stm, cas, ep64, half) {
+    bd.fill(0);
+    for (let i = 0; i < 64; i++) {
+      const c = CH.indexOf(b64[i]);
+      const s = to88(i);
+      bd[s] = c > 0 ? c : 0;
+      if (c === 6) kSq[0] = s; else if (c === 14) kSq[1] = s;
+    }
+    side = stm; hm = half | 0;
+    castle = (cas.includes('K') ? 1 : 0) | (cas.includes('Q') ? 2 : 0) | (cas.includes('k') ? 4 : 0) | (cas.includes('q') ? 8 : 0);
+    ep = ep64 >= 0 ? to88(ep64) : -1;
+    computeHash();
+    gp = 0; HL[0] = hLo;
+  }
+  function loadState(s) {
+    setBoard(s.b, s.t, s.c, s.ep, s.hm);
+    const rep = s.rep || [];
+    // game history (for repetition detection during search)
+    const n = Math.min(rep.length, 300);
+    for (let i = 0; i < n - 1; i++) HL[i] = parseInt(rep[rep.length - n + i], 36) | 0;
+    gp = Math.max(0, n - 1); HL[gp] = hLo;
+  }
+  function loadFEN(fen) {
+    const [pl, stm, cas, eps, half] = fen.split(' ');
+    let b = '';
+    for (const ch of pl) { if (ch === '/') continue; if (/\d/.test(ch)) b += '.'.repeat(+ch); else b += ch; }
+    let e = -1;
+    if (eps && eps !== '-') e = (8 - +eps[1]) * 8 + (eps.charCodeAt(0) - 97);
+    setBoard(b, stm === 'b' ? 1 : 0, cas || '-', e, half || 0);
+  }
+  function boardStr() { let s = ''; for (let i = 0; i < 64; i++) s += CH[bd[to88(i)]]; return s; }
+  function castleStr() { return ((castle & 1 ? 'K' : '') + (castle & 2 ? 'Q' : '') + (castle & 4 ? 'k' : '') + (castle & 8 ? 'q' : '')) || '-'; }
+  const PROMO_CH = ['', '', 'n', 'b', 'r', 'q'];
+
+  function legalMoves() {
+    const base = MAXPLY * 256;
+    const n = gen(base, false), out = [];
+    for (let i = base; i < n; i++) {
+      const m = MV[i];
+      make(m);
+      if (!attacked(kSq[side ^ 1], side)) out.push(m);
+      unmake(m);
+    }
+    return out;
+  }
+  function mInfo(m) { return { f: to64(m & 127), t: to64((m >> 7) & 127), p: PROMO_CH[(m >> 14) & 7], fl: m >> 17, m }; }
+
+  function perft(d, ply) {
+    ply = ply || 0;
+    const base = ply * 256, n = gen(base, false);
+    let c = 0;
+    for (let i = base; i < n; i++) {
+      const m = MV[i];
+      make(m);
+      if (!attacked(kSq[side ^ 1], side)) c += d === 1 ? 1 : perft(d - 1, ply + 1);
+      unmake(m);
+    }
+    return c;
+  }
+
+  function insufficient() {
+    let minors = [0, 0], bishopsColor = [[], []];
+    for (let s = 0; s < 128; s++) {
+      if (s & 0x88) { s += 7; continue; }
+      const p = bd[s]; if (!p) continue;
+      const t = p & 7, c = p >> 3;
+      if (t === 1 || t === 4 || t === 5) return false;
+      if (t === 2 || t === 3) { minors[c]++; if (t === 3) bishopsColor[c].push(((s >> 4) + (s & 7)) & 1); }
+    }
+    if (minors[0] + minors[1] <= 1) return true;
+    // only bishops, all on the same square colour
+    if (minors[0] === bishopsColor[0].length && minors[1] === bishopsColor[1].length) {
+      const all = bishopsColor[0].concat(bishopsColor[1]);
+      if (all.every((x) => x === all[0])) return true;
+    }
+    return false;
+  }
+
+  /* --- evaluation --- */
+  const PST = [null,
+    [0, 0, 0, 0, 0, 0, 0, 0, 50, 50, 50, 50, 50, 50, 50, 50, 10, 10, 20, 30, 30, 20, 10, 10, 5, 5, 10, 25, 25, 10, 5, 5, 0, 0, 0, 20, 20, 0, 0, 0, 5, -5, -10, 0, 0, -10, -5, 5, 5, 10, 10, -20, -20, 10, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0],
+    [-50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10, 0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10, 5, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50],
+    [-20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0, -10, -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10, 10, 10, 10, 10, -10, -10, 5, 0, 0, 0, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10, -20],
+    [0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 0, 0, 0, 5, 5, 0, 0, 0],
+    [-20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10, -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10, -10, 0, 5, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20],
+    [-30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30, -30, -40, -40, -30, -30, -20, -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, 0, 0, 0, 0, 20, 20, 20, 30, 10, 0, 0, 10, 30, 20],
+  ];
+  const KEG = [-50, -40, -30, -20, -20, -30, -40, -50, -30, -20, -10, 0, 0, -10, -20, -30, -30, -10, 20, 30, 30, 20, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 30, 40, 40, 30, -10, -30, -30, -10, 20, 30, 30, 20, -10, -30, -30, -30, 0, 0, 0, 0, -30, -30, -50, -30, -30, -30, -30, -30, -30, -50];
+  const PADV = [0, 0, 8, 16, 30, 50, 80, 0]; // endgame bonus by ranks advanced
+  const PH = [0, 0, 1, 1, 2, 4, 0];
+  const cmd = (s) => { const r = s >> 4, f = s & 7; return Math.max(3 - r, r - 4) + Math.max(3 - f, f - 4); };
+
+  // pawn-structure scratch (per file): counts, most advanced pawn rows
+  const wCnt = new Int8Array(8), bCnt = new Int8Array(8), wMax = new Int8Array(8), bMin = new Int8Array(8);
+  const PSQ = new Int16Array(16), RSQ = new Int16Array(10);
+  const PASSMG = [0, 5, 10, 15, 25, 40, 60, 0], PASSEG = [0, 10, 20, 35, 60, 100, 150, 0];
+  function evaluate() {
+    let base = 0, kmg = 0, keg = 0, peg = 0, phase = 0;
+    let wb = 0, bb = 0, wm = 0, bm = 0, wp = 0, bp = 0, heavy = 0, np = 0, nr = 0;
+    wCnt.fill(0); bCnt.fill(0); wMax.fill(-1); bMin.fill(8);
+    for (let s = 0; s < 128; s++) {
+      if (s & 0x88) { s += 7; continue; }
+      const p = bd[s]; if (!p) continue;
+      const t = p & 7, black = p >> 3, i = ((s >> 4) << 3) | (s & 7), j = black ? i ^ 56 : i;
+      phase += PH[t];
+      if (t === 6) { const a = PST[6][j], e = KEG[j]; if (black) { kmg -= a; keg -= e; } else { kmg += a; keg += e; } continue; }
+      const v = VAL[t] + PST[t][j];
+      if (black) { base -= v; bm += VAL[t]; } else { base += v; wm += VAL[t]; }
+      if (t === 1) {
+        const adv = 7 - (j >> 3), r = s >> 4, f = s & 7;
+        if (np < 16) PSQ[np++] = s;
+        if (black) { peg -= PADV[adv]; bp++; bCnt[f]++; if (r < bMin[f]) bMin[f] = r; }
+        else { peg += PADV[adv]; wp++; wCnt[f]++; if (r > wMax[f]) wMax[f] = r; }
+      } else if (t === 3) { if (black) bb++; else wb++; }
+      else if (t === 4 && nr < 10) RSQ[nr++] = s;
+      if (t >= 4) heavy++;
+    }
+    if (!wp && !bp && !heavy && wm <= 330 && bm <= 330) return 0;
+    if (wb >= 2) base += 30;
+    if (bb >= 2) base -= 30;
+    // pawn structure: doubled, isolated, passed
+    for (let k = 0; k < np; k++) {
+      const s = PSQ[k], r = s >> 4, f = s & 7, black = bd[s] === 9;
+      const own = black ? bCnt : wCnt;
+      let sc = 0;
+      if (own[f] > 1) sc -= 8;
+      if ((f === 0 || !own[f - 1]) && (f === 7 || !own[f + 1])) sc -= 12;
+      let passed = true;
+      for (let x = f - 1; x <= f + 1 && passed; x++) {
+        if (x < 0 || x > 7) continue;
+        if (black ? wMax[x] > r : bMin[x] < r) passed = false;
+      }
+      let pe = 0;
+      if (passed) { const adv = black ? r - 1 : 6 - r; sc += PASSMG[adv]; pe = PASSEG[adv]; }
+      if (black) { base -= sc; peg -= pe; } else { base += sc; peg += pe; }
+    }
+    // rooks on open / half-open files
+    for (let k = 0; k < nr; k++) {
+      const s = RSQ[k], f = s & 7, black = bd[s] === 12;
+      const own = black ? bCnt[f] : wCnt[f], opp = black ? wCnt[f] : bCnt[f];
+      const v = own ? 0 : opp ? 10 : 22;
+      base += black ? -v : v;
+    }
+    // king pawn shield (middlegame only, folded into kmg)
+    for (let c = 0; c < 2; c++) {
+      const ks = kSq[c], kr = ks >> 4, kf = ks & 7;
+      if (c === 0 ? kr < 6 : kr > 1) continue;
+      const d = c === 0 ? -16 : 16, pw = c === 0 ? 1 : 9;
+      let sh = 0;
+      for (let x = kf - 1; x <= kf + 1; x++) {
+        if (x < 0 || x > 7) continue;
+        const a = (kr << 4) + x + d;
+        if (bd[a] === pw) sh += 12; else if (!((a + d) & 0x88) && bd[a + d] === pw) sh += 6; else sh -= 6;
+      }
+      kmg += c === 0 ? sh : -sh;
+    }
+    if (phase > 24) phase = 24;
+    let sc = base + ((kmg * phase + (keg + peg) * (24 - phase)) / 24 | 0);
+    // mop-up: drive a lone-ish king to the edge and bring ours closer
+    const diff = wm - bm;
+    if (phase <= 12 && Math.abs(diff) >= 300) {
+      const wk = kSq[0], bk = kSq[1];
+      const dist = Math.abs((wk >> 4) - (bk >> 4)) + Math.abs((wk & 7) - (bk & 7));
+      const mop = (diff > 0 ? cmd(bk) : cmd(wk)) * 10 + (14 - dist) * 4;
+      sc += diff > 0 ? mop : -mop;
+      // without pawns a small edge rarely wins
+      if (diff > 0 && !wp && wm - bm < 400) sc = sc / 4 | 0;
+      if (diff < 0 && !bp && bm - wm < 400) sc = sc / 4 | 0;
+    }
+    return (side ? -sc : sc) + 10;
+  }
+
+  /* --- search --- */
+  const TT_BITS = 18, TT_N = 1 << TT_BITS, TT_MASK = TT_N - 1;
+  const ttKey = new Int32Array(TT_N), ttMove = new Int32Array(TT_N), ttScore = new Int16Array(TT_N), ttDepth = new Int8Array(TT_N), ttFlag = new Int8Array(TT_N);
+  const killers = new Int32Array(MAXPLY * 2), hist = new Int32Array(16 * 128);
+  let nodes = 0, deadline = 0, stop = false, canStop = false;
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  function isRep() {
+    const lim = Math.max(0, gp - hm);
+    for (let i = gp - 2; i >= lim; i -= 2) if (HL[i] === hLo) return true;
+    return false;
+  }
+  function scoreMoves(base, n, ply, ttm) {
+    for (let i = base; i < n; i++) {
+      const m = MV[i], f = m & 127, t = (m >> 7) & 127, pr = (m >> 14) & 7, fl = m >> 17;
+      let s;
+      if (m === ttm) s = 4000000;
+      else if (bd[t] || (fl & 1)) s = 2000000 + ((bd[t] & 7) || 1) * 16 - (bd[f] & 7);
+      else if (pr === 5) s = 1900000;
+      else if (m === killers[ply * 2]) s = 1800000;
+      else if (m === killers[ply * 2 + 1]) s = 1700000;
+      else s = Math.min(1600000, hist[(bd[f] << 7) | t]) - (pr ? 1000 : 0);
+      SC[i] = s;
+    }
+  }
+  function pick(i, n) {
+    let b = i, bs = SC[i];
+    for (let j = i + 1; j < n; j++) if (SC[j] > bs) { bs = SC[j]; b = j; }
+    if (b !== i) { const tm = MV[i]; MV[i] = MV[b]; MV[b] = tm; const ts = SC[i]; SC[i] = SC[b]; SC[b] = ts; }
+    return MV[i];
+  }
+  function timeUp() { if ((++nodes & 1023) === 0 && canStop && now() > deadline) stop = true; return stop; }
+
+  function qsearch(alpha, beta, ply) {
+    if (timeUp()) return 0;
+    const stand = evaluate();
+    if (stand >= beta) return stand;
+    if (stand > alpha) alpha = stand;
+    if (ply >= MAXPLY * 2 - 2) return stand;
+    const base = ply * 256, n = gen(base, true);
+    scoreMoves(base, n, ply, 0);
+    for (let i = base; i < n; i++) {
+      const m = pick(i, n);
+      // delta pruning: hopeless captures
+      const t = (m >> 7) & 127;
+      if (!((m >> 14) & 7) && stand + VAL[(bd[t] & 7) || 1] + 200 < alpha) continue;
+      make(m);
+      if (attacked(kSq[side ^ 1], side)) { unmake(m); continue; }
+      const sc = -qsearch(-beta, -alpha, ply + 1);
+      unmake(m);
+      if (stop) return 0;
+      if (sc > alpha) { alpha = sc; if (sc >= beta) return sc; }
+    }
+    return alpha;
+  }
+
+  /* 어려움 only: null-move pruning + late-move reductions (ADV) */
+  let ADV = false;
+  const NUL = new Int8Array(MAXPLY * 2 + 2);
+  function hasPieces() {
+    for (let s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } const p = bd[s]; if (p && (p >> 3) === side && (p & 7) > 1 && (p & 7) < 6) return true; }
+    return false;
+  }
+  function makeNull() {
+    U_EP[gp] = ep; U_HM[gp] = hm; U_HL[gp] = hLo; U_HH[gp] = hHi;
+    if (ep >= 0) { hLo ^= zEL[ep]; hHi ^= zEH[ep]; }
+    ep = -1; hm = 0;
+    side ^= 1; hLo ^= zSL; hHi ^= zSH;
+    gp++; HL[gp] = hLo;
+  }
+  function unmakeNull() { gp--; side ^= 1; ep = U_EP[gp]; hm = U_HM[gp]; hLo = U_HL[gp]; hHi = U_HH[gp]; }
+  function search(depth, alpha, beta, ply) {
+    if (timeUp()) return 0;
+    if (ply > 0 && (hm >= 100 || isRep())) return 0;
+    const chk = inCheck();
+    if (chk && ply < MAXPLY) depth++;
+    if (depth <= 0 || ply >= MAXPLY) return qsearch(alpha, beta, ply);
+    NUL[ply + 1] = 0;
+    if (ADV && !chk && ply > 0 && !NUL[ply] && depth >= 3 && beta < MATE - 500 && beta > -MATE + 500 && hasPieces() && evaluate() >= beta) {
+      makeNull(); NUL[ply + 1] = 1;
+      const ns = -search(depth - 3, -beta, -beta + 1, ply + 1);
+      NUL[ply + 1] = 0; unmakeNull();
+      if (stop) return 0;
+      if (ns >= beta) return beta;
+    }
+    const ti = hLo & TT_MASK;
+    let ttm = 0;
+    if (ttKey[ti] === hHi) {
+      ttm = ttMove[ti];
+      if (ply > 0 && ttDepth[ti] >= depth) {
+        let s = ttScore[ti];
+        if (s > MATE - 500) s -= ply; else if (s < -MATE + 500) s += ply;
+        const fl = ttFlag[ti];
+        if (fl === 0 || (fl === 1 && s >= beta) || (fl === 2 && s <= alpha)) return s;
+      }
+    }
+    const base = ply * 256, n = gen(base, false);
+    scoreMoves(base, n, ply, ttm);
+    let best = -INF, bestM = 0, legal = 0;
+    const a0 = alpha;
+    for (let i = base; i < n; i++) {
+      const m = pick(i, n);
+      make(m);
+      if (attacked(kSq[side ^ 1], side)) { unmake(m); continue; }
+      legal++;
+      let sc;
+      if (legal === 1) sc = -search(depth - 1, -beta, -alpha, ply + 1);
+      else {
+        // principal variation search (+ late-move reductions at 어려움)
+        let r = 0;
+        if (ADV && depth >= 3 && !chk && legal > 3 && !U_CAP[gp - 1] && !((m >> 14) & 7) && m !== killers[ply * 2] && m !== killers[ply * 2 + 1] && !inCheck()) r = legal > 10 && depth >= 5 ? 2 : 1;
+        sc = -search(depth - 1 - r, -alpha - 1, -alpha, ply + 1);
+        if (sc > alpha && r && !stop) sc = -search(depth - 1, -alpha - 1, -alpha, ply + 1);
+        if (sc > alpha && sc < beta && !stop) sc = -search(depth - 1, -beta, -alpha, ply + 1);
+      }
+      unmake(m);
+      if (stop) return 0;
+      if (sc > best) {
+        best = sc; bestM = m;
+        if (sc > alpha) {
+          alpha = sc;
+          if (sc >= beta) {
+            const t = (m >> 7) & 127;
+            if (!bd[t] && !((m >> 17) & 1) && !((m >> 14) & 7)) {
+              if (killers[ply * 2] !== m) { killers[ply * 2 + 1] = killers[ply * 2]; killers[ply * 2] = m; }
+              hist[(bd[m & 127] << 7) | t] += depth * depth;
+            }
+            break;
+          }
+        }
+      }
+    }
+    if (!legal) return chk ? -MATE + ply : 0;
+    let st = best;
+    if (st > MATE - 500) st += ply; else if (st < -MATE + 500) st -= ply;
+    ttKey[ti] = hHi; ttMove[ti] = bestM; ttScore[ti] = st; ttDepth[ti] = depth;
+    ttFlag[ti] = best >= beta ? 1 : best <= a0 ? 2 : 0;
+    return best;
+  }
+
+  /* ---------------------------------------------------------------------
+   * Root search as a resumable "job": iterative deepening over the root moves,
+   * run in small time slices (setTimeout) so the page never freezes. An aborted
+   * root move is simply retried in the next slice — the transposition table keeps
+   * the finished sub-trees, so no work is lost. The same job runs synchronously
+   * (one huge slice) in node tests.
+   * o = { budget ms (wall), maxDepth, adv, noise (cp, 0 = none), owner (TT owner tag) }
+   * --------------------------------------------------------------------- */
+  const CFG = { slice: 28, scale: 1 };
+  function newJob(pos, o) { return { pos, o, t0: now(), init: false, done: false, res: null }; }
+  function jobFinish(j) {
+    j.done = true; ADV = false;
+    j.res = { m: j.best, score: j.bestScore, depth: j.depthDone, ms: now() - j.t0 };
+    return true;
+  }
+  function jobStep(j, sliceMs) {
+    if (j.done) return true;
+    const o = j.o;
+    loadState(j.pos);
+    ownTT(o.owner === '*' ? ttOwner : o.owner); // '*': share whatever TT is warm (live eval bar)
+    ADV = !!o.adv;
+    if (!j.init) {
+      j.init = true;
+      j.hard = j.t0 + o.budget;
+      killers.fill(0);
+      for (let i = 0; i < hist.length; i++) hist[i] >>= 2;
+      const legal = legalMoves();
+      if (!legal.length) { j.best = 0; j.bestScore = inCheck() ? -MATE : 0; j.depthDone = 0; return jobFinish(j); }
+      for (let i = 0; i < legal.length; i++) MV[i] = legal[i];
+      const ti = hLo & TT_MASK;
+      scoreMoves(0, legal.length, 0, ttKey[ti] === hHi ? ttMove[ti] : 0);
+      j.order = legal.map((m, i) => [m, SC[i]]).sort((a, b) => b[1] - a[1]).map((x) => x[0]);
+      j.noise = new Map(j.order.map((m) => [m, o.noise ? Math.floor(Math.random() * o.noise) : 0]));
+      if (o.style && o.style !== 'bal' && Math.random() < 0.6) { // AI 성향: 루트 수에 살짝 덧칠(센티폰 단위)
+        for (const m of j.order) {
+          const cap = !!bd[(m >> 7) & 127];
+          make(m); const chk = inCheck(); unmake(m);
+          let b = 0;
+          if (o.style === 'agg') b = (cap ? 22 : 0) + (chk ? 14 : 0);
+          else if (o.style === 'def') b = (cap ? -12 : 6) - (chk ? 6 : 0);
+          else if (o.style === 'gamble') b = Math.floor(Math.random() * 30) + (chk ? 8 : 0);
+          j.noise.set(m, j.noise.get(m) + b);
+        }
+      }
+      j.best = j.order[0]; j.bestScore = 0; j.depthDone = 0;
+      j.depth = 1; j.idx = 0; j.alpha = -INF; j.iterBest = 0; j.iterScore = -INF; j.scores = new Map();
+      if (legal.length === 1) { j.bestScore = evaluate(); return jobFinish(j); }
+    }
+    const sliceEnd = now() + sliceMs;
+    nodes = 0;
+    for (;;) {
+      while (j.idx < j.order.length) {
+        const m = j.order[j.idx], nz = j.noise.get(m);
+        deadline = j.depthDone ? Math.min(sliceEnd, j.hard) : sliceEnd;
+        stop = false; canStop = true;
+        make(m);
+        let sc;
+        if (j.idx === 0) sc = -search(j.depth - 1, -INF, -(j.alpha - nz), 1) + nz;
+        else {
+          sc = -search(j.depth - 1, -(j.alpha - nz) - 1, -(j.alpha - nz), 1) + nz;
+          if (!stop && sc > j.alpha) sc = -search(j.depth - 1, -INF, -(j.alpha - nz), 1) + nz;
+        }
+        unmake(m);
+        if (stop) {
+          // a deeper iteration was cut by the hard deadline: keep its best if the old best was already re-searched
+          if (j.depthDone && now() >= j.hard) { if (j.idx > 0 && j.iterBest) { j.best = j.iterBest; j.bestScore = j.iterScore; } return jobFinish(j); }
+          ADV = false;
+          return false; // yield; retry this move next slice
+        }
+        j.scores.set(m, sc);
+        if (sc > j.iterScore) { j.iterScore = sc; j.iterBest = m; }
+        if (sc > j.alpha) j.alpha = sc;
+        j.idx++;
+      }
+      // iteration complete
+      j.best = j.iterBest; j.bestScore = j.iterScore; j.depthDone = j.depth;
+      const sc = j.scores, best = j.best;
+      j.order = j.order.slice().sort((a, b) => (b === best) - (a === best) || (sc.get(b) ?? -INF) - (sc.get(a) ?? -INF));
+      j.depth++; j.idx = 0; j.alpha = -INF; j.iterBest = 0; j.iterScore = -INF; j.scores = new Map();
+      if (Math.abs(j.bestScore) > MATE - 200) return jobFinish(j);
+      if (o.maxDepth && j.depth > o.maxDepth) return jobFinish(j);
+      if (now() - j.t0 > o.budget * (o.adv ? 0.45 : 0.55)) return jobFinish(j);
+      if (now() >= sliceEnd) { ADV = false; return false; }
+    }
+  }
+  /* synchronous search (node tests, draw answers) */
+  function think(budget, noisy, maxDepth, adv, owner) {
+    const j = newJob(snapshot(), { budget, maxDepth, adv, noise: noisy ? 22 : 0, owner: owner == null ? ttOwner : owner });
+    while (!jobStep(j, 1e9));
+    return j.res;
+  }
+  /* cooperative runner: one slice per macrotask */
+  function runJob(j, alive, done) {
+    const tick = () => {
+      if (!alive()) return;
+      let fin;
+      try { fin = jobStep(j, CFG.slice); } catch (e) { console.error(e); return; }
+      if (fin) done(j.res); else setTimeout(tick, 0);
+    };
+    setTimeout(tick, 0);
+  }
+  /* current engine position as a loadState()-compatible object */
+  function snapshot() {
+    const rep = [];
+    const lim = Math.max(0, gp - hm);
+    for (let i = lim; i <= gp; i++) rep.push((HL[i] >>> 0).toString(36));
+    return { b: boardStr(), t: side, c: castleStr(), ep: ep >= 0 ? to64(ep) : -1, hm, rep };
+  }
+  /* 쉬움: full-window shallow scores for every root move, then a human-like (often sloppy) pick */
+  function rootScores(depth) {
+    deadline = now() + 1e9; stop = false; canStop = false; ADV = false;
+    const out = [];
+    for (const m of legalMoves()) {
+      make(m);
+      const sc = depth <= 1 ? -qsearch(-INF, INF, 1) : -search(depth - 1, -INF, INF, 1);
+      unmake(m);
+      out.push([m, sc]);
+    }
+    return out.sort((a, b) => b[1] - a[1]);
+  }
+  function easyMove() {
+    const r = rootScores(Math.random() < 0.55 ? 1 : 2);
+    if (!r.length) return 0;
+    const best = r[0][1];
+    if (best > MATE - 200 && Math.random() < 0.7) return r[0][0]; // usually sees a mate in one
+    const x = Math.random();
+    if (x < 0.12) { // blunder: anything that is not suicidal-by-mate, often hangs a piece
+      const pool = r.filter((e) => e[1] > -MATE + 200);
+      return (pool.length ? pool : r)[(Math.random() * (pool.length || r.length)) | 0][0];
+    }
+    if (x < 0.45) { // among the top few, ignoring what they cost (up to ~a minor piece)
+      const pool = r.filter((e) => e[1] >= best - 320).slice(0, 4);
+      return pool[(Math.random() * pool.length) | 0][0];
+    }
+    let bm = r[0][0], bs = -INF;
+    for (const [m, sc] of r) { const v = sc + Math.random() * 70; if (v > bs) { bs = v; bm = m; } }
+    return bm;
+  }
+
+  /* =====================================================================
+   * Game rules on the JSON state
+   * ===================================================================== */
+  const START = 'rnbqkbnrpppppppp' + '.'.repeat(32) + 'PPPPPPPPRNBQKBNR';
+  function init(players, opts) {
+    setBoard(START, 0, 'KQkq', -1, 0);
+    const hv = opts && opts.hint != null ? +opts.hint : 3;
+    const eb = opts && (opts.evbar === 'on' || opts.evbar === 'off') ? opts.evbar : 'auto';
+    return { b: START, t: 0, c: 'KQkq', ep: -1, hm: 0, fm: 1, last: null, cap: '', st: null, ck: 0, seq: 0, rep: [(hLo >>> 0).toString(36)],
+      mv: '', m0: 0, f0: null, dr: null, nd: -1, u: [], ev: null, hn: hv >= 0 ? hv : 3, eb };
+  }
+  /* compact move list: 2 chars per ply (from, to on a 64-char alphabet) + a marker for under-promotion.
+     `f0` (if set) is the position the list starts from ('b|t|c|ep|hm'), `m0` its ply number. */
+  const SQA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const UPM = { n: '!', b: '*', r: '~' }, UPD = { '!': 'n', '*': 'b', '~': 'r' };
+  const encMove = (f, t, p) => SQA[f] + SQA[t] + (p && p !== 'q' ? UPM[p] : '');
+  const splitMv = (mv) => (mv ? mv.match(/[^!*~]{2}[!*~]?/g) || [] : []);
+  const fenOf = (o) => [o.b, o.t, o.c, o.ep, o.hm].join('|');
+  function loadF0(f0) {
+    if (!f0) { setBoard(START, 0, 'KQkq', -1, 0); return; }
+    const x = f0.split('|');
+    setBoard(x[0], +x[1], x[2], +x[3], +x[4]);
+  }
+  /* replay a game's move list → positions (loadState-compatible), SAN and moves. Clobbers the engine position. */
+  function replayGame(s) {
+    loadF0(s.f0);
+    let rep = [(hLo >>> 0).toString(36)];
+    const pos = [{ b: boardStr(), t: side, c: castleStr(), ep: ep >= 0 ? to64(ep) : -1, hm, rep, ck: inCheck() ? 1 : 0 }];
+    const san = [], moves = [];
+    for (const tok of splitMv(s.mv)) {
+      const f = SQA.indexOf(tok[0]), t = SQA.indexOf(tok[1]);
+      const legal = legalMoves().map(mInfo);
+      const cand = legal.filter((m) => m.f === f && m.t === t);
+      const mv = cand.find((m) => m.p === (tok[2] ? UPD[tok[2]] : cand.some((c) => c.p) ? 'q' : ''));
+      if (!mv) break;
+      let sn = sanOf(mv, legal, boardStr());
+      make(mv.m);
+      const key = (hLo >>> 0).toString(36);
+      rep = hm === 0 ? [key] : rep.concat([key]);
+      const chk = inCheck();
+      if (chk) sn += legalMoves().length ? '+' : '#';
+      san.push(sn); moves.push({ f: mv.f, t: mv.t, p: mv.p });
+      pos.push({ b: boardStr(), t: side, c: castleStr(), ep: ep >= 0 ? to64(ep) : -1, hm, rep, ck: chk ? 1 : 0 });
+    }
+    return { pos, san, moves };
+  }
+  /* while a draw offer is pending the opponent of the offerer must answer it */
+  function actor(s) { return s.st ? null : s.dr ? 1 - s.dr.by : s.t; }
+  // 상황 도움말(라운드 35)
+  function hint(s, seat) {
+    if (s.dr) return [s.dr.by === seat ? '무승부를 제안했어요. 상대의 답을 기다려요.' : '상대가 무승부를 제안했어요. 받으면 비김, 거절하면 계속 둬요.'];
+    const side = s.t === 0 ? '백' : '흑', mine = seat === s.t;
+    const L2 = legalFromState(s);
+    const out = [];
+    if (!L2.length) return [s.ck ? '체크메이트 — 킹이 피할 곳이 없어 게임이 끝났어요.' : '스테일메이트 — 둘 수가 없지만 체크가 아니라서 무승부예요.'];
+    if (s.ck) out.push((mine ? '내 킹이' : side + ' 킹이') + ' 체크 상태! 킹을 피하거나, 막거나, 공격한 기물을 잡아야 해요(가능한 수 ' + L2.length + '개).');
+    else out.push(mine ? '내 차례(' + side + ')예요. 둘 수 있는 수 ' + L2.length + '개.' : side + ' 차례예요 — 상대가 생각 중이에요.');
+    const my = mine ? L2 : [];
+    const castle = my.filter((m) => m.fl & 2);
+    if (castle.length) out.push('캐슬링 가능: 킹을 룩 쪽으로 2칸 옮기면 룩이 킹을 넘어 옆에 서요(' + castle.map((m) => ((m.t & 7) === 6 ? '킹 쪽' : '퀸 쪽')).join('·') + ').');
+    else if (mine && s.c && s.c !== '-') out.push('캐슬링: 킹·룩이 안 움직였고 사이가 비고, 지나는 칸이 공격받지 않을 때만 돼요.');
+    if (my.some((m) => m.fl & 1)) out.push('앙파상 가능: 방금 2칸 전진한 상대 폰을 옆에서 대각선으로 지나가며 잡을 수 있어요.');
+    if (my.some((m) => m.p)) out.push('승격 가능: 폰이 끝 줄에 닿으면 퀸·룩·비숍·나이트 중 하나로 바뀌어요.');
+    if (s.hm >= 80) out.push('50수 규칙: ' + Math.max(0, 50 - Math.floor(s.hm / 2)) + '수 안에 폰 이동이나 잡기가 없으면 무승부예요.');
+    if (s.rep && s.rep.length > 4) { const last = s.rep[s.rep.length - 1], c = s.rep.filter((k) => k === last).length; if (c >= 2) out.push('같은 배치가 ' + c + '번 나왔어요. 3번이면 무승부예요.'); }
+    if (out.length < 2) out.push('기물 가치(대략): 폰 1 · 나이트/비숍 3 · 룩 5 · 퀸 9. 중앙을 차지하고 킹을 안전하게.');
+    return out;
+  }
+
+
+  /* SAN for move `mv` (mInfo) given the pre-move legal list; suffix added after the move */
+  const FILES = 'abcdefgh';
+  const sqName = (i) => FILES[i & 7] + (8 - (i >> 3));
+  function sanOf(mv, moves, b) {
+    if (mv.fl & 2) return (mv.t & 7) === 6 ? 'O-O' : 'O-O-O';
+    const pc = b[mv.f].toUpperCase(), capture = b[mv.t] !== '.' || (mv.fl & 1);
+    if (pc === 'P') return (capture ? FILES[mv.f & 7] + 'x' : '') + sqName(mv.t) + (mv.p ? '=' + mv.p.toUpperCase() : '');
+    let dis = '';
+    const others = moves.filter((m) => m.t === mv.t && m.f !== mv.f && b[m.f] === b[mv.f]);
+    if (others.length) {
+      if (!others.some((m) => (m.f & 7) === (mv.f & 7))) dis = FILES[mv.f & 7];
+      else if (!others.some((m) => (m.f >> 3) === (mv.f >> 3))) dis = String(8 - (mv.f >> 3));
+      else dis = sqName(mv.f);
+    }
+    return pc + dis + (capture ? 'x' : '') + sqName(mv.t);
+  }
+  /* undo support: snapshot of the position before a ply. `r` (the repetition list) is only kept when
+     that ply reset it — otherwise it can be rebuilt by dropping the last key. */
+  function snap(s) { return { b: s.b, t: s.t, c: s.c, ep: s.ep, hm: s.hm, fm: s.fm, cap: s.cap, ck: s.ck, last: s.last, nd: s.nd }; }
+  const LIMIT = 2380;
+  /* very long games: drop the oldest plies of the move list (the review then starts from `f0`) */
+  function trimMoves(s, k) {
+    const toks = splitMv(s.mv);
+    k = Math.min(k, toks.length);
+    if (k <= 0) return;
+    const r = replayGame({ f0: s.f0, mv: toks.slice(0, k).join('') });
+    s.f0 = fenOf(r.pos[r.pos.length - 1]);
+    s.m0 += r.san.length;
+    s.mv = toks.slice(r.san.length).join('');
+  }
+  function fit(s) {
+    const size = () => JSON.stringify(s).length;
+    let n = size();
+    if (n <= LIMIT) return;
+    while (n > LIMIT && splitMv(s.mv).length > 120) { trimMoves(s, 40); n = size(); }
+    if (n > LIMIT && s.u.length) { s.u = []; n = size(); }
+    while (n > LIMIT && s.mv) { trimMoves(s, 20); n = size(); }
+  }
+
+  function apply(s, seat, a) {
+    if (s.st) throw new Error('game over');
+    if (seat !== actor(s)) throw new Error('not your turn');
+    if (!a) throw new Error('bad action');
+    if (s.dr) { // only an answer to the pending offer is allowed
+      if (a.type !== 'drawReply') throw new Error('answer the draw offer');
+      s.seq++;
+      const by = s.dr.by;
+      s.dr = null;
+      if (a.ok) s.st = { r: 'agree', w: -1 };
+      else s.ev = { id: s.seq, k: 'n', by };
+      return s;
+    }
+    if (a.type === 'resign') {
+      s.seq++;
+      s.st = { r: 'resign', w: 1 - seat };
+      return s;
+    }
+    if (a.type === 'draw') {
+      if (s.nd === seat) throw new Error('already offered');
+      s.seq++;
+      s.dr = { by: seat }; s.nd = seat;
+      s.ev = { id: s.seq, k: 'o', by: seat };
+      return s;
+    }
+    if (a.type === 'undo') {
+      // revert this player's last move and the opponent's reply (two plies)
+      if (!s.u || s.u.length !== 2 || s.u[0].t !== seat) throw new Error('nothing to undo');
+      const [o, nw] = s.u;
+      let r = nw.r || s.rep.slice(0, -1);
+      r = o.r || r.slice(0, -1);
+      if (!r.length) throw new Error('nothing to undo');
+      Object.assign(s, { b: o.b, t: o.t, c: o.c, ep: o.ep, hm: o.hm, fm: o.fm, cap: o.cap, ck: o.ck, last: o.last, nd: o.nd, rep: r });
+      const toks = splitMv(s.mv);
+      if (toks.length >= 2) s.mv = toks.slice(0, -2).join('');
+      else { s.mv = ''; s.f0 = fenOf(o); s.m0 = Math.max(0, s.m0 + toks.length - 2); }
+      s.u = [];
+      s.seq++;
+      s.ev = { id: s.seq, k: 'u', by: seat };
+      return s;
+    }
+    if (a.type !== 'move') throw new Error('bad action');
+    loadState(s);
+    const moves = legalMoves().map(mInfo);
+    const mv = moves.find((m) => m.f === a.f && m.t === a.t && m.p === (a.p || ''));
+    if (!mv) throw new Error('illegal move');
+    const before = snap(s), repBefore = s.rep;
+    const t88 = to88(mv.t);
+    let capCh = bd[t88] ? CH[bd[t88]] : '';
+    if (mv.fl & 1) capCh = side ? 'P' : 'p';
+    const mover = CH[bd[to88(mv.f)]];
+    make(mv.m);
+    s.seq++;
+    s.b = boardStr(); s.t = side; s.c = castleStr(); s.ep = ep >= 0 ? to64(ep) : -1; s.hm = hm;
+    if (side === 0) s.fm++;
+    s.cap += capCh;
+    s.last = { f: mv.f, t: mv.t, id: s.seq, pc: mover };
+    if (capCh) s.last.x = capCh;
+    if (mv.p) s.last.p = mv.p;
+    if (mv.fl & 2) s.last.k = 'c';
+    if (mv.fl & 1) s.last.k = 'e';
+    const key = (hLo >>> 0).toString(36);
+    if (hm === 0) { s.rep = [key]; before.r = repBefore; } else s.rep.push(key);
+    if (s.rep.length > 110) s.rep = s.rep.slice(-110);
+    const chk = inCheck();
+    s.ck = chk ? 1 : 0;
+    const replies = legalMoves().length;
+    s.mv = (s.mv || "") + encMove(mv.f, mv.t, mv.p);
+    if (s.nd !== seat) s.nd = -1; // the opponent moved: the other side may offer again
+    s.u = (s.u || []).slice(-1).concat([before]);
+    if (!replies) s.st = chk ? { r: 'mate', w: seat } : { r: 'stale', w: -1 };
+    else if (hm >= 100) s.st = { r: '50', w: -1 };
+    else if (insufficient()) s.st = { r: 'ins', w: -1 };
+    else if (s.rep.filter((k) => k === key).length >= 3) s.st = { r: 'rep', w: -1 };
+    fit(s);
+    return s;
+  }
+
+  const SIDE = ['백', '흑'];
+  function result(s) {
+    if (!s.st) return null;
+    const r = s.st.r, w = s.st.w, moves = (s.fm - (s.t === 0 ? 1 : 0)) + '수';
+    // seat 0 = 백 captures lowercase (black) pieces, seat 1 = 흑 captures uppercase ones
+    const took = [[...s.cap].filter((c) => c !== c.toUpperCase()), [...s.cap].filter((c) => c !== c.toLowerCase())];
+    const stats = [{ label: '잡은 기물', values: took.map((a) => String(a.length)) }, { label: '잡은 점수', values: took.map((a) => String(a.reduce((x, c) => x + (PV[c.toLowerCase()] || 0), 0))) }];
+    const R = (o) => Object.assign(o, { stats });
+    if (r === 'mate') return R({ winners: [w], title: '체크메이트', text: SIDE[w] + ' 승리 · ' + moves });
+    if (r === 'resign') return R({ winners: [w], title: SIDE[1 - w] + ' 기권', text: SIDE[w] + ' 승리 · ' + moves });
+    if (r === 'stale') return R({ winners: [], title: '스테일메이트', text: '둘 수 있는 수가 없지만 체크가 아니라서 무승부예요.' });
+    if (r === '50') return R({ winners: [], title: '무승부 (50수)', text: '50수 동안 폰 이동도, 잡은 기물도 없었어요.' });
+    if (r === 'ins') return R({ winners: [], title: '무승부 (기물 부족)', text: '양쪽 모두 체크메이트할 기물이 남지 않았어요.' });
+    if (r === 'rep') return R({ winners: [], title: '무승부 (3회 반복)', text: '같은 국면이 세 번 나왔어요.' });
+    if (r === 'agree') return R({ winners: [], title: '무승부 (합의)', text: '무승부 제안을 받아들였어요 · ' + moves });
+    return R({ winners: [], title: '무승부' });
+  }
+
+  const DRAW_OK = 30; // AI accepts a draw when its own search says it is at most +0.3 pawns (any move number, as in the official rules)
+  /* per-seat level: 1 쉬움 (얕게 읽고 가끔 실수) · 2 보통 (4수 깊이, 클럽 수준) · 3 어려움 (약 1초, 깊은 탐색)
+     budgets are wall-clock ms on the device, so slower phones simply search a little shallower */
+  const LVL = {
+    1: { draw: 0 },
+    2: { budget: 320, maxDepth: 4, adv: false, noise: 26, noisePlies: 12, draw: 120 },
+    3: { budget: 1000, maxDepth: 0, adv: true, noise: 10, noisePlies: 3, draw: 200 },
+  };
+  function levelOpts(lv, s, speed) {
+    const c = LVL[lv];
+    return { budget: c.budget * CFG.scale / (speed || 1), maxDepth: c.maxDepth, adv: c.adv, noise: s.fm <= c.noisePlies ? c.noise : 0, owner: lv };
+  }
+  function drawAnswer(s, seat, lv) {
+    loadState(s); // side to move = the offerer
+    ownTT(lv);
+    let sc;
+    if (lv === 1) { const r = rootScores(1); sc = r.length ? r[0][1] : evaluate(); }
+    else { const r = think(LVL[lv].draw, false, lv === 2 ? 4 : 0, lv === 3, lv); sc = typeof r.score === 'number' ? r.score : evaluate(); }
+    const mine = seat === s.t ? sc : -sc;
+    return mine <= DRAW_OK;
+  }
+  /* each user of the engine keeps its own search memory: a bot must not reuse the deeper results of another level
+     (AI vs AI on one device); hints ('H') and the post-game review ('A') have their own too */
+  let ttOwner = 0;
+  function ownTT(o) { if (ttOwner !== o) { ttKey.fill(0); hist.fill(0); ttOwner = o; } }
+  function toAction(m) {
+    const i = mInfo(m);
+    const a = { type: 'move', f: i.f, t: i.t };
+    if (i.p) a.p = i.p;
+    return a;
+  }
+  /* small opening book (보통·어려움): main lines of common openings, picked at random for variety and instant replies */
+  const BOOK = [
+    'e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7', 'e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3 g8f6 d2d3 d7d6',
+    'e2e4 e7e5 g1f3 b8c6 d2d4 e5d4 f3d4 g8f6 d4c6 b7c6', 'e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6',
+    'e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 g8f6 b1c3 e7e5', 'e2e4 c7c5 b1c3 b8c6 g1f3 g7g6 d2d4 c5d4 f3d4 f8g7',
+    'e2e4 e7e6 d2d4 d7d5 b1c3 g8f6 c1g5 f8e7', 'e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 c8f5 e4g3 f5g6',
+    'e2e4 d7d5 e4d5 d8d5 b1c3 d5a5 d2d4 g8f6', 'd2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8',
+    'd2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 d5c4 a2a4 c8f5', 'd2d4 g8f6 c2c4 e7e6 b1c3 f8b4 e2e3 e8g8 f1d3 d7d5',
+    'd2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 g1f3 e8g8', 'd2d4 g8f6 c2c4 e7e6 g1f3 b7b6 g2g3 c8b7 f1g2 f8e7',
+    'c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 d7d5', 'g1f3 d7d5 d2d4 g8f6 c2c4 e7e6 b1c3 f8e7',
+  ].map((l) => l.split(' '));
+  const sqIdx = (a) => (a.charCodeAt(0) - 97) + (8 - +a[1]) * 8;
+  function bookMove(s) {
+    if (s.f0 || s.m0 || s.fm > 6) return null;
+    const played = splitMv(s.mv).map((t) => t.slice(0, 2)), n = played.length;
+    const next = [];
+    for (const l of BOOK) {
+      if (l.length <= n) continue;
+      let ok = true;
+      for (let i = 0; i < n; i++) if (SQA[sqIdx(l[i].slice(0, 2))] + SQA[sqIdx(l[i].slice(2))] !== played[i]) { ok = false; break; }
+      if (ok) next.push(l[n]);
+    }
+    if (!next.length) return null;
+    const mv = next[(Math.random() * next.length) | 0], f = sqIdx(mv.slice(0, 2)), t = sqIdx(mv.slice(2));
+    loadState(s);
+    return legalMoves().map(mInfo).some((m) => m.f === f && m.t === t) ? { type: 'move', f, t } : null;
+  }
+  function syncMove(s, lv) {
+    loadState(s);
+    ownTT(lv);
+    let m;
+    if (lv === 1) m = easyMove();
+    else {
+      const j = newJob(s, Object.assign(levelOpts(lv, s, 1), { style: (L.aiStyle && L.aiStyle(s.t)) || 'bal' }));
+      while (!jobStep(j, 1e9));
+      m = j.res.m;
+      if (CFG.log) CFG.log(j.res, lv);
+    }
+    if (!m) { loadState(s); m = legalMoves()[0]; }
+    return toAction(m);
+  }
+  /* in the app the 보통/어려움 search runs in background slices: ai() returns null (core then waits),
+     and the finished move is submitted through the core once the position is still current */
+  const keyOf = (s) => s.seq + ':' + s.t + ':' + s.b;
+  let aiJob = null, aiEval = null; // aiEval: the AI's own search score for its position (reused by the eval bar)
+  const canAsync = () => !CFG.sync && typeof window !== 'undefined' && typeof L._submit === 'function' && typeof L.session === 'function' && typeof document !== 'undefined';
+  function sessionFor(key, seat) {
+    const S = L.session();
+    return S && S.state && S.gameId === 'chess' && keyOf(S.state) === key && S.players[seat] && S.players[seat].ai ? S : null;
+  }
+  function ai(s, seat, lv) {
+    lv = lv === 1 || lv === 3 ? lv : 2;
+    if (s.dr) return { type: 'drawReply', ok: drawAnswer(s, seat, lv) };
+    if (lv !== 1 && !CFG.noBook) { const bm = bookMove(s); if (bm) return bm; }
+    if (lv === 1 || !canAsync()) return syncMove(s, lv);
+    const key = keyOf(s);
+    if (aiJob && aiJob.key === key && aiJob.seat === seat) {
+      if (aiJob.action) { const a = aiJob.action; aiJob = null; return a; }
+      return null; // still thinking
+    }
+    const me = { key, seat, action: null };
+    aiJob = me;
+    const job = newJob(s, Object.assign(levelOpts(lv, s, (L.debug && L.debug.speed) || 1), { style: (L.aiStyle && L.aiStyle(seat)) || 'bal' }));
+    const alive = () => aiJob === me && !!sessionFor(key, seat);
+    runJob(job, alive, (res) => {
+      let m = res.m;
+      if (!m) { loadState(s); m = legalMoves()[0]; }
+      aiEval = { key, sc: res.score || 0, t: s.t };
+      me.action = toAction(m);
+      const deliver = () => {
+        if (aiJob !== me) return;
+        const S = sessionFor(key, seat);
+        if (!S) { aiJob = null; return; }
+        if (S.paused || S.busy || document.querySelector('.overlay.curtain') || (S.mode === 'local' && document.querySelector('.overlay.rules-ov'))) { setTimeout(deliver, 120); return; }
+        aiJob = null;
+        L._submit(seat, me.action);
+      };
+      deliver();
+    });
+    return null;
+  }
+  function aiDelayFor(s, seat, lv) { return lv === 1 ? 650 : lv === 3 ? 60 : 200; }
+  function legalFromState(s) { loadState(s); return legalMoves().map(mInfo); }
+
+  /* =====================================================================
+   * View
+   * ===================================================================== */
+  const PV = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+  const isW = (c) => c >= 'A' && c <= 'Z';
+  const FONT = '"IBM Plex Sans KR", system-ui, sans-serif', MONO = '"IBM Plex Mono", ui-monospace, monospace';
+  /* 설정 「보드 판 재질」(라운드 34): 칸 색·테두리만 바꾼다(기물 스킨·평면/입체는 게임 「모양」 그대로). */
+  const MATS = {
+    wood: null,
+    marble: { light: '#eeebe5', dark: '#8d9098', rail0: '#5d5f66', rail1: '#33353b', grain: 'rgba(60,62,70,.16)' },
+    paper: { light: '#f6efdc', dark: '#b39a6c', rail0: '#7a6646', rail1: '#4d3f2a', grain: 'rgba(90,70,40,.10)' },
+    lacquer: { light: '#c9a45e', dark: '#2a201d', rail0: '#1a1312', rail1: '#0b0807', grain: 'rgba(200,150,90,.10)' },
+  };
+  function boardCol() { const id = (L.ui && L.ui.board) ? L.ui.board().id : 'wood'; return MATS[id] || { light: COL.light, dark: COL.dark, rail0: COL.rail0, rail1: COL.rail1, grain: 'rgba(70,40,20,.12)' }; }
+  const COL = {
+    light: '#ecdcbc', dark: '#a87650', rail0: '#5b3a25', rail1: '#3a2416', brass: '#e3ae45',
+    wFill0: '#fbf4e4', wFill1: '#dccaa6', wLine: '#2b1d15', bFill0: '#3d3442', bFill1: '#1b161e', bLine: '#e8d9bb',
+  };
+  const PROMOS = [['q', '퀸'], ['r', '룩'], ['b', '비숍'], ['n', '나이트']];
+
+  /* piece silhouettes in a unit box (0..1), drawn as fill + outline */
+  function piecePaths(ctx, t) {
+    const parts = [];
+    const P = () => { const p = new Path2D(); parts.push(p); return p; };
+    const base = (y, w) => { const p = P(); const x = 0.5 - w / 2; p.moveTo(x + 0.04, y); p.lineTo(x + w - 0.04, y); p.quadraticCurveTo(x + w, y, x + w, y + 0.04); p.lineTo(x + w, y + 0.07); p.lineTo(x, y + 0.07); p.lineTo(x, y + 0.04); p.quadraticCurveTo(x, y, x + 0.04, y); p.closePath(); };
+    if (t === 'p') {
+      let p = P(); p.moveTo(0.34, 0.8); p.quadraticCurveTo(0.36, 0.6, 0.44, 0.5); p.lineTo(0.56, 0.5); p.quadraticCurveTo(0.64, 0.6, 0.66, 0.8); p.closePath();
+      p = P(); p.ellipse(0.5, 0.49, 0.13, 0.045, 0, 0, Math.PI * 2);
+      p = P(); p.arc(0.5, 0.33, 0.12, 0, Math.PI * 2);
+      base(0.78, 0.48);
+    } else if (t === 'r') {
+      let p = P();
+      p.moveTo(0.27, 0.18); p.lineTo(0.37, 0.18); p.lineTo(0.37, 0.25); p.lineTo(0.45, 0.25); p.lineTo(0.45, 0.18); p.lineTo(0.55, 0.18);
+      p.lineTo(0.55, 0.25); p.lineTo(0.63, 0.25); p.lineTo(0.63, 0.18); p.lineTo(0.73, 0.18); p.lineTo(0.73, 0.35); p.lineTo(0.66, 0.4);
+      p.lineTo(0.68, 0.72); p.lineTo(0.32, 0.72); p.lineTo(0.34, 0.4); p.lineTo(0.27, 0.35); p.closePath();
+      p = P(); p.moveTo(0.29, 0.71); p.lineTo(0.71, 0.71); p.lineTo(0.74, 0.79); p.lineTo(0.26, 0.79); p.closePath();
+      base(0.78, 0.58);
+    } else if (t === 'b') {
+      let p = P(); p.moveTo(0.36, 0.78); p.quadraticCurveTo(0.4, 0.64, 0.44, 0.55); p.lineTo(0.56, 0.55); p.quadraticCurveTo(0.6, 0.64, 0.64, 0.78); p.closePath();
+      p = P(); p.moveTo(0.5, 0.15); p.bezierCurveTo(0.68, 0.27, 0.69, 0.45, 0.6, 0.54); p.lineTo(0.4, 0.54); p.bezierCurveTo(0.31, 0.45, 0.32, 0.27, 0.5, 0.15); p.closePath();
+      p = P(); p.ellipse(0.5, 0.555, 0.14, 0.04, 0, 0, Math.PI * 2);
+      p = P(); p.arc(0.5, 0.12, 0.045, 0, Math.PI * 2);
+      base(0.77, 0.5);
+      parts.slit = true;
+    } else if (t === 'n') {
+      let p = P();
+      p.moveTo(0.3, 0.79); p.lineTo(0.72, 0.79);
+      p.bezierCurveTo(0.75, 0.6, 0.73, 0.38, 0.63, 0.26);
+      p.bezierCurveTo(0.57, 0.19, 0.5, 0.16, 0.45, 0.16);
+      p.lineTo(0.42, 0.08); p.lineTo(0.36, 0.18);
+      p.bezierCurveTo(0.29, 0.23, 0.22, 0.33, 0.18, 0.44);
+      p.lineTo(0.17, 0.5);
+      p.bezierCurveTo(0.18, 0.56, 0.25, 0.58, 0.3, 0.54);
+      p.bezierCurveTo(0.35, 0.51, 0.41, 0.5, 0.47, 0.47);
+      p.bezierCurveTo(0.41, 0.57, 0.33, 0.66, 0.3, 0.79);
+      p.closePath();
+      base(0.77, 0.56);
+      parts.eye = true;
+    } else if (t === 'q') {
+      let p = P();
+      p.moveTo(0.3, 0.74); p.lineTo(0.18, 0.3); p.lineTo(0.34, 0.5); p.lineTo(0.35, 0.22); p.lineTo(0.45, 0.47); p.lineTo(0.5, 0.17);
+      p.lineTo(0.55, 0.47); p.lineTo(0.65, 0.22); p.lineTo(0.66, 0.5); p.lineTo(0.82, 0.3); p.lineTo(0.7, 0.74); p.closePath();
+      for (const [x, y] of [[0.18, 0.28], [0.35, 0.2], [0.5, 0.15], [0.65, 0.2], [0.82, 0.28]]) { p = P(); p.arc(x, y, 0.045, 0, Math.PI * 2); }
+      p = P(); p.ellipse(0.5, 0.72, 0.21, 0.045, 0, 0, Math.PI * 2);
+      base(0.78, 0.56);
+    } else if (t === 'k') {
+      let p = P(); p.moveTo(0.46, 0.06); p.lineTo(0.54, 0.06); p.lineTo(0.54, 0.12); p.lineTo(0.6, 0.12); p.lineTo(0.6, 0.19); p.lineTo(0.54, 0.19);
+      p.lineTo(0.54, 0.27); p.lineTo(0.46, 0.27); p.lineTo(0.46, 0.19); p.lineTo(0.4, 0.19); p.lineTo(0.4, 0.12); p.lineTo(0.46, 0.12); p.closePath();
+      p = P(); p.moveTo(0.31, 0.74); p.bezierCurveTo(0.14, 0.52, 0.27, 0.32, 0.43, 0.42); p.lineTo(0.5, 0.3); p.lineTo(0.57, 0.42);
+      p.bezierCurveTo(0.73, 0.32, 0.86, 0.52, 0.69, 0.74); p.closePath();
+      p = P(); p.ellipse(0.5, 0.72, 0.21, 0.045, 0, 0, Math.PI * 2);
+      base(0.78, 0.56);
+    }
+    return parts;
+  }
+  const pathCache = {};
+  // 기물 모양 · 판 모양 (이 기기에 저장, 게임 옵션 아님)
+  const LOOK = { skin: 'classic', board: 'flat', tilt: false };
+  try { const v = U.store.get('chess.look', null); if (v && typeof v === 'object') Object.assign(LOOK, v); } catch (e) {}
+  const TILT = 0.86;
+  const SKINS = [['classic', '클래식'], ['minimal', '미니멀'], ['statue', '석상']];
+  /* 미니멀: 납작한 원판 위의 기하 도형 */
+  function drawMinimal(ctx, t, white) {
+    const fg = white ? '#f6f1e7' : '#2c2733', ln = white ? '#2b1d15' : '#efe3c8';
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.fillStyle = white ? '#d9cdb5' : '#17131b';
+    ctx.beginPath(); ctx.ellipse(0.5, 0.8, 0.3, 0.075, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = fg; ctx.strokeStyle = ln; ctx.lineWidth = 0.045;
+    ctx.beginPath(); ctx.ellipse(0.5, 0.76, 0.3, 0.075, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    if (t === 'p') { ctx.moveTo(0.4, 0.72); ctx.lineTo(0.46, 0.5); ctx.lineTo(0.54, 0.5); ctx.lineTo(0.6, 0.72); ctx.closePath(); ctx.moveTo(0.63, 0.4); ctx.arc(0.5, 0.4, 0.13, 0, Math.PI * 2); }
+    else if (t === 'r') { ctx.rect(0.33, 0.3, 0.34, 0.42); ctx.moveTo(0.3, 0.16); ctx.lineTo(0.7, 0.16); ctx.lineTo(0.7, 0.3); ctx.lineTo(0.3, 0.3); ctx.closePath(); }
+    else if (t === 'b') { ctx.moveTo(0.5, 0.12); ctx.lineTo(0.68, 0.44); ctx.lineTo(0.5, 0.72); ctx.lineTo(0.32, 0.44); ctx.closePath(); }
+    else if (t === 'n') { ctx.moveTo(0.32, 0.72); ctx.lineTo(0.32, 0.2); ctx.lineTo(0.72, 0.2); ctx.lineTo(0.72, 0.4); ctx.lineTo(0.52, 0.4); ctx.lineTo(0.52, 0.72); ctx.closePath(); }
+    else if (t === 'q') { for (let k = 0; k < 16; k++) { const a = -Math.PI / 2 + k * Math.PI / 8, r = k % 2 ? 0.15 : 0.27; const x = 0.5 + Math.cos(a) * r, y = 0.44 + Math.sin(a) * r; if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y); } ctx.closePath(); ctx.moveTo(0.42, 0.72); ctx.lineTo(0.45, 0.66); ctx.lineTo(0.55, 0.66); ctx.lineTo(0.58, 0.72); ctx.closePath(); }
+    else if (t === 'k') { ctx.moveTo(0.76, 0.48); ctx.arc(0.5, 0.48, 0.26, 0, Math.PI * 2); }
+    ctx.fill(); ctx.stroke();
+    if (t === 'k') { ctx.lineWidth = 0.06; ctx.beginPath(); ctx.moveTo(0.5, 0.33); ctx.lineTo(0.5, 0.63); ctx.moveTo(0.37, 0.46); ctx.lineTo(0.63, 0.46); ctx.stroke(); }
+    if (t === 'b') { ctx.lineWidth = 0.04; ctx.beginPath(); ctx.moveTo(0.43, 0.44); ctx.lineTo(0.57, 0.44); ctx.stroke(); }
+    if (t === 'n') { ctx.fillStyle = ln; ctx.beginPath(); ctx.arc(0.6, 0.3, 0.035, 0, Math.PI * 2); ctx.fill(); }
+  }
+  function drawPiece(ctx, ch, cx, cy, size, alpha) {
+    const t = ch.toLowerCase(), white = isW(ch);
+    if (LOOK.skin === 'minimal') {
+      ctx.save(); if (alpha != null) ctx.globalAlpha = alpha;
+      ctx.translate(cx - size / 2, cy - size / 2); ctx.scale(size, size);
+      drawMinimal(ctx, t, white); ctx.restore(); return;
+    }
+    const stone = LOOK.skin === 'statue';
+    const parts = pathCache[t] || (pathCache[t] = piecePaths(ctx, t));
+    ctx.save();
+    if (alpha != null) ctx.globalAlpha = alpha;
+    ctx.translate(cx - size / 2, cy - size / 2);
+    ctx.scale(size, size);
+    ctx.fillStyle = 'rgba(0,0,0,.22)';
+    ctx.beginPath(); ctx.ellipse(0.5, 0.87, 0.3, 0.045, 0, 0, Math.PI * 2); ctx.fill();
+    let g;
+    if (stone) { // 석상: 받침돌 + 돌결 그라데이션
+      g = ctx.createRadialGradient(0.36, 0.3, 0.05, 0.5, 0.5, 0.7);
+      if (white) { g.addColorStop(0, '#fbfaf6'); g.addColorStop(0.6, '#d3cfc6'); g.addColorStop(1, '#9d978b'); }
+      else { g.addColorStop(0, '#6f6b74'); g.addColorStop(0.6, '#3a3740'); g.addColorStop(1, '#16151a'); }
+      ctx.fillStyle = white ? '#8d877b' : '#141317';
+      ctx.fillRect(0.2, 0.84, 0.6, 0.06);
+      ctx.fillStyle = white ? '#bdb7ab' : '#2c2a31';
+      ctx.fillRect(0.22, 0.8, 0.56, 0.05);
+    } else {
+      g = ctx.createLinearGradient(0.2, 0.1, 0.8, 0.9);
+      if (white) { g.addColorStop(0, COL.wFill0); g.addColorStop(1, COL.wFill1); }
+      else { g.addColorStop(0, COL.bFill0); g.addColorStop(1, COL.bFill1); }
+    }
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = stone ? (white ? '#4a463f' : '#a8a3ae') : white ? COL.wLine : COL.bLine;
+    const lw = white ? 0.05 : 0.044;
+    ctx.lineWidth = lw * 2;
+    for (const p of parts) ctx.stroke(p);          // silhouette outline (outer half shows)
+    ctx.fillStyle = g;
+    for (const p of parts) ctx.fill(p);
+    ctx.globalAlpha = (alpha == null ? 1 : alpha) * 0.55; // faint inner detail lines
+    ctx.lineWidth = lw * 0.6;
+    for (let i = 1; i < parts.length; i++) ctx.stroke(parts[i]);
+    ctx.globalAlpha = alpha == null ? 1 : alpha;
+    ctx.lineWidth = lw;
+    if (parts.slit) { ctx.beginPath(); ctx.moveTo(0.52, 0.3); ctx.lineTo(0.58, 0.4); ctx.stroke(); }
+    if (parts.eye) { ctx.fillStyle = ctx.strokeStyle; ctx.beginPath(); ctx.arc(0.36, 0.28, 0.03, 0, Math.PI * 2); ctx.fill(); ctx.beginPath(); ctx.moveTo(0.6, 0.3); ctx.quadraticCurveTo(0.66, 0.45, 0.64, 0.62); ctx.stroke(); }
+    if (stone) { // 돌 알갱이 (위치 고정)
+      ctx.globalAlpha = (alpha == null ? 1 : alpha) * 0.22; ctx.fillStyle = white ? '#6d675c' : '#cfcad6';
+      ctx.save(); ctx.clip(parts[0]);
+      for (let k = 0; k < 26; k++) { const x = 0.2 + ((k * 37) % 61) / 100, y = 0.1 + ((k * 53) % 71) / 100; ctx.fillRect(x, y, 0.014, 0.014); }
+      ctx.restore();
+    } else if (!white) { // soft sheen on dark pieces
+      ctx.globalAlpha = (alpha == null ? 1 : alpha) * 0.18;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.ellipse(0.42, 0.4, 0.05, 0.12, 0.3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    let st = null, G = null, sel = -1, targets = [], legal = [], anim = null, drag = null, promo = null;
+    let stopLoop = null, shownSeq = -1, dropTo = -1, confirmTimer = 0, flip = false, busy = false, animTimer = 0;
+
+    let showDots = U.store.get('chess.dots', true);
+    const BS = { minHeight: '44px', flex: '1 1 0', minWidth: 0, padding: '6px 3px', fontSize: '12.5px', whiteSpace: 'nowrap' };
+    const hud = L.h('div', { class: 'hud bottom', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px' } });
+    const dotsBtn = L.h('button', { 'data-action': 'dots', class: 'btn sm ghost ch-dots', style: BS, 'aria-pressed': String(showDots), onclick: toggleDots });
+    const undoBtn = L.h('button', { 'data-action': 'undo', class: 'btn sm ghost ch-undo', style: BS, text: '↶ 무르기', 'aria-label': '한 수 무르기', onclick: onUndo });
+    const drawBtn = L.h('button', { class: 'btn sm ghost ch-draw', style: BS, text: '무승부', 'aria-label': '무승부 제안', onclick: onDraw });
+    const resignBtn = L.h('button', { class: 'btn sm ghost ch-resign', style: BS, text: '기권', 'aria-label': '기권하기', onclick: onResign });
+    const hintBtn = L.h('button', { 'data-action': 'hint', class: 'btn sm ghost ch-hint', style: BS, onclick: onHint });
+    hud.append(dotsBtn, hintBtn, undoBtn, drawBtn, resignBtn);
+    root.append(hud);
+    // 복기(review) controls, shown instead of the game HUD
+    const rhud = L.h('div', { class: 'hud bottom ch-rhud', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px', display: 'none' } });
+    const RB = Object.assign({}, BS, { fontSize: '15px' });
+    const rvFirst = L.h('button', { 'data-key': 'Home', class: 'btn sm ghost', style: RB, text: '⏮', 'aria-label': '처음으로', onclick: () => rvGo(0) });
+    const rvPrev = L.h('button', { 'data-key': 'ArrowLeft', class: 'btn sm', style: RB, text: '◀', 'aria-label': '이전 수', onclick: () => rvGo(rv.idx - 1) });
+    const rvNext = L.h('button', { 'data-key': 'ArrowRight', class: 'btn sm', style: RB, text: '▶', 'aria-label': '다음 수', onclick: () => rvGo(rv.idx + 1) });
+    const rvLast = L.h('button', { 'data-key': 'End', class: 'btn sm ghost', style: RB, text: '⏭', 'aria-label': '마지막으로', onclick: () => rvGo(1e9) });
+    const rvClose = L.h('button', { 'data-action': 'close', class: 'btn sm primary', style: BS, text: '결과', 'aria-label': '복기 닫고 결과 보기', onclick: exitReview });
+    rhud.append(rvFirst, rvPrev, rvNext, rvLast, rvClose);
+    root.append(rhud);
+    // move list (SAN), one compact horizontally scrolling row
+    const mlist = L.h('div', { class: 'mono ch-moves', 'aria-label': '기보', style: { position: 'absolute', left: '0', right: '0', height: '30px', overflowX: 'auto', overflowY: 'hidden', whiteSpace: 'nowrap', fontSize: '12.5px', lineHeight: '30px', padding: '0 4px', scrollbarWidth: 'none', touchAction: 'pan-x', WebkitOverflowScrolling: 'touch' } });
+    root.append(mlist);
+    const lookBtn = L.h('button', { class: 'btn sm ghost ch-look', text: '🎨', 'aria-label': '기물·판 모양 바꾸기', style: { position: 'absolute', width: '44px', height: '44px', minHeight: '44px', padding: '0', fontSize: '18px' }, onclick: openLook });
+    root.append(lookBtn);
+    // draw-offer answer / waiting panel
+    // (not class "overlay": core removes every .overlay on rematch)
+    const offer = L.h('div', { style: { position: 'absolute', inset: '0', zIndex: 15, display: 'none', alignItems: 'flex-end', justifyContent: 'center', padding: '16px', background: 'rgba(15,10,22,.45)' } });
+    const vis = (el, on) => { el.style.display = on ? '' : 'none'; };
+    root.append(offer);
+    const lookP = L.h('div', { style: { position: 'absolute', inset: '0', zIndex: 16, display: 'none', alignItems: 'flex-end', justifyContent: 'center', padding: '16px', background: 'rgba(15,10,22,.45)' } });
+    root.append(lookP);
+    // invisible boxes over canvas areas, so the first-play tutorial can spotlight them
+    const spot = (cls) => { const d = L.h('div', { class: cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none' } }); root.append(d); return d; };
+    const place = (d, x, y, w, h) => Object.assign(d.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' });
+    const spBoard = spot('ch-board'), spMe = spot('ch-me'), spOpp = spot('ch-opp');
+
+    function dotsLabel() { dotsBtn.textContent = (showDots ? '● ' : '○ ') + '길 표시'; dotsBtn.setAttribute('aria-pressed', String(showDots)); dotsBtn.setAttribute('aria-label', '갈 수 있는 칸 표시 ' + (showDots ? '켜짐' : '꺼짐')); }
+    dotsLabel();
+    function openLook() {
+      api.sfx('click');
+      lookP.innerHTML = '';
+      const row = (label, items, cur, set) => L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', margin: '8px 0', flexWrap: 'wrap' } },
+        [L.h('b', { style: { minWidth: '58px', fontSize: '14px' }, text: label })].concat(items.map(([v, lb]) => L.h('button', {
+          class: 'btn sm' + (cur === v ? ' primary' : ''), style: { minHeight: '44px', minWidth: '64px' }, text: lb, 'aria-pressed': String(cur === v),
+          onclick: (e) => { e.stopPropagation(); set(v); U.store.set('chess.look', LOOK); draw(); openLook(); } }))));
+      const sheet = L.h('div', { class: 'sheet ch-looksheet', style: { width: '100%' }, onclick: (e) => e.stopPropagation() },
+        L.h('div', { style: { display: 'flex', alignItems: 'center' } }, L.h('b', { style: { fontFamily: 'var(--f-display)', fontWeight: 400, fontSize: '19px' }, text: '모양' }),
+          L.h('span', { class: 'muted', style: { marginLeft: 'auto', fontSize: '11px' }, text: '이 기기에 저장 · 바깥을 누르면 닫혀요' })),
+        row('기물', SKINS, LOOK.skin, (v) => { LOOK.skin = v; }),
+        row('판', [['flat', '평면'], ['3d', '입체']], LOOK.board, (v) => { LOOK.board = v; }),
+        row('기울기', [[false, '끔'], [true, '켬']], !!LOOK.tilt, (v) => { LOOK.tilt = v; }));
+      lookP.append(sheet);
+      lookP.onclick = () => { lookP.onclick = null; vis(lookP, false); lookP.innerHTML = ''; };
+      lookP.style.display = 'flex';
+    }
+    function toggleDots() { showDots = !showDots; U.store.set('chess.dots', showDots); dotsLabel(); api.sfx('click'); api.buzz(10); draw(); }
+
+    const confirms = new Map(); // button -> {label, timer}
+    function armed(btn, label, ask) {
+      if (confirms.has(btn)) { disarm(btn); return true; }
+      for (const b of [...confirms.keys()]) disarm(b);
+      btn.classList.add('danger'); btn.classList.remove('ghost'); btn.textContent = ask;
+      confirms.set(btn, { label, timer: setTimeout(() => disarm(btn), 3000) });
+      api.sfx('click'); api.buzz(10);
+      return false;
+    }
+    function disarm(btn) {
+      const c = confirms.get(btn); if (!c) return;
+      clearTimeout(c.timer); confirms.delete(btn);
+      btn.classList.remove('danger'); btn.classList.add('ghost'); btn.textContent = c.label;
+    }
+    function disarmAll() { for (const b of [...confirms.keys()]) disarm(b); }
+    function onResign() {
+      if (!st || st.st || !myTurn() || locked()) return;
+      if (!armed(resignBtn, '기권', '기권 확인')) return;
+      sendAct({ type: 'resign' });
+    }
+    function onDraw() {
+      if (!canOffer()) return;
+      if (!armed(drawBtn, '무승부', '제안 확인')) return;
+      sendAct({ type: 'draw' });
+    }
+    function onUndo() {
+      if (!canUndo()) return;
+      sel = -1; targets = []; promo = null;
+      api.sfx('click'); api.buzz(15);
+      sendAct({ type: 'undo' });
+    }
+    function resetResign() { disarmAll(); }
+    function soloVsAI() {
+      if (api.online || !api.players[0] || !api.players[1]) return -1;
+      const h = [0, 1].filter((i) => api.canAct(i)), a = [0, 1].filter((i) => api.players[i].ai);
+      return h.length === 1 && a.length === 1 ? h[0] : -1;
+    }
+    function canOffer() { return !!st && !st.st && !st.dr && myTurn() && !locked() && st.nd !== st.t; }
+    function canUndo() {
+      const me = soloVsAI();
+      return me >= 0 && !!st && !st.st && !st.dr && st.t === me && myTurn() && !locked() && !anim && st.u && st.u.length === 2 && st.u[0].t === me;
+    }
+
+    /* ---- game record (replayed from the compact move list) ---- */
+    let histSig = '', histC = null, dead = false;
+    function getHist() {
+      const sig = (st.f0 || '') + '|' + (st.mv || '');
+      if (sig !== histSig) { histSig = sig; histC = replayGame(st); }
+      return histC;
+    }
+
+    /* ---- 힌트: limited per seat, a ~0.9 s background search ---- */
+    let hintLeft = [3, 3], hint = null, hintBusy = null;
+    const hintMax = () => (st && st.hn != null ? st.hn : 3);
+    function onHint() {
+      if (!st || st.st || st.dr || !myTurn() || locked() || anim || hintBusy || rv) return;
+      const seat = st.t, unl = hintMax() >= 99;
+      if (hint && hint.seq === st.seq) { api.toast('힌트: ' + hint.san); return; }
+      if (!unl && hintLeft[seat] <= 0) { api.toast('힌트를 다 썼어요'); api.buzz(20); return; }
+      const me = { seq: st.seq }, s0 = st;
+      hintBusy = me; api.sfx('click'); updateHud();
+      const job = newJob(s0, { budget: 900, adv: true, noise: 0, owner: 'H' });
+      runJob(job, () => !dead && hintBusy === me && st && st.seq === me.seq, (res) => {
+        hintBusy = null;
+        if (res.m) {
+          const i = mInfo(res.m);
+          loadState(s0);
+          const san = sanOf(i, legalMoves().map(mInfo), s0.b);
+          hint = { f: i.f, t: i.t, seq: me.seq, san };
+          if (!unl) hintLeft[seat]--;
+          api.toast('힌트: ' + san); api.sfx('pop'); api.buzz(10);
+        }
+        updateHud(); draw();
+      });
+    }
+
+    /* ---- 복기 (post-game review) ---- */
+    let rv = null, ana = null, resultOv = null;
+    const RV_BAD = 300, RV_MIS = 150, ANA_MS = 230;
+    function startAnalysis() {
+      const h = getHist();
+      if (ana && ana.sig === histSig) return;
+      const me = { sig: histSig, h, ev: [], bm: [], i: 0, done: false };
+      ana = me;
+      const fin = st.st && st.st.r;
+      const step = () => {
+        if (dead || ana !== me) return;
+        if (me.i >= h.pos.length) { me.done = true; if (rv) { draw(); renderList(); } renderBlunders(); return; }
+        const i = me.i, p = h.pos[i];
+        loadState(p);
+        const leg = legalMoves();
+        const last = i === h.pos.length - 1;
+        if (!leg.length || (last && /^(rep|50|ins)$/.test(fin))) {
+          me.ev[i] = !leg.length && inCheck() ? (p.t === 0 ? -MATE : MATE) : 0; me.bm[i] = null; me.i++;
+          if (rv) { draw(); renderList(); }
+          setTimeout(step, 0); return;
+        }
+        const job = newJob(p, { budget: ANA_MS / ((L.debug && L.debug.speed) || 1), adv: true, noise: 0, owner: 'A' });
+        runJob(job, () => !dead && ana === me, (res) => {
+          const sc = res.score || 0;
+          me.ev[i] = p.t === 0 ? sc : -sc;
+          me.bm[i] = res.m ? mInfo(res.m) : null;
+          me.i++;
+          if (rv) { draw(); renderList(); }
+          renderBlunders();
+          setTimeout(step, 0);
+        });
+      };
+      setTimeout(step, 30);
+    }
+    const clampEv = (e) => Math.max(-1000, Math.min(1000, e));
+    /* 0 = fine, 1 = 실수, 2 = 큰 실수, null = not analysed yet */
+    function markOf(k) {
+      if (!ana) return null;
+      const e0 = ana.ev[k], e1 = ana.ev[k + 1];
+      if (e0 == null || e1 == null) return null;
+      const h = ana.h, bm = ana.bm[k], pl = h.moves[k];
+      if (bm && bm.f === pl.f && bm.t === pl.t && (bm.p || '') === (pl.p || '')) return 0;
+      const drop = (clampEv(e0) - clampEv(e1)) * (h.pos[k].t === 0 ? 1 : -1);
+      return drop >= RV_BAD ? 2 : drop >= RV_MIS ? 1 : 0;
+    }
+    function fmtEv(e) {
+      if (e == null) return '…';
+      const a = Math.abs(e);
+      if (a > MATE - 300) { const n = Math.ceil((MATE - a) / 2); return n <= 0 ? '#' : (e > 0 ? '+M' : '-M') + n; }
+      return (e >= 0 ? '+' : '') + (e / 100).toFixed(1);
+    }
+    function enterReview(pre) {
+      if (!st || !st.st) return;
+      const h = getHist();
+      if (!h.san.length) { api.toast('복기할 수가 없어요'); return; }
+      startAnalysis();
+      rv = pre != null ? { idx: pre, pre } : { idx: h.pos.length - 1 };
+      sel = -1; targets = []; promo = null; drag = null;
+      api.sfx('click');
+      updateHud(); draw();
+    }
+    function exitReview() {
+      if (!rv) return;
+      rv = null;
+      if (resultOv && resultOv.isConnected) resultOv.style.display = '';
+      api.sfx('click');
+      updateHud(); draw();
+    }
+    function rvGo(i) {
+      if (!rv) return;
+      const h = getHist(), n = h.pos.length - 1;
+      i = Math.max(0, Math.min(n, i));
+      if (i === rv.idx) return;
+      const fwd = i === rv.idx + 1;
+      rv.idx = i;
+      if (fwd) api.sfx(h.san[i - 1].includes('x') ? 'hit' : 'thud'); else api.sfx('tick');
+      updateHud(); draw();
+    }
+    function onKey(e) {
+      if (!rv) return;
+      if (e.code === 'ArrowLeft') { rvGo(rv.idx - 1); e.preventDefault(); }
+      else if (e.code === 'ArrowRight') { rvGo(rv.idx + 1); e.preventDefault(); }
+      else if (e.code === 'Home') { rvGo(0); e.preventDefault(); }
+      else if (e.code === 'End') { rvGo(1e9); e.preventDefault(); }
+    }
+    window.addEventListener('keydown', onKey);
+    // add 「복기」 to the core's result sheet
+    const mo = new MutationObserver(() => {
+      const o = root.querySelector('.overlay.result');
+      if (!o || o.querySelector('.ch-review') || !st || !st.st || !(st.mv || '').length) return;
+      const row = [...o.querySelectorAll('.sheet .row')].pop();
+      if (!row) return;
+      resultOv = o;
+      const b = L.h('button', { class: 'btn ch-review', text: '🔍 복기', 'aria-label': '이번 판 복기하기', onclick() { o.style.display = 'none'; enterReview(); } });
+      row.prepend(b);
+      const mb = L.h('button', { class: 'btn ch-blunders', text: '⚠ 결정적 실수', 'aria-label': '결정적 실수 3수 보기', onclick() { openBlunders(); } });
+      row.prepend(mb);
+      startAnalysis(); // warm up in the background while the sheet is open
+    });
+    mo.observe(root, { childList: true });
+
+    /* ---- 형세 막대 (live eval bar): time-sliced search on this device; reuses the AI's own score when it just searched ---- */
+    let liveEv = null, evRun = null;
+    function barOn() {
+      if (!st) return false;
+      const m = st.eb || 'auto';
+      if (m === 'on' || m === 'off') return m === 'on';
+      return !api.online && [0, 1].some((i) => api.players[i] && api.players[i].ai);
+    }
+    function evTick() {
+      if (dead || !st || st.st || rv || !barOn()) return;
+      const key = keyOf(st);
+      if (liveEv && liveEv.key === key) return;
+      if (aiEval && aiEval.key === key) { liveEv = { key, ev: aiEval.t === 0 ? aiEval.sc : -aiEval.sc }; draw(); return; }
+      if ((evRun && evRun.key === key) || aiJob || hintBusy || anim) return; // never steal CPU from the AI / hint
+      const s0 = st, me = { key };
+      evRun = me;
+      const job = newJob(s0, { budget: 450 / ((L.debug && L.debug.speed) || 1), adv: true, noise: 0, owner: '*' });
+      runJob(job, () => {
+        const ok = !dead && evRun === me && !aiJob && !hintBusy && !rv && !!st && keyOf(st) === key;
+        if (!ok && evRun === me) evRun = null;
+        return ok;
+      }, (res) => {
+        if (evRun === me) evRun = null;
+        liveEv = { key, ev: s0.t === 0 ? (res.score || 0) : -(res.score || 0) };
+        if (!dead) draw();
+      });
+    }
+    const evTimer = setInterval(evTick, 160);
+    function drawEvBar() { // in the (otherwise empty) top rail of the board
+      const { x0, size, rail } = G, y0 = G.y0 + G.stripH + G.gap;
+      const fresh = !!liveEv && liveEv.key === keyOf(st), ev = liveEv ? liveEv.ev : 0;
+      const tw = Math.round(rail * 2.9), bh = Math.max(5, rail - 6), by = y0 + (rail - bh) / 2, bx = x0 + rail, bw = size - rail * 2 - tw;
+      const frac = Math.abs(ev) > MATE - 300 ? (ev > 0 ? 1 : 0) : 1 / (1 + Math.exp(-clampEv(ev) / 260));
+      rr(bx, by, bw, bh, bh / 2); ctx.fillStyle = '#15111a'; ctx.fill();
+      ctx.save(); rr(bx, by, bw, bh, bh / 2); ctx.clip(); ctx.fillStyle = '#f2e9d8'; ctx.fillRect(bx, by, bw * frac, bh); ctx.restore();
+      ctx.fillStyle = 'rgba(227,174,69,.85)'; ctx.fillRect(bx + bw / 2 - 0.5, by - 1, 1, bh + 2);
+      ctx.font = '700 ' + Math.max(9, Math.min(12, rail - 2)) + 'px ' + MONO; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = fresh ? COL.brass : 'rgba(171,159,184,.8)';
+      ctx.fillText(liveEv ? fmtEv(ev) : '…', x0 + size - rail + 2, y0 + rail / 2 + 0.5);
+    }
+
+    /* ---- 결정적 실수 3수: the 3 plies (either side) that lost the most evaluation ---- */
+    const PNAME = { p: '폰', n: '나이트', b: '비숍', r: '룩', q: '퀸', k: '킹' };
+    function topBlunders() {
+      if (!ana) return [];
+      const h = ana.h, out = [];
+      for (let k = 0; k < h.moves.length; k++) {
+        const e0 = ana.ev[k], e1 = ana.ev[k + 1];
+        if (e0 == null || e1 == null) continue;
+        const bm = ana.bm[k], pl = h.moves[k];
+        if (!bm || (bm.f === pl.f && bm.t === pl.t && (bm.p || '') === (pl.p || ''))) continue;
+        const sg = h.pos[k].t === 0 ? 1 : -1, drop = (clampEv(e0) - clampEv(e1)) * sg;
+        if (drop >= 80) out.push({ k, drop });
+      }
+      return out.sort((a, b) => b.drop - a.drop).slice(0, 3).sort((a, b) => a.k - b.k);
+    }
+    function whyText(k) { // easy one-line explanation
+      const h = ana.h, P = h.pos[k], sg = P.t === 0 ? 1 : -1;
+      const e0 = ana.ev[k] * sg, e1 = ana.ev[k + 1] * sg, bm = ana.bm[k], rep = ana.bm[k + 1];
+      if (e1 < -(MATE - 300)) return '이 수 뒤로 상대가 메이트로 끝낼 수 있게 됐어요.';
+      if (e0 > MATE - 300) return '메이트로 끝낼 수 있었는데 놓쳤어요.';
+      const nb = h.pos[k + 1].b;
+      if (rep && nb[rep.t] !== '.' && PV[nb[rep.t].toLowerCase()] >= 3) {
+        const pc = PNAME[nb[rep.t].toLowerCase()];
+        return rep.t === h.moves[k].t ? '옮긴 ' + pc + '을(를) 상대가 그냥 잡을 수 있어요 — 기물을 공짜로 내줬어요.' : pc + '이(가) 지켜지지 않아 공짜로 잡히게 됐어요.';
+      }
+      if (bm && P.b[bm.t] !== '.' && PV[P.b[bm.t].toLowerCase()] >= 3) return '상대 ' + PNAME[P.b[bm.t].toLowerCase()] + '을(를) 잡을 기회를 놓쳤어요.';
+      if (bm && bm.p) return '폰을 승격할 기회를 놓쳤어요.';
+      if (e0 > 150 && e1 < 60) return '이기고 있던 형세를 거의 다 날렸어요.';
+      return e0 - e1 >= 300 ? '형세가 크게 나빠졌어요 — 더 좋은 수가 있었어요.' : '조금 손해 본 수예요. 추천 수가 더 단단했어요.';
+    }
+    function miniBoard(b, flipB, pl, bm, px) {
+      const c = L.h('canvas', { width: px * 2, height: px * 2, style: { width: px + 'px', height: px + 'px', borderRadius: '6px', flex: '0 0 auto', display: 'block' } });
+      const g = c.getContext('2d'), q = px * 2 / 8, BC = boardCol();
+      const xy = (i) => { const r = i >> 3, f = i & 7; return { x: (flipB ? 7 - f : f) * q, y: (flipB ? 7 - r : r) * q }; };
+      for (let i = 0; i < 64; i++) { const { x, y } = xy(i); g.fillStyle = ((i >> 3) + (i & 7)) % 2 ? BC.dark : BC.light; g.fillRect(x, y, q, q); }
+      for (let i = 0; i < 64; i++) if (b[i] !== '.') { const { x, y } = xy(i); drawPiece(g, b[i], x + q / 2, y + q / 2, q * 0.94); }
+      const arrow = (f, t, col) => {
+        const a = xy(f), z = xy(t), x1 = a.x + q / 2, y1 = a.y + q / 2, x2 = z.x + q / 2, y2 = z.y + q / 2, d = Math.hypot(x2 - x1, y2 - y1);
+        if (d < 1) return;
+        const ux = (x2 - x1) / d, uy = (y2 - y1) / d, hl = q * 0.42, hw = q * 0.26;
+        g.save(); g.globalAlpha = 0.85; g.strokeStyle = g.fillStyle = col; g.lineWidth = q * 0.16; g.lineCap = 'round';
+        g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2 - ux * hl, y2 - uy * hl); g.stroke();
+        g.beginPath(); g.moveTo(x2, y2); g.lineTo(x2 - ux * hl - uy * hw, y2 - uy * hl + ux * hw); g.lineTo(x2 - ux * hl + uy * hw, y2 - uy * hl - ux * hw); g.closePath(); g.fill();
+        g.restore();
+      };
+      if (pl) arrow(pl.f, pl.t, '#ee6a55');
+      if (bm) arrow(bm.f, bm.t, '#3fbf75');
+      return c;
+    }
+    const blP = L.h('div', { class: 'ch-blpanel', style: { position: 'absolute', inset: '0', zIndex: 17, display: 'none', alignItems: 'center', justifyContent: 'center', padding: '12px', background: 'rgba(15,10,22,.55)' } });
+    root.append(blP);
+    let blSig = '';
+    function openBlunders() {
+      if (!st || !st.st) return;
+      startAnalysis();
+      api.sfx('click');
+      blSig = ''; blP.style.display = 'flex';
+      if (resultOv && resultOv.isConnected) resultOv.style.display = 'none';
+      renderBlunders();
+    }
+    function closeBlunders(back) {
+      blP.style.display = 'none';
+      if (back && resultOv && resultOv.isConnected) resultOv.style.display = '';
+    }
+    function renderBlunders() {
+      if (blP.style.display === 'none' || !ana) return;
+      const h = ana.h, done = ana.done, list = done ? topBlunders() : [];
+      const sig = done + '|' + ana.i;
+      if (sig === blSig) return;
+      blSig = sig;
+      const sheet = L.h('div', { class: 'sheet', style: { width: '100%', maxWidth: '460px', maxHeight: '100%', overflowY: 'auto', padding: '14px 12px', boxSizing: 'border-box' } });
+      sheet.append(L.h('h2', { style: { margin: '0 0 4px' }, text: '⚠ 결정적 실수 3수' }),
+        L.h('p', { style: { margin: '0 0 8px', color: 'var(--muted)', fontSize: '12.5px' }, text: '형세(엔진 점수)를 가장 많이 잃은 수예요. 빨간 화살표 = 둔 수, 초록 = 더 좋았던 수. 카드를 탭하면 그 장면을 크게 봐요.' }));
+      if (!done) sheet.append(L.h('p', { style: { margin: '14px 0', fontWeight: 700 }, text: '엔진이 한 수씩 분석하고 있어요… ' + Math.min(ana.i, h.pos.length) + '/' + h.pos.length }));
+      else if (!list.length) sheet.append(L.h('p', { style: { margin: '14px 0', fontWeight: 700 }, text: '눈에 띄는 큰 실수가 없었어요. 양쪽 모두 깔끔하게 뒀어요!' }));
+      for (const { k, drop } of list) {
+        const P = h.pos[k], ply = st.m0 + k, n = (ply >> 1) + 1, white = P.t === 0, bm = ana.bm[k];
+        const who = (api.players[P.t] && api.players[P.t].name) || SIDE[P.t];
+        loadState(P);
+        const best = bm ? sanOf(bm, legalMoves().map(mInfo), P.b) : '—';
+        const sev = drop >= RV_BAD ? ['?? 큰 실수', 'var(--coral)'] : drop >= RV_MIS ? ['? 실수', '#f0a04c'] : ['?! 아쉬운 수', '#e3c45a'];
+        const card = L.h('button', { class: 'ch-blcard', 'aria-label': n + '수째 ' + SIDE[P.t] + ' ' + h.san[k] + ' 장면 보기',
+          style: { display: 'flex', gap: '10px', alignItems: 'center', width: '100%', minHeight: '96px', margin: '6px 0', padding: '8px', textAlign: 'left', background: 'rgba(46,38,64,.7)', border: '1px solid rgba(242,233,216,.13)', borderRadius: '12px', color: 'var(--ink)', font: 'inherit', cursor: 'pointer' },
+          onclick() { closeBlunders(false); enterReview(k); } },
+          miniBoard(P.b, flip, h.moves[k], bm, 88),
+          L.h('div', { style: { minWidth: 0, flex: '1 1 auto', fontSize: '12.5px', lineHeight: '1.45' } },
+            L.h('div', { style: { fontWeight: 700, fontSize: '13.5px' } }, L.h('span', { class: 'mono', text: n + (white ? '. ' : '… ') + h.san[k] }), L.h('span', { style: { color: sev[1], marginLeft: '6px' }, text: sev[0] })),
+            L.h('div', { style: { color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, text: SIDE[P.t] + ' · ' + who }),
+            L.h('div', {}, L.h('span', { text: '추천 ' }), L.h('b', { class: 'mono', style: { color: '#5fd08a' }, text: best })),
+            L.h('div', { class: 'mono', text: '형세 ' + fmtEv(ana.ev[k]) + ' → ' + fmtEv(ana.ev[k + 1]) }),
+            L.h('div', { style: { fontWeight: 700 }, text: whyText(k) })));
+        sheet.append(card);
+      }
+      sheet.append(L.h('div', { class: 'row', style: { marginTop: '8px' } }, L.h('button', { class: 'btn primary', 'data-action': 'close', style: { flex: '1 1 0', minHeight: '44px' }, text: '결과로', onclick() { api.sfx('click'); closeBlunders(true); } })));
+      blP.innerHTML = ''; blP.append(sheet);
+    }
+
+    let waitSeq = -1, waitUntil = 0; // after sending a move, lock input until the next state (online round-trip)
+    function myTurn() { const a = st && actor(st); return a != null && api.canAct(a); }
+    function sendAct(a) { waitSeq = st.seq; waitUntil = performance.now() + 3000; api.act(a); }
+    function locked() { return st && st.seq === waitSeq && performance.now() < waitUntil; }
+    function computeFlip() {
+      const mine = [0, 1].filter((i) => api.canAct(i));
+      flip = mine.length === 1 && mine[0] === 1;
+    }
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      const stripH = 42, hudH = 60, gap = 8, listH = 30;
+      let size = Math.min(W - 16, H - hudH - listH - stripH * 2 - gap * 2 - 8, 640);
+      size = Math.max(180, size);
+      const rail = Math.round(U.clamp(size * 0.035, 11, 18));
+      const sq = Math.floor((size - rail * 2) / 8);
+      size = sq * 8 + rail * 2;
+      const x0 = Math.round((W - size) / 2);
+      const block = stripH * 2 + gap * 2 + size + listH;
+      const y0 = Math.round(Math.max(4, (H - hudH - block) / 2));
+      G = { x0, y0, size, rail, sq, stripH, gap, bx: x0 + rail, by: y0 + stripH + gap + rail, topY: y0, botY: y0 + stripH + gap * 2 + size };
+      place(spBoard, x0, y0 + stripH + gap, size, size);
+      place(spMe, x0, G.botY, size, stripH); place(spOpp, x0, G.topY, size, stripH);
+      mlist.style.top = (G.botY + stripH + 1) + 'px';
+      mlist.style.left = x0 + 'px'; mlist.style.right = 'auto'; mlist.style.width = (size - 50) + 'px';
+      Object.assign(lookBtn.style, { top: (G.botY + stripH + 1) + 'px', left: (x0 + size - 44) + 'px' });
+    }
+    cv.onresize = () => { layout(); draw(); };
+    layout();
+
+    function sqXY(i) {
+      const r = i >> 3, f = i & 7;
+      const c = flip ? 7 - f : f, rr = flip ? 7 - r : r;
+      return { x: G.bx + c * G.sq, y: G.by + rr * G.sq };
+    }
+    function hit(x, y) {
+      if (LOOK.tilt) { const top = G.y0 + G.stripH + G.gap; y = top + (y - top - G.size * (1 - TILT) / 2) / TILT; }
+      const c = Math.floor((x - G.bx) / G.sq), rr = Math.floor((y - G.by) / G.sq);
+      if (c < 0 || c > 7 || rr < 0 || rr > 7) return -1;
+      const f = flip ? 7 - c : c, r = flip ? 7 - rr : rr;
+      return r * 8 + f;
+    }
+
+    function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+
+    function material(b) { let w = 0, k = 0; for (const c of b) { if (c === '.') continue; const v = PV[c.toLowerCase()]; if (isW(c)) w += v; else k += v; } return w - k; }
+
+    function drawStrip(seat, y) {
+      const p = api.players[seat] || { name: SIDE[seat], color: '#888' };
+      const x = G.x0, w = G.size, hh = G.stripH;
+      const active = st && !st.st && st.t === seat;
+      rr(x, y, w, hh, 12);
+      ctx.fillStyle = active ? 'rgba(46,38,64,.95)' : 'rgba(34,28,46,.75)'; ctx.fill();
+      ctx.lineWidth = active ? 1.5 : 1;
+      ctx.strokeStyle = active ? COL.brass : 'rgba(242,233,216,.13)'; ctx.stroke();
+      const cy = y + hh / 2;
+      // player colour dot
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(x + 15, cy, 5.5, 0, Math.PI * 2); ctx.fill();
+      // side chip: tiny king silhouette in the side's colour
+      drawPiece(ctx, seat === 0 ? 'K' : 'k', x + 35, cy - 1, 26);
+      ctx.fillStyle = '#f2e9d8'; ctx.font = '700 14px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      let name = p.name;
+      const maxNameW = w * 0.36;
+      while (ctx.measureText(name).width > maxNameW && name.length > 1) name = name.slice(0, -1);
+      if (name !== p.name) name += '…';
+      L.ui.strokeText(ctx, name, x + 52, cy);
+      let nx = x + 52 + ctx.measureText(name).width + 6;
+      const checked = st && st.ck && st.t === seat && (!st.st || st.st.r === 'mate');
+      ctx.fillStyle = checked ? '#ee6a55' : '#ab9fb8'; ctx.font = (checked ? '700' : '600') + ' 12px ' + FONT;
+      const tag = checked ? (st.st ? '메이트' : '체크') : SIDE[seat];
+      ctx.fillText(tag, nx, cy + 0.5);
+      nx += ctx.measureText(tag).width + 8;
+      // captured pieces (opponent colour) + material lead, right-aligned
+      if (!st) return;
+      const caps = st.cap.split('').filter((c) => (seat === 0 ? !isW(c) : isW(c)))
+        .sort((a, b) => 'qrbnp'.indexOf(a.toLowerCase()) - 'qrbnp'.indexOf(b.toLowerCase()));
+      const diff = material(st.b) * (seat === 0 ? 1 : -1);
+      let rx = x + w - 10;
+      ctx.textAlign = 'right';
+      if (diff > 0) { ctx.fillStyle = COL.brass; ctx.font = '700 13px ' + MONO; ctx.fillText('+' + diff, rx, cy + 0.5); rx -= ctx.measureText('+' + diff).width + 5; }
+      if (!caps.length) return;
+      const ps = 22;
+      const steps = caps.map((c, i) => (i === 0 ? 0 : caps[i - 1].toLowerCase() === c.toLowerCase() ? 7 : 12));
+      let total = steps.reduce((a, b) => a + b, 0);
+      const avail = Math.max(10, rx - ps / 2 - (nx + ps / 2 - 4));
+      const k = total > avail ? avail / total : 1;
+      let cx = rx - ps / 2 - total * k;
+      for (let i = 0; i < caps.length; i++) { cx += steps[i] * k; drawPiece(ctx, caps[i], cx, cy, ps); }
+    }
+
+    /* review: eval bar on top, move comment below */
+    function drawRvStrips() {
+      if (!G || !rv) return;
+      const h = getHist(), x = G.x0, w = G.size, hh = G.stripH;
+      const ev = ana ? ana.ev[rv.idx] : null;
+      // top: evaluation bar (white share from the left)
+      let y = G.topY;
+      ctx.clearRect(x - 2, y - 2, w + 4, hh + 4);
+      rr(x, y, w, hh, 12); ctx.fillStyle = 'rgba(34,28,46,.9)'; ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(242,233,216,.13)'; ctx.stroke();
+      const bx = x + 12, bw = w - 24 - 62, bh = 14, by = y + (hh - bh) / 2;
+      const frac = ev == null ? 0.5 : Math.abs(ev) > MATE - 300 ? (ev > 0 ? 1 : 0) : 1 / (1 + Math.exp(-clampEv(ev) / 260));
+      rr(bx, by, bw, bh, 7); ctx.fillStyle = '#15111a'; ctx.fill();
+      ctx.save(); rr(bx, by, bw, bh, 7); ctx.clip();
+      ctx.fillStyle = '#f2e9d8'; ctx.fillRect(bx, by, bw * frac, bh);
+      ctx.restore();
+      ctx.strokeStyle = 'rgba(227,174,69,.7)'; ctx.beginPath(); ctx.moveTo(bx + bw / 2, by - 3); ctx.lineTo(bx + bw / 2, by + bh + 3); ctx.stroke();
+      ctx.font = '700 10px ' + FONT; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      ctx.fillStyle = '#2b1d15'; if (frac > 0.12) ctx.fillText('백', bx + 6, by + bh / 2 + 0.5);
+      ctx.fillStyle = '#ab9fb8'; ctx.textAlign = 'right'; if (frac < 0.88) ctx.fillText('흑', bx + bw - 6, by + bh / 2 + 0.5);
+      ctx.textAlign = 'right'; ctx.font = '700 14px ' + MONO; ctx.fillStyle = ev == null ? '#ab9fb8' : COL.brass;
+      ctx.fillText(ev == null ? '분석…' : fmtEv(ev), x + w - 12, y + hh / 2 + 0.5);
+      // bottom: what happened on this move
+      y = G.botY;
+      ctx.clearRect(x - 2, y - 2, w + 4, hh + 4);
+      rr(x, y, w, hh, 12); ctx.fillStyle = 'rgba(46,38,64,.95)'; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = COL.brass; ctx.stroke();
+      const cy = y + hh / 2 + 0.5;
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      let tx = x + 12;
+      const put = (t, font, col) => { ctx.font = font; ctx.fillStyle = col; ctx.fillText(t, tx, cy); tx += ctx.measureText(t).width + 8; };
+      if (rv.pre != null && rv.idx === rv.pre && ana) {
+        const k = rv.pre, ply = st.m0 + k, n = (ply >> 1) + 1, white = (ply & 1) === 0;
+        put('다음 ' + n + (white ? '.' : '…') + ' ' + h.san[k], '700 14px ' + MONO, '#ee6a55');
+        if (ana.bm[k]) { loadState(h.pos[k]); put('→ 추천 ' + sanOf(ana.bm[k], legalMoves().map(mInfo), h.pos[k].b), '700 13px ' + FONT, '#5fd08a'); }
+      } else if (rv.idx === 0) {
+        if (ana && ana.done) {
+          const c = [[0, 0], [0, 0]];
+          for (let k = 0; k < h.moves.length; k++) { const m = markOf(k); if (m) c[h.pos[k].t][m - 1]++; }
+          put('백 실수 ' + c[0][0] + '·큰 실수 ' + c[0][1], '700 12.5px ' + FONT, '#f2e9d8');
+          put('흑 실수 ' + c[1][0] + '·큰 실수 ' + c[1][1], '700 12.5px ' + FONT, '#ab9fb8');
+        } else put('처음 국면 · ▶로 한 수씩 넘겨 보세요', '700 13px ' + FONT, '#f2e9d8');
+      } else {
+        const k = rv.idx - 1, ply = st.m0 + k, n = (ply >> 1) + 1, white = (ply & 1) === 0;
+        put(n + (white ? '.' : '…') + ' ' + h.san[k], '700 14px ' + MONO, '#f2e9d8');
+        const mk = markOf(k);
+        if (mk === 2) put('?? 큰 실수', '700 13px ' + FONT, '#ee6a55');
+        else if (mk === 1) put('? 실수', '700 13px ' + FONT, '#f0a04c');
+        else if (mk === 0 && ana.bm[k] && ana.bm[k].f === h.moves[k].f && ana.bm[k].t === h.moves[k].t) put('최선', '700 13px ' + FONT, '#5fd08a');
+        if (mk && ana.bm[k]) {
+          loadState(h.pos[k]);
+          const sn = sanOf(ana.bm[k], legalMoves().map(mInfo), h.pos[k].b);
+          put('추천 ' + sn, '700 13px ' + FONT, '#5fd08a');
+        }
+      }
+      if (ana && !ana.done) {
+        ctx.textAlign = 'right'; ctx.font = '600 11px ' + MONO; ctx.fillStyle = '#ab9fb8';
+        ctx.fillText(Math.min(ana.i, h.pos.length) + '/' + h.pos.length, x + w - 10, cy);
+      }
+    }
+
+    function boardChars() {
+      if (rv) return getHist().pos[rv.idx].b;
+      if (!anim) return st.b;
+      return anim.base;
+    }
+
+    function pc(c, x, y, size, alpha) { // 판 위 기물: 기울기·입체 그림자
+      const deep = LOOK.tilt || LOOK.board === '3d';
+      if (!deep) { drawPiece(ctx, c, x, y, size, alpha); return; }
+      ctx.save(); ctx.translate(x, y);
+      if (LOOK.tilt) ctx.scale(1, 1 / TILT);
+      const lift = LOOK.tilt ? size * 0.12 : 0;
+      ctx.globalAlpha = alpha == null ? 1 : alpha;
+      ctx.fillStyle = 'rgba(20,10,4,.28)';
+      ctx.beginPath(); ctx.ellipse(size * 0.08, size * 0.34 - lift * 0.3, size * 0.3, size * 0.09, -0.2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+      drawPiece(ctx, c, 0, -lift, size, alpha);
+      ctx.restore();
+    }
+    function draw() {
+      cv.clear();
+      if (!G || !st) return;
+      const { x0, size, rail, sq, bx, by } = G;
+      const y0 = G.y0 + G.stripH + G.gap;
+      // strips
+      if (rv) drawRvStrips();
+      else { drawStrip(flip ? 0 : 1, G.topY); drawStrip(flip ? 1 : 0, G.botY); }
+      ctx.save();
+      if (LOOK.tilt) { ctx.translate(0, y0 + size * (1 - TILT) / 2); ctx.scale(1, TILT); ctx.translate(0, -y0); }
+      const deep = LOOK.tilt || LOOK.board === '3d';
+      // board shadow + rail (+ 두께)
+      ctx.fillStyle = 'rgba(0,0,0,.45)'; rr(x0 + 3, y0 + 7, size, size + (deep ? rail : 0), 10); ctx.fill();
+      if (deep) { ctx.fillStyle = '#24160d'; rr(x0, y0 + 12, size, size - 12 + rail * 0.9 / (LOOK.tilt ? TILT : 1), 10); ctx.fill(); }
+      const BC = boardCol();
+      const wg = ctx.createLinearGradient(x0, y0, x0 + size, y0 + size);
+      wg.addColorStop(0, BC.rail0); wg.addColorStop(1, BC.rail1);
+      ctx.fillStyle = wg; rr(x0, y0, size, size, 10); ctx.fill();
+      // rail grain
+      ctx.save(); rr(x0, y0, size, size, 10); ctx.clip();
+      ctx.strokeStyle = 'rgba(255,220,170,.05)'; ctx.lineWidth = 1;
+      for (let i = 0; i < 14; i++) { const yy = y0 + (i + 0.5) * size / 14; ctx.beginPath(); ctx.moveTo(x0, yy); ctx.bezierCurveTo(x0 + size * 0.3, yy + 3, x0 + size * 0.7, yy - 3, x0 + size, yy + 1); ctx.stroke(); }
+      ctx.restore();
+      ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 1;
+      ctx.strokeRect(bx - 1.5, by - 1.5, sq * 8 + 3, sq * 8 + 3);
+      // squares
+      for (let i = 0; i < 64; i++) {
+        const { x, y } = sqXY(i);
+        const light = ((i >> 3) + (i & 7)) % 2 === 0;
+        ctx.fillStyle = light ? BC.light : BC.dark;
+        ctx.fillRect(x, y, sq, sq);
+        if (LOOK.board === '3d') { // 비스듬한 모서리(베벨)
+          const e = Math.max(1.5, sq * 0.06);
+          ctx.fillStyle = 'rgba(255,250,235,.22)'; ctx.fillRect(x, y, sq, e); ctx.fillRect(x, y, e, sq);
+          ctx.fillStyle = 'rgba(30,14,4,.22)'; ctx.fillRect(x, y + sq - e, sq, e); ctx.fillRect(x + sq - e, y, e, sq);
+        }
+      }
+      // subtle wood grain on the dark squares + overall sheen
+      ctx.save(); ctx.beginPath(); ctx.rect(bx, by, sq * 8, sq * 8); ctx.clip();
+      ctx.strokeStyle = BC.grain; ctx.lineWidth = 1;
+      for (let i = 0; i < 64; i++) {
+        if (((i >> 3) + (i & 7)) % 2 === 0) continue;
+        const { x, y } = sqXY(i);
+        for (let k = 1; k < 4; k++) { const yy = y + k * sq / 4 + ((i * 7 + k * 3) % 5) - 2; ctx.beginPath(); ctx.moveTo(x, yy); ctx.quadraticCurveTo(x + sq / 2, yy + ((i + k) % 3) - 1, x + sq, yy); ctx.stroke(); }
+      }
+      const sh = ctx.createLinearGradient(bx, by, bx + sq * 8, by + sq * 8);
+      sh.addColorStop(0, 'rgba(255,248,230,.10)'); sh.addColorStop(0.5, 'rgba(255,248,230,0)'); sh.addColorStop(1, 'rgba(30,15,5,.12)');
+      ctx.fillStyle = sh; ctx.fillRect(bx, by, sq * 8, sq * 8);
+      ctx.restore();
+      if (!rv && barOn()) drawEvBar();
+      // coordinates in the rail
+      ctx.fillStyle = 'rgba(242,233,216,.62)';
+      ctx.font = '600 ' + Math.max(9, Math.round(rail * 0.62)) + 'px ' + MONO;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      for (let c = 0; c < 8; c++) {
+        const f = flip ? 7 - c : c;
+        ctx.fillText('abcdefgh'[f], bx + c * sq + sq / 2, by + sq * 8 + rail / 2 + 0.5);
+        const r = flip ? c + 1 : 8 - c;
+        ctx.fillText(String(r), x0 + rail / 2, by + c * sq + sq / 2 + 0.5);
+      }
+      // highlights
+      const H = rv ? getHist() : null, P = rv ? H.pos[rv.idx] : null;
+      const showLast = rv ? (rv.idx > 0 ? H.moves[rv.idx - 1] : null) : st.last && !anim ? st.last : anim ? anim.last : null;
+      if (showLast) for (const i of [showLast.f, showLast.t]) { const { x, y } = sqXY(i); ctx.fillStyle = i === showLast.t ? 'rgba(227,174,69,.48)' : 'rgba(227,174,69,.28)'; ctx.fillRect(x, y, sq, sq); }
+      if (sel >= 0) { const { x, y } = sqXY(sel); ctx.fillStyle = 'rgba(227,174,69,.7)'; ctx.fillRect(x, y, sq, sq); }
+      const b = boardChars();
+      if (rv ? P.ck : st.ck && !anim) {
+        const ki = b.indexOf((rv ? P.t : st.t) === 0 ? 'K' : 'k');
+        if (ki >= 0) {
+          const { x, y } = sqXY(ki);
+          const g = ctx.createRadialGradient(x + sq / 2, y + sq / 2, sq * 0.1, x + sq / 2, y + sq / 2, sq * 0.72);
+          g.addColorStop(0, 'rgba(238,80,60,.95)'); g.addColorStop(0.55, 'rgba(238,80,60,.45)'); g.addColorStop(1, 'rgba(238,80,60,0)');
+          ctx.fillStyle = g; ctx.fillRect(x, y, sq, sq);
+        }
+      }
+      // drag hover
+      if (drag && drag.moved && drag.hover >= 0 && targets.some((m) => m.t === drag.hover)) {
+        const { x, y } = sqXY(drag.hover); ctx.strokeStyle = 'rgba(255,248,230,.85)'; ctx.lineWidth = 3; ctx.strokeRect(x + 1.5, y + 1.5, sq - 3, sq - 3);
+      }
+      // pieces
+      const ps = sq * 0.94;
+      for (let i = 0; i < 64; i++) {
+        const c = b[i];
+        if (c === '.') continue;
+        const { x, y } = sqXY(i);
+        const ghost = drag && drag.moved && drag.idx === i;
+        pc(c, x + sq / 2, y + sq / 2, ps, ghost ? 0.3 : null);
+      }
+      // last-move arrow (over the pieces, translucent)
+      if (showLast && !anim && !drag) drawArrow(showLast.f, showLast.t);
+      // review: the engine's better move for a marked move
+      if (rv && rv.pre != null && rv.idx === rv.pre && ana) { const k = rv.pre, pl = getHist().moves[k], bm = ana.bm[k]; if (pl) drawArrow(pl.f, pl.t, '#ee6a55'); if (bm) drawArrow(bm.f, bm.t, '#5fd08a'); }
+      else if (rv && rv.idx > 0 && ana) { const k = rv.idx - 1, mk = markOf(k), bm = ana.bm[k]; if (mk && bm) drawArrow(bm.f, bm.t, '#5fd08a'); }
+      // hint arrow
+      if (!rv && hint && st && hint.seq === st.seq && !st.st && !anim) drawArrow(hint.f, hint.t, '#5fd08a');
+      // legal targets
+      if (sel >= 0 && !anim && showDots) {
+        const seen = {};
+        for (const m of targets) {
+          if (seen[m.t]) continue; seen[m.t] = 1;
+          const { x, y } = sqXY(m.t);
+          const capture = st.b[m.t] !== '.' || (m.fl & 1);
+          ctx.fillStyle = 'rgba(38,24,14,.34)'; ctx.strokeStyle = 'rgba(38,24,14,.38)';
+          if (capture) { ctx.lineWidth = sq * 0.08; ctx.beginPath(); ctx.arc(x + sq / 2, y + sq / 2, sq * 0.44, 0, Math.PI * 2); ctx.stroke(); }
+          else { ctx.beginPath(); ctx.arc(x + sq / 2, y + sq / 2, sq * 0.15, 0, Math.PI * 2); ctx.fill(); }
+        }
+      }
+      // moving pieces
+      if (anim) {
+        const k = anim.k;
+        for (const mv of anim.movers) {
+          const a = sqXY(mv.f), z = sqXY(mv.t);
+          const lift = Math.sin(k * Math.PI) * sq * 0.08;
+          pc(k >= 1 && mv.end ? mv.end : mv.ch, U.lerp(a.x, z.x, k) + sq / 2, U.lerp(a.y, z.y, k) + sq / 2 - lift, ps * (1 + 0.06 * Math.sin(k * Math.PI)));
+        }
+      }
+      ctx.restore();
+      if (drag && drag.moved) drawPiece(ctx, st.b[drag.idx], drag.x, drag.y - sq * 0.25, ps * 1.18);
+      if (promo) drawPromo();
+    }
+
+    function drawArrow(f, t, color) {
+      const a = sqXY(f), z = sqXY(t), h = G.sq / 2;
+      const x1 = a.x + h, y1 = a.y + h, x2 = z.x + h, y2 = z.y + h;
+      const L2 = Math.hypot(x2 - x1, y2 - y1); if (L2 < 1) return;
+      const ux = (x2 - x1) / L2, uy = (y2 - y1) / L2, nx = -uy, ny = ux;
+      const w = Math.max(3, G.sq * 0.11), hl = G.sq * 0.34, hw = G.sq * 0.22;
+      const sx = x1 + ux * G.sq * 0.22, sy = y1 + uy * G.sq * 0.22;
+      const ex = x2 - ux * G.sq * 0.12, ey = y2 - uy * G.sq * 0.12;
+      const bx2 = ex - ux * hl, by2 = ey - uy * hl;
+      ctx.save();
+      ctx.globalAlpha = 0.62;
+      ctx.fillStyle = color || '#f0b43c';
+      if (color) ctx.globalAlpha = 0.82;
+      ctx.strokeStyle = 'rgba(40,22,8,.55)'; ctx.lineWidth = 1.2; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(sx + nx * w / 2, sy + ny * w / 2);
+      ctx.lineTo(bx2 + nx * w / 2, by2 + ny * w / 2);
+      ctx.lineTo(bx2 + nx * hw, by2 + ny * hw);
+      ctx.lineTo(ex, ey);
+      ctx.lineTo(bx2 - nx * hw, by2 - ny * hw);
+      ctx.lineTo(bx2 - nx * w / 2, by2 - ny * w / 2);
+      ctx.lineTo(sx - nx * w / 2, sy - ny * w / 2);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawPromo() {
+      const { bx, by, sq } = G;
+      ctx.fillStyle = 'rgba(15,10,22,.5)'; ctx.fillRect(bx, by, sq * 8, sq * 8);
+      const white = st.t === 0;
+      const tw = Math.min(sq * 1.7, (sq * 8 - 30) / 4), th = tw * 1.28, gap = 8;
+      const total = tw * 4 + gap * 3;
+      let x = bx + (sq * 8 - total) / 2;
+      const y = by + sq * 4 - th / 2;
+      ctx.fillStyle = '#f2e9d8'; ctx.font = '700 15px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+      L.ui.strokeText(ctx, '승격할 기물을 고르세요', bx + sq * 4, y - 10);
+      promo.rects = [];
+      for (const [p, label] of PROMOS) {
+        rr(x, y, tw, th, 12);
+        ctx.fillStyle = white ? '#3a3050' : '#e9dcc0'; ctx.fill();
+        ctx.strokeStyle = COL.brass; ctx.lineWidth = 1.5; ctx.stroke();
+        drawPiece(ctx, white ? p.toUpperCase() : p, x + tw / 2, y + tw * 0.5, tw * 0.86);
+        ctx.fillStyle = white ? '#f2e9d8' : '#2b1d15'; ctx.font = '700 13px ' + FONT; ctx.textBaseline = 'middle';
+        ctx.fillText(label, x + tw / 2, y + th - 15);
+        promo.rects.push({ p, x, y, w: tw, h: th });
+        x += tw + gap;
+      }
+    }
+
+    /* ---- input ---- */
+    function refreshLegal() {
+      legal = st && !st.st && !st.dr && myTurn() ? legalFromState(st) : [];
+      if (sel >= 0) { targets = legal.filter((m) => m.f === sel); if (!targets.length) sel = -1; }
+      else targets = [];
+    }
+    function onDown(e) {
+      if (!st || !G || !e.isPrimary) return; // ignore extra fingers (multi-touch)
+      const pt = cv.local(e);
+      if (rv) { // review: tap the left/right half of the board to step
+        if (hit(pt.x, pt.y) >= 0) rvGo(rv.idx + (pt.x < G.bx + G.sq * 4 ? -1 : 1));
+        return;
+      }
+      if (promo) {
+        const r = (promo.rects || []).find((q) => pt.x >= q.x && pt.x <= q.x + q.w && pt.y >= q.y && pt.y <= q.y + q.h);
+        const pm = promo; promo = null;
+        if (r) { sel = -1; targets = []; dropTo = pm.dropped ? pm.t : -1; api.sfx('click'); sendAct({ type: 'move', f: pm.f, t: pm.t, p: r.p }); }
+        draw();
+        return;
+      }
+      if (anim || !myTurn() || locked() || st.dr) return;
+      const i = hit(pt.x, pt.y);
+      if (i < 0) { sel = -1; targets = []; draw(); return; }
+      if (sel >= 0 && targets.some((m) => m.t === i)) { tryMove(sel, i, false); return; }
+      const c = st.b[i];
+      const own = c !== '.' && isW(c) === (st.t === 0);
+      if (own) {
+        const wasSel = sel === i;
+        sel = i; targets = legal.filter((m) => m.f === i);
+        drag = { idx: i, x: pt.x, y: pt.y, sx: pt.x, sy: pt.y, moved: false, wasSel, hover: i, id: e.pointerId };
+        try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+        api.sfx('tick');
+        if (!targets.length && !wasSel) { api.buzz(20); api.toast(st.ck ? '체크! 킹을 지키는 수만 둘 수 있어요' : '이 기물은 지금 움직일 수 없어요'); }
+      } else { sel = -1; targets = []; }
+      draw();
+    }
+    function onMove(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      const pt = cv.local(e);
+      drag.x = pt.x; drag.y = pt.y;
+      if (!drag.moved && Math.hypot(pt.x - drag.sx, pt.y - drag.sy) > 7) drag.moved = true;
+      drag.hover = hit(pt.x, pt.y - (e.pointerType === 'touch' ? G.sq * 0.25 : 0));
+      if (drag.moved) draw();
+    }
+    function onUp(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      const d = drag; drag = null;
+      if (d.moved) {
+        const to = d.hover;
+        if (to >= 0 && to !== d.idx && targets.some((m) => m.t === to)) { tryMove(d.idx, to, true); return; }
+      } else if (d.wasSel) { sel = -1; targets = []; }
+      draw();
+    }
+    function onCancel() { if (drag) { drag = null; draw(); } }
+    function tryMove(f, t, dropped) {
+      const ms = legal.filter((m) => m.f === f && m.t === t);
+      if (!ms.length) return;
+      if (ms.some((m) => m.p)) { promo = { f, t, dropped }; drag = null; draw(); return; }
+      sel = -1; targets = []; dropTo = dropped ? t : -1;
+      sendAct({ type: 'move', f, t });
+      draw();
+    }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onCancel);
+    /* 라운드 34: 판 재질 바뀌면 다시 그리기, 오른쪽 클릭 = 선택 해제 */
+    const onBoardMat = () => draw();
+    const onRC = (e) => { if (sel >= 0 || drag || promo) { sel = -1; targets = []; drag = null; promo = null; draw(); e.preventDefault(); } };
+    window.addEventListener('lounge-board', onBoardMat); window.addEventListener('lounge-contrast', onBoardMat); window.addEventListener('lounge-cancel', onRC);
+
+    /* ---- animation ---- */
+    function finishAnim() {
+      clearTimeout(animTimer);
+      if (stopLoop) { stopLoop(); stopLoop = null; }
+      const had = !!anim;
+      anim = null;
+      if (busy) { busy = false; api.setBusy(false); }
+      if (had && st) updateHud();
+    }
+    function startAnim(prev, next) {
+      const l = next.last;
+      const movers = [{ f: l.f, t: l.t, ch: prev.b[l.f], end: l.p ? (next.t === 1 ? l.p.toUpperCase() : l.p) : null }];
+      const base = prev.b.split('');
+      base[l.f] = '.';
+      if (l.k === 'c') {
+        const r = l.t > l.f ? [l.t + 1, l.t - 1] : [l.t - 2, l.t + 1];
+        movers.push({ f: r[0], t: r[1], ch: prev.b[r[0]] });
+        base[r[0]] = '.';
+      }
+      if (l.k === 'e') base[(l.f & 56) | (l.t & 7)] = '.';
+      anim = { movers, base: base.join(''), last: l, k: 0, t0: performance.now(), dur: 180 / SPD() };
+      busy = true; api.setBusy(true);
+      // rAF pauses in background tabs; make sure busy can't stick (AI/result would wait forever)
+      animTimer = setTimeout(() => { if (anim) { finishAnim(); draw(); } }, anim.dur + 600);
+      stopLoop = U.loop((dt, nowT) => {
+        if (!anim) return;
+        const k = Math.min(1, (nowT - anim.t0) / anim.dur);
+        anim.k = k < 1 ? 1 - Math.pow(1 - k, 3) : 1;
+        if (k >= 1) { finishAnim(); draw(); return; }
+        draw();
+      });
+    }
+
+    function updateHud() {
+      const mine = !!st && !st.st && myTurn() && !st.dr;
+      vis(resignBtn, mine); vis(drawBtn, mine);
+      drawBtn.disabled = !canOffer();
+      drawBtn.title = st && st.nd === st.t ? '상대가 한 수 둔 뒤에 다시 제안할 수 있어요' : '';
+      const solo = soloVsAI() >= 0;
+      vis(undoBtn, solo && !(st && st.st));
+      undoBtn.disabled = !canUndo();
+      vis(dotsBtn, !!st && !st.st && [0, 1].some((i) => api.canAct(i)));
+      const hm0 = hintMax();
+      vis(hintBtn, mine && hm0 > 0);
+      if (st) {
+        const left = hm0 >= 99 ? '' : ' ' + Math.max(0, hintLeft[st.t] | 0);
+        hintBtn.textContent = hintBusy ? '생각 중…' : '💡 힌트' + left;
+        hintBtn.disabled = !!hintBusy || (hm0 < 99 && hintLeft[st.t] <= 0 && !(hint && hint.seq === st.seq));
+        hintBtn.setAttribute('aria-label', '힌트 보기' + (hm0 >= 99 ? '' : ', 남은 횟수 ' + Math.max(0, hintLeft[st.t] | 0)));
+      }
+      hud.style.display = rv ? 'none' : '';
+      rhud.style.display = rv ? 'flex' : 'none';
+      if (rv) {
+        const n = getHist().pos.length - 1;
+        rvFirst.disabled = rvPrev.disabled = rv.idx <= 0;
+        rvNext.disabled = rvLast.disabled = rv.idx >= n;
+      }
+      if (!mine) disarmAll();
+      renderList();
+      renderOffer();
+    }
+    let listSig = '';
+    function renderList() {
+      if (!st) return;
+      const marks = rv && ana ? getHist().san.map((_, k) => markOf(k)) : null;
+      const sig = st.m0 + '|' + (st.f0 || '') + (st.mv || '') + '|' + (myTurn() && !st.st ? 1 : 0) + '|' + (rv ? rv.idx + ':' + marks.join(',') : '');
+      if (sig === listSig) return;
+      listSig = sig;
+      mlist.innerHTML = '';
+      const toks = getHist().san;
+      if (!toks.length) {
+        mlist.append(L.h('span', { style: { color: 'var(--muted)', fontFamily: 'var(--f-body)', fontWeight: 700, fontSize: '12px' }, text: myTurn() ? '기물을 탭하거나 끌어서 두세요' : '기보가 여기에 쌓여요' }));
+        return;
+      }
+      let ply = st.m0;
+      const frag = [];
+      if (st.m0 > 0) frag.push(L.h('span', { style: { color: 'var(--muted)', marginRight: '6px' }, text: '…' }));
+      let cur = null;
+      toks.forEach((t, i) => {
+        const n = (ply >> 1) + 1, white = (ply & 1) === 0;
+        if (white || i === 0) frag.push(L.h('span', { style: { color: 'var(--muted)', marginLeft: i ? '8px' : '0', marginRight: '3px' }, text: n + (white ? '.' : '…') }));
+        const last = rv ? i === rv.idx - 1 : i === toks.length - 1;
+        const mk = marks ? marks[i] : 0;
+        const col = mk === 2 ? 'var(--coral)' : mk === 1 ? '#f0a04c' : last ? 'var(--brass)' : 'var(--ink)';
+        const el = L.h('span', { style: { color: col, fontWeight: last || mk ? 700 : 500, marginRight: '4px', padding: last ? '1px 4px' : '0', borderRadius: '5px', background: last ? 'rgba(227,174,69,.14)' : 'none', cursor: rv ? 'pointer' : '' }, text: t + (mk === 2 ? '??' : mk === 1 ? '?' : '') });
+        if (rv) el.onclick = () => rvGo(i + 1);
+        if (last) cur = el;
+        frag.push(el);
+        ply++;
+      });
+      mlist.append(...frag);
+      if (rv && cur) mlist.scrollLeft = Math.max(0, cur.offsetLeft - mlist.clientWidth / 2);
+      else mlist.scrollLeft = mlist.scrollWidth;
+    }
+    let offerSig = '';
+    function renderOffer() {
+      const d = st && !st.st && st.dr;
+      const responder = d ? 1 - d.by : -1;
+      const answer = d && api.canAct(responder);
+      const waiting = d && !answer && api.canAct(d.by);
+      const sig = d ? (answer ? 'a' : waiting ? 'w' : 'x') + d.by + ':' + st.seq : '';
+      if (sig === offerSig) return;
+      offerSig = sig;
+      offer.innerHTML = '';
+      if (!answer && !waiting) { offer.style.display = 'none'; return; }
+      offer.style.display = 'flex';
+      const by = api.players[d.by] || { name: SIDE[d.by], color: '#888' };
+      const sheet = L.h('div', { class: 'sheet', style: { width: '100%' } },
+        L.h('span', { class: 'label', text: '무승부 제안' }),
+        L.h('h2', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, L.h('span', { class: 'dot', style: { '--c': by.color } }), by.name + ' (' + SIDE[d.by] + ')'),
+        L.h('p', { class: 'muted', style: { margin: 0 }, text: answer ? '무승부로 끝낼까요? 거절하면 게임이 이어져요.' : '상대의 답을 기다리는 중…' }));
+      if (answer) {
+        sheet.append(L.h('div', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
+          L.h('button', { class: 'btn', style: { flex: '1 1 0' }, text: '거절', onclick() { api.sfx('click'); sendAct({ type: 'drawReply', ok: false }); } }),
+          L.h('button', { class: 'btn primary', style: { flex: '1 1 0' }, text: '수락 (무승부)', onclick() { api.sfx('click'); sendAct({ type: 'drawReply', ok: true }); } })));
+      }
+      offer.append(sheet);
+    }
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prev) {
+        const fresh = prev && prev !== next && next.seq !== shownSeq;
+        st = next;
+        if (!prev || next.seq < (prev.seq | 0) || (next.seq === 0 && prev !== next)) { const hm1 = hintMax(); hintLeft = [hm1, hm1]; hint = null; }
+        if (rv && !next.st) { rv = null; }
+        if (!next.st) { ana = null; resultOv = null; if (blP.style.display !== 'none') closeBlunders(false); }
+        if (!prev || next.seq < (prev.seq | 0)) liveEv = null;
+        computeFlip();
+        if (fresh && next.last && next.last.id === next.seq) {
+          finishAnim();
+          const l = next.last;
+          if (dropTo !== l.t && prev.seq === next.seq - 1) startAnim(prev, next);
+          if (l.x) { api.sfx('hit'); api.buzz(15); } else if (l.k === 'c') api.sfx('whoosh'); else api.sfx('thud');
+          if (next.ck && !next.st) { api.toast('체크!'); api.sfx('pop'); api.buzz(30); }
+          else if (l.p && !next.st) api.toast('폰 승격!');
+        } else if (fresh && next.st && (next.st.r === 'resign' || next.st.r === 'agree')) finishAnim();
+        if (fresh && next.ev && next.ev.id === next.seq) {
+          const e = next.ev, who = api.players[e.by] ? api.players[e.by].name : SIDE[e.by];
+          if (e.k === 'o') { api.sfx('chip'); api.buzz(20); if (!api.canAct(1 - e.by) && !api.canAct(e.by)) api.toast(who + ' 무승부 제안'); }
+          else if (e.k === 'n') { api.sfx('click'); api.toast(api.canAct(e.by) ? '상대가 무승부 제안을 거절했어요' : '무승부 제안 거절'); }
+          else if (e.k === 'u') { finishAnim(); api.sfx('whoosh'); api.toast('한 수 물렀어요'); }
+        }
+        dropTo = -1;
+        shownSeq = next.seq;
+        if (prev && prev.seq !== next.seq) { sel = -1; promo = null; drag = null; disarmAll(); }
+        if (!prev) { finishAnim(); sel = -1; promo = null; }
+        refreshLegal();
+        updateHud();
+        draw();
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true);
+        dead = true; mo.disconnect(); window.removeEventListener('keydown', onKey); rhud.remove();
+        finishAnim();
+        clearTimeout(confirmTimer); disarmAll();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onCancel);
+        window.removeEventListener('lounge-board', onBoardMat); window.removeEventListener('lounge-contrast', onBoardMat); window.removeEventListener('lounge-cancel', onRC);
+        clearInterval(evTimer); blP.remove();
+        cv.destroy(); hud.remove(); mlist.remove(); offer.remove(); lookP.remove(); lookBtn.remove();
+      },
+    };
+  }
+
+  L.register({
+    undo: false, id: 'chess', name: '체스', tag: '전략',
+    blurb: '백과 흑이 번갈아 두는 정통 체스. 상대 킹을 체크메이트하면 승리해요. 캐슬링·앙파상·승격, 50수·3회 반복 무승부와 무승부 제안까지 모두 적용되고, 힌트와 판 끝난 뒤 엔진 복기도 있어요.',
+    controls: [
+      { id: 'undo', label: '무르기', keys: ['KeyZ', 'Backspace'], pad: ['b'] },
+      { id: 'hint', label: '힌트', keys: ['KeyH'], pad: ['y'] },
+      { id: 'dots', label: '갈 수 있는 칸 표시', keys: ['KeyD'] },
+      { id: 'close', label: '복기 닫기', keys: ['Enter'] },
+    ],
+    minPlayers: 2, maxPlayers: 2, defaultPlayers: 2, hidden: false, aiDelay: 300,
+    options: [{ id: 'hint', label: '힌트', tip: '판마다 쓸 수 있는 💡 힌트(추천 수) 횟수.', choices: [{ v: 3, label: '3번' }, { v: 99, label: '무제한' }, { v: 0, label: '끔' }], def: 3 },
+      { id: 'evbar', label: '형세 막대', tip: '판 위쪽 테두리에 엔진이 본 형세(누가 유리한지)를 보여 줘요. 「AI전만」은 AI와 둘 때만 켜고, 사람끼리·온라인에선 공정하게 꺼요.', choices: [{ v: 'auto', label: 'AI전만' }, { v: 'on', label: '켬' }, { v: 'off', label: '끔' }], def: 'auto' }],
+    quick: [
+      '상대 킹을 「체크메이트」(도망칠 곳 없이 잡히게 된 상태)로 만들면 이겨요. 백이 먼저 둬요.',
+      '내 차례: 내 기물 하나를 탭 → 점으로 보이는 칸을 탭(또는 끌어다 놓기)해 한 수 둬요.',
+      '내 킹이 공격받는 상태(체크)로 끝나는 수는 둘 수 없어요. 둘 수가 없는데 체크도 아니면 무승부예요.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '1번 자리가 백(흰 기물), 2번 자리가 흑이에요. 백이 먼저, 한 수씩 번갈아 둬요.',
+        '상대 킹을 잡히기 직전으로 몰아(체크) 어디로도 피할 수 없게 하면 「체크메이트」 — 이겨요.',
+        '킹은 실제로 잡히지 않아요. 체크메이트가 되는 순간 게임이 끝나요.'] },
+      { h: '기물별 움직임', fig: { svg: '<svg viewBox="0 0 340 150" xmlns="http://www.w3.org/2000/svg"><rect x="20" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="38" y="8" width="18" height="18" fill="#a87650"/><rect x="56" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="74" y="8" width="18" height="18" fill="#a87650"/><rect x="92" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="110" y="8" width="18" height="18" fill="#a87650"/><rect x="128" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="20" y="26" width="18" height="18" fill="#a87650"/><rect x="38" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="56" y="26" width="18" height="18" fill="#a87650"/><rect x="74" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="92" y="26" width="18" height="18" fill="#a87650"/><rect x="110" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="128" y="26" width="18" height="18" fill="#a87650"/><rect x="20" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="38" y="44" width="18" height="18" fill="#a87650"/><rect x="56" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="74" y="44" width="18" height="18" fill="#a87650"/><rect x="92" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="110" y="44" width="18" height="18" fill="#a87650"/><rect x="128" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="20" y="62" width="18" height="18" fill="#a87650"/><rect x="38" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="56" y="62" width="18" height="18" fill="#a87650"/><rect x="74" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="92" y="62" width="18" height="18" fill="#a87650"/><rect x="110" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="128" y="62" width="18" height="18" fill="#a87650"/><rect x="20" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="38" y="80" width="18" height="18" fill="#a87650"/><rect x="56" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="74" y="80" width="18" height="18" fill="#a87650"/><rect x="92" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="110" y="80" width="18" height="18" fill="#a87650"/><rect x="128" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="20" y="98" width="18" height="18" fill="#a87650"/><rect x="38" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="56" y="98" width="18" height="18" fill="#a87650"/><rect x="74" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="92" y="98" width="18" height="18" fill="#a87650"/><rect x="110" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="128" y="98" width="18" height="18" fill="#a87650"/><rect x="20" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="38" y="116" width="18" height="18" fill="#a87650"/><rect x="56" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="74" y="116" width="18" height="18" fill="#a87650"/><rect x="92" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="110" y="116" width="18" height="18" fill="#a87650"/><rect x="128" y="116" width="18" height="18" fill="#ecdcbc"/><circle cx="101" cy="107" r="4.5" fill="#2f8a5a"/><circle cx="119" cy="89" r="4.5" fill="#2f8a5a"/><circle cx="65" cy="107" r="4.5" fill="#2f8a5a"/><circle cx="47" cy="89" r="4.5" fill="#2f8a5a"/><circle cx="101" cy="35" r="4.5" fill="#2f8a5a"/><circle cx="119" cy="53" r="4.5" fill="#2f8a5a"/><circle cx="65" cy="35" r="4.5" fill="#2f8a5a"/><circle cx="47" cy="53" r="4.5" fill="#2f8a5a"/><text x="83" y="77" font-size="17" text-anchor="middle" fill="#1d1a22">♘</text><rect x="194" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="212" y="8" width="18" height="18" fill="#a87650"/><rect x="230" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="248" y="8" width="18" height="18" fill="#a87650"/><rect x="266" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="284" y="8" width="18" height="18" fill="#a87650"/><rect x="302" y="8" width="18" height="18" fill="#ecdcbc"/><rect x="194" y="26" width="18" height="18" fill="#a87650"/><rect x="212" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="230" y="26" width="18" height="18" fill="#a87650"/><rect x="248" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="266" y="26" width="18" height="18" fill="#a87650"/><rect x="284" y="26" width="18" height="18" fill="#ecdcbc"/><rect x="302" y="26" width="18" height="18" fill="#a87650"/><rect x="194" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="212" y="44" width="18" height="18" fill="#a87650"/><rect x="230" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="248" y="44" width="18" height="18" fill="#a87650"/><rect x="266" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="284" y="44" width="18" height="18" fill="#a87650"/><rect x="302" y="44" width="18" height="18" fill="#ecdcbc"/><rect x="194" y="62" width="18" height="18" fill="#a87650"/><rect x="212" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="230" y="62" width="18" height="18" fill="#a87650"/><rect x="248" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="266" y="62" width="18" height="18" fill="#a87650"/><rect x="284" y="62" width="18" height="18" fill="#ecdcbc"/><rect x="302" y="62" width="18" height="18" fill="#a87650"/><rect x="194" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="212" y="80" width="18" height="18" fill="#a87650"/><rect x="230" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="248" y="80" width="18" height="18" fill="#a87650"/><rect x="266" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="284" y="80" width="18" height="18" fill="#a87650"/><rect x="302" y="80" width="18" height="18" fill="#ecdcbc"/><rect x="194" y="98" width="18" height="18" fill="#a87650"/><rect x="212" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="230" y="98" width="18" height="18" fill="#a87650"/><rect x="248" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="266" y="98" width="18" height="18" fill="#a87650"/><rect x="284" y="98" width="18" height="18" fill="#ecdcbc"/><rect x="302" y="98" width="18" height="18" fill="#a87650"/><rect x="194" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="212" y="116" width="18" height="18" fill="#a87650"/><rect x="230" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="248" y="116" width="18" height="18" fill="#a87650"/><rect x="266" y="116" width="18" height="18" fill="#ecdcbc"/><rect x="284" y="116" width="18" height="18" fill="#a87650"/><rect x="302" y="116" width="18" height="18" fill="#ecdcbc"/><circle cx="275" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="293" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="311" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="239" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="221" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="203" cy="71" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="89" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="107" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="125" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="53" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="35" r="4.5" fill="#2f8a5a"/><circle cx="257" cy="17" r="4.5" fill="#2f8a5a"/><circle cx="275" cy="89" r="4.5" fill="#2f8a5a"/><circle cx="293" cy="107" r="4.5" fill="#2f8a5a"/><circle cx="311" cy="125" r="4.5" fill="#2f8a5a"/><circle cx="275" cy="53" r="4.5" fill="#2f8a5a"/><circle cx="293" cy="35" r="4.5" fill="#2f8a5a"/><circle cx="311" cy="17" r="4.5" fill="#2f8a5a"/><circle cx="239" cy="89" r="4.5" fill="#2f8a5a"/><circle cx="221" cy="107" r="4.5" fill="#2f8a5a"/><circle cx="203" cy="125" r="4.5" fill="#2f8a5a"/><circle cx="239" cy="53" r="4.5" fill="#2f8a5a"/><circle cx="221" cy="35" r="4.5" fill="#2f8a5a"/><circle cx="203" cy="17" r="4.5" fill="#2f8a5a"/><text x="257" y="77" font-size="17" text-anchor="middle" fill="#1d1a22">♕</text><text x="83" y="146" font-size="12" text-anchor="middle" fill="currentColor">나이트: L자, 뛰어넘기</text><text x="257" y="146" font-size="12" text-anchor="middle" fill="currentColor">퀸: 8방향 끝까지</text></svg>', cap: '초록 점 = 갈 수 있는 칸' }, p: [
+        '♙ 폰: 앞으로 1칸(처음엔 2칸까지). 잡을 땐 대각선 앞 1칸. 뒤로는 못 가요.',
+        '♘ 나이트: L자(두 칸 + 옆 한 칸). 유일하게 다른 기물을 뛰어넘어요.',
+        '♗ 비숍: 대각선으로 막히지 않는 만큼.',
+        '♖ 룩: 가로·세로로 막히지 않는 만큼.',
+        '♕ 퀸: 가로·세로·대각선 8방향으로 막히지 않는 만큼(가장 강해요).',
+        '♔ 킹: 8방향으로 1칸. 상대가 공격하고 있는 칸으로는 못 가요.',
+        '상대 기물이 있는 칸으로 가면 그 기물을 잡아요(판에서 빠져요). 내 기물은 못 잡아요.'] },
+      { h: '차례에 할 일', p: [
+        '기물 하나를 한 번 움직여요. 건너뛸 수는 없어요.',
+        '체크(내 킹이 공격받는 중)면 반드시 풀어야 해요: 킹 피하기 · 공격하는 기물 잡기 · 사이 막기.',
+        '내 킹이 공격받는 채로 남는 수는 둘 수 없어요(그런 기물은 골라도 「움직일 수 없음」이라고 알려 줘요).'] },
+      { h: '특수 규칙', p: [
+        '캐슬링: 킹과 룩이 둘 다 한 번도 안 움직였고 사이가 비었으면, 킹을 룩 쪽으로 2칸 옮겨요. 룩은 킹 너머로 자동으로 넘어와요. 체크 중이거나, 킹이 지나가는 칸·도착 칸이 공격받으면 안 돼요.',
+        '앙파상: 상대 폰이 처음에 2칸 전진해 내 폰 바로 옆에 서면, 바로 다음 수에만 그 폰이 지나간 칸으로 대각선 이동하며 잡을 수 있어요.',
+        '승격: 폰이 맨 끝 줄에 닿으면 퀸·룩·비숍·나이트 중 하나로 바뀌어요. 고르는 창이 떠요(보통 퀸).'] },
+      { h: '승패 · 무승부', p: [
+        '승리: 체크메이트, 또는 상대가 기권.',
+        '스테일메이트: 내 차례인데 체크는 아닌데 둘 수 있는 수가 하나도 없으면 무승부.',
+        '50수 규칙: 양쪽 합쳐 100번 동안 폰도 안 움직이고 잡기도 없으면 자동 무승부.',
+        '3회 반복: 똑같은 국면(같은 차례·캐슬링·앙파상 가능 여부까지)이 세 번 나오면 자동 무승부.',
+        '기물 부족: 킹만 남았거나, 킹 + 나이트/비숍 하나뿐이거나, 남은 비숍이 모두 같은 색 칸이면 무승부.',
+        '합의: 무승부 제안을 상대가 수락하면 무승부.'] },
+      { h: '무승부 제안', p: [
+        '내 차례에 「무승부」 → 3초 안에 「제안 확인」. 상대가 수락/거절할 때까지 아무도 못 둬요.',
+        '거절당하면 내 차례로 돌아와요. 상대가 한 수 둘 때까지는 다시 제안할 수 없어요. 몇 수째든 제안할 수 있어요.',
+        'AI는 자기 수읽기로 형세를 봐요: 비슷하거나(자기 쪽 +0.3폰 이하) 불리하면 수락, 유리하면 거절.'] },
+      { h: '조작', p: [
+        '내 기물을 탭 → 갈 수 있는 칸에 점(잡을 수 있는 칸은 원)이 떠요. 그 칸을 탭하거나 기물을 끌어다 놓으면 둬요.',
+        '고른 기물을 다시 탭하면 선택이 풀려요. 「길 표시」로 점을 끄고 켤 수 있어요(기기에 기억).',
+        '직전 수는 칸 강조와 화살표로 보여요. 보드 아래에 기보(SAN 표기: Nf3 = 나이트가 f3으로)가 쌓여요. 옆으로 밀어 볼 수 있어요.',
+        '↶ 무르기: 이 폰에서 사람 1명 대 AI일 때만. 내 직전 수와 AI의 응수를 함께 되돌려요(한 번에 한 수).',
+        '기권: 「기권」 → 3초 안에 「기권 확인」. 혼자 흑을 맡으면 보드가 뒤집혀 흑이 아래에 보여요.',
+        '💡 힌트: 내 차례에 누르면 엔진이 추천하는 수를 초록 화살표로 보여 줘요. 판마다 자리별 3번(설정에서 무제한·끔).',
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 1~2수만 읽고 가끔 기물을 놓쳐요(입문자). 보통은 4수 깊이로 읽는 동호인 수준. 어려움은 약 1초 동안 깊게(폰에서 보통 6~9수) 읽어서 꽤 강해요. 생각하는 동안에도 화면은 멈추지 않아요.'] },
+      { h: '복기', p: [
+        '게임이 끝나면 결과 창의 「🔍 복기」를 눌러요. 엔진이 뒤에서 한 수씩 분석해요(오른쪽 아래 숫자가 진행도).',
+        '◀ ▶(또는 판 왼쪽·오른쪽 탭, 키보드 ←→)로 한 수씩 넘겨요. 기보의 수를 탭하면 바로 그 수로 가요.',
+        '위 막대는 형세예요: 흰색이 많을수록 백이 유리. 숫자는 폰 1개 = 1.0, M3 = 3수 안에 메이트.',
+        '형세를 폰 1.5개 이상 잃은 수는 「? 실수」, 3개 이상이면 「?? 큰 실수」 — 엔진이 더 나은 수를 초록 화살표와 「추천」으로 보여 줘요.',
+        '「결과」를 누르면 복기를 닫고 결과 창으로 돌아가요.',
+        '「⚠ 결정적 실수」: 이번 판에서 형세를 가장 많이 잃은 3수(백·흑 상관없이)를 작은 판과 함께 보여 줘요. 빨간 화살표는 둔 수, 초록은 더 좋았던 수. 카드를 탭하면 그 장면으로 가요.'] },
+      { h: '형세 막대', p: [
+        '판 위쪽 테두리의 막대가 형세예요. 흰색이 많을수록 백이 유리, 오른쪽 숫자는 백 기준 점수(폰 1개 = 1.0, +M3 = 백이 3수 안에 메이트).',
+        '한 수 둘 때마다 이 기기에서 엔진이 잠깐 계산해요(화면은 멈추지 않아요). 계산 중엔 숫자가 흐리게 보여요.',
+        '설정 「형세 막대」: AI전만(기본) · 켬 · 끔. 사람끼리·온라인은 기본으로 꺼져 있어요(켜면 각자 기기에서 계산해요).'] },
+      { h: '예시', p: [
+        '첫 수로 e2의 폰을 탭 → e3·e4에 점이 떠요 → e4를 탭. 기보에 「1. e4」가 적혀요.',
+        '내 퀸이 상대 킹을 공격하는데 킹이 피할 칸도, 막을 기물도, 퀸을 잡을 기물도 없다면 → 체크메이트로 승리!',
+        '상대 킹은 체크가 아닌데 움직일 칸이 하나도 없고 다른 기물도 없다면 → 스테일메이트로 무승부(이기고 있어도!).'] },
+      { h: '모양 바꾸기', p: ['기보 줄 오른쪽 🎨 버튼: 기물 모양(클래식·미니멀·석상), 판(평면·입체), 기울기(끔·켬)를 고를 수 있어요. 이 기기에만 저장돼요.'] }
+    ],
+    tutorial: [
+      { sel: '.ch-board', text: '체스판이에요. 아래쪽이 내 기물이고 백이 먼저 둬요. 목표는 상대 킹을 도망칠 수 없게 몰아붙이는 「체크메이트」!' },
+      { sel: '.ch-board', text: '내 기물을 탭하면 갈 수 있는 칸에 점이 떠요(잡을 수 있으면 원). 그 칸을 탭하거나 끌어다 놓으면 한 수 끝! 기물마다 움직임이 달라서, 점을 보면서 익히면 돼요.' },
+      { sel: '.ch-board', text: '폰은 앞으로 1칸(처음엔 2칸), 잡을 땐 대각선. 나이트는 L자로 뛰어넘고, 비숍은 대각선, 룩은 가로·세로, 퀸은 8방향, 킹은 1칸씩이에요.' },
+      { sel: '.ch-opp', text: '위 이름표가 상대, 아래가 나예요. 내 차례면 금색 테두리가 켜지고, 킹이 공격받으면 「체크」가 떠요. 체크면 반드시 풀어야 해요. 잡은 기물과 점수 차도 여기 보여요.' },
+      { sel: '.ch-moves', text: '여기에 기보(지금까지 둔 수)가 쌓여요. 옆으로 밀어 볼 수 있어요.' },
+      { sel: '.ch-undo', text: '실수했으면 「↶ 무르기」로 내 직전 수를 되돌려요(AI전에서만). 「길 표시」로 점을 끄고 켤 수 있어요.' },
+      { sel: '.ch-hint', text: '막히면 「💡 힌트」 — 엔진이 추천하는 수를 초록 화살표로 보여 줘요(판마다 3번). 게임이 끝나면 결과 창의 「🔍 복기」로 실수를 짚어 볼 수 있어요.' },
+      { sel: '.ch-draw', text: '비길 것 같으면 「무승부」로 제안, 질 것 같으면 「기권」. 둘 다 한 번 더 눌러 확인해야 해요. 캐슬링·앙파상·승격 같은 특수 규칙은 「?」에 쉽게 적어 뒀어요. 시작!' },
+    ],
+    init, actor, apply, ai, aiDelayFor, result, mount, hint,
+    _engine: { perft, loadFEN, think, CFG, legalFromState, evaluate, rootScores, replayGame, newJob, jobStep, snapshot },
+  });
+})();

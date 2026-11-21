@@ -1,0 +1,1489 @@
+/* 물건 변신 숨바꼭질 (prophunt) — 4~16명. 숨는 쪽은 방 안 물건으로 변신해 숨고, 찾는 쪽은 수상한 물건을 쏴서 찾는 3D 숨바꼭질.
+   시스템만 참고(Garry's Mod 「Prop Hunt」 방식) — 맵 · 이름 · 화면은 모두 새로 만든 것. 물건 모델 · 결은 Poly Haven(CC0).
+
+   파일 구성 (결정 사항: docs/DECISIONS.md 「물건 변신 숨바꼭질」)
+   - 이 파일: 순수 로직(노드 시험 가능) — 물건 표 · 맵 4곳(방 · 문 · 붙박이 가구 · 물건 놓기 씨앗 → 결정적) · 충돌 · 사격 판정 · 라운드 진행 · 점수
+     · AI(숨는 쪽: 방에 맞는 물건 · 엄폐 자리 점수 + 씨앗 버릇 / 찾는 쪽: 보이는 것만으로 의심 점수 — 움직임 · 어울리지 않음 · 각도 · 새로 생김 · 소리) · 규칙 · 도감 · L.register.
+   - assets/prophunt/view.js: 3D 화면(three.js — 하이퍼 레이스의 assets/hyperrace/lib/three.min.js를 같이 씀) · 조작 · HUD · 소리 · 온라인.
+   - assets/prophunt/pk_*.js: 물건 모델(p_<키>) · 바닥/벽 결(t_<키>) 묶음 — 그 판 맵에 필요한 것만 불러옴.
+   온라인: 기기마다 자기 캐릭터를 직접 움직이고(호스트는 봇까지) 약 12Hz로 알림. 체력 · 명중 · 점수 · 강제 소리 · 탈락은 호스트 판정(hostSend),
+   라운드 단계 · 점수 합계는 api.setState. 물건 배치는 라운드 씨앗에서 모든 기기가 똑같이 만듦. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+
+  /* ======================= 상수 ======================= */
+  const DT = 1 / 60, TAU = Math.PI * 2, EYE = 1.55;
+  const HUN_SPD = 4.0, HID_SPD = 2.5, HUN_R = 0.3, HUN_HP = 100, DMG = 25, MISS = 5, FIRE_CD = 0.34, XF_CD = 1.2, TAUNT_CD = 10, REACH = 4.5, RANGE = 45;
+  /* 점프 · 오르기(조작감 우선): 중력 14m/s² · 점프 0.72m(체공 약 0.64초) — 누구나 같은 높이. 걸어서 넘는 턱 0.2m(팔레트 · 납작한 물건),
+     공중에서 발이 윗면보다 0.32m까지 낮아도 밀고 있으면 올려 줌 → 한 번에 약 1.04m(탁자 · 상자 · 통 · 화단 · 조리대 · 화덕).
+     찬장 · 목록 함 · 서류함 · 벽난로(1.2~1.4m)는 탁자나 통을 딛고, 철제 선반 · 책장(2.1~2.7m)은 그 위에서 한 번 더. 숨는 쪽 · 찾는 쪽 모두 오름.
+     모서리에서 떨어진 뒤 0.1초까지 점프(코요테), 누른 점프는 0.13초 기억(버퍼). */
+  const GRAV = 14, JUMP_H = 0.72, JUMP_V = Math.sqrt(2 * GRAV * JUMP_H), STEP_UP = 0.2, MANTLE = 0.32, HUN_BODY = 1.75, JUMP_BUF = 0.13, COYOTE = 0.1;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  function prng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function shuffle(R, a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const x = a[i]; a[i] = a[j]; a[j] = x; } return a; }
+  const angD = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+  const hash = (a, b) => { let h = Math.imul(a ^ 0x9E3779B9, 2654435761) ^ Math.imul(b + 0x7F4A7C15, 1597334677); h ^= h >>> 15; h = Math.imul(h, 2246822519); h ^= h >>> 13; return (h >>> 0) / 4294967296; };
+
+  /* ======================= 물건 표 ======================= */
+  /* [키, 이름, 폭(x), 깊이(z), 높이, 모양(b 상자 · c 원통), 재질(소리), 변신 가능] — 치수는 가공한 모델 그대로(m). 앞면 = +z */
+  const PDEF = [
+    ['chair', '나무 의자', 0.434, 0.576, 0.973, 'b', 'wood', 1], ['rchair', '천 의자', 0.673, 0.664, 1.059, 'b', 'fab', 1], ['arm', '안락의자', 0.848, 0.766, 1.065, 'b', 'fab', 1],
+    ['ottoman', '발받침', 0.885, 0.621, 0.624, 'b', 'fab', 1], ['stable', '작은 협탁', 0.55, 0.45, 0.551, 'b', 'wood', 1], ['books', '백과사전 한 질', 0.551, 0.163, 0.237, 'b', 'paper', 1],
+    ['oillamp', '석유등', 0.22, 0.22, 0.802, 'c', 'metal', 1], ['bvase', '놋쇠 화병', 0.227, 0.227, 0.692, 'c', 'metal', 1], ['bust', '대리석 흉상', 0.272, 0.3, 0.515, 'b', 'stone', 1],
+    ['basket2', '등나무 바구니', 0.347, 0.254, 0.2, 'b', 'wicker', 1], ['gclock', '괘종시계', 0.626, 0.427, 2.191, 'b', 'wood', 1], ['stool', '나무 걸상', 0.425, 0.442, 0.437, 'b', 'wood', 1],
+    ['mclock', '탁상시계', 0.342, 0.126, 0.16, 'b', 'wood', 1], ['avase', '옛 도자기', 0.255, 0.255, 0.44, 'c', 'cer', 1], ['cbox', '종이 상자', 0.387, 0.516, 0.342, 'b', 'paper', 1],
+    ['crate1', '낮은 나무 상자', 0.825, 0.409, 0.35, 'b', 'wood', 1], ['crate2', '긴 나무 상자', 0.529, 1.166, 0.464, 'b', 'wood', 1], ['barrel', '나무통', 0.563, 0.563, 0.88, 'c', 'wood', 1],
+    ['cement', '시멘트 포대', 0.462, 0.7, 0.18, 'b', 'soft', 1], ['propane', '가스통', 0.337, 0.337, 0.554, 'c', 'metal', 1], ['toolbox', '공구함', 0.4, 0.271, 0.305, 'b', 'metal', 1],
+    ['tyre', '헌 타이어', 0.6, 0.165, 0.6, 'b', 'soft', 1], ['jerry', '기름통', 0.36, 0.171, 0.5, 'b', 'metal', 1], ['pcrate', '플라스틱 상자', 0.506, 0.406, 0.254, 'b', 'plastic', 1],
+    ['wetsign', '바닥 주의 표지판', 0.3, 0.359, 0.63, 'b', 'plastic', 1], ['trash', '쓰레기 봉투', 0.528, 0.463, 0.575, 'b', 'soft', 1], ['bucket', '나무 들통', 0.367, 0.342, 0.55, 'c', 'wood', 1],
+    ['truck', '손수레', 0.593, 0.693, 1.403, 'b', 'metal', 1],
+    ['pchair', '칠한 나무 의자', 0.432, 0.54, 0.956, 'b', 'wood', 1], ['pstool', '칠한 걸상', 0.385, 0.406, 0.579, 'b', 'wood', 1], ['epot', '법랑 냄비', 0.263, 0.18, 0.178, 'b', 'metal', 1],
+    ['bpot', '놋쇠 단지', 0.302, 0.302, 0.291, 'c', 'metal', 1], ['cpot', '질항아리', 0.656, 0.502, 0.372, 'b', 'cer', 1], ['jug', '물병', 0.275, 0.168, 0.211, 'b', 'cer', 1],
+    ['mjug', '쇠 주전자', 0.197, 0.195, 0.288, 'c', 'metal', 1], ['wbarrel', '포도주 통', 0.742, 0.756, 0.871, 'c', 'wood', 1], ['cheese', '치즈 상자', 0.24, 0.107, 0.066, 'b', 'wood', 0],
+    ['bucket2', '나무 함지', 0.615, 0.616, 0.35, 'c', 'wood', 1],
+    ['clay', '토분', 0.266, 0.263, 0.222, 'c', 'cer', 1], ['plant', '화분 식물', 0.62, 0.62, 0.95, 'c', 'plant', 1], ['pbox1', '낮은 화단 상자', 0.913, 0.414, 0.425, 'b', 'wood', 1],
+    ['pbox3', '높은 화단 상자', 0.914, 0.656, 0.855, 'b', 'wood', 1], ['wcan', '물뿌리개', 0.191, 0.452, 0.197, 'b', 'metal', 1], ['compost', '퇴비 포대', 0.539, 0.471, 0.434, 'b', 'soft', 1],
+    ['basket1', '납작 바구니', 0.383, 0.295, 0.117, 'b', 'wicker', 1], ['fstool', '접이 걸상', 0.528, 0.547, 0.442, 'b', 'wood', 1], ['bench', '칠한 벤치', 1.165, 0.497, 0.889, 'b', 'wood', 1],
+    ['cat', '고양이 석상', 0.153, 0.25, 0.283, 'b', 'stone', 1], ['cvase', '도자기 화병', 0.218, 0.218, 0.309, 'c', 'cer', 1], ['barrel2', '빗물 통', 0.488, 0.485, 0.88, 'c', 'wood', 1],
+  ];
+  const MAT_NM = { wood: '나무', fab: '천', paper: '종이', metal: '금속', stone: '돌', wicker: '등나무', cer: '도자기', soft: '천 · 고무', plastic: '플라스틱', plant: '식물' };
+  /* 올라서는 높이(st): 의자 · 벤치는 등받이 꼭대기가 아니라 앉는 면 */
+  const SEAT = { chair: 0.46, rchair: 0.46, arm: 0.42, pchair: 0.46, bench: 0.45 };
+  const PROPS = PDEF.map((p, i) => {
+    const [k, nm, w, d, h, sh, m, hide] = p, s = Math.cbrt(w * d * h);
+    return { i, k, nm, w, d, h, sh, m, hide, hp: clamp(Math.round((35 + 115 * s) / 5) * 5, 40, 160), r: clamp((w + d) / 4, 0.14, 0.5), spd: s > 0.75 ? 0.86 : 1, st: SEAT[k] || h };
+  });
+  const PI = {}; PROPS.forEach((p) => { PI[p.k] = p.i; });
+  /* 붙박이 가구(변신 안 됨): 모델(m) 또는 코드로 그림. 위에 작은 물건을 올림 */
+  const DECOR = {
+    shelf: { nm: '책장', los: 1 }, shelf2: { nm: '양면 서가', los: 1 }, ltable: { nm: '열람 탁자' }, catalog: { nm: '목록 함' }, fire: { nm: '벽난로' }, hbench: { nm: '대기 의자' }, rug: { nm: '양탄자', nocol: 1 },
+    racks: { nm: '철제 선반', m: 'racks', los: 1 }, pillar: { nm: '기둥', los: 1 }, pallet: { nm: '팔레트' }, desk: { nm: '사무 책상' }, fcab: { nm: '서류함' }, dock: { nm: '셔터', nocol: 1 },
+    counter: { nm: '조리대' }, range: { nm: '무쇠 화덕' }, ptable: { nm: '작업 탁자', m: 'ptable' }, sink: { nm: '돌 개수대' }, pcab: { nm: '찬장', m: 'pcab' }, pshelf: { nm: '식료품 선반', los: 1 }, wrack: { nm: '포도주 선반', los: 1 },
+    dtable: { nm: '식탁', m: 'ptable' }, bed: { nm: '화단' }, wtable: { nm: '분갈이 작업대', m: 'wtable' }, palm: { nm: '큰 야자 화분' },
+  };
+
+  /* ======================= 맵 ======================= */
+  /* 방: [id, 이름, x0, z0, x1, z1, 종류, 바닥 결, 벽 결] · 문: [x, z, 폭, 방향('x' = z가 같은 벽 · 'z' = x가 같은 벽)] · 창: 같은 형식(바깥 벽)
+     붙박이: [종류, x, z, 길이(로컬 x), 깊이(로컬 z), 높이, 방향(도) — 0 = +z를 봄 · 90 = +x · 180 = −z · −90 = −x]
+     pools: 방 종류마다 그 방에 어울리는 물건 비율(찾는 쪽 AI의 「어울리지 않는 물건」 판단 · 숨는 쪽 AI의 물건 고르기) */
+  const MAPS = {
+    lib: {
+      nm: '옛 도서관', sub: '문 닫은 지 오래된 사립 도서관 · 해 질 녘', W: 30, D: 22, H: 4.6, spawn: [14, 18.5], sp: 'hall',
+      d: '높은 창으로 저녁 해가 드는 열람실, 키 큰 서가가 줄지어 선 서고, 벽난로가 있는 서재. 의자 · 책 · 화병 · 흉상이 많아 작은 물건으로 숨기 좋음.',
+      env: { tod: 'dusk', fog: 0x3a2c22, fogN: 9, fogF: 46, hemi: [0xffe2bf, 0x2a1e17, 0.55], sun: [0xffb36b, 2.6], sunDir: [-0.55, 0.42, -0.72], lamp: 0xffc27a, ceil: 'dwood' },
+      rooms: [['read', '열람실', 0, 0, 18, 12, 'read', 'parquet', 'panel'], ['stack', '서고', 18, 0, 30, 22, 'stack', 'parquet', 'panel'],
+        ['study', '서재', 0, 12, 10, 22, 'study', 'parquet', 'panel'], ['hall', '현관', 10, 12, 18, 22, 'hall', 'stone', 'plaster']],
+      doors: [[18, 3, 2, 'z'], [18, 9, 2, 'z'], [5, 12, 2, 'x'], [14, 12, 2, 'x'], [10, 17, 2, 'z'], [18, 18, 2, 'z']],
+      wins: [[3, 0, 1.6, 'x'], [7.5, 0, 1.6, 'x'], [12, 0, 1.6, 'x'], [16, 0, 1.4, 'x'], [30, 4, 1.4, 'z'], [30, 11, 1.4, 'z'], [30, 18, 1.4, 'z'], [5, 22, 1.6, 'x'], [14, 22, 1.4, 'x']],
+      decor: [['ltable', 5.5, 4.2, 4, 1.1, 0.78, 0], ['ltable', 5.5, 8.4, 4, 1.1, 0.78, 0], ['ltable', 12.5, 4.2, 4, 1.1, 0.78, 0], ['ltable', 12.5, 8.4, 4, 1.1, 0.78, 0],
+        ['shelf', 0.3, 6, 7.6, 0.5, 2.7, 90], ['catalog', 9.5, 11.55, 2.2, 0.6, 1.25, 180],
+        ['shelf2', 20.6, 5.4, 7.4, 0.6, 2.7, 90], ['shelf2', 23.2, 5.4, 7.4, 0.6, 2.7, 90], ['shelf2', 25.8, 5.4, 7.4, 0.6, 2.7, 90], ['shelf2', 28.4, 5.4, 7.4, 0.6, 2.7, 90],
+        ['shelf2', 20.6, 16.6, 7.4, 0.6, 2.7, 90], ['shelf2', 23.2, 16.6, 7.4, 0.6, 2.7, 90], ['shelf2', 25.8, 16.6, 7.4, 0.6, 2.7, 90], ['shelf2', 28.4, 16.6, 7.4, 0.6, 2.7, 90],
+        ['fire', 0.35, 17, 2.0, 0.6, 1.4, 90], ['rug', 4.4, 17, 4.2, 3.2, 0.01, 0], ['shelf', 5.4, 21.7, 5.6, 0.5, 2.7, 180], ['hbench', 10.45, 20.4, 1.8, 0.45, 0.48, 90], ['hbench', 17.55, 14.3, 1.8, 0.45, 0.48, -90]],
+      lamps: [[5.5, 3.2, 6.3, 'pend'], [12.5, 3.2, 6.3, 'pend'], [24.5, 3.6, 11, 'pend'], [5, 3.4, 17, 'pend'], [14, 3.6, 17, 'pend'], [1.2, 0.9, 17, 'fire']],
+      pools: { read: { chair: 6, books: 4, oillamp: 2, bvase: 1, avase: 1, stool: 2, cbox: 1, bust: 1, basket2: 1, gclock: 1 }, stack: { books: 6, cbox: 3, stool: 2, basket2: 1, avase: 1, chair: 1 },
+        study: { arm: 3, rchair: 2, ottoman: 2, stable: 2, oillamp: 2, mclock: 1, bust: 2, bvase: 2, avase: 1, gclock: 1, books: 2, basket2: 1 }, hall: { chair: 2, stool: 1, basket2: 1, cbox: 2, bvase: 1, avase: 1, books: 1 } },
+      gen(g) {
+        for (const di of g.decOf('ltable')) {
+          g.aroundTable(di, 'chair', 3, 0.18, 0.28);
+          g.onTop(di, ['books', 'books', 'oillamp', 'mclock'], 1 + g.ri(2));
+        }
+        g.onTop(g.decOf('catalog')[0], ['bust', 'avase', 'oillamp'], 2);
+        g.alongDecor(g.decOf('shelf')[0], ['books', 'books', 'stool', 'cbox'], 3);
+        for (const di of g.decOf('shelf2')) g.alongDecor(di, ['books', 'books', 'books', 'cbox', 'stool', 'basket2'], 1 + g.ri(2));
+        g.corners('read', ['bvase', 'avase', 'gclock'], 3); g.corners('stack', ['cbox', 'avase', 'stool'], 3);
+        g.wall('read', ['gclock', 'bvase', 'stool', 'chair'], 3); g.wall('stack', ['cbox', 'books', 'basket2'], 3);
+        // 서재: 벽난로를 보는 안락의자 둘 · 발받침 · 협탁(위에 등 · 시계 · 흉상)
+        g.put('arm', 2.7, 15.5, -Math.PI / 2 + 0.35); g.put('arm', 2.7, 18.6, -Math.PI / 2 - 0.35); g.put('ottoman', 4.3, 17.05, Math.PI / 2);
+        const t1 = g.put('stable', 2.5, 14.3, 0), t2 = g.put('stable', 2.6, 19.85, Math.PI);
+        if (t1 >= 0) g.onProp(t1, ['oillamp', 'mclock', 'books']); if (t2 >= 0) g.onProp(t2, ['oillamp', 'bust', 'mclock']);
+        g.wall('study', ['rchair', 'gclock', 'bvase', 'bust', 'stable', 'avase'], 4); g.corners('study', ['bvase', 'avase', 'basket2'], 2);
+        g.wall('hall', ['chair', 'chair', 'cbox', 'basket2', 'stool', 'bvase'], 4); g.corners('hall', ['avase', 'cbox'], 2);
+        g.scatter('read', ['books', 'stool', 'cbox'], 2); g.scatter('stack', ['books', 'cbox', 'basket2'], 3);
+      },
+    },
+    ware: {
+      nm: '부두 창고', sub: '밤의 항구 창고 · 형광등 몇 개만 켜짐', W: 32, D: 24, H: 6.0, spawn: [27, 3.4], sp: 'office',
+      d: '철제 선반이 줄지어 선 넓은 창고와 하역장, 작은 사무실. 상자 · 통 · 포대가 무더기로 쌓여 있어 같은 물건 사이에 섞이기 좋음.',
+      env: { tod: 'night', fog: 0x0e1418, fogN: 10, fogF: 52, hemi: [0x9fb4c8, 0x1a150f, 0.58], sun: [0x8fb0ff, 1.1], sunDir: [0.3, 0.5, 0.8], lamp: 0xdff2ff, ceil: 'planks', xtex: ['wplank'] },
+      rooms: [['store', '창고', 0, 0, 22, 24, 'store', 'concrete', 'brick'], ['office', '사무실', 22, 0, 32, 8, 'office', 'planks', 'plaster'], ['bay', '하역장', 22, 8, 32, 24, 'bay', 'concrete', 'brick']],
+      doors: [[22, 4, 1.6, 'z'], [22, 13, 4, 'z'], [22, 20.5, 2, 'z'], [27, 8, 1.6, 'x']],
+      wins: [[4, 0, 2.2, 'x'], [10, 0, 2.2, 'x'], [16, 0, 2.2, 'x'], [0, 8, 2.2, 'z'], [0, 16, 2.2, 'z'], [26, 0, 1.6, 'x'], [30, 0, 1.4, 'x']],
+      decor: [['racks', 2.8, 4.6, 0, 0, 0, 0], ['racks', 3.9, 4.6, 0, 0, 0, 0], ['racks', 5.0, 4.6, 0, 0, 0, 0], ['racks', 6.1, 4.6, 0, 0, 0, 0], ['racks', 7.2, 4.6, 0, 0, 0, 0], ['racks', 8.3, 4.6, 0, 0, 0, 0], ['racks', 9.4, 4.6, 0, 0, 0, 0],
+        ['racks', 2.8, 11.6, 0, 0, 0, 180], ['racks', 3.9, 11.6, 0, 0, 0, 180], ['racks', 5.0, 11.6, 0, 0, 0, 180], ['racks', 6.1, 11.6, 0, 0, 0, 180], ['racks', 7.2, 11.6, 0, 0, 0, 180], ['racks', 8.3, 11.6, 0, 0, 0, 180], ['racks', 9.4, 11.6, 0, 0, 0, 180],
+        ['racks', 2.8, 12.2, 0, 0, 0, 0], ['racks', 3.9, 12.2, 0, 0, 0, 0], ['racks', 5.0, 12.2, 0, 0, 0, 0], ['racks', 6.1, 12.2, 0, 0, 0, 0], ['racks', 7.2, 12.2, 0, 0, 0, 0], ['racks', 8.3, 12.2, 0, 0, 0, 0], ['racks', 9.4, 12.2, 0, 0, 0, 0],
+        ['racks', 2.8, 19.4, 0, 0, 0, 180], ['racks', 3.9, 19.4, 0, 0, 0, 180], ['racks', 5.0, 19.4, 0, 0, 0, 180], ['racks', 6.1, 19.4, 0, 0, 0, 180], ['racks', 7.2, 19.4, 0, 0, 0, 180], ['racks', 8.3, 19.4, 0, 0, 0, 180], ['racks', 9.4, 19.4, 0, 0, 0, 180],
+        ['pillar', 14, 6, 0.45, 0.45, 6, 0], ['pillar', 14, 12, 0.45, 0.45, 6, 0], ['pillar', 14, 18, 0.45, 0.45, 6, 0],
+        ['pallet', 17.5, 3.5, 1.2, 1.0, 0.14, 0], ['pallet', 19.2, 9, 1.2, 1.0, 0.14, 90], ['pallet', 16.5, 15, 1.2, 1.0, 0.14, 0], ['pallet', 18.6, 21.4, 1.2, 1.0, 0.14, 0], ['pallet', 26, 21.5, 1.2, 1.0, 0.14, 0], ['pallet', 29.5, 12, 1.2, 1.0, 0.14, 90],
+        ['desk', 29.4, 2.2, 1.6, 0.8, 0.76, 180], ['fcab', 31.6, 5.6, 0.5, 0.62, 1.3, -90], ['fcab', 31.6, 6.3, 0.5, 0.62, 1.3, -90], ['racks', 23.4, 0.35, 0, 0, 0, 0], ['dock', 31.9, 13.5, 3.6, 0.3, 3.4, -90], ['dock', 31.9, 19.5, 3.6, 0.3, 3.4, -90]],
+      lamps: [[6, 5.4, 8, 'tube'], [6, 5.4, 16, 'tube'], [16, 5.4, 6, 'tube'], [16, 5.4, 18, 'flick'], [27, 2.8, 4, 'tube'], [27, 5.4, 12, 'tube'], [27, 5.4, 20, 'flick']],
+      pools: { store: { crate1: 4, crate2: 3, barrel: 3, cbox: 4, pcrate: 2, cement: 2, toolbox: 1, jerry: 1, truck: 1, propane: 1, bucket: 1 },
+        office: { pchair: 2, cbox: 3, toolbox: 2, trash: 2, wetsign: 1, bucket: 1, jerry: 1, pcrate: 1 }, bay: { barrel: 4, tyre: 3, jerry: 2, propane: 2, crate1: 2, crate2: 2, trash: 2, wetsign: 1, pcrate: 2, cement: 1 } },
+      gen(g) {
+        for (const di of g.decOf('racks')) if (g.dec[di].z < 22 && g.dec[di].x < 12 && g.R() < 0.55) g.alongDecor(di, ['cbox', 'pcrate', 'toolbox', 'crate1', 'jerry'], 1);
+        g.cluster('store', 'crate1', 4 + g.ri(3), 1); g.cluster('store', 'crate2', 3 + g.ri(2), 1); g.cluster('store', 'barrel', 3 + g.ri(3)); g.cluster('store', 'cbox', 4 + g.ri(3), 1); g.cluster('store', 'pcrate', 3, 1);
+        for (const di of g.decOf('pallet')) g.onTop(di, ['cement', 'cement', 'cbox', 'crate1'], 1 + g.ri(2));
+        g.wall('store', ['barrel', 'truck', 'propane', 'jerry', 'bucket', 'crate2', 'cbox'], 6); g.scatter('store', ['cbox', 'pcrate', 'toolbox', 'bucket'], 3); g.corners('store', ['barrel', 'crate1', 'cbox'], 3);
+        g.put('pchair', 29.4, 3.2, Math.PI + 0.3); g.onTop(g.decOf('desk')[0], ['toolbox', 'cbox', 'jerry'], 1);
+        g.wall('office', ['cbox', 'cbox', 'trash', 'toolbox', 'pchair', 'wetsign', 'bucket'], 5); g.corners('office', ['trash', 'cbox'], 2);
+        g.cluster('bay', 'barrel', 4 + g.ri(3)); g.cluster('bay', 'tyre', 3, 1); g.cluster('bay', 'crate2', 3, 1); g.wall('bay', ['jerry', 'propane', 'trash', 'wetsign', 'pcrate', 'crate1', 'propane'], 6);
+        g.scatter('bay', ['trash', 'jerry', 'pcrate', 'cement'], 3); g.corners('bay', ['barrel', 'tyre', 'trash'], 3);
+      },
+    },
+    kit: {
+      nm: '저택 부엌', sub: '오래된 저택의 부엌 · 식료품실 · 지하 저장고', W: 28, D: 20, H: 3.8, spawn: [18, 6.5], sp: 'scull',
+      d: '무쇠 화덕과 작업 탁자가 있는 부엌, 개수대가 줄지어 선 설거지 방, 선반 가득한 식료품실, 긴 식탁의 식당, 포도주 통이 쌓인 저장고.',
+      env: { tod: 'eve', fog: 0x2b241e, fogN: 8, fogF: 40, hemi: [0xffe6c8, 0x221a14, 0.55], sun: [0xffcf94, 2.0], sunDir: [-0.35, 0.5, -0.8], lamp: 0xffbe6e, ceil: 'planks', xtex: ['kwood'] },
+      rooms: [['kitchen', '부엌', 0, 0, 14, 12, 'kitchen', 'terra', 'stucco'], ['scull', '설거지 방', 14, 0, 22, 12, 'scull', 'stone', 'stucco'], ['pantry', '식료품실', 0, 12, 8, 20, 'pantry', 'stone', 'stucco'],
+        ['dining', '식당', 8, 12, 22, 20, 'dining', 'parquet', 'panel'], ['cellar', '저장고', 22, 0, 28, 20, 'cellar', 'stone', 'brick2']],
+      doors: [[14, 6, 1.6, 'z'], [4, 12, 1.4, 'x'], [11, 12, 1.8, 'x'], [22, 16, 1.4, 'z'], [22, 5, 1.4, 'z'], [8, 16, 1.4, 'z']],
+      wins: [[3, 0, 1.4, 'x'], [7, 0, 1.4, 'x'], [11, 0, 1.4, 'x'], [16.5, 0, 1.2, 'x'], [19.5, 0, 1.2, 'x'], [12, 20, 1.4, 'x'], [18, 20, 1.4, 'x']],
+      decor: [['counter', 0.35, 4.6, 7.2, 0.7, 0.92, 90], ['range', 7.5, 11.55, 1.9, 0.85, 0.95, 180], ['ptable', 7, 5.6, 0, 0, 0, 0], ['counter', 13.6, 2.4, 3.0, 0.7, 0.92, -90],
+        ['sink', 16.5, 0.4, 1.4, 0.6, 0.88, 0], ['sink', 19.5, 0.4, 1.4, 0.6, 0.88, 0], ['pcab', 21.6, 9.2, 0, 0, 0, -90], ['counter', 17.5, 11.6, 3.4, 0.7, 0.92, 180],
+        ['pshelf', 0.28, 16, 7.0, 0.45, 2.2, 90], ['pshelf', 4.3, 19.72, 5.6, 0.45, 2.2, 180],
+        ['dtable', 13.8, 16, 0, 0, 0, 0], ['dtable', 16.2, 16, 0, 0, 0, 0], ['pcab', 15, 19.62, 0, 0, 0, 180], ['rug', 15, 16, 6.4, 3.4, 0.01, 0],
+        ['wrack', 27.7, 3.4, 3.4, 0.5, 2.1, -90], ['wrack', 27.7, 9.6, 3.4, 0.5, 2.1, -90], ['wrack', 27.7, 16.2, 3.4, 0.5, 2.1, -90]],
+      lamps: [[7, 2.9, 5.6, 'pend'], [18, 3.0, 5, 'pend'], [4, 2.9, 16, 'bulb'], [15, 2.8, 16, 'chand'], [25, 2.8, 6, 'bulb'], [25, 2.8, 14, 'bulb'], [7.5, 0.5, 11.2, 'fire']],
+      pools: { kitchen: { epot: 3, bpot: 2, jug: 3, mjug: 2, cpot: 2, pstool: 2, bucket2: 1, basket2: 2, bucket: 1, cheese: 1, pchair: 1 }, scull: { bucket: 3, bucket2: 2, pstool: 1, cpot: 1, jug: 1, basket1: 1, mjug: 1 },
+        pantry: { cpot: 3, wbarrel: 2, basket2: 2, jug: 2, mjug: 1, bucket2: 1, cheese: 1, crate1: 1 }, dining: { pchair: 6, gclock: 1, bvase: 1, avase: 1, oillamp: 1, mclock: 1, pstool: 1 },
+        cellar: { wbarrel: 6, crate1: 2, crate2: 2, barrel: 2, bucket: 1, basket1: 1 } },
+      gen(g) {
+        const pt = g.decOf('ptable')[0];
+        g.onTop(pt, ['epot', 'bpot', 'jug', 'mjug', 'basket2', 'cheese'], 3 + g.ri(2)); g.aroundTable(pt, 'pstool', 1, 0.3, 0.3);
+        for (const di of g.decOf('counter')) g.onTop(di, ['jug', 'cpot', 'epot', 'mjug', 'bpot', 'cheese'], 2 + g.ri(2));
+        g.wall('kitchen', ['bucket2', 'pstool', 'basket2', 'cpot', 'bucket', 'pchair'], 4); g.corners('kitchen', ['cpot', 'bucket', 'basket2'], 2);
+        g.wall('scull', ['bucket', 'bucket', 'bucket2', 'pstool', 'basket1', 'cpot'], 4); g.scatter('scull', ['bucket', 'jug'], 1);
+        for (const di of g.decOf('pshelf')) { g.onShelf(di, ['cpot', 'jug', 'mjug', 'cheese', 'basket2', 'bpot', 'epot'], 5 + g.ri(3)); g.alongDecor(di, ['cpot', 'basket2', 'bucket2'], 1); }
+        g.cluster('pantry', 'wbarrel', 2); g.wall('pantry', ['crate1', 'cpot', 'basket2'], 2);
+        for (const di of g.decOf('dtable')) { g.aroundTable(di, 'pchair', 2, 0.12, 0.2); g.onTop(di, ['oillamp', 'jug', 'bpot', 'mclock'], 1); }
+        for (const di of g.decOf('pcab')) g.onTop(di, ['avase', 'mclock', 'bpot', 'jug'], 2);
+        g.wall('dining', ['gclock', 'bvase', 'pchair', 'avase', 'pstool'], 4); g.corners('dining', ['bvase', 'avase'], 2);
+        for (const di of g.decOf('wrack')) g.alongDecor(di, ['wbarrel', 'crate1', 'basket1'], 1);
+        g.cluster('cellar', 'wbarrel', 4 + g.ri(3)); g.cluster('cellar', 'crate2', 2, 1); g.wall('cellar', ['wbarrel', 'barrel', 'crate1', 'bucket', 'basket1'], 4); g.corners('cellar', ['wbarrel', 'barrel'], 2);
+      },
+    },
+    green: {
+      nm: '유리 온실', sub: '식물원 뒤편의 낡은 유리 온실 · 흐린 오후', W: 30, D: 20, H: 4.8, spawn: [25, 3.6], sp: 'shed',
+      d: '유리 지붕 아래 화단과 분갈이 작업대가 늘어선 온실, 퇴비 포대가 쌓인 작업 헛간, 통과 상자가 쌓인 창고. 화분 사이에 섞이면 찾기 어려움.',
+      env: { tod: 'grey', fog: 0x8a9488, fogN: 12, fogF: 60, hemi: [0xe6f0ea, 0x3a3a2e, 0.95], sun: [0xf2f0e6, 1.4], sunDir: [0.4, 0.8, 0.3], lamp: 0xffd9a0, ceil: 'glass', glass: 1, xtex: ['wplank'] },
+      rooms: [['glass', '온실', 0, 0, 20, 20, 'glass', 'stone', 'glass'], ['shed', '작업 헛간', 20, 0, 30, 10, 'shed', 'planks', 'brick2'], ['gstore', '창고', 20, 10, 30, 20, 'gstore', 'concrete', 'brick2']],
+      doors: [[20, 5, 1.6, 'z'], [20, 15, 1.6, 'z'], [25, 10, 1.4, 'x']],
+      wins: [[24, 0, 1.4, 'x'], [28, 20, 1.4, 'x']],
+      decor: [['bed', 4.3, 4.4, 5.6, 1.3, 0.5, 0], ['bed', 4.3, 9.6, 5.6, 1.3, 0.5, 0], ['bed', 4.3, 14.8, 5.6, 1.3, 0.5, 0], ['bed', 14.7, 4.4, 5.6, 1.3, 0.5, 0], ['bed', 14.7, 9.6, 5.6, 1.3, 0.5, 0], ['bed', 14.7, 14.8, 5.6, 1.3, 0.5, 0],
+        ['wtable', 2.6, 0.45, 0, 0, 0, 0], ['wtable', 6.2, 0.45, 0, 0, 0, 0], ['wtable', 13.8, 0.45, 0, 0, 0, 0], ['wtable', 17.4, 0.45, 0, 0, 0, 0], ['wtable', 3.2, 19.55, 0, 0, 0, 180], ['wtable', 16.8, 19.55, 0, 0, 0, 180],
+        ['palm', 9.5, 9.6, 1.0, 1.0, 0.7, 0], ['wtable', 29.55, 3.2, 0, 0, 0, -90], ['wtable', 29.55, 6.8, 0, 0, 0, -90], ['racks', 21.2, 9.6, 0, 0, 0, 180], ['racks', 28.8, 9.6, 0, 0, 0, 180],
+        ['racks', 29.6, 13.2, 0, 0, 0, -90], ['racks', 29.6, 16.8, 0, 0, 0, -90], ['pallet', 23.5, 18.6, 1.2, 1.0, 0.14, 0]],
+      lamps: [[9.5, 4.2, 4.5, 'bulb'], [9.5, 4.2, 15, 'bulb'], [25, 3.6, 5, 'bulb'], [25, 3.6, 15, 'bulb']],
+      pools: { glass: { plant: 6, clay: 3, pbox1: 2, pbox3: 2, wcan: 2, fstool: 1, bench: 1, cat: 1, cvase: 1, basket1: 1, bucket: 1 }, shed: { compost: 4, bucket: 2, wcan: 2, fstool: 1, basket1: 1, clay: 2, barrel2: 1, plant: 1, crate1: 1 },
+        gstore: { barrel2: 3, compost: 2, crate1: 2, crate2: 2, pbox1: 2, bucket: 1, plant: 1, clay: 1 } },
+      gen(g) {
+        for (const di of g.decOf('bed')) { g.alongDecor(di, ['plant', 'plant', 'clay', 'wcan', 'pbox1'], 1 + g.ri(2)); }
+        for (const di of g.decOf('wtable')) if (g.dec[di].x < 20) { g.onTop(di, ['clay', 'clay', 'plant', 'cvase', 'wcan', 'basket1'], 2 + g.ri(2)); g.alongDecor(di, ['plant', 'clay', 'bucket'], g.ri(2)); }
+        g.wall('glass', ['plant', 'plant', 'pbox3', 'pbox1', 'bench', 'fstool', 'cat', 'wcan', 'bucket'], 9); g.corners('glass', ['plant', 'pbox3', 'cat'], 4);
+        g.around(g.decOf('palm')[0], ['plant', 'clay', 'cat', 'cvase'], 3); g.scatter('glass', ['plant', 'clay', 'wcan', 'basket1'], 3);
+        for (const di of g.decOf('wtable')) if (g.dec[di].x > 20) g.onTop(di, ['clay', 'clay', 'wcan', 'basket1', 'cvase'], 2);
+        g.cluster('shed', 'compost', 3 + g.ri(2)); g.wall('shed', ['bucket', 'wcan', 'fstool', 'barrel2', 'plant', 'crate1'], 4); g.corners('shed', ['compost', 'bucket'], 2);
+        g.cluster('gstore', 'barrel2', 3 + g.ri(2)); g.cluster('gstore', 'crate1', 3, 1); g.onTop(g.decOf('pallet')[0], ['compost', 'compost', 'crate1'], 2);
+        g.wall('gstore', ['crate2', 'pbox1', 'compost', 'bucket', 'plant', 'barrel2'], 5); g.corners('gstore', ['barrel2', 'crate2'], 2);
+      },
+    },
+  };
+  const MAP_KEYS = Object.keys(MAPS);
+
+  /* ---------- 맵 만들기: 벽 · 붙박이 · 물건 놓기 (씨앗 → 결정적) ---------- */
+  const WT = 0.24;
+  function wallsOf(def) {
+    // 방 테두리를 같은 선끼리 합친 뒤 문 자리를 뺌 → 벽 상자
+    const lines = {};
+    const add = (k, a, b) => { (lines[k] = lines[k] || []).push([Math.min(a, b), Math.max(a, b)]); };
+    for (const r of def.rooms) { const [, , x0, z0, x1, z1] = r; add('z' + z0, x0, x1); add('z' + z1, x0, x1); add('x' + x0, z0, z1); add('x' + x1, z0, z1); }
+    const out = [];
+    for (const k of Object.keys(lines)) {
+      const iv = lines[k].sort((a, b) => a[0] - b[0]), merged = [];
+      for (const s of iv) { const l = merged[merged.length - 1]; if (l && s[0] <= l[1] + 1e-6) l[1] = Math.max(l[1], s[1]); else merged.push(s.slice()); }
+      const ax = k[0], c = +k.slice(1), gaps = def.doors.filter((d) => (ax === 'z' ? d[3] === 'x' && Math.abs(d[1] - c) < 1e-6 : d[3] === 'z' && Math.abs(d[0] - c) < 1e-6)).map((d) => (ax === 'z' ? [d[0] - d[2] / 2, d[0] + d[2] / 2] : [d[1] - d[2] / 2, d[1] + d[2] / 2]));
+      for (const [a0, a1] of merged) {
+        let segs = [[a0, a1]];
+        for (const [g0, g1] of gaps) { const nx = []; for (const [s0, s1] of segs) { if (g1 <= s0 || g0 >= s1) nx.push([s0, s1]); else { if (g0 > s0) nx.push([s0, g0]); if (g1 < s1) nx.push([g1, s1]); } } segs = nx; }
+        for (const [s0, s1] of segs) {
+          if (s1 - s0 < 0.05) continue;
+          const ext = WT / 2;
+          if (ax === 'z') out.push({ x: (s0 + s1) / 2, z: c, hx: (s1 - s0) / 2 + ext, hz: WT / 2, ax: 'x', c, s0, s1 });
+          else out.push({ x: c, z: (s0 + s1) / 2, hx: WT / 2, hz: (s1 - s0) / 2 + ext, ax: 'z', c, s0, s1 });
+        }
+      }
+    }
+    return out;
+  }
+  const DIMS_M = { racks: [1.097, 0.502, 2.14], ptable: [2.406, 1.137, 0.959], pcab: [1.195, 0.617, 1.182], wtable: [1.327, 0.575, 0.83] };
+  function decorOf(def) {
+    return def.decor.map((d, i) => {
+      let [t, x, z, w, dd, h, a] = d;
+      if (DIMS_M[t] || (DECOR[t] && DECOR[t].m)) { const m = DIMS_M[DECOR[t].m || t]; w = m[0]; dd = m[1]; h = m[2]; }
+      const ar = (a || 0) * Math.PI / 180;
+      return { i, t, x, z, hx: w / 2, hz: dd / 2, h, a: ar, ca: Math.cos(ar), sa: Math.sin(ar), los: DECOR[t] && DECOR[t].los ? 1 : (h > 1.45 ? 1 : 0), nocol: DECOR[t] && DECOR[t].nocol ? 1 : 0, top: t === 'ptable' || t === 'dtable' ? 0.78 : t === 'wtable' ? 0.8 : t === 'pcab' ? 1.18 : h };
+    });
+  }
+  const roomAt = (M, x, z) => { for (const r of M.rooms) if (x >= r.x0 && x <= r.x1 && z >= r.z0 && z <= r.z1) return r; return null; };
+
+  /* 물건 놓기 — 점유 격자(0.25m) 위에서 */
+  const GC = 0.25;
+  function makeGen(M, R) {
+    const gw = Math.ceil(M.W / GC), gd = Math.ceil(M.D / GC), occ = new Uint8Array(gw * gd);
+    const mark = (x, z, hx, hz, ca, sa, v, pad) => {
+      const ex = Math.abs(hx * ca) + Math.abs(hz * sa) + pad, ez = Math.abs(hx * sa) + Math.abs(hz * ca) + pad;
+      const i0 = Math.max(0, Math.floor((x - ex) / GC)), i1 = Math.min(gw - 1, Math.floor((x + ex) / GC)), j0 = Math.max(0, Math.floor((z - ez) / GC)), j1 = Math.min(gd - 1, Math.floor((z + ez) / GC));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const cx = (i + 0.5) * GC - x, cz = (j + 0.5) * GC - z, lx = cx * ca - cz * sa, lz = cx * sa + cz * ca;
+        if (Math.abs(lx) <= hx + pad + GC * 0.5 && Math.abs(lz) <= hz + pad + GC * 0.5) occ[j * gw + i] = Math.max(occ[j * gw + i], v);
+      }
+    };
+    const free = (x, z, hx, hz, ca, sa, pad) => {
+      const ex = Math.abs(hx * ca) + Math.abs(hz * sa) + pad, ez = Math.abs(hx * sa) + Math.abs(hz * ca) + pad;
+      if (x - ex < 0.15 || z - ez < 0.15 || x + ex > M.W - 0.15 || z + ez > M.D - 0.15) return false;
+      const i0 = Math.floor((x - ex) / GC), i1 = Math.floor((x + ex) / GC), j0 = Math.floor((z - ez) / GC), j1 = Math.floor((z + ez) / GC);
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        if (!occ[j * gw + i]) continue;
+        const cx = (i + 0.5) * GC - x, cz = (j + 0.5) * GC - z, lx = cx * ca - cz * sa, lz = cx * sa + cz * ca;
+        if (Math.abs(lx) <= hx + pad && Math.abs(lz) <= hz + pad) return false;
+      }
+      return true;
+    };
+    for (const w of M.walls) mark(w.x, w.z, w.hx, w.hz, 1, 0, 2, 0.02);
+    for (const d of M.dec) if (!d.nocol) mark(d.x, d.z, d.hx, d.hz, d.ca, d.sa, 2, 0.04);
+    for (const d of M.doorsW) mark(d.x, d.z, d.hx, d.hz, 1, 0, 1, 0);   // 문 앞은 비워 둠
+    // 사냥꾼 출발 자리 둘레도 비움
+    mark(M.spawn[0], M.spawn[1], 1.2, 1.2, 1, 0, 1, 0);
+    const g = {
+      R, dec: M.dec, ri: (n) => Math.floor(R() * (n + 1)),
+      decOf: (t) => M.dec.filter((d) => d.t === t).map((d) => d.i),
+      tryPut(k, x, z, a, y, pad) {
+        const P = PROPS[PI[k]]; if (!P) return -1;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        if (!y) { if (!free(x, z, P.w / 2, P.d / 2, ca, sa, pad == null ? 0.05 : pad)) return -1; mark(x, z, P.w / 2, P.d / 2, ca, sa, 3, 0.04); }
+        const rm = roomAt(M, x, z);
+        M.props.push({ i: M.props.length, k: P.i, x: +x.toFixed(3), y: +(y || 0).toFixed(3), z: +z.toFixed(3), a: +a.toFixed(3), fl: y ? 0 : 1, rm: rm ? rm.id : '' });
+        return M.props.length - 1;
+      },
+      put(k, x, z, a) { return g.tryPut(k, x, z, a, 0); },
+      aroundTable(di, k, perSide, miss, skew) {
+        const d = M.dec[di], P = PROPS[PI[k]], n = perSide;
+        for (const sd of [-1, 1]) for (let q = 0; q < n; q++) {
+          if (R() < miss) continue;
+          const lx = (n === 1 ? 0 : (q - (n - 1) / 2) * (d.hx * 2 - 0.5) / Math.max(1, n - 1)) + (R() - 0.5) * 0.2, lz = sd * (d.hz + P.d * 0.32 + R() * 0.12);
+          const x = d.x + lx * d.ca + lz * d.sa, z = d.z - lx * d.sa + lz * d.ca;
+          g.tryPut(k, x, z, d.a + (sd > 0 ? Math.PI : 0) + (R() - 0.5) * 2 * skew, 0, 0.02);
+        }
+      },
+      onTop(di, keys, cnt) {
+        if (di == null) return;
+        const d = M.dec[di], top = d.top, spots = [];
+        for (let c = 0; c < cnt * 4 && spots.length < cnt; c++) {
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]];
+          if (P.w > d.hx * 2 - 0.1 || P.d > d.hz * 2 + 0.2) continue;
+          const lx = (R() - 0.5) * (d.hx * 2 - P.w - 0.1), lz = (R() - 0.5) * Math.max(0, d.hz * 2 - P.d - 0.06);
+          if (spots.some((s) => Math.abs(s[0] - lx) < (s[2] + P.w) / 2 + 0.06)) continue;
+          spots.push([lx, lz, P.w]);
+          const x = d.x + lx * d.ca + lz * d.sa, z = d.z - lx * d.sa + lz * d.ca;
+          g.tryPut(k, x, z, d.a + (R() < 0.7 ? (R() - 0.5) * 0.3 : R() * TAU), top);
+        }
+      },
+      onShelf(di, keys, cnt) {
+        const d = M.dec[di], lv = [0.42, 0.98, 1.54], used = lv.map(() => []);
+        for (let c = 0; c < cnt * 4 && cnt > 0; c++) {
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]], L = Math.floor(R() * lv.length);
+          if (P.h > 0.5 || P.d > d.hz * 2 + 0.05) continue;
+          const lx = (R() - 0.5) * (d.hx * 2 - P.w - 0.15);
+          if (used[L].some((s) => Math.abs(s[0] - lx) < (s[1] + P.w) / 2 + 0.05)) continue;
+          used[L].push([lx, P.w]); cnt--;
+          const lz = 0.02, x = d.x + lx * d.ca + lz * d.sa, z = d.z - lx * d.sa + lz * d.ca;
+          g.tryPut(k, x, z, d.a + (R() - 0.5) * 0.25, lv[L]);
+        }
+      },
+      onProp(pi, keys) {
+        const p = M.props[pi], P = PROPS[p.k], k = keys[Math.floor(R() * keys.length)], Q = PROPS[PI[k]];
+        if (Q.w > P.w + 0.05) return;
+        g.tryPut(k, p.x, p.z, p.a + (R() - 0.5) * 0.4, p.y + P.h);
+      },
+      alongDecor(di, keys, cnt) {
+        const d = M.dec[di];
+        for (let c = 0; c < cnt * 6 && cnt > 0; c++) {
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]], sd = d.t === 'shelf2' || d.t === 'bed' || d.t === 'racks' ? (R() < 0.5 ? -1 : 1) : 1;
+          const lx = (R() - 0.5) * (d.hx * 2 - P.w), lz = sd * (d.hz + P.d / 2 + 0.04 + R() * 0.06);
+          const x = d.x + lx * d.ca + lz * d.sa, z = d.z - lx * d.sa + lz * d.ca;
+          if (g.tryPut(k, x, z, d.a + (sd < 0 ? Math.PI : 0) + (R() - 0.5) * 0.3) >= 0) cnt--;
+        }
+      },
+      around(di, keys, cnt) {
+        const d = M.dec[di];
+        for (let c = 0; c < cnt * 8 && cnt > 0; c++) {
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]], an = R() * TAU, rr = Math.max(d.hx, d.hz) + P.r + 0.15 + R() * 0.3;
+          if (g.tryPut(k, d.x + Math.sin(an) * rr, d.z + Math.cos(an) * rr, an + Math.PI + (R() - 0.5) * 0.5) >= 0) cnt--;
+        }
+      },
+      roomR(id) { return M.rooms.find((r) => r.id === id); },
+      wall(id, keys, cnt) {
+        const r = g.roomR(id);
+        for (let c = 0; c < cnt * 10 && cnt > 0; c++) {
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]], side = Math.floor(R() * 4);
+          const off = WT / 2 + P.d / 2 + 0.04 + R() * 0.05;
+          let x, z, a;
+          if (side === 0) { x = r.x0 + 0.5 + R() * (r.x1 - r.x0 - 1); z = r.z0 + off; a = 0; }
+          else if (side === 1) { x = r.x0 + 0.5 + R() * (r.x1 - r.x0 - 1); z = r.z1 - off; a = Math.PI; }
+          else if (side === 2) { z = r.z0 + 0.5 + R() * (r.z1 - r.z0 - 1); x = r.x0 + off; a = Math.PI / 2; }
+          else { z = r.z0 + 0.5 + R() * (r.z1 - r.z0 - 1); x = r.x1 - off; a = -Math.PI / 2; }
+          if (g.tryPut(k, x, z, a + (R() - 0.5) * 0.2) >= 0) cnt--;
+        }
+      },
+      corners(id, keys, cnt) {
+        const r = g.roomR(id), cs = shuffle(R, [[0, 0], [1, 0], [0, 1], [1, 1]]);
+        for (const [cx, cz] of cs) {
+          if (cnt <= 0) break;
+          const k = keys[Math.floor(R() * keys.length)], P = PROPS[PI[k]], o = WT / 2 + Math.max(P.w, P.d) / 2 + 0.08;
+          const x = cx ? r.x1 - o : r.x0 + o, z = cz ? r.z1 - o : r.z0 + o;
+          if (g.tryPut(k, x, z, Math.atan2((r.x0 + r.x1) / 2 - x, (r.z0 + r.z1) / 2 - z) + (R() - 0.5) * 0.3) >= 0) cnt--;
+        }
+      },
+      cluster(id, k, n, grid) {
+        const r = g.roomR(id), P = PROPS[PI[k]];
+        for (let tries = 0; tries < 30; tries++) {
+          const x0 = r.x0 + 1 + R() * (r.x1 - r.x0 - 2), z0 = r.z0 + 1 + R() * (r.z1 - r.z0 - 2), a0 = grid ? Math.floor(R() * 4) * Math.PI / 2 : R() * TAU;
+          if (!free(x0, z0, P.w / 2, P.d / 2, 1, 0, 0.3)) continue;
+          let put = 0;
+          const cols = Math.ceil(Math.sqrt(n)), sx = (grid ? P.w : Math.max(P.w, P.d)) + 0.03, sz = (grid ? P.d : Math.max(P.w, P.d)) + 0.03, ca = Math.cos(a0), sa = Math.sin(a0);
+          for (let q = 0; q < n; q++) {
+            const lx = (q % cols) * sx + (grid ? 0 : (R() - 0.5) * 0.06), lz = Math.floor(q / cols) * sz;
+            const x = x0 + lx * ca + lz * sa, z = z0 - lx * sa + lz * ca;
+            const pi = g.tryPut(k, x, z, a0 + (grid ? (R() - 0.5) * 0.06 : R() * TAU), 0, 0.01);
+            if (pi >= 0) { put++; if (grid && P.h < 0.5 && R() < 0.35) g.tryPut(k, x, z, a0 + (R() - 0.5) * 0.1, P.h); }
+          }
+          if (put) return;
+        }
+      },
+      scatter(id, keys, cnt) {
+        const r = g.roomR(id);
+        for (let c = 0; c < cnt * 10 && cnt > 0; c++) {
+          const k = keys[Math.floor(R() * keys.length)];
+          if (g.tryPut(k, r.x0 + 0.8 + R() * (r.x1 - r.x0 - 1.6), r.z0 + 0.8 + R() * (r.z1 - r.z0 - 1.6), R() * TAU) >= 0) cnt--;
+        }
+      },
+    };
+    return g;
+  }
+
+  function genMap(key, seed) {
+    const def = MAPS[key] || MAPS.lib, R = prng(seed);
+    const M = { key, def, W: def.W, D: def.D, H: def.H, spawn: def.spawn, rooms: def.rooms.map((r) => ({ id: r[0], nm: r[1], x0: r[2], z0: r[3], x1: r[4], z1: r[5], kind: r[6], floor: r[7], wall: r[8] })),
+      walls: wallsOf(def), dec: decorOf(def), props: [], doorsW: [] };
+    for (const d of def.doors) M.doorsW.push(d[3] === 'x' ? { x: d[0], z: d[1], hx: d[2] / 2, hz: 0.9 } : { x: d[0], z: d[1], hx: 0.9, hz: d[2] / 2 });
+    const g = makeGen(M, R);
+    def.gen(g);
+    // 그 판 물건 수가 너무 적으면(좁은 방 실패) 흩어 놓기로 보충
+    for (const r of M.rooms) { const have = M.props.filter((p) => p.rm === r.id && p.fl).length, want = Math.round((r.x1 - r.x0) * (r.z1 - r.z0) / 9); if (have < want) g.scatter(r.id, Object.keys(def.pools[r.kind] || {}).filter((k) => PROPS[PI[k]].hide), want - have); }
+    buildCol(M);
+    return M;
+  }
+
+  /* ======================= 충돌 · 광선 ======================= */
+  /* 장애물 = 방향 상자(OBB) 또는 원통. 2m 칸 격자로 묶음 */
+  const CELL = 2;
+  function buildCol(M) {
+    const O = [];
+    for (const w of M.walls) O.push({ k: 'w', x: w.x, z: w.z, hx: w.hx, hz: w.hz, ca: 1, sa: 0, h: M.H, y0: 0, los: 1 });
+    for (const d of M.dec) if (!d.nocol) O.push({ k: 'd', i: d.i, x: d.x, z: d.z, hx: d.hx, hz: d.hz, ca: d.ca, sa: d.sa, h: d.h, y0: 0, los: d.los, top: d.top });
+    M.nStatic = O.length;
+    for (const p of M.props) {
+      const P = PROPS[p.k], ca = Math.cos(p.a), sa = Math.sin(p.a);
+      p.ca = ca; p.sa = sa;
+      // 바닥 물건 + 가구 위 물건(el — 높이가 있는 장애물: 탁자 위에 올라서면 부딪힘 · 그 위에 설 수 있음. 길찾기 · 숨을 자리 계산에는 넣지 않음)
+      O.push({ k: 'p', i: p.i, x: p.x, z: p.z, hx: P.w / 2, hz: P.d / 2, ca, sa, h: P.h, y0: p.fl ? 0 : p.y, r: P.sh === 'c' ? Math.max(P.w, P.d) / 2 : 0, los: 0, el: p.fl ? 0 : 1, top: (p.fl ? 0 : p.y) + P.st });
+    }
+    M.O = O;
+    const gw = Math.ceil(M.W / CELL) + 1, gd = Math.ceil(M.D / CELL) + 1, grid = Array.from({ length: gw * gd }, () => []);
+    O.forEach((o, oi) => {
+      const e = Math.hypot(o.hx, o.hz) + 0.6;   // 몸 반지름(최대 0.5m)만큼 떨어진 칸에서도 찾히게
+      for (let j = Math.max(0, Math.floor((o.z - e) / CELL)); j <= Math.min(gd - 1, Math.floor((o.z + e) / CELL)); j++)
+        for (let i = Math.max(0, Math.floor((o.x - e) / CELL)); i <= Math.min(gw - 1, Math.floor((o.x + e) / CELL)); i++) grid[j * gw + i].push(oi);
+    });
+    M.grid = grid; M.gw = gw; M.gd = gd;
+    // 길찾기 격자(0.5m): 막힌 칸 = 장애물(+여유)
+    const NC = 0.5, nw = Math.ceil(M.W / NC), nd = Math.ceil(M.D / NC), nav = new Uint8Array(nw * nd);
+    for (let j = 0; j < nd; j++) for (let i = 0; i < nw; i++) {
+      const x = (i + 0.5) * NC, z = (j + 0.5) * NC;
+      if (x < 0.3 || z < 0.3 || x > M.W - 0.3 || z > M.D - 0.3) { nav[j * nw + i] = 1; continue; }
+      for (const oi of nearO(M, x, z)) if (!O[oi].el && circHit(O[oi], x, z, 0.3)) { nav[j * nw + i] = 1; break; }
+    }
+    M.nav = nav; M.nw = nw; M.nd = nd; M.NC = NC;
+  }
+  function nearO(M, x, z) { const i = clamp(Math.floor(x / CELL), 0, M.gw - 1), j = clamp(Math.floor(z / CELL), 0, M.gd - 1); return M.grid[j * M.gw + i]; }
+  function circHit(o, x, z, r) {
+    if (o.r) return Math.hypot(x - o.x, z - o.z) < o.r + r;
+    const dx = x - o.x, dz = z - o.z, lx = dx * o.ca - dz * o.sa, lz = dx * o.sa + dz * o.ca;
+    const cx = clamp(lx, -o.hx, o.hx), cz = clamp(lz, -o.hz, o.hz);
+    return (lx - cx) * (lx - cx) + (lz - cz) * (lz - cz) < r * r;
+  }
+  /* 원(캐릭터) 밀어내기 */
+  function pushOut(o, c, r) {
+    if (o.r) {
+      const dx = c.x - o.x, dz = c.z - o.z, d = Math.hypot(dx, dz), m = o.r + r;
+      if (d < m && d > 1e-6) { c.x = o.x + dx / d * m; c.z = o.z + dz / d * m; return true; }
+      return false;
+    }
+    const dx = c.x - o.x, dz = c.z - o.z, lx = dx * o.ca - dz * o.sa, lz = dx * o.sa + dz * o.ca;
+    const cx = clamp(lx, -o.hx, o.hx), cz = clamp(lz, -o.hz, o.hz);
+    let nx = lx - cx, nz = lz - cz, d = Math.hypot(nx, nz), px, pz;
+    if (d >= r) return false;
+    if (d > 1e-6) { px = cx + nx / d * r; pz = cz + nz / d * r; }
+    else { const ex = o.hx - Math.abs(lx), ez = o.hz - Math.abs(lz); if (ex < ez) { px = Math.sign(lx || 1) * (o.hx + r); pz = lz; } else { px = lx; pz = Math.sign(lz || 1) * (o.hz + r); } }
+    // 로컬 → 월드
+    c.x = o.x + px * o.ca + pz * o.sa; c.z = o.z - px * o.sa + pz * o.ca;
+    return true;
+  }
+  /* 광선 vs 방향 상자(높이 y0..y0+h). 맞으면 t, 아니면 Infinity */
+  function rayOBB(o, ox, oy, oz, dx, dy, dz, yb, h) {
+    const rx = ox - o.x, rz = oz - o.z;
+    const lox = rx * o.ca - rz * o.sa, loz = rx * o.sa + rz * o.ca, ldx = dx * o.ca - dz * o.sa, ldz = dx * o.sa + dz * o.ca;
+    let t0 = 0, t1 = Infinity;
+    const slab = (p, d, lo, hi) => {
+      if (Math.abs(d) < 1e-9) return p >= lo && p <= hi;
+      let a = (lo - p) / d, b = (hi - p) / d; if (a > b) { const q = a; a = b; b = q; }
+      if (a > t0) t0 = a; if (b < t1) t1 = b; return t0 <= t1;
+    };
+    if (o.r) {
+      // 원통: 2D 원 + 높이
+      const A = dx * dx + dz * dz, B = 2 * (rx * dx + rz * dz), C = rx * rx + rz * rz - o.r * o.r;
+      if (A < 1e-9) { if (C > 0) return Infinity; } else {
+        const D = B * B - 4 * A * C; if (D < 0) return Infinity;
+        const s = Math.sqrt(D), a = (-B - s) / (2 * A), b = (-B + s) / (2 * A);
+        t0 = Math.max(0, a); t1 = b; if (t0 > t1) return Infinity;
+      }
+      if (!slab(oy, dy, yb, yb + h)) return Infinity;
+      return t0;
+    }
+    if (!slab(lox, ldx, -o.hx, o.hx)) return Infinity;
+    if (!slab(loz, ldz, -o.hz, o.hz)) return Infinity;
+    if (!slab(oy, dy, yb, yb + h)) return Infinity;
+    return t0;
+  }
+  /* 2D 시야 막힘(벽 · 키 큰 가구) — 두 점 사이 */
+  function losBlocked(M, x0, z0, x1, z1) {
+    const dx = x1 - x0, dz = z1 - z0, L = Math.hypot(dx, dz); if (L < 0.01) return false;
+    const ux = dx / L, uz = dz / L;
+    const seen = M._seen || (M._seen = new Uint32Array(M.O.length)); M._sq = (M._sq || 0) + 1; const sq = M._sq;
+    const steps = Math.ceil(L) + 1;
+    for (let s = 0; s <= steps; s++) {
+      const t = Math.min(L, s), px = x0 + ux * t, pz = z0 + uz * t;
+      for (const oi of nearO(M, px, pz)) {
+        if (oi >= M.nStatic || seen[oi] === sq) continue; seen[oi] = sq;
+        const o = M.O[oi]; if (!o.los) continue;
+        const tt = rayOBB(o, x0, 1, z0, ux, 0, uz, 0, 3); if (tt < L - 0.05) return true;
+      }
+    }
+    return false;
+  }
+
+  /* 3D 시야 막힘(벽 · 붙박이 가구, 높이까지 봄) — 가구 위에 있는 것을 볼 때 */
+  function los3(M, ox, oy, oz, tx, ty, tz) {
+    const dx = tx - ox, dy = ty - oy, dz = tz - oz, L = Math.hypot(dx, dy, dz); if (L < 0.01) return false;
+    const ux = dx / L, uy = dy / L, uz = dz / L;
+    for (let i = 0; i < M.nStatic; i++) { const o = M.O[i]; if (rayOBB(o, ox, oy, oz, ux, uy, uz, 0, topOf(o)) < L - 0.05) return true; }
+    return false;
+  }
+
+  /* ======================= 판(라운드) 세계 ======================= */
+  const PH = { HIDE: 0, HUNT: 1, END: 2 };
+  function makeWorld(st, opt) {
+    opt = opt || {};
+    const M = genMap(st.map, st.rs);
+    const W = { st, M, t: 0, n: st.n, chars: [], ht: st.ht, tt: st.tt, pi: st.pi, host: !!opt.host, fx: [], ev: [], evOut: [], seenEv: {}, evSeq: 1, ai: {},
+      dyn: { hp: [], al: [], sc: [], kills: [], tnt: [], miss: [], hits: [], surv: [] }, ended: false };
+    const hunT = hunterTeam(st.ri), R = prng(st.rs ^ 0x5bd1e995);
+    const hidSpots = hiderSpots(M, R, st.n);
+    let hi = 0, hu = 0;
+    for (let s = 0; s < st.n; s++) {
+      const hun = st.team[s] === hunT;
+      const c = { s, hun, x: 0, y: 0, z: 0, yaw: 0, pit: 0, vx: 0, vy: 0, vz: 0, gr: 1, jb: 0, ct: 0, p: -1, pa: 0, lock: 1, fireT: -9, xfT: -9, tauntT: -99, nextP: 0, mv: 0 };
+      if (hun) { const a = hu * 2.39996, r = 0.25 + 0.42 * Math.sqrt(hu); c.x = M.spawn[0] + Math.sin(a) * r; c.z = M.spawn[1] + Math.cos(a) * r; c.yaw = R() * TAU; hu++; }
+      else {
+        const sp = hidSpots[hi++ % hidSpots.length]; c.x = sp[0]; c.z = sp[1]; c.yaw = R() * TAU;
+        const pool = M.props.filter((p) => PROPS[p.k].hide && PROPS[p.k].h < 0.7);
+        const src = pool.length ? pool[Math.floor(R() * pool.length)] : null;
+        c.p = src ? src.k : PI.cbox; c.pa = c.yaw;
+        c.nextP = st.ht + st.pi * (0.6 + R() * 0.5);
+      }
+      W.chars.push(c);
+      W.dyn.hp.push(hun ? HUN_HP : PROPS[c.p].hp); W.dyn.al.push(1); W.dyn.sc.push(0); W.dyn.kills.push(0); W.dyn.tnt.push(0); W.dyn.miss.push(0); W.dyn.hits.push(0); W.dyn.surv.push(0);
+    }
+    return W;
+  }
+  function hiderSpots(M, R, n) {
+    const sp = M.rooms.find((r) => r.id === M.def.sp), out = [];
+    for (let k = 0; k < 400 && out.length < n; k++) {
+      const r = M.rooms[Math.floor(R() * M.rooms.length)];
+      if (r === sp && M.rooms.length > 1) continue;
+      const x = r.x0 + 0.8 + R() * (r.x1 - r.x0 - 1.6), z = r.z0 + 0.8 + R() * (r.z1 - r.z0 - 1.6);
+      if (navBlocked(M, x, z)) continue;
+      if (out.some((q) => Math.hypot(q[0] - x, q[1] - z) < 1.2)) continue;
+      out.push([x, z]);
+    }
+    while (out.length < n) out.push([M.spawn[0] + 2, M.spawn[1]]);
+    return out;
+  }
+  const hunterTeam = (ri) => (ri % 2 === 0 ? 1 : 0);
+  const phaseOf = (W) => (W.t < W.ht ? PH.HIDE : W.t < W.ht + W.tt ? PH.HUNT : PH.END);
+  function navBlocked(M, x, z) { const i = Math.floor(x / M.NC), j = Math.floor(z / M.NC); if (i < 0 || j < 0 || i >= M.nw || j >= M.nd) return true; return !!M.nav[j * M.nw + i]; }
+  const radOf = (c) => (c.hun ? HUN_R : PROPS[c.p] ? PROPS[c.p].r : 0.25);
+
+  /* 캐릭터 한 걸음 — inp: {mx, mz(월드 방향 −1..1), yaw, pit, fire, xf(물건 번호 · −1), lock(토글), taunt, jump(누른 순간)} */
+  function stepChar(W, c, inp, dt) {
+    if (!W.dyn.al[c.s]) { c.vx = c.vz = 0; return; }
+    const ph = phaseOf(W);
+    if (ph === PH.END) { c.vx = c.vz = 0; return; }
+    const frozen = c.hun && ph === PH.HIDE;
+    if (inp) {
+      if (typeof inp.yaw === 'number') c.yaw = inp.yaw;
+      if (typeof inp.pit === 'number') c.pit = clamp(inp.pit, -1.2, 1.2);
+    }
+    if (c.y == null) { c.y = 0; c.vy = 0; c.gr = 1; }
+    const P = c.hun ? null : PROPS[c.p];
+    const spd = c.hun ? HUN_SPD : HID_SPD * (P ? P.spd : 1);
+    let mx = frozen || !inp ? 0 : inp.mx || 0, mz = frozen || !inp ? 0 : inp.mz || 0;
+    const m = Math.hypot(mx, mz); if (m > 1) { mx /= m; mz /= m; }
+    const k = 1 - Math.exp(-dt * (c.gr ? 14 : 7));   // 공중에서는 방향을 조금만 바꿈
+    c.vx += (mx * spd - c.vx) * k; c.vz += (mz * spd - c.vz) * k;
+    if (Math.abs(c.vx) < 0.01 && !mx) c.vx = 0; if (Math.abs(c.vz) < 0.01 && !mz) c.vz = 0;
+    const px = c.x, pz = c.z;
+    c.x += c.vx * dt; c.z += c.vz * dt;
+    collide(W, c);
+    if (Math.hypot(c.x - px, c.z - pz) > 0.2 && wallBetween(W.M, px, pz, c.x, c.z)) { c.x = px; c.z = pz; }   // 밀려나다 벽을 넘는 일은 없게(안전장치)
+    // 점프 · 중력 · 착지 (누른 순간을 0.13초 기억 · 모서리에서 떨어진 뒤 0.1초까지는 점프 가능)
+    if (inp && inp.jump && !frozen) c.jb = JUMP_BUF + dt;
+    c.jb = Math.max(0, (c.jb || 0) - dt); c.ct = Math.max(0, (c.ct || 0) - dt);
+    const y0 = c.y, body = bodyOf(c), top = W.M.H - body;
+    if (c.jb > 0 && (c.gr || c.ct > 0) && !frozen) {
+      c.vy = JUMP_V; c.gr = 0; c.jb = 0; c.ct = 0;
+      fx(W, 'jump', c, 0);
+    }
+    if (!c.gr) { c.vy -= GRAV * dt; c.y += c.vy * dt; if (c.y > top) { c.y = Math.max(y0, top); if (c.vy > 0) c.vy = 0; } }   // 천장에 머리가 닿으면 멈춤
+    const g = supportAt(W, c, c.x, c.z, Math.max(y0, c.y) + 0.035);
+    if (c.gr) {
+      if (g < c.y - 1e-3) {
+        if (c.y - g <= STEP_UP + 1e-6) c.y = g;   // 낮은 턱은 그대로 내려섬
+        else { c.gr = 0; c.vy = 0; c.ct = COYOTE; }   // 가장자리 밖 → 떨어짐
+      } else c.y = g;
+    } else if (c.vy <= 0 && c.y <= g) {
+      const fall = -c.vy;
+      c.y = g; c.vy = 0; c.gr = 1;
+      if (fall > 1.2) fx(W, 'land', c, Math.min(9, Math.round(fall * 10) / 10));
+    }
+    if (!(c.y >= 0)) { c.y = 0; c.vy = 0; c.gr = 1; }
+    if (!(c.x === c.x && c.z === c.z)) { c.x = W.M.spawn[0]; c.z = W.M.spawn[1]; c.vx = c.vz = 0; }
+    c.mv = Math.hypot(c.vx, c.vz) > 0.2 ? 1 : 0;
+    if (!c.hun) {
+      if (!c.lock) c.pa = c.yaw;
+      if (inp && inp.lock) { c.lock = c.lock ? 0 : 1; fx(W, 'lock', c, c.lock); }
+      if (inp && inp.xf >= 0 && W.t - c.xfT >= XF_CD) transform(W, c, inp.xf);
+      if (inp && inp.taunt && ph === PH.HUNT && W.t - c.tauntT >= TAUNT_CD) taunt(W, c);
+    } else if (inp && inp.fire && ph === PH.HUNT && W.t - c.fireT >= FIRE_CD) {
+      c.fireT = W.t;
+      const o = eyeOf(c), d = dirOf(c.yaw, c.pit);
+      fireShot(W, c.s, o, d);
+    }
+  }
+  /* 장애물 윗면 높이(올라서는 면) — 탁자는 상판, 의자는 앉는 면 */
+  const topOf = (o) => (o.top != null ? o.top : (o.y0 || 0) + o.h);
+  const bodyOf = (c) => (c.hun ? HUN_BODY : PROPS[c.p] ? PROPS[c.p].h : 0.5);
+  /* 찾는 쪽은 숨은 물건(사람)에도 막히고 그 위에 설 수 있음 — 진짜 물건과 똑같이 */
+  function hidObs(q) { const P = PROPS[q.p], y = q.y || 0; return { x: q.x, z: q.z, hx: P.w / 2, hz: P.d / 2, ca: Math.cos(q.pa), sa: Math.sin(q.pa), r: P.sh === 'c' ? Math.max(P.w, P.d) / 2 : 0, h: P.h, y0: y, top: y + P.st }; }
+  /* 발밑 높이: (x, z)에서 몸 반지름의 60%가 걸치는 윗면 중, maxY 이하에서 가장 높은 것(없으면 바닥 0). 머리가 천장에 닿는 곳은 뺌.
+     숨는 쪽 · 찾는 쪽 모두 가구 · 물건 위에 섬(변신한 물건은 그 물건 크기의 발판으로) */
+  function supportAt(W, c, x, z, maxY) {
+    const M = W.M, rr = radOf(c) * 0.6, lim = M.H - bodyOf(c) + 1e-6;
+    let g = 0;
+    for (const oi of nearO(M, x, z)) { const o = M.O[oi], t = topOf(o); if (t > g && t <= maxY && t <= lim && circHit(o, x, z, rr)) g = t; }
+    if (c.hun) for (const q of W.chars) {
+      if (q.hun || !W.dyn.al[q.s] || q.p < 0) continue;
+      const o = hidObs(q), t = o.top; if (t > g && t <= maxY && t <= lim && circHit(o, x, z, rr)) g = t;
+    }
+    return g;
+  }
+  /* 옆 충돌: 발이 장애물 윗면보다 높거나 머리가 바닥면보다 낮으면 통과.
+     걸어서 넘을 턱(0.2m · 가구 위에 놓인 물건은 0.32m) · 공중에서 짚고 오를 높이(0.32m) 안이면 밀어내지 않고, 몸이 충분히(60%) 걸치면 그 위로 올려 줌 */
+  function bump(c, o, r, body, H) {
+    const t = topOf(o), feet = c.y || 0;
+    if (feet + body <= (o.y0 || 0) + 0.02) return;
+    if (feet >= t - 0.03) return;
+    if (!circHit(o, c.x, c.z, r)) return;
+    if (t - feet <= (c.gr && !o.el ? STEP_UP : MANTLE) && t + body <= H + 1e-6) {   // 탁자 · 선반 위에 놓인 작은 물건(el)은 걸어서도 딛고 넘음 — 올라설 자리를 막지 않게
+      if (circHit(o, c.x, c.z, r * 0.6)) { c.y = t; c.vy = 0; c.gr = 1; }
+      else if (!c.gr) {
+        // 모서리 잡아 주기: 공중에서 모서리에 걸쳤고 그쪽으로 가는 중이면(비스듬히 스쳐도) 윗면으로 끌어올림 — 발판이 걸칠 만큼만 안쪽으로 당김
+        const q = nearPt(o, c.x, c.z), dx = q[0] - c.x, dz = q[1] - c.z, d = Math.hypot(dx, dz);
+        if (d > 1e-6 && (c.vx * dx + c.vz * dz) / d > 0.4) { const k = (d - r * 0.6 + 0.02) / d; c.x += dx * k; c.z += dz * k; c.y = t; c.vy = 0; c.gr = 1; }
+      }
+      return;
+    }
+    pushOut(o, c, r);
+  }
+  /* 장애물 바닥 모양에서 (x, z)에 가장 가까운 점 */
+  function nearPt(o, x, z) {
+    const dx = x - o.x, dz = z - o.z;
+    if (o.r) { const d = Math.hypot(dx, dz); return d <= o.r ? [x, z] : [o.x + dx / d * o.r, o.z + dz / d * o.r]; }
+    const lx = clamp(dx * o.ca - dz * o.sa, -o.hx, o.hx), lz = clamp(dx * o.sa + dz * o.ca, -o.hz, o.hz);
+    return [o.x + lx * o.ca + lz * o.sa, o.z - lx * o.sa + lz * o.ca];
+  }
+  function wallBetween(M, x0, z0, x1, z1) {
+    const dx = x1 - x0, dz = z1 - z0, L = Math.hypot(dx, dz); if (L < 1e-6) return false;
+    for (let i = 0; i < M.nStatic; i++) { const o = M.O[i]; if (o.k !== 'w') break; if (rayOBB(o, x0, 1, z0, dx / L, 0, dz / L, 0, 3) <= L) return true; }
+    return false;
+  }
+  function collide(W, c) {
+    const M = W.M, r = radOf(c), body = bodyOf(c);
+    if (c.y == null) c.y = 0;
+    for (let it = 0; it < 3; it++) {
+      const x0 = c.x, z0 = c.z;
+      for (const oi of nearO(M, c.x, c.z)) bump(c, M.O[oi], r, body, M.H);
+      if (c.hun) for (const q of W.chars) {
+        if (q.hun || !W.dyn.al[q.s] || q.p < 0) continue;
+        const bx = c.x, bz = c.z;
+        bump(c, hidObs(q), r, body, M.H);
+        if (Math.hypot(c.x - bx, c.z - bz) > 0.15) { c.x = bx; c.z = bz; }   // 숨은 사람이 내 쪽으로 파고든 경우(걸어와서 · 큰 물건으로 변신) — 멀리 떠밀리지 않고 겹친 채 둠
+      }
+      c.x = clamp(c.x, 0.3, M.W - 0.3); c.z = clamp(c.z, 0.3, M.D - 0.3);
+      if (c.x === x0 && c.z === z0) break;
+    }
+    // 물건과 벽 사이에 끼었을 때는 벽이 이김(벽 속으로 밀려 들어가지 않게)
+    for (const oi of nearO(M, c.x, c.z)) { const o = M.O[oi]; if (o.k === 'w' && circHit(o, c.x, c.z, r)) pushOut(o, c, r); }
+    c.x = clamp(c.x, 0.3, M.W - 0.3); c.z = clamp(c.z, 0.3, M.D - 0.3);
+  }
+  const eyeOf = (c) => ({ x: c.x, y: (c.y || 0) + (c.hun ? EYE : 0.6), z: c.z });
+  const dirOf = (yaw, pit) => ({ x: Math.sin(yaw) * Math.cos(pit), y: Math.sin(pit), z: Math.cos(yaw) * Math.cos(pit) });
+  function fx(W, k, c, v) { if (W.fx.length < 200) W.fx.push([k, c ? c.s : -1, c ? c.x : 0, 0, c ? c.z : 0, v == null ? 0 : v]); }
+
+  /* 변신: 손 닿는 거리(4.5m)의 진짜 물건만. 모양 · 방향을 그대로 따라하고 방향 고정 */
+  function canTransform(W, c, pi) {
+    const p = W.M.props[pi]; if (!p) return false;
+    const P = PROPS[p.k]; if (!P.hide) return false;
+    return Math.hypot(p.x - c.x, p.z - c.z) < REACH;
+  }
+  function transform(W, c, pi) {
+    if (!canTransform(W, c, pi)) return false;
+    const p = W.M.props[pi], old = c.p;
+    if (old === p.k) { c.pa = p.a; c.lock = 1; c.xfT = W.t; return true; }
+    const frac = W.dyn.hp[c.s] / (PROPS[old] ? PROPS[old].hp : 100);
+    c.p = p.k; c.pa = p.a; c.lock = 1; c.xfT = W.t;
+    W.dyn.hp[c.s] = Math.max(1, Math.round(frac * PROPS[c.p].hp));
+    fx(W, 'xf', c, c.p);
+    collide(W, c);
+    return true;
+  }
+  function taunt(W, c) {
+    c.tauntT = W.t;
+    c.nextP = Math.max(c.nextP, W.t + W.pi);
+    W.dyn.tnt[c.s]++;
+    if (W.host) { W.dyn.sc[c.s] += 15; pushEv(W, ['t', c.s, Math.round(c.x * 50), Math.round(c.z * 50), PROPS[c.p] ? PROPS[c.p].i : 0]); }
+    else W.evOut.push([0, 'T', c.s]);
+    fx(W, 'taunt', c, 1);
+  }
+
+  /* ---------- 사격 ---------- */
+  /* 광선 판정: 벽 · 붙박이 → 진짜 물건(맞히면 찾는 쪽 체력 −5) → 숨은 사람(−25) — 가장 가까운 것 */
+  function castShot(W, s, o, d) {
+    const M = W.M; let best = RANGE, kind = 'n', idx = -1;
+    // 바닥 · 천장
+    if (d.y < -1e-6) { const t = -o.y / d.y; if (t < best) { best = t; kind = 'f'; } }
+    if (d.y > 1e-6) { const t = (M.H - o.y) / d.y; if (t < best) { best = t; kind = 'f'; } }
+    for (let i = 0; i < M.nStatic; i++) { const ob = M.O[i]; const t = rayOBB(ob, o.x, o.y, o.z, d.x, d.y, d.z, 0, topOf(ob)); if (t < best) { best = t; kind = 'w'; idx = i; } }   // 탁자는 상판 높이까지 — 그 위에 놓인 것 · 올라선 사람이 가려지지 않게
+    for (const p of M.props) {
+      const P = PROPS[p.k], ob = { x: p.x, z: p.z, hx: P.w / 2, hz: P.d / 2, ca: p.ca, sa: p.sa, r: P.sh === 'c' ? Math.max(P.w, P.d) / 2 : 0 };
+      const t = rayOBB(ob, o.x, o.y, o.z, d.x, d.y, d.z, p.y, P.h); if (t < best) { best = t; kind = 'p'; idx = p.i; }
+    }
+    for (const c of W.chars) {
+      if (c.hun || c.s === s || !W.dyn.al[c.s] || c.p < 0) continue;
+      const P = PROPS[c.p], ob = { x: c.x, z: c.z, hx: P.w / 2, hz: P.d / 2, ca: Math.cos(c.pa), sa: Math.sin(c.pa), r: P.sh === 'c' ? Math.max(P.w, P.d) / 2 : 0 };
+      const t = rayOBB(ob, o.x, o.y, o.z, d.x, d.y, d.z, c.y || 0, P.h); if (t < best) { best = t; kind = 'h'; idx = c.s; }
+    }
+    return { kind, idx, t: best, x: o.x + d.x * best, y: o.y + d.y * best, z: o.z + d.z * best };
+  }
+  function fireShot(W, s, o, d) {
+    const c = W.chars[s];
+    fx(W, 'fire', c, 0);
+    if (!W.host) { W.evOut.push([0, 'S', s, Math.round(o.x * 100), Math.round(o.y * 100), Math.round(o.z * 100), Math.round(d.x * 1000), Math.round(d.y * 1000), Math.round(d.z * 1000)]); const h = castShot(W, s, o, d); W.lastShot = h; return h; }
+    return resolveShot(W, s, o, d);
+  }
+  function resolveShot(W, s, o, d) {
+    const h = castShot(W, s, o, d), D = W.dyn;
+    if (!D.al[s] || phaseOf(W) !== PH.HUNT) return h;
+    let res = 0;
+    if (h.kind === 'p') {
+      D.hp[s] = Math.max(0, D.hp[s] - MISS); D.miss[s]++; res = 1;
+      if (D.hp[s] <= 0) { D.al[s] = 0; pushEv(W, ['d', s]); }
+    } else if (h.kind === 'h') {
+      const v = h.idx; D.hp[v] = Math.max(0, D.hp[v] - DMG); D.hits[s]++; D.sc[s] += 5; res = 2;
+      D.hp[s] = Math.min(HUN_HP, D.hp[s] + 3);
+      const ai = W.ai[v]; if (ai) { ai.hurtT = W.t; ai.hurtBy = s; }
+      if (D.hp[v] <= 0) {
+        D.al[v] = 0; D.kills[s]++; D.sc[s] += 100; D.hp[s] = Math.min(HUN_HP, D.hp[s] + 20); res = 3;
+        // 최근 10초 안에 함께 맞힌 찾는 쪽 +30
+        const asst = (W.dmgLog || []).filter((q) => q[0] === v && q[1] !== s && W.t - q[2] < 10).map((q) => q[1]);
+        for (const a of new Set(asst)) if (D.al[a] !== undefined) D.sc[a] += 30;
+        pushEv(W, ['k', s, v]);
+      }
+      (W.dmgLog = W.dmgLog || []).push([v, s, W.t]); if (W.dmgLog.length > 60) W.dmgLog.shift();
+    }
+    (W.lastRes = W.lastRes || {})[s] = { res, idx: h.idx, x: h.x, z: h.z };
+    pushEv(W, ['s', s, Math.round(o.x * 100), Math.round(o.y * 100), Math.round(o.z * 100), Math.round(h.x * 100), Math.round(h.y * 100), Math.round(h.z * 100), res, h.kind === 'p' || h.kind === 'h' ? h.idx : -1]);
+    W.lastShot = h;
+    return h;
+  }
+  function pushEv(W, e) { e.unshift(W.evSeq++); e.push(Math.round(W.t * 100) / 100); W.ev.push(e); if (W.ev.length > 400) W.ev.splice(0, 100); W.efx = W.efx || []; W.efx.push(e); }
+
+  /* 호스트 판정: 강제 소리 · 생존 점수 · 라운드 끝 */
+  function hostTick(W, dt) {
+    if (W.ended) return;
+    const ph = phaseOf(W), D = W.dyn;
+    if (ph === PH.HUNT) {
+      const late = W.t > W.ht + W.tt - 60;
+      for (const c of W.chars) {
+        if (c.hun || !D.al[c.s]) continue;
+        D.surv[c.s] += dt;
+        if (W.t >= c.nextP) {
+          c.nextP = W.t + W.pi * (late ? 0.6 : 1);
+          pushEv(W, ['p', c.s, Math.round(c.x * 50), Math.round(c.z * 50), c.p]);
+          fx(W, 'ping', c, 0);
+        }
+      }
+    }
+  }
+  function roundEnd(W) {
+    if (W.ended) return null;
+    const D = W.dyn, hid = W.chars.filter((c) => !c.hun), hun = W.chars.filter((c) => c.hun);
+    const hidA = hid.filter((c) => D.al[c.s]).length, hunA = hun.filter((c) => D.al[c.s]).length;
+    let win = null;
+    if (phaseOf(W) === PH.HUNT || phaseOf(W) === PH.END) {
+      if (!hidA) win = 'hun';
+      else if (!hunA || W.t >= W.ht + W.tt) win = 'hid';
+    }
+    if (!win) return null;
+    W.ended = true;
+    const pts = D.sc.slice();
+    for (const c of hid) { if (D.al[c.s]) pts[c.s] += 100; pts[c.s] += Math.floor(D.surv[c.s] / 3); if (win === 'hid') pts[c.s] += 25; }
+    if (win === 'hun') for (const c of hun) pts[c.s] += 50;
+    return { win, pts, al: D.al.slice(), kills: D.kills.slice(), tnt: D.tnt.slice(), miss: D.miss.slice(), hits: D.hits.slice(), t: Math.round(Math.max(0, W.t - W.ht)), hidA, hidN: hid.length };
+  }
+
+  /* ======================= AI ======================= */
+  /* 버릇(씨앗): 크기 선호 · 멀리 숨기 · 배짱(가까이 와도 버팀) · 도발 · 방아쇠(의심이 낮아도 쏨) · 꼼꼼함 · 소리 따라가기 */
+  function habits(seed, s) { const R = prng((seed ^ Math.imul(s + 1, 2654435761)) >>> 0); return { size: R(), far: R(), nerve: R(), taunt: R(), trig: R(), sweep: R(), ear: R(), seed: (seed + s * 7919) >>> 0 }; }
+  /* 길찾기(A*, 0.5m 격자, 대각선 허용) → 꺾이는 점 목록 */
+  function findPath(M, x0, z0, x1, z1) {
+    const nw = M.nw, nd = M.nd, NC = M.NC;
+    const cell = (x, z) => [clamp(Math.floor(x / NC), 0, nw - 1), clamp(Math.floor(z / NC), 0, nd - 1)];
+    let [si, sj] = cell(x0, z0), [ti, tj] = cell(x1, z1);
+    const okc = (i, j) => i >= 0 && j >= 0 && i < nw && j < nd && !M.nav[j * nw + i];
+    const near = (i, j) => { if (okc(i, j)) return [i, j]; for (let r = 1; r < 6; r++) for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) if (okc(i + di, j + dj)) return [i + di, j + dj]; return [i, j]; };
+    [si, sj] = near(si, sj); [ti, tj] = near(ti, tj);
+    const N = nw * nd, gS = new Float32Array(N).fill(1e9), from = new Int32Array(N).fill(-1), closed = new Uint8Array(N);
+    const open = [[0, sj * nw + si]]; gS[sj * nw + si] = 0;
+    const H = (i, j) => { const dx = Math.abs(i - ti), dz = Math.abs(j - tj); return Math.max(dx, dz) + 0.414 * Math.min(dx, dz); };
+    let it = 0, goal = tj * nw + ti, found = false;
+    while (open.length && it++ < 4000) {
+      let bi = 0; for (let q = 1; q < open.length; q++) if (open[q][0] < open[bi][0]) bi = q;
+      const cur = open[bi][1]; open[bi] = open[open.length - 1]; open.pop();
+      if (closed[cur]) continue; closed[cur] = 1;
+      if (cur === goal) { found = true; break; }
+      const ci = cur % nw, cj = (cur - ci) / nw;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        if (!di && !dj) continue;
+        const ni = ci + di, nj = cj + dj; if (!okc(ni, nj)) continue;
+        if (di && dj && (!okc(ci + di, cj) || !okc(ci, cj + dj))) continue;
+        const nI = nj * nw + ni, g = gS[cur] + (di && dj ? 1.414 : 1);
+        if (g < gS[nI]) { gS[nI] = g; from[nI] = cur; open.push([g + H(ni, nj), nI]); }
+      }
+    }
+    if (!found) return [[x1, z1]];
+    const pts = []; let c = goal;
+    while (c >= 0 && c !== sj * nw + si) { const i = c % nw, j = (c - i) / nw; pts.push([(i + 0.5) * NC, (j + 0.5) * NC]); c = from[c]; }
+    pts.reverse();
+    // 줄 당기기: 직선으로 갈 수 있으면 건너뜀
+    const out = []; let ax = x0, az = z0, k = 0;
+    while (k < pts.length) {
+      let far = k;
+      for (let q = pts.length - 1; q > k; q--) if (clearLine(M, ax, az, pts[q][0], pts[q][1])) { far = q; break; }
+      out.push(pts[far]); ax = pts[far][0]; az = pts[far][1]; k = far + 1;
+    }
+    if (out.length) out[out.length - 1] = [x1, z1];
+    return out;
+  }
+  function clearLine(M, x0, z0, x1, z1) {
+    const L = Math.hypot(x1 - x0, z1 - z0), n = Math.ceil(L / (M.NC * 0.5));
+    for (let q = 1; q <= n; q++) { const t = q / n; if (navBlocked(M, x0 + (x1 - x0) * t, z0 + (z1 - z0) * t)) return false; }
+    return true;
+  }
+  function aiState(W, c, hab) { return W.ai[c.s] || (W.ai[c.s] = { path: null, pk: 0, goal: null, mode: '', t: 0, seen: [], mem: new Map(), cells: new Map(), pings: [], cleared: new Set(), hab, plan: null, look: c.yaw, stuck: 0, lx: c.x, lz: c.z, tgt: null, aimT: 0, hurtT: -99, nextLook: 0, perT: 0, wander: null, fled: 0 }); }
+  function goTo(W, c, A, x, z) {
+    if (!A.goal || Math.hypot(A.goal[0] - x, A.goal[1] - z) > 0.4 || !A.path) { A.goal = [x, z]; A.path = findPath(W.M, c.x, c.z, x, z); A.pk = 0; }
+    const p = A.path; if (!p || A.pk >= p.length) return null;
+    let [tx, tz] = p[A.pk];
+    if (Math.hypot(tx - c.x, tz - c.z) < 0.35) { A.pk++; if (A.pk >= p.length) return null; [tx, tz] = p[A.pk]; }
+    const dx = tx - c.x, dz = tz - c.z, d = Math.hypot(dx, dz) || 1;
+    return { mx: dx / d, mz: dz / d };
+  }
+  function stuckCheck(A, c, dt, moving) {
+    if (!moving) { A.stuck = 0; A.lx = c.x; A.lz = c.z; return false; }
+    A.stuckT = (A.stuckT || 0) + dt;
+    if (A.stuckT > 0.8) { const mv = Math.hypot(c.x - A.lx, c.z - A.lz); A.stuck = mv < 0.25 ? A.stuck + 1 : 0; A.lx = c.x; A.lz = c.z; A.stuckT = 0; }
+    if (A.stuck >= 2) { A.stuck = 0; A.path = null; A.goal = null; return true; }
+    return false;
+  }
+  const poolW = (M, room, k) => { const r = room && M.def.pools[room.kind]; if (!r) return 0; const tot = Object.values(r).reduce((a, b) => a + b, 0); return (r[PROPS[k].k] || 0) / tot; };
+
+  /* ---- 숨는 쪽 AI ---- */
+  function planHide(W, c, lv, hab, R, opt) {
+    opt = opt || {};
+    const M = W.M, others = W.chars.filter((q) => !q.hun && q.s !== c.s && W.ai[q.s] && W.ai[q.s].plan).map((q) => W.ai[q.s].plan);
+    const sp = M.spawn, cand = [];
+    let srcs = M.props.filter((p) => PROPS[p.k].hide && (lv > 1 || R() < 0.7));
+    if (opt.keep) { const same = srcs.filter((p) => p.k === c.p && Math.hypot(p.x - c.x, p.z - c.z) < (opt.maxD || 99)); if (same.length) srcs = same; }
+    for (let k = 0; k < 70; k++) {
+      const p = srcs[Math.floor(R() * srcs.length)]; if (!p) break;
+      const P = PROPS[p.k];
+      // 같은 종류 옆자리(무리 속) 또는 그 방 벽가
+      let x, z, a;
+      const near = M.props.filter((q) => q.k === p.k && q.fl && Math.hypot(q.x - p.x, q.z - p.z) < 6);
+      const base = near.length ? near[Math.floor(R() * near.length)] : p;
+      const side = R() < 0.5 ? 1 : -1, along = R() < 0.6;
+      const off = (along ? P.w : P.d) + 0.08 + R() * 0.25;
+      const lx = along ? side * off : (R() - 0.5) * 0.3, lz = along ? (R() - 0.5) * 0.2 : side * off;
+      x = base.x + lx * Math.cos(base.a) + lz * Math.sin(base.a); z = base.z - lx * Math.sin(base.a) + lz * Math.cos(base.a);
+      a = base.a + (lv >= 3 ? 0 : lv === 2 ? (R() - 0.5) * 0.3 : (R() - 0.5) * 2.5);
+      if (lv === 1 && R() < 0.35) { x = 1 + R() * (M.W - 2); z = 1 + R() * (M.D - 2); a = R() * TAU; }
+      if (x < 0.5 || z < 0.5 || x > M.W - 0.5 || z > M.D - 0.5) continue;
+      if (opt.maxD && (Math.hypot(x - c.x, z - c.z) > opt.maxD || Math.hypot(x - c.x, z - c.z) < 2.5)) continue;
+      const ob = { x, z, hx: P.w / 2, hz: P.d / 2, ca: Math.cos(a), sa: Math.sin(a), r: P.sh === 'c' ? Math.max(P.w, P.d) / 2 : 0 };
+      let bad = false;
+      for (const oi of nearO(M, x, z)) { const o = M.O[oi]; if (!o.el && (o.k === 'p' || o.k === 'd' || o.k === 'w')) { if (overlapOO(o, ob)) { bad = true; break; } } }
+      if (bad) continue;
+      const room = roomAt(M, x, z);
+      const fit = poolW(M, room, p.k);
+      let cover = 0; for (const oi of nearO(M, x, z)) { const o = M.O[oi]; if (!o.el && Math.hypot(o.x - x, o.z - z) < 1.4 + Math.max(o.hx, o.hz)) cover++; }
+      const dSp = Math.hypot(x - sp[0], z - sp[1]);
+      const crowd = others.reduce((a2, q) => a2 + (Math.hypot(q.x - x, q.z - z) < 2.5 ? 1 : 0), 0);
+      const sz = P.hp / 160;
+      let sc = fit * 3 + Math.min(cover, 6) * 0.25 + Math.min(dSp, 20) / 20 * (0.4 + hab.far) + (near.length > 1 ? 0.6 : 0) - crowd * 0.9 - (room && room.id === M.def.sp ? 2 : 0)
+        + (1 - Math.abs(sz - hab.size * 0.8)) * 0.6 - Math.hypot(x - c.x, z - c.z) / 40 + (opt.keep && p.k === c.p ? 1.5 : 0)
+        - (opt.avoid ? opt.avoid.reduce((a2, q) => a2 + Math.max(0, 8 - Math.hypot(q[0] - x, q[1] - z)) * 0.3, 0) : 0);
+      // 다니는 길(문 앞 · 방 가운데)을 피하고 시야를 가리는 큰 가구 곁을 고름 — 난이도가 높을수록 신경 씀
+      if (lv > 1) {
+        let dDoor = 9; for (const dw of M.doorsW) dDoor = Math.min(dDoor, Math.hypot(dw.x - x, dw.z - z));
+        const edge = room ? Math.min(x - room.x0, room.x1 - x, z - room.z0, room.z1 - z) : 0;
+        let blk = 0; for (const oi of nearO(M, x, z)) { const o = M.O[oi]; if (o.los && oi < M.nStatic && Math.hypot(o.x - x, o.z - z) < 2 + Math.max(o.hx, o.hz)) blk++; }
+        sc += ((Math.min(dDoor, 4) / 4) * 0.6 + (edge < 1.3 ? 0.35 : 0) + Math.min(blk, 4) * 0.15) * (lv - 1);
+      }
+      sc += (R() - 0.5) * (lv === 1 ? 2.5 : lv === 2 ? 1.0 : 0.4);
+      cand.push({ sc, src: p.i, x, z, a });
+    }
+    cand.sort((a2, b) => b.sc - a2.sc);
+    return cand[0] || { src: -1, x: c.x, z: c.z, a: c.yaw };
+  }
+  /* 가구 위에 숨을 자리(가끔만): 한 번 뛰어 닿는 탁자 · 조리대 · 화단 위, 거기 놓인 작은 물건 옆. 못 찾으면 null
+     → {src(따라 할 물건), x, z, a, up(윗면 높이), ax, az(뛰어오를 발판 자리)} */
+  function planUp(W, c, R) {
+    const M = W.M, sp = M.spawn, cand = [];
+    const els = M.props.filter((p) => !p.fl && PROPS[p.k].hide && PROPS[p.k].h <= 0.6);
+    for (let k = 0; k < 24 && els.length; k++) {
+      const p = els[Math.floor(R() * els.length)], P = PROPS[p.k];
+      const d = M.dec.find((q) => !q.nocol && Math.abs(q.top - p.y) < 0.02 && q.top <= JUMP_H + MANTLE - 0.08 && circHit({ x: q.x, z: q.z, hx: q.hx, hz: q.hz, ca: q.ca, sa: q.sa }, p.x, p.z, 0.01));
+      if (!d) continue;
+      const rm = roomAt(M, d.x, d.z); if (rm && rm.id === M.def.sp) continue;
+      // 가구 로컬 좌표에서 그 물건 옆자리
+      const px = (p.x - d.x) * d.ca - (p.z - d.z) * d.sa, pz = (p.x - d.x) * d.sa + (p.z - d.z) * d.ca;
+      const lx = px + (R() < 0.5 ? -1 : 1) * (P.w + 0.1 + R() * 0.3), mgx = d.hx - Math.max(P.w, P.d) / 2 - 0.04, mgz = d.hz - Math.max(P.w, P.d) / 2 - 0.02;
+      if (mgx < 0 || mgz < 0 || Math.abs(lx) > mgx) continue;
+      const lz = clamp(pz + (R() - 0.5) * 0.1, -mgz, mgz);
+      const x = d.x + lx * d.ca + lz * d.sa, z = d.z - lx * d.sa + lz * d.ca, a = p.a + (R() - 0.5) * 0.2;
+      const ob = { x, z, hx: P.w / 2, hz: P.d / 2, ca: Math.cos(a), sa: Math.sin(a) };
+      if (M.props.some((q) => !q.fl && Math.abs(q.y - p.y) < 0.5 && Math.hypot(q.x - x, q.z - z) < 1.5 && overlapOO({ x: q.x, z: q.z, hx: PROPS[q.k].w / 2 + 0.03, hz: PROPS[q.k].d / 2 + 0.03, ca: q.ca, sa: q.sa }, ob))) continue;
+      // 발판 자리: 가구 긴 변 바로 앞(걸어갈 수 있는 쪽)
+      let ap = null;
+      for (const sd of [1, -1]) { const oz = sd * (d.hz + 0.5), ax = d.x + lx * d.ca + oz * d.sa, az = d.z - lx * d.sa + oz * d.ca; if (!navBlocked(M, ax, az) && (!ap || Math.hypot(ax - c.x, az - c.z) < Math.hypot(ap[0] - c.x, ap[1] - c.z))) ap = [ax, az]; }
+      if (!ap) continue;
+      cand.push({ sc: Math.min(Math.hypot(x - sp[0], z - sp[1]), 20) / 20 + R() * 0.6 - Math.hypot(x - c.x, z - c.z) / 40, src: p.i, x, z, a, up: d.top, ax: ap[0], az: ap[1] });
+    }
+    cand.sort((a2, b) => b.sc - a2.sc);
+    return cand[0] || null;
+  }
+  function overlapOO(a, b) {
+    // 두 방향 상자 겹침(원통은 외접 상자로) — 분리축
+    const ax = [[a.ca, -a.sa], [a.sa, a.ca], [b.ca, -b.sa], [b.sa, b.ca]];
+    const ex = (o, u) => Math.abs(o.hx * (o.ca * u[0] - o.sa * u[1])) + Math.abs(o.hz * (o.sa * u[0] + o.ca * u[1]));
+    const dx = b.x - a.x, dz = b.z - a.z;
+    for (const u of ax) { const d = Math.abs(dx * u[0] + dz * u[1]); if (d > ex(a, u) + ex(b, u) - 0.02) return false; }
+    return true;
+  }
+  function aiHider(W, c, lv, hab, dt) {
+    const A = aiState(W, c, hab), M = W.M, ph = phaseOf(W), R = A.R || (A.R = prng(hab.seed ^ 0x3c6ef372));
+    const out = { mx: 0, mz: 0, yaw: c.yaw, pit: 0, xf: -1, lock: 0, taunt: 0 };
+    if (!A.plan) {
+      // 보통 · 어려움은 가끔(약 8% · 14%) 탁자 · 조리대 위 물건 사이에 숨음
+      const up = lv >= 2 && R() < (lv === 2 ? 0.05 : 0.1) + hab.nerve * 0.06 ? planUp(W, c, R) : null;
+      A.plan = up || planHide(W, c, lv, hab, R); A.mode = 'src';
+    }
+    const pl = A.plan;
+    // 위협 인식: 보이는(시야 · 14m) 찾는 쪽
+    let threat = null, td = 99;
+    A.perT -= dt;
+    if (A.perT <= 0) {
+      A.perT = 0.3;
+      A.thr = null;
+      for (const q of W.chars) {
+        if (!q.hun || !W.dyn.al[q.s]) continue;
+        const d = Math.hypot(q.x - c.x, q.z - c.z);
+        if (d < 14 && d < td && !losBlocked(M, c.x, c.z, q.x, q.z)) { td = d; threat = q; }
+      }
+      A.thr = threat ? { s: threat.s, d: td } : null;
+    }
+    const thr = A.thr ? W.chars[A.thr.s] : null, thd = A.thr ? A.thr.d : 99;
+    if (A.mode === 'src') {
+      const p = M.props[pl.src];
+      const nx = pl.up != null ? 'up' : 'go';
+      if (!p || c.p === p.k) A.mode = nx;
+      else if (Math.hypot(p.x - c.x, p.z - c.z) < REACH - 1.2) out.xf = p.i;
+      else { const mv = goTo(W, c, A, p.x, p.z); if (mv) { out.mx = mv.mx; out.mz = mv.mz; } else A.mode = nx; }
+      if (ph !== PH.HIDE && lv === 1) A.mode = nx;
+    } else if (A.mode === 'up') {
+      // 가구 앞 발판 자리까지 걸어감 → 그 자리에서 가구 쪽으로 뛰어오름
+      const mv = Math.hypot(pl.ax - c.x, pl.az - c.z) > 0.25 ? goTo(W, c, A, pl.ax, pl.az) : null;
+      if (mv) { out.mx = mv.mx; out.mz = mv.mz; } else { A.mode = 'climb'; A.clT = 0; }
+      if (stuckCheck(A, c, dt, !!mv)) { A.plan = planHide(W, c, lv, hab, R); A.mode = 'src'; }
+    } else if (A.mode === 'climb') {
+      A.clT += dt;
+      const dx = pl.x - c.x, dz = pl.z - c.z, d = Math.hypot(dx, dz), on = c.gr && (c.y || 0) > pl.up - 0.05;
+      if (on && d < 0.1) { A.mode = 'still'; if (!c.lock) out.lock = 1; }
+      else if (A.clT > 5) { if (on) { pl.x = c.x; pl.z = c.z; A.mode = 'still'; } else { A.plan = planHide(W, c, lv, hab, R); A.mode = 'src'; A.path = null; A.goal = null; } }
+      else {
+        const sp = on ? Math.min(1, 0.25 + d) : 1;
+        if (d > 0.01) { out.mx = dx / d * sp; out.mz = dz / d * sp; }
+        if (!on && c.gr) out.jump = 1;
+        if (on) { if (c.lock && Math.abs(angD(c.pa, pl.a)) > 0.05) out.lock = 1; if (!c.lock) out.yaw = pl.a; }
+      }
+    } else if (A.mode === 'go') {
+      if (ph !== PH.HIDE && lv === 1 && R() < 0.02) A.mode = 'still';
+      const mv = Math.hypot(pl.x - c.x, pl.z - c.z) > 0.12 ? goTo(W, c, A, pl.x, pl.z) : null;
+      if (mv) { out.mx = mv.mx; out.mz = mv.mz; if (Math.hypot(pl.x - c.x, pl.z - c.z) < 0.6) { out.mx *= 0.4; out.mz *= 0.4; } }
+      else { A.mode = 'still'; if (!c.lock) out.lock = 1; }
+      if (stuckCheck(A, c, dt, !!mv)) { pl.x = c.x; pl.z = c.z; A.mode = 'still'; }
+      // 방향: 계획한 각도로 맞춤(고정 풀고 → 맞추고 → 고정)
+      if (c.lock && Math.abs(angD(c.pa, pl.a)) > 0.05 && Math.hypot(pl.x - c.x, pl.z - c.z) < 1.5) out.lock = 1;
+      if (!c.lock) out.yaw = pl.a;
+    } else if (A.mode === 'still') {
+      if (!c.lock) { out.yaw = pl.a; out.lock = 1; }
+      // 맞으면 · 아주 가까이서 노려보면 달아남(난이도 · 배짱)
+      const hurt = W.t - A.hurtT < 0.6;
+      let flee = false;
+      if (hurt && A.hurtT !== A.hurtSeen) { A.hurtSeen = A.hurtT; flee = R() < (lv === 1 ? 0.85 : lv === 2 ? 0.4 : 0.2) * (1.2 - hab.nerve * 0.4) + (W.dyn.hp[c.s] < PROPS[c.p].hp * 0.4 ? 0.3 : 0); }
+      else if (thr && thd < (lv === 1 ? 5 : 3.2)) {
+        const look = Math.abs(angD(Math.atan2(c.x - thr.x, c.z - thr.z), thr.yaw));
+        if (look < 0.35) A.stare = (A.stare || 0) + dt; else { A.stare = 0; A.rolled = 0; }
+        if (!A.rolled && A.stare > (lv === 1 ? 0.6 : lv === 2 ? 2.2 : 4) + hab.nerve * 2) { A.rolled = 1; flee = R() < (lv === 1 ? 0.7 : lv === 2 ? 0.25 : 0.08) * (1.3 - hab.nerve * 0.6); }
+      } else { A.stare = 0; A.rolled = 0; }
+      if (flee && ph === PH.HUNT) {
+        A.fled++; A.hurtT = -99;
+        const np = planHide(W, c, Math.max(1, lv), hab, R);
+        if (thr) { // 찾는 쪽에서 먼 쪽 후보로 다시
+          for (let k = 0; k < 8; k++) { const q = planHide(W, c, lv, hab, R); if (Math.hypot(q.x - thr.x, q.z - thr.z) > Math.hypot(np.x - thr.x, np.z - thr.z)) Object.assign(np, q); }
+        }
+        A.plan = { src: -1, x: np.x, z: np.z, a: np.a }; A.mode = 'go'; A.path = null; A.goal = null;
+        if (np.src >= 0 && R() < 0.5) { A.plan.src = np.src; A.mode = 'src'; }
+      }
+      // 내 소리가 난 직후, 아무도 안 보이면 근처 같은 물건 곁으로 자리를 옮김(소리로 짐작한 자리를 비움)
+      if (A.lastP !== c.nextP) {
+        const pinged = A.lastP != null && ph === PH.HUNT; A.lastP = c.nextP;
+        if (pinged && !thr && !W.chars.some((q) => q.hun && W.dyn.al[q.s] && Math.hypot(q.x - c.x, q.z - c.z) < 10) && R() < (lv === 1 ? 0.05 : lv === 2 ? 0.2 : 0.55) * (0.6 + hab.nerve * 0.8)) {
+          const np = planHide(W, c, lv, hab, R, { keep: 1, maxD: 6, avoid: [[c.x, c.z]] });
+          if (np.src >= 0 && M.props[np.src].k === c.p) { A.plan = { src: -1, x: np.x, z: np.z, a: np.a }; A.mode = 'go'; A.path = null; A.goal = null; A.moved = (A.moved || 0) + 1; }
+        }
+      }
+      // 자발 도발(점수): 찾는 쪽이 멀고 안 보일 때
+      if (ph === PH.HUNT && W.t - c.tauntT >= TAUNT_CD) {
+        A.tq = (A.tq || 0) - dt;
+        if (A.tq <= 0) {
+          A.tq = 2;
+          let nearH = 99; for (const q of W.chars) if (q.hun && W.dyn.al[q.s]) nearH = Math.min(nearH, Math.hypot(q.x - c.x, q.z - c.z));
+          const safe = lv >= 3 ? nearH > 22 && !thr : lv === 2 ? nearH > 14 : nearH > 6;
+          if (safe && R() < (lv >= 3 ? 0.03 + hab.taunt * 0.06 : hab.taunt * (lv === 1 ? 0.25 : 0.12))) out.taunt = 1;
+        }
+      }
+    }
+    if (out.mx || out.mz) out.yaw = c.lock ? Math.atan2(out.mx, out.mz) : out.yaw;
+    if (A.mode !== 'go' && A.mode !== 'src' && A.mode !== 'up' && A.mode !== 'climb' && !out.lock) out.yaw = c.yaw;
+    out.jump = out.jump || jumpIfStuck(A, c, dt, !!(out.mx || out.mz));
+    return out;
+  }
+
+  const UP_PRIOR = [0, 0.3, 0.35, 0.3];
+  /* ---- 찾는 쪽 AI: 보이는 것만(시야 110° · 24m · 벽 · 키 큰 가구에 막힘) ---- */
+  function thingsSeen(W, c) {
+    const M = W.M, out = [], fov = 1.0;
+    const add = (id, k, x, z, a, y, real) => {
+      const d = Math.hypot(x - c.x, z - c.z); if (d > 24 || d < 0.3) return;
+      if (Math.abs(angD(Math.atan2(x - c.x, z - c.z), c.yaw)) > fov) return;
+      if (y > 0.05 ? los3(M, c.x, (c.y || 0) + EYE, c.z, x, y + PROPS[k].h * 0.75, z) : losBlocked(M, c.x, c.z, x, z)) return;   // 가구 위의 것은 높이까지 따져서(책장 꼭대기도 멀리서는 보임)
+      out.push({ id, k, x, z, a, y, d, real });
+    };
+    for (const p of M.props) add('r' + p.i, p.k, p.x, p.z, p.a, p.y, 1);
+    for (const q of W.chars) if (!q.hun && W.dyn.al[q.s] && q.p >= 0) add('h' + q.s, q.p, q.x, q.z, q.pa, q.y || 0, 0);
+    return out;
+  }
+  function aiHunter(W, c, lv, hab, dt) {
+    const A = aiState(W, c, hab), M = W.M, ph = phaseOf(W), R = A.R || (A.R = prng(hab.seed ^ 0x1b873593)), D = W.dyn;
+    const out = { mx: 0, mz: 0, yaw: c.yaw, pit: c.pit, fire: 0 };
+    if (ph !== PH.HUNT) { A.look = c.yaw; return out; }
+    const nz = lv === 1 ? 0.8 : lv === 2 ? 0.45 : 0.25;
+    // 소리 듣기(벽 너머도 들림, 35m) — 위치 추정에 오차
+    const evs = W.ev, lastId = A.lastEv || 0;
+    let e0 = evs.length; while (e0 > 0 && evs[e0 - 1][0] > lastId) e0--;
+    if (evs.length) A.lastEv = evs[evs.length - 1][0];
+    for (let ei = e0; ei < evs.length; ei++) { const e = evs[ei]; if (e[1] !== 'p' && e[1] !== 't') continue;
+      const x = e[3] / 50, z = e[4] / 50, d = Math.hypot(x - c.x, z - c.z);
+      if (d > (e[1] === "t" ? 30 : 16)) continue;   // 강제 소리는 작아서 16m 밖에선 안 들림
+      const wall = losBlocked(M, c.x, c.z, x, z) ? 1.5 : 1;
+      const er = (lv === 1 ? 4.0 : lv === 2 ? 3.2 : 2.7) * (0.8 + d / 30) * wall * (e[1] === "t" ? 0.8 : 1);
+      const gx = (R() + R() + R() + R() - 2) * er * 0.6, gz = (R() + R() + R() + R() - 2) * er * 0.6;
+      A.pings.push({ id: e[0], x: x + gx, z: z + gz, t: W.t, sg: er + 0.6, tries: 0 });
+    }
+    A.pings = A.pings.filter((q) => W.t - q.t < 25);
+    // 보기(0.25초마다)
+    A.perT -= dt;
+    if (A.perT <= 0) {
+      A.perT = 0.25;
+      const seen = thingsSeen(W, c), prev = A.seen;
+      // 칸(1m)마다 마지막으로 본 시각 → 「전에 본 자리에 새로 생긴 것」
+      const cellK = (x, z) => Math.floor(x) + Math.floor(z) * 64;
+      const kOf = (k, x, z, y) => k + ":" + Math.round(x * 4) + ":" + Math.round(z * 4) + (y > 0.05 ? "^" + Math.round(y * 4) : "");
+      for (const t of seen) { t.key = kOf(t.k, t.x, t.z, t.y); let q = 1; while (seen.some((u) => u !== t && u.key === t.key)) t.key = kOf(t.k, t.x, t.z, t.y) + "#" + q++; }
+      A.kOf = kOf;
+      const curK = new Set(seen.map((t) => t.key));
+      for (const t of seen) {
+        const key = t.key;
+        let m = A.mem.get(key);
+        if (m && (Math.hypot(m.x - t.x, m.z - t.z) > 0.1 || Math.abs((m.y || 0) - t.y) > 0.1 || (PROPS[t.k].sh === 'b' && Math.abs(angD(m.a, t.a)) > 0.12))) m.moved = 1;
+        if (!m) {
+          // 움직이는 중인 것: 직전에 본 같은 종류 중, 지금도 보이는 자리인데 비어 있는 것과 이어 붙임
+          const pv = prev.find((q) => q.k === t.k && !curK.has(q.key) && Math.hypot(q.x - t.x, q.z - t.z) < 1.4 && Math.hypot(q.x - c.x, q.z - c.z) < 23
+            && Math.abs(angD(Math.atan2(q.x - c.x, q.z - c.z), c.yaw)) < 0.9 && !losBlocked(M, c.x, c.z, q.x, q.z));
+          const ck = cellK(t.x, t.z), lastC = A.cells.get(ck);
+          m = { key, k: t.k, x: t.x, z: t.z, a: t.a, y: t.y, first: W.t, moved: pv ? 1 : 0, appeared: lastC != null && W.t - lastC > 2.5 && !pv ? 1 : 0, shot: 0, hit: 0, j: (hash(hab.seed, (t.x * 37 | 0) ^ (t.z * 91 | 0) ^ t.k) - 0.5) * 2 };
+          if (pv) { const old = A.mem.get(pv.key); if (old) { m.hit = old.hit; m.shot = old.shot; A.mem.delete(pv.key); } }
+          A.mem.set(key, m);
+        }
+        m.seenT = W.t; m.x = t.x; m.y = t.y; m.z = t.z; m.a = t.a; m.d = t.d;
+      }
+      // 이번에 본 자리 칸 기록(시야 안 가까운 칸)
+      for (const t of seen) A.cells.set(cellK(t.x, t.z), W.t);
+      for (let r = 2; r < 12; r += 2) for (let q = -2; q <= 2; q++) { const an = c.yaw + q * 0.35, x = c.x + Math.sin(an) * r, z = c.z + Math.cos(an) * r; if (x > 0 && z > 0 && x < M.W && z < M.D && !losBlocked(M, c.x, c.z, x, z)) A.cells.set(cellK(x, z), W.t); }
+      A.seen = seen.map((t) => ({ k: t.k, x: t.x, z: t.z, key: t.key }));
+      // 의심 점수
+      let best = null, bs = -1e9;
+      for (const t of seen) {
+        const m = A.mem.get(t.key); if (!m || m.clr) continue;
+        // 가구 위의 것도 사람일 수 있음(누구나 올라감). 다만 탁자 · 선반 위에는 원래 온갖 것이 놓이므로 「방에 안 어울림」은 따지지 않고 조금 덜 의심
+        const room = roomAt(M, t.x, t.z), w = poolW(M, room, t.k), up = t.y > 0.05;
+        let s = up ? -UP_PRIOR[lv] : w === 0 ? 1.6 : w < 0.07 ? 0.45 : 0;
+        // 같은 물건 무리 속에서 혼자 방향이 다름(마주 보는 의자처럼 반 바퀴 차이는 같은 방향으로 침)
+        if (PROPS[t.k].sh === 'b') {
+          let nb = 0, mn = 9;
+          for (const q of seen) if (q !== t && q.k === t.k && Math.abs(q.y - t.y) < 0.3 && Math.hypot(q.x - t.x, q.z - t.z) < 2.6) { nb++; mn = Math.min(mn, Math.abs(angD(2 * t.a, 2 * q.a)) / 2); }
+          if (nb >= 2 && mn > 0.3) s += 0.8;
+        }
+        let near = 0; for (const oi of nearO(M, t.x, t.z)) { const o = M.O[oi]; if (o.k !== 'p' && Math.hypot(o.x - t.x, o.z - t.z) < 1.0 + Math.max(o.hx, o.hz)) near++; }
+        if (!near && !up) s += 0.2;
+        if (m.moved) s += 4; if (m.appeared) s += lv === 1 ? 0.6 : 1.4; if (m.hit) s += 6;
+        for (const pg of A.pings) { const dd = Math.hypot(pg.x - t.x, pg.z - t.z); s += 1.75 * Math.exp(-dd * dd / (2 * pg.sg * pg.sg)) * (1 - (W.t - pg.t) / 25) * Math.max(0, 1 - pg.tries / (lv === 1 ? 1.5 : lv === 2 ? 2.5 : 3)); }
+        s += m.j * nz - t.d * 0.03;
+        if (W.dbg) m.why = [m.moved, m.appeared, m.hit, +(1 - Math.min(1, w * 4)).toFixed(2), +s.toFixed(2)];
+        if (s > bs) { bs = s; best = m; }
+      }
+      const late = clamp((W.t - W.ht) / W.tt, 0, 1);
+      const thr = (lv === 1 ? 1.0 : lv === 2 ? 1.25 : 1.5) + (D.hp[c.s] < 35 ? 0.7 : D.hp[c.s] < 60 ? 0.3 : 0) - hab.trig * 0.35 - late * 0.45;
+      A.tgt = best && bs > thr ? best : (A.tgt && W.t - (A.tgt.seenT || 0) < 1.5 && !A.tgt.clr ? A.tgt : null);
+      // 쉬움: 가끔 아무거나 쏴 봄
+      if (!A.tgt && lv === 1 && seen.length && R() < 0.02 + hab.trig * 0.03) { const t = seen[Math.floor(R() * seen.length)], m = A.mem.get(t.key); if (m && t.d < 9) A.tgt = m; }
+    }
+    // 이전 사격 결과 반영
+    if (A.wait && W.lastRes && W.lastRes[c.s]) {
+      const r = W.lastRes[c.s], tg0 = A.wait.m; W.lastRes[c.s] = null;
+      if (r.res === 1) {   // 진짜 물건 — 그 물건은 지우고, 겨냥한 것이 따로 있었으면 가려진 것
+        const p = M.props[r.idx], mm = p && A.kOf ? A.mem.get(A.kOf(p.k, p.x, p.z, p.y)) : null;
+        if (mm) mm.clr = 1;
+        if (tg0 && mm !== tg0) { tg0.blk = (tg0.blk || 0) + 1; if (tg0.blk >= 2) tg0.clr = 1; }
+        A.pause = W.t + (lv === 3 ? 0.4 : lv === 2 ? 0.9 : 1.3) + R() * 0.8;
+        if (p) for (const pg of A.pings) if (Math.hypot(pg.x - p.x, pg.z - p.z) < pg.sg * 1.5) pg.tries++;
+      } else if (r.res >= 2) {
+        let mm = tg0 && Math.hypot(tg0.x - r.x, tg0.z - r.z) < 1.2 ? tg0 : null;
+        if (!mm) for (const m of A.mem.values()) if (Math.hypot(m.x - r.x, m.z - r.z) < 0.8) { mm = m; break; }
+        if (mm) mm.hit = 1;
+      } else if (tg0) { tg0.mis = (tg0.mis || 0) + 1; if (tg0.mis >= 3) tg0.clr = 1; }
+      A.wait = null;
+    }
+    const tg = A.tgt;
+    if (tg && !tg.clr) {
+      const P = PROPS[tg.k], high = (tg.y || 0) > 0.05, eyeY = (c.y || 0) + EYE, dx = tg.x - c.x, dz = tg.z - c.z, d = Math.hypot(dx, dz);
+      const cy = (tg.y || 0) + P.h * (high && tg.y > eyeY - 0.3 ? 0.75 : 0.5);   // 눈높이보다 위에 있으면 윗부분을 겨눔(아래쪽은 가구 모서리에 가림)
+      const blk = high ? los3(M, c.x, eyeY, c.z, tg.x, cy, tg.z) : losBlocked(M, c.x, c.z, tg.x, tg.z);
+      const want = Math.atan2(dx, dz), wp = Math.atan2(cy - eyeY, d);
+      const er = (lv === 1 ? 0.06 : lv === 2 ? 0.03 : 0.012) * (1 + (A.aimJ || 0));
+      if (!A.aimN || W.t - A.aimN > 0.5) { A.aimN = W.t; A.ex = (R() - 0.5) * 2 * er; A.ey = (R() - 0.5) * 2 * er; A.aimJ = R(); }
+      const turn = (lv === 1 ? 3 : lv === 2 ? 5 : 8) * dt;
+      out.yaw = c.yaw + clamp(angD(want + A.ex, c.yaw), -turn, turn); out.pit = c.pit + clamp(wp + A.ey - c.pit, -turn, turn);
+      if (high && blk && d < 5 && d > 0.05) { if (!navBlocked(M, c.x - dx / d * 0.6, c.z - dz / d * 0.6)) { out.mx = -dx / d; out.mz = -dz / d; } A.path = null; }   // 높은 곳이 가구 모서리에 가리면 물러나서 각을 만듦
+      else if (d > 8 || blk) { const mv = goTo(W, c, A, tg.x, tg.z); if (mv) { out.mx = mv.mx; out.mz = mv.mz; } }
+      else A.path = null;
+      const aimed = Math.abs(angD(want, out.yaw)) < Math.max(0.05, Math.atan2(Math.max(P.w, P.d) * 0.45, d)) && Math.abs(wp - out.pit) < 0.12;
+      if (aimed && d < 12 && !(high && blk) && !A.wait && W.t > (A.pause || 0) && W.t - c.fireT >= FIRE_CD + (lv === 1 ? 0.25 : lv === 2 ? 0.1 : 0)) { out.fire = 1; A.wait = { m: tg, t: W.t }; if (W.dbg) W.dbg.push({ s: c.s, m: Object.assign({}, tg), why: tg.why }); }
+      if (A.wait && W.t - A.wait.t > 1) A.wait = null;
+      out.jump = jumpIfStuck(A, c, dt, !!(out.mx || out.mz));
+      return out;
+    }
+    // 둘러보기: 소리가 난 곳 → 오래 안 본 방 → 방 안 아무 곳. 걸으며 고개를 돌림
+    if (!A.wander || A.wander.until < W.t || (Math.hypot(A.wander.x - c.x, A.wander.z - c.z) < 1.0)) {
+      const pg = A.pings.filter((q) => W.t - q.t < 12).sort((a2, b) => b.t - a2.t)[0];
+      let x, z;
+      if (pg && R() < 0.55 + hab.ear * 0.4) { x = pg.x + (R() - 0.5) * 2; z = pg.z + (R() - 0.5) * 2; }
+      else {
+        let br = null, bv = -1e9;
+        for (const r of M.rooms) {
+          const cx = (r.x0 + r.x1) / 2, cz = (r.z0 + r.z1) / 2, last = A.roomT && A.roomT[r.id] != null ? A.roomT[r.id] : -60;
+          const v = (W.t - last) * (0.6 + hab.sweep * 0.6) + (r.x1 - r.x0) * (r.z1 - r.z0) * 0.04 - Math.hypot(cx - c.x, cz - c.z) * 0.3 + R() * 6 - (r.id === M.def.sp ? 20 : 0);
+          if (v > bv) { bv = v; br = r; }
+        }
+        x = br.x0 + 1 + R() * (br.x1 - br.x0 - 2); z = br.z0 + 1 + R() * (br.z1 - br.z0 - 2);
+      }
+      for (let k = 0; k < 8 && navBlocked(M, x, z); k++) { x += (R() - 0.5) * 2; z += (R() - 0.5) * 2; }
+      A.wander = { x: clamp(x, 0.6, M.W - 0.6), z: clamp(z, 0.6, M.D - 0.6), until: W.t + 9 + R() * 6 };
+      A.path = null; A.goal = null;
+    }
+    const rm = roomAt(M, c.x, c.z); if (rm) { A.roomT = A.roomT || {}; A.roomT[rm.id] = W.t; }
+    const mv = goTo(W, c, A, A.wander.x, A.wander.z);
+    if (mv) { out.mx = mv.mx * 0.8; out.mz = mv.mz * 0.8; }
+    if (stuckCheck(A, c, dt, !!mv)) A.wander = null;
+    // 시선: 진행 방향 ± 훑기
+    if (W.t > A.nextLook) { A.nextLook = W.t + 0.8 + R() * 1.4; A.lookOff = (R() - 0.5) * 2.2; }
+    const head = mv ? Math.atan2(mv.mx, mv.mz) : c.yaw;
+    const want = head + (A.lookOff || 0) * (mv ? 0.6 : 1);
+    out.yaw = c.yaw + clamp(angD(want, c.yaw), -2.5 * dt, 2.5 * dt);
+    out.pit = c.pit + clamp(-0.18 - c.pit, -dt, dt);
+    out.jump = jumpIfStuck(A, c, dt, !!mv);
+    return out;
+  }
+  /* 걸으려는데 0.5초 동안 거의 못 움직였으면 한 번 뛰어 봄(낮은 턱 · 물건 모서리에 걸렸을 때) */
+  function jumpIfStuck(A, c, dt, moving) {
+    A.jT = (A.jT || 0) + dt;
+    if (A.jT < 0.5) return 0;
+    A.jT = 0;
+    const was = A.jx != null && moving && c.gr && Math.hypot(c.x - A.jx, c.z - A.jz) < 0.12;
+    A.jx = c.x; A.jz = c.z;
+    return was ? 1 : 0;
+  }
+  function aiInput(W, c, lv, hab, dt) { return c.hun ? aiHunter(W, c, lv, hab, dt) : aiHider(W, c, lv, hab, dt); }
+
+  /* 한 스텝(모든 캐릭터) — inputOf(seat, c) → inp 또는 null(이 기기가 움직이지 않음) */
+  function worldStep(W, dt, inputOf) {
+    W.t += dt;
+    for (const c of W.chars) {
+      const inp = inputOf(c.s, c);
+      if (inp === undefined) continue;
+      stepChar(W, c, inp, dt);
+    }
+    if (W.host) hostTick(W, dt);
+    if (W.efx && W.efx.length > 200) W.efx.splice(0, W.efx.length - 200);
+  }
+
+  /* ======================= 판 진행(api.setState로 가는 거친 상태) ======================= */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = Math.random;
+    const map = MAP_KEYS.includes(opts.map) ? opts.map : MAP_KEYS[Math.floor(R() * MAP_KEYS.length)];
+    const rounds = clamp(+opts.rounds || 4, 1, 8), ht = clamp(+opts.ht || 40, 10, 60), tt = clamp(+opts.tt || 180, 45, 300), pi = clamp(+opts.pi || 45, 15, 90);
+    // 두 편 — 무작위로 나눔(홀수면 첫 판 숨는 쪽이 한 명 더)
+    const ord = shuffle(prng(1 + Math.floor(R() * 2e9)), [...Array(n).keys()]), team = Array(n).fill(0);
+    ord.forEach((s, i) => { team[s] = i < Math.ceil(n / 2) ? 0 : 1; });
+    const st = { v: 1, rid: 1 + Math.floor(R() * 1e6), seed: 1 + Math.floor(R() * 2e9), n, nm: players.map((p) => String(p.name || '').slice(0, 12)), map, R: rounds, ri: 0, ht, tt, pi,
+      team, sc: Array(n).fill(0), rs: 1, ph: 'intro', rr: null, hist: [], seq: 0, stat: { kills: Array(n).fill(0), surv: Array(n).fill(0), tnt: Array(n).fill(0), miss: Array(n).fill(0), hits: Array(n).fill(0) } };
+    return setupRound(st);
+  }
+  function setupRound(st) {
+    st.rs = (prng((st.seed + st.ri * 7919 + 13) >>> 0)() * 2e9 | 0) + 1;
+    st.ph = 'intro'; st.rr = null; st.seq = (st.seq || 0) + 1;
+    return st;
+  }
+  function endRound(st, out) {
+    const ns = JSON.parse(JSON.stringify(st));
+    for (let s = 0; s < ns.n; s++) ns.sc[s] += out.pts[s] || 0;
+    const hunT = hunterTeam(ns.ri);
+    for (let s = 0; s < ns.n; s++) {
+      ns.stat.kills[s] += out.kills[s] || 0; ns.stat.tnt[s] += out.tnt[s] || 0; ns.stat.miss[s] += out.miss[s] || 0; ns.stat.hits[s] += out.hits[s] || 0;
+      if (ns.team[s] !== hunT && out.al[s]) ns.stat.surv[s]++;
+    }
+    ns.rr = { win: out.win, pts: out.pts, al: out.al, t: out.t, hidA: out.hidA, hidN: out.hidN, hunT };
+    ns.hist.push([out.win === 'hun' ? 1 : 0, out.hidA, out.hidN, out.t]);
+    ns.ph = 'res'; ns.seq++;
+    return ns;
+  }
+  function afterRes(st) {
+    const ns = JSON.parse(JSON.stringify(st));
+    if (ns.ri + 1 >= ns.R) { ns.ph = 'done'; ns.seq++; return ns; }
+    ns.ri++;
+    return setupRound(ns);
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done') return null;
+    const nm = (i) => (s.nm && s.nm[i]) || ((i + 1) + '번');
+    const order = [...Array(s.n).keys()].sort((a, b) => s.sc[b] - s.sc[a]);
+    const top = s.sc[order[0]], winners = order.filter((p) => s.sc[p] === top);
+    const tw = [0, 0]; s.hist.forEach((h, i) => { const hunT = hunterTeam(i); tw[h[0] ? hunT : 1 - hunT]++; });
+    return {
+      winners, title: winners.length > 1 ? '공동 1위 ' + winners.map(nm).join(' · ') : nm(winners[0]) + ' 1위',
+      text: order.map((p, k) => (k + 1) + '위  ' + nm(p) + '  ' + s.sc[p] + '점').join('\n'),
+      highlights: s.hist.map((h, i) => (i + 1) + '라운드 — ' + (h[0] ? '찾는 쪽 승리 · 모두 찾음' : '숨는 쪽 승리 · ' + h[1] + '/' + h[2] + ' 생존')).slice(0, 4),
+      stats: [{ label: '점수', values: s.sc.map(String) }, { label: '찾아낸 수', values: s.stat.kills.map(String) }, { label: '끝까지 숨음', values: s.stat.surv.map((v) => v + '회') }, { label: '도발', values: s.stat.tnt.map(String) },
+        { label: '헛쏜 물건', values: s.stat.miss.map(String), low: true }, { label: '편 승리', value: 'A편 ' + tw[0] + ' · B편 ' + tw[1] }],
+    };
+  }
+  function hint(st, seat) {
+    if (!st) return null;
+    const m = MAPS[st.map], out = [(st.ri + 1) + ' / ' + st.R + '라운드 · ' + m.nm];
+    if (seat >= 0) {
+      const hun = st.team[seat] === hunterTeam(st.ri);
+      if (hun) out.push('찾는 쪽. ' + st.ht + '초 눈가림 후 출발.', '수상한 물건을 사격. 진짜 물건이면 체력 −' + MISS + ', 숨은 사람 명중 +3.', '단서: 움직임 · 방에 안 어울림 · 삐뚤게 놓임 · 주기적인 소리.');
+      else out.push('숨는 쪽. 물건 쪽을 보고 변신(E). 모양 · 방향을 그대로 따름.', '방향 고정(R)을 풀면 시점을 따라 돎. 자리를 잡고 다시 고정.', st.pi + '초마다 작은 소리. 도발(F)은 +15점, 위치가 드러남.');
+      out.push(hun ? '점프(Space): 탁자 · 상자 위로 올라섬. 가구 위에 숨은 사람도 있음.' : '점프(Space): 탁자 · 상자 · 통 위로 올라섬. 닿는 곳이면 어디든 숨을 수 있음.');
+    }
+    out.push('점수: 찾아냄 +100 · 끝까지 숨음 +100 · 버틴 3초마다 +1 · 도발 +15.');
+    return out.slice(0, 6);
+  }
+
+  /* ======================= 네트워크 묶기 ======================= */
+  const q50 = (v) => Math.round(v * 50), q100 = (v) => Math.round(v * 100);
+  /* [x, z, yaw, pit, 물건, 물건 방향, 깃발(1 고정 · 2 움직임 · 4 공중), vx, vz, y, vy] — y · vy는 뒤에 붙여 옛 기기와도 맞음 */
+  function packChar(c) { return [q50(c.x), q50(c.z), q100(c.yaw), q100(c.pit), c.p, q100(c.pa), (c.lock ? 1 : 0) | (c.mv ? 2 : 0) | (c.gr === 0 ? 4 : 0), q50(c.vx), q50(c.vz), q50(c.y || 0), q50(c.vy || 0)]; }
+  function unpackChar(c, a) {
+    if (!Array.isArray(a)) return;
+    c.snap = { x: a[0] / 50, z: a[1] / 50, vx: (a[7] || 0) / 50, vz: (a[8] || 0) / 50, y: (a[9] || 0) / 50, vy: (a[10] || 0) / 50, air: (a[6] & 4) ? 1 : 0 };
+    c.yaw = a[2] / 100; c.pit = a[3] / 100;
+    if (typeof a[4] === 'number' && a[4] >= -1 && a[4] < PROPS.length) c.p = a[4];
+    c.pa = a[5] / 100; c.lock = a[6] & 1; c.mv = (a[6] & 2) ? 1 : 0;
+  }
+  function packDyn(W) { const D = W.dyn; return { hp: D.hp.slice(), al: D.al.join(''), sc: D.sc.slice(), tn: D.tnt.slice() }; }
+  function unpackDyn(W, o) {
+    if (!o) return;
+    const D = W.dyn;
+    if (Array.isArray(o.hp)) o.hp.forEach((v, i) => { D.hp[i] = v; });
+    if (typeof o.al === 'string') for (let i = 0; i < o.al.length && i < W.n; i++) D.al[i] = +o.al[i];
+    if (Array.isArray(o.sc)) o.sc.forEach((v, i) => { D.sc[i] = v; });
+    if (Array.isArray(o.tn)) o.tn.forEach((v, i) => { D.tnt[i] = v; });
+  }
+
+  /* ======================= 규칙 · 조작 · 도감 ======================= */
+  const RULES = [
+    { h: '목표', p: ['두 편이 라운드마다 숨는 쪽과 찾는 쪽을 번갈아 맡음. 라운드 점수를 모두 더해 가장 높은 사람이 1위.', '4~16명. 빈자리는 봇. 한 기기에 한 명(온라인 · 같은 와이파이).'] },
+    { h: '숨는 쪽', p: ['처음 「숨는 시간」(기본 40초)은 찾는 쪽이 눈을 가리고 기다림. 그동안 자리를 잡음.', '물건 쪽을 보고 변신(E · 「변신」 단추). 손 닿는 거리(4.5m) 안의 물건만. 모양과 놓인 방향을 그대로 따름.',
+      '방향 고정(R)을 풀면 물건이 시점을 따라 돎. 원하는 방향에서 다시 고정.', '움직이거나 뛰는 동안은 눈에 띔. 자리를 잡으면 멈출 것.',
+      '찾는 시간에는 「소리 간격」(기본 45초)마다 작은 소리가 남. 가까운 곳에서만 들리고, 마지막 1분은 더 자주.', '도발(F)은 큰 소리를 내는 대신 +15점. 10초에 한 번.'] },
+    { h: '찾는 쪽', p: ['눈가림이 끝나면 출발. 수상한 물건을 조준해 사격(마우스 왼쪽 · 「사격」 단추).', '한 발 −25. 숨는 쪽 체력은 물건 크기에 따라 55~135.', '진짜 물건을 쏘면 내 체력 −5. 숨은 사람 명중 +3, 찾아내면 +20.',
+      '단서: 움직이는 물건 · 방에 안 어울리는 물건 · 삐뚤게 놓인 물건 · 전에 없던 물건 · 소리. 탁자 · 선반 위에도 사람이 숨을 수 있음.', '체력이 0이 되면 그 라운드는 관전.'] },
+    { h: '점프 · 오르기', p: ['Space · 「점프」 단추. 숨는 쪽 · 찾는 쪽 모두 같은 높이(약 0.7m)로 뜀. 착지 때 작은 소리.',
+      '점프로 닿는 곳은 어디든 올라설 수 있음. 탁자 · 상자 · 통 · 화단 · 조리대는 한 번에. 가구 쪽으로 밀면서 뛰면 모서리에 조금 못 미쳐도 올라감.',
+      '높은 곳은 낮은 것을 딛고 차례로: 의자 → 탁자 → 찬장 · 서류함 → 선반. 의자는 앉는 면에 올라섬. 팔레트 같은 낮은 턱은 걸어서 오름.',
+      '숨는 쪽: 변신한 채로 가구 위에 올라가 다른 물건 사이에 숨을 수 있음. 뛰어도 방향은 그대로(고정 상태 유지). 가장자리를 벗어나면 떨어짐.',
+      '찾는 쪽: 눈가림 동안은 못 뜀. 가구 위 물건도 쏴서 확인. 숨은 사람(물건)을 밟고 올라설 수도 있음.'] },
+    { h: '라운드 끝', p: ['숨는 쪽이 모두 찾히면 찾는 쪽 승리. 시간이 다 되거나 찾는 쪽이 모두 쓰러지면 숨는 쪽 승리.', '두 편이 역할을 바꿔 다음 라운드. 물건 배치는 라운드마다 새로.'] },
+    { h: '점수', p: ['찾아냄 +100(최근 10초 안에 함께 맞힌 사람 +30) · 명중 +5 · 찾는 쪽 승리 +50.', '끝까지 숨음 +100 · 찾는 시간 3초 버틸 때마다 +1 · 숨는 쪽 승리 +25 · 도발 +15.'] },
+    { h: '조작 — 모바일', p: ['왼쪽 끌기: 이동. 오른쪽 빈 화면 끌기: 시점.', '오른쪽 아래 단추. 숨는 쪽: 변신 · 점프 · 고정 · 도발. 찾는 쪽: 사격 · 점프(사격 단추를 누른 채 끌면 조준).', '탈락 후 화면 누르기: 지켜볼 사람 바꾸기.'] },
+    { h: '조작 — PC', p: ['WASD · 방향키 이동, 마우스를 움직이면 바로 시점(Esc: 마우스 풀기), Space 점프, 왼쪽 클릭 사격.', 'E 변신 · R 방향 고정 · F 도발 · Tab 지켜볼 사람.', '게임패드: 왼쪽 스틱 이동 · 오른쪽 스틱 시점 · A 점프 · RT 사격 · X 변신 · Y 고정 · B 도발.', '키는 설정 화면 「조작 설정」에서 바꿈.'] },
+    { h: '맵', p: MAP_KEYS.map((k) => MAPS[k].nm + ' — ' + MAPS[k].d).concat(['「맵」 옵션 기본은 무작위. 한 판(모든 라운드)은 같은 맵, 물건 배치는 라운드마다 새로.']) },
+    { h: 'AI', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움.', '숨는 쪽 AI는 방에 어울리는 물건을 골라 같은 물건 무리 곁 · 엄폐가 많은 자리에 방향을 맞춰 숨음. 쉬움은 아무 데나 숨거나 방향이 삐뚤고, 들키면 잘 달아남.',
+      '찾는 쪽 AI는 자기 눈에 보이는 것만으로 판단(벽 너머는 못 봄): 움직임 · 어울리지 않는 물건 · 각도 · 새로 생긴 물건 · 들린 소리의 대략 위치. 쉬움은 소리 위치를 크게 틀리고 아무거나 쏘기도 함.'] },
+    { h: '그래픽', p: ['설정 화면 「그래픽 품질(이 기기)」: 낮음(모바일 기본) · 보통 · 높음(그림자 · 고해상도). 끊기면 낮음 권장.'] },
+    { h: '만든 사람', p: ['물건 · 가구 모델 53종 · 바닥 · 벽 결 13종: Poly Haven(polyhaven.com, CC0) — 줄여 압축해 사용. 자료별 목록: app/assets/prophunt/CREDITS.txt',
+      '모델 · 결 만든 사람(영문 순): Amal Kumar, Anzor Lezhava, Aron Łyczek, Benny Weimer, Caspian Fortune, Charles Nderitu, Charlotte Baglioni, Dario Barresi, Dimitrios Savva, Fabi_G, Fran Calvente, Gabriel Radić, James Ray Cock, Jenelle van Heerden, John Malcolm, Jorge Camacho, Jurita Burger, Kirill Sannikov, Kuutti Siitonen, MP, Mateusz Sadek, Monsta3D, Mutanzom3D, PierreB3D, Rahul Chaudhary, Rico Cilliers, Riley Queen, Rob Tuytel, Satyaki Mandal, Sergej Majboroda, Slinc, Ulan Cabanilla, Yann Kervran.',
+      '건물 · 붙박이 가구 · 책 · 잎 · 빛줄기는 코드로 생성. 효과음은 앱 합성음. 3D 엔진 three.js(MIT) — 하이퍼 레이스와 같은 파일 공용.'] },
+  ];
+  const CONTROLS = [
+    { id: 'up', label: '앞으로', keys: ['KeyW', 'ArrowUp'], pad: ['ly-', 'up'] },
+    { id: 'down', label: '뒤로', keys: ['KeyS', 'ArrowDown'], pad: ['ly+', 'down'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA', 'ArrowLeft'], pad: ['lx-', 'left'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD', 'ArrowRight'], pad: ['lx+', 'right'] },
+    { id: 'jump', label: '점프', keys: ['Space'], pad: ['a'] },
+    { id: 'fire', label: '사격(찾는 쪽 · 마우스 왼쪽도)', keys: ['KeyX'], pad: ['rt', 'rb'] },
+    { id: 'xf', label: '변신(숨는 쪽)', keys: ['KeyE'], pad: ['x'] },
+    { id: 'lock', label: '방향 고정(숨는 쪽)', keys: ['KeyR'], pad: ['y'] },
+    { id: 'taunt', label: '도발(숨는 쪽)', keys: ['KeyF'], pad: ['b'] },
+    { id: 'camL', label: '시점 왼쪽', keys: ['KeyQ'], pad: ['rx-'] },
+    { id: 'camR', label: '시점 오른쪽', keys: ['KeyZ'], pad: ['rx+'] },
+    { id: 'camU', label: '시점 위', keys: ['PageUp'], pad: ['ry-'] },
+    { id: 'camD', label: '시점 아래', keys: ['PageDown'], pad: ['ry+'] },
+    { id: 'spec', label: '지켜볼 사람 바꾸기', keys: ['Tab'], pad: ['lb'] },
+  ];
+  const MAT_ICON = {
+    wood: '<rect x="12" y="20" width="32" height="22" rx="2" fill="none" stroke="currentColor" stroke-width="3"/><path d="M12 31h32M28 20v22" stroke="currentColor" stroke-width="2"/>',
+    fab: '<path d="M14 40v-12a6 6 0 016-6h16a6 6 0 016 6v12z" fill="currentColor"/><rect x="10" y="30" width="6" height="12" rx="2" fill="currentColor"/><rect x="40" y="30" width="6" height="12" rx="2" fill="currentColor"/>',
+    paper: '<rect x="14" y="16" width="8" height="26" fill="currentColor"/><rect x="24" y="14" width="8" height="28" fill="currentColor" opacity=".7"/><rect x="34" y="18" width="8" height="24" fill="currentColor"/>',
+    metal: '<path d="M22 14h12l2 6v18a4 4 0 01-4 4H24a4 4 0 01-4-4V20z" fill="currentColor"/><rect x="22" y="22" width="12" height="3" fill="#000" opacity=".3"/>',
+    stone: '<circle cx="28" cy="20" r="7" fill="currentColor"/><path d="M16 42c0-8 5-13 12-13s12 5 12 13z" fill="currentColor"/>',
+    wicker: '<path d="M12 26h32l-4 16H16z" fill="none" stroke="currentColor" stroke-width="3"/><path d="M18 30l4 10M26 30l1 10M34 30l-2 10" stroke="currentColor" stroke-width="2"/>',
+    cer: '<path d="M22 14h12v4c6 3 8 9 6 16-2 6-6 8-12 8s-10-2-12-8c-2-7 0-13 6-16z" fill="currentColor"/>',
+    soft: '<path d="M16 22c4-6 20-6 24 0l2 18c-6 4-22 4-28 0z" fill="currentColor"/>',
+    plastic: '<rect x="14" y="22" width="28" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="3"/><path d="M14 28h28" stroke="currentColor" stroke-width="2"/>',
+    plant: '<path d="M20 34h16l-2 10H22z" fill="currentColor"/><path d="M28 34c0-8-6-14-12-16 2 6 6 12 12 16zM28 34c0-10 4-16 10-18-1 7-4 13-10 18z" fill="currentColor"/>',
+  };
+  const svgI = (inner) => '<svg viewBox="0 0 56 56" width="28" height="28">' + inner + '</svg>';
+  const MAP_ICON = '<path d="M8 44V14h40v30z" fill="none" stroke="currentColor" stroke-width="3"/><path d="M8 28h18v16M26 14v8M34 28h14" stroke="currentColor" stroke-width="3"/>';
+  const codex = [
+    { h: '맵', p: ['4곳 — 기본은 무작위. 물건 배치는 라운드마다 새로 생성.'], rows: MAP_KEYS.map((k) => ({ icon: svgI(MAP_ICON), name: MAPS[k].nm, tag: MAPS[k].rooms.map((r) => r[1]).join(' · '), desc: MAPS[k].sub + '. ' + MAPS[k].d + ' 변신할 수 있는 물건 ' + [...new Set(Object.values(MAPS[k].pools).flatMap((o) => Object.keys(o)))].filter((q) => PROPS[PI[q]].hide).length + '종.' })) },
+    { h: '물건', p: ['변신할 수 있는 물건. 체력은 크기에 따라(사격 한 발 25), 큰 물건은 조금 느림.'], rows: PROPS.filter((p) => p.hide).map((p) => ({ icon: svgI(MAT_ICON[p.m] || MAT_ICON.wood), name: p.nm, tag: MAT_NM[p.m] + ' · 체력 ' + p.hp,
+      desc: '크기 ' + Math.round(p.w * 100) + '×' + Math.round(p.d * 100) + '×' + Math.round(p.h * 100) + 'cm · ' + Math.ceil(p.hp / DMG) + '발에 찾힘' + (p.spd < 1 ? ' · 이동 조금 느림' : '') + ' · 나오는 곳: ' + MAP_KEYS.filter((mk) => Object.values(MAPS[mk].pools).some((o) => o[p.k])).map((mk) => MAPS[mk].nm).join(', ') })) },
+  ];
+
+  /* 홈 미리보기(640×360): 해 질 녘 열람실 — 의자 사이 하나만 조금 삐뚤게 */
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height, R = prng(41);
+    const bg = g.createLinearGradient(0, 0, 0, h); bg.addColorStop(0, '#1d140f'); bg.addColorStop(0.6, '#3b2a1f'); bg.addColorStop(1, '#1a120d'); g.fillStyle = bg; g.fillRect(0, 0, w, h);
+    // 높은 창 · 빛줄기
+    for (const x of [0.16, 0.42, 0.68]) {
+      g.fillStyle = '#e8b878'; g.globalAlpha = 0.85; g.fillRect(w * x, h * 0.08, w * 0.09, h * 0.42); g.globalAlpha = 1;
+      g.fillStyle = '#2a1d15'; g.fillRect(w * x + w * 0.043, h * 0.08, 3, h * 0.42); g.fillRect(w * x, h * 0.27, w * 0.09, 3);
+      const sh = g.createLinearGradient(w * x, h * 0.3, w * (x + 0.25), h); sh.addColorStop(0, 'rgba(255,200,130,.28)'); sh.addColorStop(1, 'rgba(255,200,130,0)');
+      g.fillStyle = sh; g.beginPath(); g.moveTo(w * x, h * 0.5); g.lineTo(w * (x + 0.09), h * 0.5); g.lineTo(w * (x + 0.33), h); g.lineTo(w * (x + 0.16), h); g.fill();
+    }
+    // 마루
+    g.fillStyle = '#4a3122'; g.beginPath(); g.moveTo(0, h * 0.62); g.lineTo(w, h * 0.62); g.lineTo(w, h); g.lineTo(0, h); g.fill();
+    g.strokeStyle = 'rgba(0,0,0,.18)'; for (let k = 0; k < 14; k++) { g.beginPath(); g.moveTo(w * 0.5 + (k - 7) * 18, h * 0.62); g.lineTo(w * 0.5 + (k - 7) * 90, h); g.stroke(); }
+    // 먼지
+    g.fillStyle = 'rgba(255,225,180,.6)'; for (let i = 0; i < 70; i++) { g.globalAlpha = 0.2 + R() * 0.5; g.fillRect(w * (0.15 + R() * 0.7), h * (0.3 + R() * 0.5), 1.5, 1.5); } g.globalAlpha = 1;
+    // 탁자와 의자
+    g.fillStyle = '#2c1b12'; g.fillRect(w * 0.18, h * 0.66, w * 0.64, h * 0.05); g.fillRect(w * 0.2, h * 0.71, 8, h * 0.17); g.fillRect(w * 0.79, h * 0.71, 8, h * 0.17);
+    const chair = (x, y, s, rot) => { g.save(); g.translate(x, y); g.rotate(rot); g.fillStyle = '#21140d'; g.fillRect(-s * 0.3, -s, s * 0.08, s); g.fillRect(-s * 0.3, -s, s * 0.6, s * 0.08); g.fillRect(-s * 0.3, -s * 0.45, s * 0.6, s * 0.1); g.fillRect(-s * 0.26, -s * 0.4, s * 0.06, s * 0.4); g.fillRect(s * 0.22, -s * 0.4, s * 0.06, s * 0.4); g.restore(); };
+    [[0.26, 0.92, 70, 0], [0.4, 0.93, 72, 0], [0.55, 0.93, 72, 0.16], [0.7, 0.92, 70, 0]].forEach(([x, y, s, r]) => chair(w * x, h * y, s, r));
+    // 녹색 등
+    for (const x of [0.32, 0.66]) { g.fillStyle = '#1f5136'; g.beginPath(); g.ellipse(w * x, h * 0.63, 16, 7, 0, Math.PI, 0); g.fill(); const lg = g.createRadialGradient(w * x, h * 0.66, 0, w * x, h * 0.66, 70); lg.addColorStop(0, 'rgba(255,214,150,.35)'); lg.addColorStop(1, 'rgba(255,214,150,0)'); g.fillStyle = lg; g.fillRect(w * x - 70, h * 0.6, 140, 80); }
+    const vg = g.createRadialGradient(w / 2, h / 2, h * 0.3, w / 2, h / 2, w * 0.7); vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.55)'); g.fillStyle = vg; g.fillRect(0, 0, w, h);
+  }
+
+  /* ======================= 그래픽 단계 · 불러오기 ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '폰 권장 — 그림자 없음 · 화면 배율 낮게 · 빛줄기 가볍게', pr: 1, shadow: 0, aa: false },
+    { id: 'mid', nm: '보통', tip: '창으로 드는 빛 그림자 · 계단 현상 줄임', pr: 1.5, shadow: 1024, aa: true },
+    { id: 'high', nm: '높음', tip: 'PC 권장 — 부드러운 그림자 · 고운 화면 · 등불 그림자', pr: 2, shadow: 2048, aa: true },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem('prophunt.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('prophunt.' + k, v); } catch (e) {} } };
+  /* 터치 기기인가: core의 L.touchOnly()가 먼저(주 포인터 · 앱 · 실제 터치 기준 — 갤럭시 S펜처럼 정밀 포인터가 함께 있어도 터치). core에 없을 때만 주 포인터로 판단 */
+  function touchOnly() { try { if (L && typeof L.touchOnly === 'function') return !!L.touchOnly(); return typeof matchMedia === 'function' && matchMedia('(pointer:coarse)').matches; } catch (e) { return false; } }
+  function gfxTier() { const v = store.get('gfx', ''); if (TIERS.some((t) => t.id === v)) return v; if (L && L.debug && L.debug.noTut) return (G.PH_GFX || 'low');   // 시험 도구(머리 없는 브라우저)는 가볍게
+    return touchOnly() ? 'low' : 'mid'; }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  function loadCore() { return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js')).then(() => loadScript('assets/prophunt/view.js')); }
+  /* 그 맵에 필요한 묶음: 물건 모델 + 붙박이 모델 + 바닥 · 벽 결 */
+  function mapNeeds(key) {
+    const m = MAPS[key], ks = new Set();
+    for (const o of Object.values(m.pools)) for (const k of Object.keys(o)) ks.add(k === 'plant' ? 'clay' : k);
+    for (const d of m.decor) if (DECOR[d[0]] && DECOR[d[0]].m) ks.add(DECOR[d[0]].m);
+    // 맵 생성기가 쓰는 물건(놓기 목록에만 있는 것)도
+    const src = String(m.gen); for (const p of PROPS) if (src.includes("'" + p.k + "'")) ks.add(p.k === 'plant' ? 'clay' : p.k);
+    const tx = new Set(); for (const r of m.rooms) { tx.add(r[7]); if (r[8] !== 'glass') tx.add(r[8]); }
+    if (m.env.ceil && m.env.ceil !== 'glass') tx.add(m.env.ceil);
+    tx.add('dwood'); for (const k of m.env.xtex || []) tx.add(k);
+    return { props: [...ks], tex: [...tx] };
+  }
+  function loadMap(key, prog) {
+    const need = mapNeeds(key), all = need.props.map((k) => 'assets/prophunt/pk_p_' + k + '.js').concat(need.tex.map((k) => 'assets/prophunt/pk_t_' + k + '.js'));
+    let done = 0;
+    return Promise.all(all.map((u) => loadScript(u).then(() => { done++; if (prog) prog(done / all.length); })));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+
+  const API = { DT, TAU, EYE, HUN_HP, DMG, MISS, FIRE_CD, XF_CD, TAUNT_CD, REACH, RANGE, PH, PROPS, PI, MAT_NM, DECOR, MAPS, MAP_KEYS, TIERS, clamp, prng, shuffle, angD, store, gfxTier, touchOnly,
+    genMap, makeWorld, worldStep, stepChar, aiInput, habits, castShot, resolveShot, hostTick, roundEnd, phaseOf, hunterTeam, init, setupRound, endRound, afterRes, result, hint,
+    packChar, unpackChar, packDyn, unpackDyn, canTransform, transform, taunt, fx, collide, supportAt, losBlocked, los3, topOf, bodyOf, planUp, roomAt, eyeOf, dirOf, mapNeeds, loadMap, rayOBB, nearO, findPath, navBlocked,
+    GRAV, JUMP_H, JUMP_V, STEP_UP, MANTLE };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 42%,#33251b,#0e0a08)', color: '#efe4d2', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t1 = h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '24px', letterSpacing: '1px' }, text: '물건 변신 숨바꼭질' });
+    const t2 = h('div', { style: { fontSize: '13px', color: '#d9ccb6' }, text: '3D 엔진 불러오는 중' });
+    const bar = h('div', { style: { width: '220px', height: '4px', borderRadius: '2px', background: 'rgba(255,255,255,.12)', overflow: 'hidden' } }, h('div', { style: { width: '6%', height: '100%', background: '#c9a46a', transition: 'width .2s' } }));
+    box.append(t1, t2, bar);
+    root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(clamp(f, 0.05, 1) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기에서는 3D 그래픽(WebGL)을 켤 수 없음.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.3, '맵 자료 준비 중');
+      view = G.PH_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못함. (' + (e && e.message || e) + ')'); });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<path d="M14 46V27a14 14 0 0128 0v19" fill="none" stroke="currentColor" stroke-width="3.5"/><rect x="10" y="44" width="36" height="4" rx="2" fill="currentColor"/><rect x="21" y="30" width="14" height="14" rx="2" fill="currentColor"/><circle cx="28" cy="16" r="3" fill="currentColor"/><path d="M40 12l6-4M42 18h7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" opacity=".7"/>';
+
+  if (L) L.register({
+    id: 'prophunt', name: '물건 변신 숨바꼭질', tag: '3D 숨바꼭질', cat: '파티', icon: ICON, tint: '#2a1f17',
+    blurb: '4~16명이 두 편으로 나뉘어, 숨는 쪽은 의자 · 화분 · 상자 같은 물건으로 변신해 숨고 찾는 쪽은 수상한 물건을 쏴서 찾는 3D 숨바꼭질. 진짜 물건을 쏘면 찾는 쪽이 다치고, 숨는 쪽은 주기적으로 작은 소리를 냄. 라운드마다 역할 교대.',
+    time: '10–20분', landscape: true, realtime: true, aiDelay: 0, mood: 'tension', ambient: false, sidePanel: false,
+    minPlayers: 4, maxPlayers: 16, defaultPlayers: 8,
+    options: [
+      { id: 'map', label: '맵', tip: '한 판 동안 같은 맵. 물건 배치는 라운드마다 새로.', choices: [{ v: 'rnd', label: '무작위' }].concat(MAP_KEYS.map((k) => ({ v: k, label: MAPS[k].nm, tip: MAPS[k].sub }))), def: 'rnd' },
+      { id: 'rounds', label: '라운드', tip: '두 편이 번갈아 찾으므로 짝수 권장.', choices: [{ v: 2, label: '2' }, { v: 4, label: '4' }, { v: 6, label: '6' }], def: 4 },
+      { id: 'ht', label: '숨는 시간', tip: '찾는 쪽이 눈을 가리고 기다리는 시간.', choices: [{ v: 30, label: '30초' }, { v: 40, label: '40초' }, { v: 45, label: '45초' }], def: 40 },
+      { id: 'tt', label: '찾는 시간', choices: [{ v: 60, label: '1분' }, { v: 120, label: '2분' }, { v: 180, label: '3분' }, { v: 240, label: '4분' }], def: 180 },
+      { id: 'pi', label: '소리 간격', tip: '숨는 쪽이 자동으로 작은 소리를 내는 간격. 마지막 1분은 더 자주.', choices: [{ v: 30, label: '30초' }, { v: 45, label: '45초' }, { v: 60, label: '60초' }], def: 45 },
+    ],
+    setupExtra(opts, ctx) {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 2px' }, text: '그래픽 품질(이 기기)' }));
+        for (const t of TIERS) wrap.append(h('button', { class: 'btn sm' + (gfxTier() === t.id ? ' primary' : ''), title: t.tip, style: { minHeight: '44px' }, text: t.nm, onclick() { store.set('gfx', t.id); draw(); } }));
+      };
+      draw();
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['두 편이 라운드마다 숨는 쪽 · 찾는 쪽을 번갈아 맡음. 모든 라운드 점수 합계로 순위', '숨는 쪽: 물건 쪽을 보고 변신(E), 자리 잡고 방향 고정(R). 정해진 간격마다 작은 소리, 도발(F) +15점', '찾는 쪽: 수상한 물건을 사격. 진짜 물건을 쏘면 내 체력 −5', '점프(Space · 단추). 닿는 곳이면 누구나 탁자 · 상자 · 가구 위에 올라섬. 모바일: 왼쪽 끌기 이동 · 오른쪽 끌기 시점'],
+    rules: RULES,
+    codex,
+    preview,
+    hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.PROPHUNT = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

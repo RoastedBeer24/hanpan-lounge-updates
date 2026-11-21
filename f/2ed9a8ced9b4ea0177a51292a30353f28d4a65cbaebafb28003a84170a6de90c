@@ -1,0 +1,2203 @@
+/* 잉크 영토전 (paint) — top-down realtime 2-team turf war (2–8, one human per phone; empty seats = AI).
+   Ink spirits shoot ink to paint the floor; swim in your own ink (fast, refill, hidden); enemy ink slows and hurts.
+   Host-authoritative: the host (or local phone) simulates everything. Guests publish input (~15 Hz) and receive
+   ~10 Hz snapshots (floor packed 3 cells/char + players/shots/objects/events). Phases via api.setState. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ======================= engine (pure, node-testable) ======================= */
+  const MW = 32, MH = 44, N = MW * MH;
+  const FL = 0, HW = 1, LW = 2, GR = 3, PAD0 = 4, PAD1 = 5, JP = 6, DR = 7, RL = 8; // RL..RL+3: ink rails →,↓,←,↑
+  const RDIR = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+  const isRail = (t) => t >= RL && t < RL + 4;
+  const paintable = (t) => t === FL;
+  const solid = (t) => t === HW || t === DR; // stops ink and sight
+  const ALPH = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_';
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const wrapA = (a) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
+  const PRAD = 0.36;
+  const V_WALK = 4.6, V_SWIM = 8.4, V_CRIT = 3.1, ENEMY_SLOW = 0.5;
+  const RESPAWN = 4, INV = 2, COUNT = 5, COUNT_H = 15, READY_T = 3, HOLD_MAX = 20, END_T = 2.6;
+  const TEAMC = ['#f2782e', '#5b6cf2'];
+  const TEAMN = ['주황 팀', '남보라 팀'];
+  /* Shared sight: every player (phone, PC, bot, online guest) sees the same square of VIEW×VIEW cells centred on
+     themselves. The screen zooms to fit that square; bots only notice enemies inside it; ink never flies past it. */
+  const VIEW = 17, VH = VIEW / 2, PEEK = 2.2;
+  const inBox = (p, x, y) => Math.abs(x - p.x) <= VH && Math.abs(y - p.y) <= VH;
+  function boxLen(ca, sa, len) { // how far a straight shot from the box centre may travel before leaving the box
+    let m = len;
+    if (Math.abs(ca) > 1e-6) m = Math.min(m, VH / Math.abs(ca));
+    if (Math.abs(sa) > 1e-6) m = Math.min(m, VH / Math.abs(sa));
+    return m;
+  }
+  const hiddenFrom = (p, q) => q.sm && !(q.vis > 0) && !(q.rv > 0) && Math.hypot(q.x - p.x, q.y - p.y) >= PEEK;
+  /* on screen for p: alive, inside p's sight box, not hidden under ink */
+  const inView = (p, q) => q.alive && inBox(p, q.x, q.y) && !hiddenFrom(p, q);
+  /* p knows where q is (on screen, or revealed by a sensor/scan — shown on the minimap for everyone alike) */
+  const known = (p, q) => q.alive && (q.rv > 0 || inView(p, q));
+
+  const FAMS = {
+    shooter: { name: '연사총', kind: '슈터', icon: '🔫', range: 6.5, want: 4.5, ai: 'hold',
+      desc: '누르고 있으면 잉크 방울을 빠르게 연사해요. 쓰기 쉬운 기본 무기.', stat: '초당 8발 · 한 발 피해 25(4발) · 사거리 약 6.5칸 · 쏘는 동안 ×0.78' },
+    roller: { name: '굴림대', kind: '롤러', icon: '🧻', range: 4, want: 0, ai: 'roll',
+      desc: '누른 채 움직이면 앞을 넓게 굴려 칠하고, 닿은 상대를 한 번에 쓰러뜨려요. 누르는 순간 앞으로 잉크를 휘둘러요.', stat: '휘두르기 5방울 × 50 · 사거리 약 4칸 · 굴리기 폭 3칸 · 접촉 160' },
+    charger: { name: '저격창', kind: '차저', icon: '🎯', range: 8.5, want: 7.5, ai: 'charge',
+      desc: '누르고 있으면 힘을 모으고, 떼면 곧은 먹물 줄기가 날아가요. 다 모으면 한 방. 단, 시야(내 화면) 밖으로는 못 날아가요.', stat: '다 모으기 1.2초 · 최대 피해 160 · 사거리 7~13칸(시야 안) · 모으는 동안 ×0.42' },
+    brush: { name: '붓', kind: '붓', icon: '🖌️', range: 3, want: 0, ai: 'roll',
+      desc: '누른 채 움직이면 좁게 칠하며 아주 빠르게 달려요(×1.3). 누르는 순간 앞으로 잉크를 튀겨요.', stat: '튀기기 3방울 × 38 · 사거리 약 3칸 · 칠하며 달리기 폭 2칸 · 접촉 80' },
+    bucket: { name: '양동이', kind: '양동이', icon: '🏺', range: 5.2, want: 4.6, ai: 'hold',
+      desc: '잉크를 포물선으로 퍼부어요. 벽 너머로도 넘어가 떨어진 자리를 넓게 칠해요.', stat: '0.55초마다 · 5칸 앞에 떨어짐 · 반지름 1.9칸 · 가운데 피해 90 · 벽을 넘어감' },
+    dualie: { name: '쌍권총', kind: '쌍권총', icon: '🔫', range: 5.2, want: 3.6, ai: 'hold',
+      desc: '양손으로 빠르게 연사해요. 쏘면서 「잠수」를 누르면 그 방향으로 재빨리 굴러 피해요.', stat: '초당 11발 · 한 발 피해 22 · 사거리 약 5칸 · 구르기 2.4칸(잉크 7, 0.6초마다)' },
+    brella: { name: '우산', kind: '우산', icon: '☂️', range: 3.8, want: 2.8, ai: 'hold',
+      desc: '누르고 있는 동안 앞쪽을 우산이 막아 줘요. 쏘면 7방울이 부채꼴로 퍼져요.', stat: '0.5초마다 산탄 7방울 × 30 · 사거리 약 4칸 · 우산 막기 140(부서지면 5초 뒤 다시)' },
+    gatling: { name: '개틀링', kind: '개틀링', icon: '🌀', range: 8, want: 6.5, ai: 'gat',
+      desc: '누르고 있으면 충전하고, 떼면 충전한 만큼 길게 쏟아내요. 멀리, 오래 쏴요.', stat: '충전 0.75초 · 최대 1.8초 연사 · 한 발 26 · 사거리 약 8칸 · 충전 ×0.55' },
+    sprink: { name: '분무기', kind: '분무기', icon: '💫', range: 3.8, want: 2.6, ai: 'hold',
+      desc: '누르고 있으면 몸 둘레로 빙글빙글 잉크를 뿌려요. 둘레를 빠르게 칠하고, 절반은 조준한 쪽으로 날아가요.', stat: '초당 33방울(절반은 사방, 절반은 앞쪽) · 한 방울 36 · 사거리 약 4칸' },
+    blaster: { name: '폭발 발사기', kind: '발사기', icon: '💥', range: 5, want: 4.2, ai: 'hold',
+      desc: '느린 잉크 탄을 쏴요. 직접 맞으면 한 방, 빗나가도 끝에서 터져 둘레를 다치게 해요.', stat: '0.55초마다 · 직격 125 · 폭발 반지름 1.7칸 피해 60 · 사거리 약 5칸' },
+  };
+  const FAM_KEYS = Object.keys(FAMS);
+  const W0 = (fam, name, sub, sp, spMax, note) => ({ fam, name, sub, sp, spMax, note: note || '' });
+  const WEP = [
+    W0('shooter', '잉크 연사총', 'm', 'rain', 180), W0('shooter', '연사총 정찰형', 's', 'scan', 170),
+    W0('roller', '잉크 굴림대', 'b', 'rush', 210), W0('roller', '철판 굴림대', 'w', 'dome', 190),
+    W0('charger', '먹물 저격창', 'c', 'beam', 170), W0('charger', '저격창 매복형', 'm', 'barrage', 180),
+    W0('brush', '쾌속 붓', 'k', 'rush', 200), W0('brush', '먹선 붓', 's', 'armor', 190),
+    W0('bucket', '잉크 양동이', 'b', 'bigbomb', 190), W0('bucket', '쏟는 양동이', 'q', 'rain', 180),
+    W0('dualie', '쌍권총', 'k', 'ring', 180), W0('dualie', '쌍권총 그림자형', 't', 'scan', 170),
+    W0('brella', '잉크 우산', 'q', 'dome', 180), W0('brella', '강철 우산', 'm', 'armor', 190),
+    W0('gatling', '회전 개틀링', 'w', 'barrage', 190), W0('gatling', '긴총열 개틀링', 'c', 'bigbomb', 200),
+    W0('sprink', '회전 분무기', 'm', 'ring', 170), W0('sprink', '안개 분무기', 'c', 'rain', 180),
+    W0('blaster', '폭발 발사기', 't', 'armor', 190), W0('blaster', '충격 발사기', 'b', 'beam', 180),
+  ];
+  WEP.forEach((w) => { w.spMax = Math.round(w.spMax * 0.75); const F = FAMS[w.fam]; w.icon = F.icon; w.kind = F.kind; w.desc = F.desc; w.stat = F.stat; });
+  const famOf = (p) => (WEP[p.w] || WEP[0]).fam;
+  const SUBS = {
+    b: { name: '잉크 폭탄', cost: 65, icon: '💣', desc: '던지면 0.9초 뒤 터져 반지름 2.6칸을 칠해요. 가운데 맞으면 한 번에 쓰러져요(피해 140, 가장자리 56).' },
+    m: { name: '튀김 지뢰', cost: 50, icon: '⚙️', desc: '발밑에 몰래 깔아요. 상대가 1.5칸 안에 오면 잠시 뒤 터져요(피해 110, 반지름 2.2칸). 한 명당 하나만.' },
+    c: { name: '안개 구슬', cost: 55, icon: '🌫️', desc: '던진 자리에 3.5초 동안 잉크 안개가 퍼져 그 안의 상대에게 초당 32 피해를 주고 조금씩 칠해요.' },
+    w: { name: '잉크 장벽', cost: 60, icon: '🧱', desc: '앞에 폭 2.6칸 장벽을 7초 세워요. 상대 잉크(총알·줄기)를 막아요(내구 180).' },
+    s: { name: '탐지 구슬', cost: 45, icon: '📡', desc: '던진 자리 반지름 3.2칸 안의 상대를 7초 동안 드러내요. 잠수해도 보이고 모두의 지도에 표시돼요.' },
+    k: { name: '굴림 폭탄', cost: 60, icon: '🥌', desc: '바닥을 미끄러지며 길을 칠하고 1.5초 뒤(상대에 닿으면 바로) 터져요(피해 110, 반지름 2.2칸).' },
+    q: { name: '잉크 분사기', cost: 55, icon: '⛲', desc: '던진 자리에 10초 동안 둘레 2.4칸을 저절로 칠하는 장치를 놓아요. 가까운 상대에게 초당 14 피해.' },
+    t: { name: '추적 폭탄', cost: 65, icon: '🐌', desc: '바닥을 기어 가까운 상대(보이는 상대만)를 쫓아가 터져요(피해 100, 반지름 1.8칸, 최대 3초).' },
+  };
+  const SPS = {
+    rush: { name: '해일 돌진', icon: '🌊', desc: '5초 동안 빨라지고(×1.45), 받는 피해가 1/4로 줄고, 주변을 크게 칠하며 닿은 상대를 쓰러뜨려요.' },
+    rain: { name: '잉크 소나기', icon: '🌧️', desc: '조준한 곳(최대 6칸 앞)에 6초 동안 잉크 비를 내려 반지름 3.5칸을 칠하고 그 안의 상대에게 초당 30 피해.' },
+    beam: { name: '관통 광선', icon: '⚡', desc: '0.5초 힘을 모은 뒤 조준 방향으로 벽을 뚫는 굵은 광선을 쏴요(시야 끝까지). 맞은 상대는 쓰러져요.' },
+    dome: { name: '거품 방패', icon: '🫧', desc: '내 자리에 6초 동안 반지름 2.6칸 거품을 씌워 상대 잉크 총알·줄기를 막아요.' },
+    barrage: { name: '포격 연발', icon: '🎆', desc: '조준한 곳(최대 6칸 앞) 둘레에 0.45초마다 5번 포격이 떨어져요(경고 표시 뒤 피해 95, 반지름 1.8칸).' },
+    armor: { name: '잉크 갑옷', icon: '🛡️', desc: '내 시야 안의 우리 팀 모두에게 8초 동안 피해 45를 먼저 막아 주는 갑옷을 입혀요.' },
+    bigbomb: { name: '거대 폭탄', icon: '☄️', desc: '큰 폭탄을 던져요. 1.4초 뒤 반지름 4.2칸을 크게 칠하고 터져요(피해 180).' },
+    ring: { name: '충격파 고리', icon: '⭕', desc: '내 둘레로 반지름 6칸까지 퍼지는 잉크 고리를 일으켜요. 고리에 닿은 상대는 피해 90, 고리가 지난 곳은 칠해져요.' },
+    scan: { name: '먹물 탐조등', icon: '🔦', desc: '상대 모두를 6초 동안 드러내요(잠수해도 보이고 모두의 지도에 표시).' },
+  };
+  const STYLES = {
+    open: { name: '탁 트인 광장', desc: '기둥과 낮은 담이 띄엄띄엄. 멀리 보이고 저격이 잘 통해요.' },
+    alley: { name: '좁은 골목', desc: '긴 벽이 길을 여러 갈래로 나눠요. 숨어 다니기와 근접전이 중요해요.' },
+    tower: { name: '가운데 언덕', desc: '가운데를 낮은 담과 철망 바닥이 둘러싸요. 가운데를 차지하는 싸움.' },
+  };
+  const STYLE_KEYS = Object.keys(STYLES);
+  const MODES = {
+    turf: { name: '영토전', desc: '시간이 끝났을 때 바닥을 더 넓게 칠한 팀이 이겨요.' },
+    zone: { name: '거점 점령', desc: '가운데 거점(점선 네모)의 60% 이상을 우리 색으로 칠하면 점령. 점령 시간이 먼저 100초가 되거나, 끝났을 때 더 긴 팀이 이겨요.' },
+    tower: { name: '잉크 탑 운반', desc: '가운데 잉크 탑 위에 우리 팀만 올라가 있으면 탑이 상대 기지 쪽으로 움직여요. 상대 진영 깊이 들어갈수록 탑이 빨라져요(최대 2.5배). 상대 기지 앞까지 옮기면 바로 승리, 아니면 끝났을 때 더 멀리 옮긴 팀이 이겨요.' },
+  };
+  const MODE_KEYS = Object.keys(MODES);
+  const ZONE_WIN = 100, TOWER_V = 1.6;
+
+  function rng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const SPAWN = [[MW / 2, MH - 1.7], [MW / 2, 1.7]];
+  const walkFor = (t, tm) => t === FL || t === GR || t === PAD0 + tm || t === JP || isRail(t);
+  const walkAny = (t) => t === FL || t === GR || t === JP || isRail(t);
+
+  /* deterministic map (style, seed): point-symmetric (team 0 bottom ↔ team 1 top), sometimes also mirrored left-right.
+     Gimmicks: jump pads, ink rails (conveyors), doors that open when inked. */
+  function genMap(style, seed) {
+    for (let tr = 0; tr < 40; tr++) {
+      const R = rng((seed ^ 0x5bd1) + tr * 7919);
+      const T = new Array(N).fill(FL);
+      const mx = R() < 0.55;
+      const sym = (x, y) => { const pts = [[x, y, 0], [MW - 1 - x, MH - 1 - y, 1]]; if (mx) pts.push([MW - 1 - x, y, 2], [x, MH - 1 - y, 3]); return pts; };
+      const put = (x, y, v) => {
+        if (x < 0 || y < 0 || x >= MW || y >= MH) return;
+        for (const [a, b] of sym(x, y)) T[b * MW + a] = v;
+      };
+      const putRail = (x, y, d) => { // direction transforms with the symmetry: rotate 180 / mirror x / mirror y
+        if (x < 0 || y < 0 || x >= MW || y >= MH) return;
+        for (const [a, b, k] of sym(x, y)) {
+          let dd = d;
+          if (k === 1) dd = (d + 2) % 4; else if (k === 2) dd = d === 0 ? 2 : d === 2 ? 0 : d; else if (k === 3) dd = d === 1 ? 3 : d === 3 ? 1 : d;
+          T[b * MW + a] = RL + dd;
+        }
+      };
+      const rect = (x, y, w, h, v) => { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) put(x + i, y + j, v); };
+      const rx = (lo, hi) => lo + Math.floor(R() * (hi - lo + 1));
+      const top = (h) => rx(5, MH / 2 - h);
+      if (style === 'alley') {
+        const k = 3 + rx(0, 1);
+        for (let q = 0; q < k; q++) { const len = rx(5, 9); rect(rx(2, MW - 4), top(len), 1 + (R() < 0.3 ? 1 : 0), len, HW); }
+        for (let q = 0; q < 2; q++) rect(rx(2, MW - 8), top(1), rx(3, 6), 1, LW);
+        rect(rx(3, MW - 6), rx(8, MH / 2 - 3), 2, 2, HW);
+      } else if (style === 'tower') {
+        const cx = MW / 2, cy = MH / 2, hw = rx(4, 6), hh = rx(3, 4);
+        for (let x = cx - hw; x < cx + hw; x++) { if (Math.abs(x - cx + 0.5) > 1.6) { put(x, cy - hh, LW); } }
+        for (let y = cy - hh; y < cy; y++) { if (Math.abs(y - (cy - hh / 2)) > 1) put(cx - hw, y, LW); }
+        rect(cx - 2, cy - 2, 2, 2, GR);
+        for (let q = 0; q < 3; q++) rect(rx(2, MW - 4), top(2), rx(1, 2), rx(1, 2), HW);
+        rect(rx(3, MW - 7), rx(7, 10), rx(3, 5), 1, LW);
+      } else { // open
+        const k = 4 + rx(0, 3);
+        for (let q = 0; q < k; q++) rect(rx(2, MW - 4), top(2), rx(1, 2), rx(1, 2), HW);
+        for (let q = 0; q < 3; q++) { if (R() < 0.5) rect(rx(2, MW - 7), top(1), rx(3, 5), 1, LW); else rect(rx(2, MW - 3), top(4), 1, rx(3, 4), LW); }
+      }
+      if (R() < 0.7) rect(rx(3, MW - 5), rx(8, MH / 2 - 3), 2, 2, GR);
+      // gimmicks (at least two kinds per map)
+      const gk = [R() < 0.75, R() < 0.75, R() < 0.75];
+      if (gk.filter(Boolean).length < 2) { gk[rx(0, 2)] = true; gk[rx(0, 2)] = true; }
+      if (gk[0]) { // door in a wall line: 7 long, 2 door cells
+        const y = rx(10, MH / 2 - 4), x = rx(2, MW - 10);
+        for (let i = 0; i < 7; i++) put(x + i, y, i === 2 || i === 3 ? DR : HW);
+      }
+      if (gk[1]) { // ink rail
+        if (R() < 0.6) { const len = rx(5, 8), y = rx(9, MH / 2 - 2), x = rx(2, MW - 2 - len), d = R() < 0.5 ? 0 : 2; for (let i = 0; i < len; i++) putRail(x + i, y, d); }
+        else { const len = rx(4, 7), x = rx(3, MW - 4), y = rx(8, MH / 2 - 1 - len), d = R() < 0.5 ? 1 : 3; for (let i = 0; i < len; i++) putRail(x, y + i, d); }
+      }
+      if (gk[2]) { const n = 1 + (R() < 0.4 ? 1 : 0); for (let q = 0; q < n; q++) put(rx(3, MW - 4), rx(9, MH / 2 - 2), JP); }
+      // pads & clear area in front of them
+      for (let y = 0; y < 7; y++) for (let x = 9; x < MW - 9; x++) put(x, y, FL);
+      for (let y = 0; y < 3; y++) for (let x = MW / 2 - 3; x < MW / 2 + 3; x++) { T[y * MW + x] = PAD1; T[(MH - 1 - y) * MW + (MW - 1 - x)] = PAD0; }
+      // connectivity from bottom pad (doors count as walls)
+      const seen = new Uint8Array(N), q = [((MH - 2) * MW) + MW / 2];
+      seen[q[0]] = 1;
+      while (q.length) {
+        const c = q.pop(), x = c % MW, y = (c / MW) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= MW || ny >= MH) continue;
+          const n = ny * MW + nx, t = T[n];
+          if (seen[n] || t === HW || t === LW || t === DR) continue;
+          seen[n] = 1; q.push(n);
+        }
+      }
+      if (!seen[MW + MW / 2]) continue;
+      let tot = 0;
+      for (let i = 0; i < N; i++) { if ((T[i] === FL || T[i] === GR || T[i] === JP || isRail(T[i])) && !seen[i]) T[i] = HW; if (T[i] === FL) tot++; }
+      if (tot < N * 0.7) continue;
+      return { T, tot, style };
+    }
+    const T = new Array(N).fill(FL);
+    for (let y = 0; y < 3; y++) for (let x = MW / 2 - 3; x < MW / 2 + 3; x++) { T[y * MW + x] = PAD1; T[(MH - 1 - y) * MW + x] = PAD0; }
+    let tot = 0; for (let i = 0; i < N; i++) if (T[i] === FL) tot++;
+    return { T, tot, style };
+  }
+  const cellAt = (x, y) => clamp(Math.floor(y), 0, MH - 1) * MW + clamp(Math.floor(x), 0, MW - 1);
+  function blockedAt(T, x, y, r, tm) {
+    if (x - r < 0 || y - r < 0 || x + r > MW || y + r > MH) return true;
+    for (let cy = Math.floor(y - r); cy <= Math.floor(y + r); cy++) for (let cx = Math.floor(x - r); cx <= Math.floor(x + r); cx++) {
+      if (!walkFor(T[cy * MW + cx], tm)) return true;
+    }
+    return false;
+  }
+  function los(T, x0, y0, x1, y1) {
+    const d = Math.hypot(x1 - x0, y1 - y0), n = Math.ceil(d / 0.3);
+    for (let k = 1; k < n; k++) { const x = x0 + ((x1 - x0) * k) / n, y = y0 + ((y1 - y0) * k) / n; if (solid(T[cellAt(x, y)])) return false; }
+    return true;
+  }
+  function teamSlot(W, p) { let k = 0; for (const q of W.ps) { if (q === p) break; if (q.tm === p.tm) k++; } return k; }
+  function spawnPos(W, p) {
+    const k = teamSlot(W, p), off = ((k % 4) - 1.5) * 1.3;
+    return { x: SPAWN[p.tm][0] + (p.tm ? -off : off), y: SPAWN[p.tm][1] };
+  }
+  /* mode geometry (both host and guests derive it from the map) */
+  function modeGeo(M, mode) {
+    const g = { zone: [], zset: new Uint8Array(N), path: null, c0: 0 };
+    if (mode === 'zone') {
+      for (let y = MH / 2 - 3; y < MH / 2 + 3; y++) for (let x = MW / 2 - 4; x < MW / 2 + 4; x++) { const i = y * MW + x; g.zset[i] = 1; if (paintable(M.T[i])) g.zone.push(i); }
+    }
+    if (mode === 'tower') {
+      // nearest walkable cell to the centre, then BFS paths to the cell in front of each base
+      let st = -1, bd = 1e9;
+      for (let i = 0; i < N; i++) if (walkAny(M.T[i])) { const d = Math.hypot((i % MW) + 0.5 - MW / 2, ((i / MW) | 0) + 0.5 - MH / 2); if (d < bd - 1e-9) { bd = d; st = i; } }
+      const par = new Int32Array(N).fill(-2); par[st] = -1; const q = [st];
+      for (let h = 0; h < q.length; h++) { const c = q[h], x = c % MW, y = (c / MW) | 0; for (const [dx, dy] of [[0, -1], [0, 1], [1, 0], [-1, 0]]) { const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= MW || ny >= MH) continue; const n = ny * MW + nx; if (par[n] !== -2 || !walkAny(M.T[n])) continue; par[n] = c; q.push(n); } }
+      const pathTo = (gx, gy) => { let best = -1, bd2 = 1e9; for (let i = 0; i < N; i++) if (par[i] !== -2) { const d = Math.abs((i % MW) - gx) + Math.abs(((i / MW) | 0) - gy); if (d < bd2) { bd2 = d; best = i; } } const out = []; for (let c = best; c >= 0; c = par[c]) out.push(c); return out; };
+      const up = pathTo(MW / 2, 5), dn = pathTo(MW / 2 - 1, MH - 6); // up: goal→…→start
+      const cells = up.concat(dn.reverse().slice(1));
+      g.path = cells.map((c) => [(c % MW) + 0.5, ((c / MW) | 0) + 0.5]);
+      g.c0 = up.length - 1;
+    }
+    return g;
+  }
+  function towerPos(W, idx) {
+    const P = W.geo.path; if (!P || !P.length) return [MW / 2, MH / 2];
+    const i = clamp(idx, 0, P.length - 1), a = Math.floor(i), b = Math.min(P.length - 1, a + 1), k = i - a;
+    return [P[a][0] + (P[b][0] - P[a][0]) * k, P[a][1] + (P[b][1] - P[a][1]) * k];
+  }
+  function newWorld(cfg) {
+    const M = genMap(cfg.mp, cfg.sd);
+    const mode = MODE_KEYS.includes(cfg.mode) ? cfg.mode : 'turf';
+    const W = { t: 0, T: cfg.T, n: cfg.n, map: M, mode, geo: modeGeo(M, mode), grid: new Array(N).fill(0), ps: [], shots: [], obs: [], evs: [], evId: 0,
+      dh: {}, dopen: [], zs: [0, 0], zc: -1, tw: 0, tb: [0, 0], ko: -1 };
+    W.tw = W.geo.c0;
+    for (let s = 0; s < cfg.n; s++) {
+      const w = cfg.ws && fin(cfg.ws[s]) && WEP[cfg.ws[s]] ? cfg.ws[s] : 0;
+      W.ps.push({ seat: s, tm: s % 2, x: 0, y: 0, vx: 0, vy: 0, a: s % 2 ? Math.PI / 2 : -Math.PI / 2, ma: 0,
+        mx: 0, my: 0, ax: 0, ay: 0, fire: false, dive: false, subN: 0, spN: 0, subSeen: 0, spSeen: 0,
+        w, wantW: w, hp: 100, ink: 100, sp: 0, alive: true, rsp: 0, inv: 0, dmgT: 9, fireCd: 0, inkCd: 0, chg: 0,
+        roll: false, sm: false, crit: false, spAct: 0, spK: '', vis: 0, rv: 0, pf: false, hc: {}, by: -1,
+        ar: 0, art: 0, sh: 140, shCd: 0, shOn: false, burst: 0, gt: 0, spin: 0, air: 0, jvx: 0, jvy: 0, jt: 0, dg: 0, dgCd: 0, dgx: 0, dgy: 0, pdv: false,
+        pc: 0, kills: 0, deaths: 0, spUse: 0, moved: 0, hold: false, holdT: 0, rdy: false });
+    }
+    for (const p of W.ps) { const sp = spawnPos(W, p); p.x = sp.x; p.y = sp.y; }
+    return W;
+  }
+  function pushEv(W, arr) {
+    W.evId = (W.evId + 1) % 10000;
+    W.evs.push([W.evId].concat(arr));
+    if (W.evs.length > 10) W.evs.shift();
+  }
+  function paintAt(W, cx, cy, r, v) {
+    let c = 0;
+    const T = W.map.T, g = W.grid, r2 = r * r;
+    for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(MH - 1, Math.floor(cy + r)); y++) {
+      for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(MW - 1, Math.floor(cx + r)); x++) {
+        const i = y * MW + x;
+        if (!paintable(T[i]) || g[i] === v) continue;
+        if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 > r2) continue;
+        g[i] = v; c++;
+      }
+    }
+    return c;
+  }
+  function paintBy(W, p, x, y, r) {
+    const c = paintAt(W, x, y, r, p.tm + 1);
+    if (c) { p.pc += c; if (!(p.spAct > 0)) p.sp = Math.min(WEP[p.w].spMax, p.sp + c); }
+    return c;
+  }
+  /* doors: ink hits wear them down; when broken both door cells become floor for the rest of the round */
+  function hitDoor(W, i, amt) {
+    const T = W.map.T;
+    if (T[i] !== DR) return;
+    W.dh[i] = (W.dh[i] == null ? 60 : W.dh[i]) - amt;
+    if (W.dh[i] > 0) return;
+    const q = [i];
+    while (q.length) {
+      const c = q.pop(); if (T[c] !== DR) continue;
+      T[c] = FL; W.map.tot++; W.dopen.push(c);
+      for (const n of [c - 1, c + 1, c - MW, c + MW]) if (n >= 0 && n < N && T[n] === DR) q.push(n);
+    }
+    pushEv(W, ['d', i % MW, (i / MW) | 0]);
+  }
+  function damage(W, q, amt, s, hk) {
+    if (!q.alive || q.inv > 0 || amt <= 0) return;
+    if (q.spAct > 0 && q.spK === 'rush') amt *= 0.25;
+    q.vis = Math.max(q.vis, 1.2); q.by = s; q.dmgT = 0;
+    if (q.ar > 0) { const a = Math.min(q.ar, amt); q.ar -= a; amt -= a; if (amt <= 0) return; }
+    q.hp -= amt;
+    if (hk && hk.hit) hk.hit(q, s);
+    if (q.hp <= 0) {
+      q.hp = 0; q.alive = false; q.rsp = RESPAWN; q.holdT = 0; q.deaths++; q.sp = Math.floor(q.sp * 0.5);
+      q.spAct = 0; q.spK = ''; q.chg = 0; q.roll = false; q.sm = false; q.fire = false; q.burst = 0; q.air = 0; q.dg = 0; q.ar = 0;
+      const k = W.ps[s];
+      if (k && k !== q) { k.kills++; paintAt(W, q.x, q.y, 1.8, k.tm + 1); }
+      W.obs = W.obs.filter((o) => !(o.k === 'm' && o.s === q.seat));
+      pushEv(W, ['k', Math.round(q.x * 10), Math.round(q.y * 10), q.seat, s]);
+      if (hk && hk.kill) hk.kill(q, s);
+    }
+  }
+  const enemiesOf = (W, p) => W.ps.filter((q) => q.alive && q.tm !== p.tm);
+  function explode(W, x, y, r, dmax, s, tm, hk) {
+    const p = W.ps[s];
+    if (p) paintBy(W, p, x, y, r); else paintAt(W, x, y, r, tm + 1);
+    for (const q of W.ps) {
+      if (!q.alive || q.tm === tm) continue;
+      const d = Math.hypot(q.x - x, q.y - y);
+      if (d < r) damage(W, q, dmax * (1 - (d / r) * 0.6), s, hk);
+    }
+    const T = W.map.T;
+    for (let yy = Math.max(0, Math.floor(y - r)); yy <= Math.min(MH - 1, Math.floor(y + r)); yy++) for (let xx = Math.max(0, Math.floor(x - r)); xx <= Math.min(MW - 1, Math.floor(x + r)); xx++) {
+      const i = yy * MW + xx; if (T[i] === DR && Math.hypot(xx + 0.5 - x, yy + 0.5 - y) < r + 0.5) hitDoor(W, i, dmax * 0.5);
+    }
+    pushEv(W, ['x', Math.round(x * 10), Math.round(y * 10), Math.round(r * 10), tm]);
+  }
+  /* enemy domes and barriers soak up ink (returns true when the ink at x,y is stopped) */
+  function guardHit(W, tm, x, y, dmg) {
+    for (const o of W.obs) {
+      if (o.tm === tm) continue;
+      if (o.k === 'd') { if (Math.hypot(x - o.x, y - o.y) < 2.6) return true; }
+      else if (o.k === 'w' && o.t > 0) {
+        const ca = Math.cos(o.a), sa = Math.sin(o.a), dx = x - o.x, dy = y - o.y;
+        if (Math.abs(dx * ca + dy * sa) < 1.3 && Math.abs(-dx * sa + dy * ca) < 0.4) { o.hp -= dmg; if (o.hp <= 0) o.t = 0; return true; }
+      }
+    }
+    return false;
+  }
+  /* umbrella: shots from the front are caught by the canopy */
+  function canopy(q, fx, fy, dmg) {
+    if (!q.shOn || q.sh <= 0) return false;
+    if (Math.abs(wrapA(Math.atan2(fy - q.y, fx - q.x) - q.a)) > 1.05) return false;
+    q.sh -= dmg; if (q.sh <= 0) { q.sh = 0; q.shCd = 5; q.shOn = false; }
+    return true;
+  }
+  function spawnShot(W, p, ang, spd, life, dmg, pr, trail, kind) {
+    W.shots.push({ x: p.x + Math.cos(ang) * 0.45, y: p.y + Math.sin(ang) * 0.45, ox: p.x, oy: p.y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, l: life, tm: p.tm, s: p.seat, d: dmg, pr, tr: trail, ta: 0, kd: kind || 0 });
+  }
+  function lob(W, p, ang, dist, tt, dmg, r) {
+    const ca = Math.cos(ang), sa = Math.sin(ang), d = boxLen(ca, sa, dist);
+    const tx = clamp(p.x + ca * d, 0.5, MW - 0.5), ty = clamp(p.y + sa * d, 0.5, MH - 0.5);
+    W.shots.push({ x: p.x, y: p.y, sx: p.x, sy: p.y, tx, ty, ox: p.x, oy: p.y, age: 0, tt, l: tt + 1, tm: p.tm, s: p.seat, d: dmg, pr: r, kd: 1 });
+  }
+  function fireLine(W, p, ang, len, dmg, pw, hk, pierce) {
+    // straight hitscan inside the shooter's sight box; stops at a high wall/door unless pierce
+    const ca = Math.cos(ang), sa = Math.sin(ang);
+    len = boxLen(ca, sa, len);
+    let ex = p.x, ey = p.y, hitOne = false;
+    for (let d = 0.3; d <= len; d += 0.25) {
+      const x = p.x + ca * d, y = p.y + sa * d;
+      if (x < 0 || y < 0 || x >= MW || y >= MH) break;
+      const ci = cellAt(x, y);
+      if (!pierce && solid(W.map.T[ci])) { hitDoor(W, ci, dmg * 0.5); break; }
+      if (!pierce && guardHit(W, p.tm, x, y, dmg)) { ex = x; ey = y; break; }
+      ex = x; ey = y;
+      if (Math.abs(d - Math.round(d)) < 0.13) paintBy(W, p, x, y, pw);
+      if (!hitOne || pierce) {
+        for (const q of W.ps) {
+          if (!q.alive || q.tm === p.tm || (pierce && q._bm)) continue;
+          if (Math.hypot(q.x - x, q.y - y) < (pierce ? 1.1 : 0.62)) {
+            if (pierce) q._bm = 1;
+            if (!pierce && canopy(q, p.x, p.y, dmg)) { hitOne = true; break; }
+            damage(W, q, dmg, p.seat, hk); hitOne = true; if (!pierce) break;
+          }
+        }
+        if (hitOne && !pierce) break;
+      }
+    }
+    for (const q of W.ps) delete q._bm;
+    paintBy(W, p, ex, ey, pierce ? 1.4 : 1.3);
+    pushEv(W, ['l', Math.round(p.x * 10), Math.round(p.y * 10), Math.round(ex * 10), Math.round(ey * 10), p.tm, pierce ? 1 : 0]);
+  }
+  function aimPoint(W, p, dist) { // walk forward along aim until a high wall / sight edge
+    const ca = Math.cos(p.a), sa = Math.sin(p.a), d = boxLen(ca, sa, dist);
+    let x = p.x, y = p.y;
+    for (let k = 0; k <= d; k += 0.5) { const nx = p.x + ca * k, ny = p.y + sa * k; if (nx < 1 || ny < 1 || nx > MW - 1 || ny > MH - 1 || solid(W.map.T[cellAt(nx, ny)])) break; x = nx; y = ny; }
+    return [x, y];
+  }
+  function throwObj(W, p, k, spd, extra) {
+    const ca = Math.cos(p.a), sa = Math.sin(p.a);
+    W.obs.push(Object.assign({ k, x: p.x + ca * 0.5, y: p.y + sa * 0.5, vx: ca * spd, vy: sa * spd, tm: p.tm, s: p.seat, pt: 0, ox: p.x, oy: p.y }, extra));
+  }
+  function useSub(W, p) {
+    const sb = WEP[p.w].sub, S = SUBS[sb];
+    if (!p.alive || p.ink < S.cost || p.sm || p.air > 0) return false;
+    p.ink -= S.cost; p.inkCd = 0.8;
+    const ca = Math.cos(p.a), sa = Math.sin(p.a);
+    if (sb === 'm') {
+      W.obs = W.obs.filter((o) => !(o.k === 'm' && o.s === p.seat));
+      W.obs.push({ k: 'm', x: p.x, y: p.y, t: 25, arm: 0.5, tr: -1, tm: p.tm, s: p.seat });
+    } else if (sb === 'w') {
+      W.obs = W.obs.filter((o) => !(o.k === 'w' && o.s === p.seat));
+      let d = 1.2; if (solid(W.map.T[cellAt(p.x + ca * d, p.y + sa * d)])) d = 0.6;
+      W.obs.push({ k: 'w', x: p.x + ca * d, y: p.y + sa * d, a: p.a + Math.PI / 2, hp: 180, t: 7, tm: p.tm, s: p.seat });
+    } else if (sb === 'k') W.obs.push({ k: 'k', x: p.x + ca * 0.5, y: p.y + sa * 0.5, vx: ca * 7, vy: sa * 7, t: 1.5, tm: p.tm, s: p.seat, pt: 0 });
+    else if (sb === 't') W.obs.push({ k: 't', x: p.x + ca * 0.5, y: p.y + sa * 0.5, vx: ca * 4, vy: sa * 4, t: 3, tm: p.tm, s: p.seat, pt: 0 });
+    else if (sb === 'q') { W.obs = W.obs.filter((o) => !(o.k === 'q' && o.s === p.seat)); throwObj(W, p, 'q', 8, { t: 10 }); }
+    else throwObj(W, p, sb, sb === 's' ? 11 : 10, { t: sb === 'b' ? 0.9 : sb === 's' ? 7.5 : 0.7 });
+    return true;
+  }
+  function useSpecial(W, p) {
+    const wp = WEP[p.w];
+    if (!p.alive || p.sp < wp.spMax || p.spAct > 0 || p.air > 0) return false;
+    p.sp = 0; p.spUse++;
+    const k = wp.sp;
+    if (k === 'rush') { p.spK = 'rush'; p.spAct = 5; }
+    else if (k === 'beam') { p.spK = 'beam'; p.spAct = 0.5; }
+    else if (k === 'rain') { const [x, y] = aimPoint(W, p, Math.hypot(p.ax, p.ay) > 0.1 ? 6 : 4); W.obs.push({ k: 'r', x, y, t: 6, tm: p.tm, s: p.seat, pt: 0 }); }
+    else if (k === 'dome') W.obs.push({ k: 'd', x: p.x, y: p.y, t: 6, tm: p.tm, s: p.seat });
+    else if (k === 'barrage') { const [x, y] = aimPoint(W, p, 6); W.obs.push({ k: 'A', x, y, n: 5, pt: 0, t: 9, tm: p.tm, s: p.seat }); }
+    else if (k === 'armor') { for (const q of W.ps) if (q.alive && q.tm === p.tm && inBox(p, q.x, q.y)) { q.ar = 45; q.art = 8; } }
+    else if (k === 'bigbomb') throwObj(W, p, 'g', 12, { t: 1.4 });
+    else if (k === 'ring') W.obs.push({ k: 'o', x: p.x, y: p.y, t: 0.9, e: 0, hit: 0, tm: p.tm, s: p.seat });
+    else if (k === 'scan') { for (const q of W.ps) if (q.tm !== p.tm) q.rv = Math.max(q.rv, 6); }
+    pushEv(W, ['s', Math.round(p.x * 10), Math.round(p.y * 10), p.seat, k]);
+    return true;
+  }
+  function respawn(W, p) {
+    const sp = spawnPos(W, p);
+    p.x = sp.x; p.y = sp.y; p.vx = 0; p.vy = 0; p.alive = true; p.hp = 100; p.ink = 100; p.inv = INV;
+    p.w = p.wantW; if (p.sp > WEP[p.w].spMax) p.sp = WEP[p.w].spMax;
+    p.a = p.tm ? Math.PI / 2 : -Math.PI / 2; p.chg = 0; p.spAct = 0; p.spK = ''; p.burst = 0; p.air = 0; p.dg = 0; p.sh = 140; p.shCd = 0;
+  }
+  /* player movement (shared by host sim and guest prediction): swim, jump pads, rails, dodge rolls */
+  function moveP(W, p, h) {
+    const T = W.map.T;
+    const fam = famOf(p);
+    const ox = p.x, oy = p.y;
+    if (p.air > 0) { // flying from a jump pad: walls don't matter until landing
+      p.air -= h;
+      p.x = clamp(p.x + p.jvx * h, PRAD + 0.01, MW - PRAD - 0.01); p.y = clamp(p.y + p.jvy * h, PRAD + 0.01, MH - PRAD - 0.01);
+      if (p.air <= 0) {
+        p.air = 0; p.jt = 0.6;
+        if (blockedAt(T, p.x, p.y, PRAD, p.tm)) { // slide forward to the first free spot, else back toward the pad
+          const d = Math.hypot(p.jvx, p.jvy) || 1, ux = p.jvx / d, uy = p.jvy / d; let ok = false;
+          for (let k = 0.25; k < 4 && !ok; k += 0.25) for (const sgn of [1, -1]) { const x = p.x + ux * k * sgn, y = p.y + uy * k * sgn; if (!blockedAt(T, x, y, PRAD, p.tm)) { p.x = x; p.y = y; ok = true; break; } }
+          if (!ok) { const sp = spawnPos(W, p); p.x = sp.x; p.y = sp.y; }
+        }
+      }
+      p.sm = false; p.crit = false;
+      return { own: false, enemy: false, sp: Math.hypot(p.jvx, p.jvy) };
+    }
+    p.jt = Math.max(0, (p.jt || 0) - h);
+    const i = cellAt(p.x, p.y), gv = W.grid[i], own = gv === p.tm + 1, enemy = gv && !own;
+    const beamWind = p.spK === 'beam' && p.spAct > 0;
+    const dv = !!p.dive && !(fam === 'dualie' && p.fire);
+    p.sm = dv && own && !beamWind;
+    p.crit = dv && !own && !beamWind;
+    if (p.dg > 0) { // dodge roll
+      p.dg -= h;
+      const dx = p.dgx * h, dy = p.dgy * h;
+      if (!blockedAt(T, p.x + dx, p.y, PRAD, p.tm)) p.x += dx;
+      if (!blockedAt(T, p.x, p.y + dy, PRAD, p.tm)) p.y += dy;
+      p.vx = p.dgx * 0.3; p.vy = p.dgy * 0.3;
+      p.moved += Math.hypot(p.x - ox, p.y - oy);
+      return { own, enemy, sp: Math.hypot(p.dgx, p.dgy) };
+    }
+    let v = p.sm ? V_SWIM : p.crit ? V_CRIT : V_WALK;
+    if (enemy && !(p.spK === 'rush' && p.spAct > 0)) v *= ENEMY_SLOW;
+    if (!dv) {
+      if (fam === 'charger' && p.chg > 0) v *= 0.42;
+      else if (fam === 'gatling' && p.chg > 0) v *= 0.55;
+      else if (fam === 'gatling' && p.burst > 0) v *= 0.72;
+      else if (fam === 'roller' && p.roll) v *= 0.9;
+      else if (fam === 'brush' && p.roll) v *= 1.3;
+      else if (p.fire) v *= ({ shooter: 0.78, brella: 0.75, bucket: 0.85, blaster: 0.8, sprink: 0.85, dualie: 0.92 }[fam] || 1);
+    }
+    if (p.spK === 'rush' && p.spAct > 0) v *= 1.45;
+    if (beamWind) v = 0;
+    let mx = fin(p.mx) ? p.mx : 0, my = fin(p.my) ? p.my : 0;
+    const m = Math.hypot(mx, my); if (m > 1) { mx /= m; my /= m; }
+    const k = Math.min(1, h * 14);
+    p.vx += (mx * v - p.vx) * k; p.vy += (my * v - p.vy) * k;
+    let dx = p.vx * h, dy = p.vy * h;
+    const t0 = T[i];
+    if (isRail(t0)) { const [rx, ry] = RDIR[t0 - RL]; dx += rx * 5.5 * h; dy += ry * 5.5 * h; }
+    if (!blockedAt(T, p.x + dx, p.y, PRAD, p.tm)) p.x += dx; else p.vx = 0;
+    if (!blockedAt(T, p.x, p.y + dy, PRAD, p.tm)) p.y += dy; else p.vy = 0;
+    if (blockedAt(T, p.x, p.y, PRAD * 0.9, p.tm)) { // pushed into something (spawn, closed door etc.): nudge back to a free spot
+      const sp = spawnPos(W, p); if (blockedAt(T, ox, oy, PRAD * 0.9, p.tm)) { p.x = sp.x; p.y = sp.y; } else { p.x = ox; p.y = oy; }
+    }
+    p.moved += Math.hypot(p.x - ox, p.y - oy);
+    const sp = Math.hypot(p.vx, p.vy);
+    if (sp > 0.4) p.ma = Math.atan2(p.vy, p.vx);
+    if (Math.hypot(p.ax, p.ay) > 0.15) p.a = Math.atan2(p.ay, p.ax);
+    else if (sp > 0.6) p.a = p.ma;
+    // jump pad: launch 6 cells the way you're heading
+    if (T[cellAt(p.x, p.y)] === JP && !(p.jt > 0) && !beamWind) {
+      const d = sp > 0.6 ? p.ma : p.a;
+      p.air = 0.55; p.jvx = (Math.cos(d) * 6) / 0.55; p.jvy = (Math.sin(d) * 6) / 0.55; p.sm = false; p.crit = false;
+    }
+    return { own, enemy, sp };
+  }
+  function stepPlayer(W, p, h, hk) {
+    if (!p.alive) { // 「부활 대기」: the countdown pauses while the player holds (up to HOLD_MAX s per knock-out)
+      const hl = p.hold && p.holdT < HOLD_MAX;
+      if (hl) p.holdT += h; else p.rsp -= h;
+      if (p.rsp <= 0 && !hl) respawn(W, p);
+      return;
+    }
+    p.inv = Math.max(0, p.inv - h); p.fireCd -= h; p.inkCd -= h; p.dmgT += h; p.vis = Math.max(0, p.vis - h); p.rv = Math.max(0, p.rv - h);
+    p.dgCd = Math.max(0, p.dgCd - h);
+    if (p.art > 0) { p.art -= h; if (p.art <= 0) p.ar = 0; }
+    if (p.shCd > 0) { p.shCd -= h; if (p.shCd <= 0) p.sh = 140; } else if (p.sh < 140 && !p.fire) p.sh = Math.min(140, p.sh + 30 * h);
+    for (const k in p.hc) { p.hc[k] -= h; if (p.hc[k] <= 0) delete p.hc[k]; }
+    if (p.subN !== p.subSeen) { p.subSeen = p.subN; useSub(W, p); }
+    if (p.spN !== p.spSeen) { p.spSeen = p.spN; useSpecial(W, p); }
+    const fam = famOf(p);
+    // dual pistols: dive while firing = dodge roll
+    if (fam === 'dualie' && p.dive && !p.pdv && p.fire && p.dgCd <= 0 && p.ink >= 7 && !(p.air > 0)) {
+      let mx = p.mx || 0, my = p.my || 0; const m = Math.hypot(mx, my);
+      const d = m > 0.2 ? Math.atan2(my, mx) : p.a;
+      p.dg = 0.18; p.dgx = (Math.cos(d) * 2.4) / 0.18; p.dgy = (Math.sin(d) * 2.4) / 0.18; p.ink -= 7; p.dgCd = 0.6;
+    }
+    p.pdv = !!p.dive;
+    const mv = moveP(W, p, h);
+    const beamWind = p.spK === 'beam' && p.spAct > 0;
+    const dv = !!p.dive && !(fam === 'dualie' && p.fire);
+    const shooting = p.fire && !dv && !beamWind && !(p.air > 0);
+    if (dv || beamWind) { p.chg = 0; p.burst = 0; }
+    p.roll = false; p.shOn = false;
+    const R = Math.random, a = p.a;
+    if (fam === 'shooter') {
+      if (shooting && p.fireCd <= 0 && p.ink >= 1.3) { spawnShot(W, p, a + (R() - 0.5) * 0.16, 20, 0.33, 25, 1.0, true); p.ink -= 1.3; p.fireCd = 0.125; p.inkCd = 0.45; p.vis = Math.max(p.vis, 0.3); }
+    } else if (fam === 'roller' || fam === 'brush') {
+      const rl = fam === 'roller';
+      if (shooting && !p.pf && p.fireCd <= 0 && p.ink >= (rl ? 8 : 2.5)) {
+        if (rl) { for (let k = -2; k <= 2; k++) spawnShot(W, p, a + k * 0.2 + (R() - 0.5) * 0.08, 15, 0.28, 50, 0.9, false); p.ink -= 8; p.fireCd = 0.55; p.inkCd = 0.6; }
+        else { for (let k = -1; k <= 1; k++) spawnShot(W, p, a + k * 0.17 + (R() - 0.5) * 0.08, 14, 0.22, 38, 0.75, false); p.ink -= 2.5; p.fireCd = 0.2; p.inkCd = 0.4; }
+        p.vis = 0.4;
+      } else if (shooting && mv.sp > (rl ? 1.4 : 1.2) && p.fireCd < (rl ? 0.25 : 0.12) && p.ink > 0.3) {
+        p.roll = true; p.ink -= (rl ? 4.5 : 2.5) * h; p.inkCd = 0.4;
+        const fx = p.x + Math.cos(p.ma) * (rl ? 0.7 : 0.5), fy = p.y + Math.sin(p.ma) * (rl ? 0.7 : 0.5);
+        paintBy(W, p, fx, fy, rl ? 1.45 : 1.0);
+        for (const q of W.ps) {
+          if (!q.alive || q.tm === p.tm || p.hc[q.seat]) continue;
+          if (Math.hypot(q.x - fx, q.y - fy) < (rl ? 1.05 : 0.8)) { p.hc[q.seat] = rl ? 0.5 : 0.3; damage(W, q, rl ? 160 : 80, p.seat, hk); }
+        }
+      }
+    } else if (fam === 'charger') {
+      if (shooting && p.ink >= 4) { p.chg = Math.min(1, p.chg + h / 1.2); p.inkCd = 0.4; }
+      else if (!p.fire && p.chg > 0) {
+        let c = p.chg; const cost = (cc) => 4 + 14 * cc;
+        if (p.ink < cost(c)) c = Math.max(0, (p.ink - 4) / 14);
+        p.ink -= cost(c); p.inkCd = 0.6; p.vis = 0.6;
+        fireLine(W, p, a, 7 + 6 * c, c >= 0.999 ? 160 : 40 + 80 * c, 0.75, hk, false);
+        p.chg = 0;
+      }
+    } else if (fam === 'bucket') {
+      if (shooting && p.fireCd <= 0 && p.ink >= 6.5) { lob(W, p, a, 5, 0.42, 90, 1.9); p.ink -= 6.5; p.fireCd = 0.55; p.inkCd = 0.6; p.vis = 0.4; }
+    } else if (fam === 'dualie') {
+      if (shooting && p.fireCd <= 0 && p.ink >= 1.1) { spawnShot(W, p, a + (R() - 0.5) * 0.2, 18, 0.29, 22, 0.8, true); p.ink -= 1.1; p.fireCd = 0.09; p.inkCd = 0.45; p.vis = Math.max(p.vis, 0.3); }
+    } else if (fam === 'brella') {
+      p.shOn = shooting && p.sh > 0 && p.shCd <= 0;
+      if (shooting && p.fireCd <= 0 && p.ink >= 6) { for (let k = 0; k < 7; k++) spawnShot(W, p, a + (k - 3) * 0.11 + (R() - 0.5) * 0.04, 15, 0.26, 30, 0.95, false); p.ink -= 6; p.fireCd = 0.5; p.inkCd = 0.6; p.vis = 0.4; }
+    } else if (fam === 'gatling') {
+      if (p.burst > 0) {
+        p.burst -= h; p.gt -= h;
+        if (p.gt <= 0 && p.ink >= 0.9) { spawnShot(W, p, a + (R() - 0.5) * 0.1, 22, 0.37, 26, 0.8, true); p.ink -= 0.9; p.gt = 0.075; p.inkCd = 0.5; p.vis = Math.max(p.vis, 0.3); }
+        if (p.ink < 0.9) p.burst = 0;
+      } else if (shooting && p.ink >= 3) { p.chg = Math.min(1, p.chg + h / 0.75); p.inkCd = 0.4; }
+      else if (!p.fire && p.chg > 0) { p.burst = 0.15 + 1.65 * p.chg; p.chg = 0; p.gt = 0; }
+    } else if (fam === 'sprink') {
+      if (shooting && p.fireCd <= 0 && p.ink >= 0.8) { p.spin = (p.spin + 0.75) % (Math.PI * 2); spawnShot(W, p, p.spin, 14, 0.3, 36, 0.85, false); spawnShot(W, p, a + (R() - 0.5) * 1.1, 14, 0.3, 36, 0.85, false); p.ink -= 0.8; p.fireCd = 0.06; p.inkCd = 0.45; p.vis = Math.max(p.vis, 0.3); }
+    } else if (fam === 'blaster') {
+      if (shooting && p.fireCd <= 0 && p.ink >= 8) { spawnShot(W, p, a, 12, 0.42, 125, 1.0, true, 2); p.ink -= 8; p.fireCd = 0.55; p.inkCd = 0.6; p.vis = 0.5; }
+    }
+    p.pf = p.fire && !dv;
+    // ink tank
+    if (p.sm) p.ink = Math.min(100, p.ink + 40 * h);
+    else if (p.inkCd <= 0 && !p.fire && !(p.burst > 0)) p.ink = Math.min(100, p.ink + 8 * h);
+    p.ink = Math.max(0, p.ink);
+    // health: enemy ink stings (never below 40), regen when untouched
+    if (mv.enemy && p.inv <= 0 && !(p.spK === 'rush' && p.spAct > 0)) { if (p.hp > 40) { p.hp = Math.max(40, p.hp - 10 * h); } p.dmgT = Math.min(p.dmgT, 0.6); }
+    if (p.dmgT > 1.2) p.hp = Math.min(100, p.hp + (p.sm ? 70 : 20) * h);
+    // specials
+    if (p.spAct > 0) {
+      const prev = p.spAct;
+      p.spAct = Math.max(0, p.spAct - h);
+      if (p.spK === 'rush') {
+        paintBy(W, p, p.x, p.y, 2.0);
+        for (const q of W.ps) {
+          if (!q.alive || q.tm === p.tm || p.hc[q.seat]) continue;
+          if (Math.hypot(q.x - p.x, q.y - p.y) < 1.25) { p.hc[q.seat] = 0.4; damage(W, q, 200, p.seat, hk); }
+        }
+      }
+      if (prev > 0 && p.spAct === 0) {
+        if (p.spK === 'beam') fireLine(W, p, p.a, 46, 250, 1.25, hk, true);
+        p.spK = '';
+      }
+    }
+  }
+  const THROWN = { b: 1, c: 1, s: 1, q: 1, g: 1 };
+  function stepObj(W, o, h, hk) { // returns true when the object is gone
+    const T = W.map.T, p = W.ps[o.s];
+    const paint = (x, y, r) => { if (p) paintBy(W, p, x, y, r); else paintAt(W, x, y, r, o.tm + 1); };
+    if (THROWN[o.k]) {
+      const fr = Math.max(0, 1 - h * 2.3);
+      o.vx *= fr; o.vy *= fr;
+      const nx = o.x + o.vx * h, ny = o.y + o.vy * h;
+      // thrown things bounce off walls and the thrower's sight edge
+      if (nx < 0.3 || nx > MW - 0.3 || solid(T[cellAt(nx, o.y)]) || Math.abs(nx - o.ox) > VH) o.vx = -o.vx * 0.5; else o.x = nx;
+      if (ny < 0.3 || ny > MH - 0.3 || solid(T[cellAt(o.x, ny)]) || Math.abs(ny - o.oy) > VH) o.vy = -o.vy * 0.5; else o.y = ny;
+    }
+    o.t -= h;
+    switch (o.k) {
+      case 'b': if (o.t <= 0) { explode(W, o.x, o.y, 2.6, 140, o.s, o.tm, hk); return true; } return false;
+      case 'g': if (o.t <= 0) { explode(W, o.x, o.y, 4.2, 180, o.s, o.tm, hk); return true; } return false;
+      case 'c': if (o.t <= 0) { o.k = 'f'; o.t = 3.5; o.pt = 0; pushEv(W, ['x', Math.round(o.x * 10), Math.round(o.y * 10), 12, o.tm]); } return false;
+      case 'f': case 'r': {
+        const R = o.k === 'f' ? 2.0 : 3.5, dps = o.k === 'f' ? 32 : 30;
+        o.pt -= h;
+        if (o.pt <= 0) { o.pt = o.k === 'f' ? 0.3 : 0.09; const a = Math.random() * 7, d = Math.sqrt(Math.random()) * R; paint(o.x + Math.cos(a) * d, o.y + Math.sin(a) * d, o.k === 'f' ? 0.8 : 1.05); }
+        for (const q of W.ps) if (q.alive && q.tm !== o.tm && Math.hypot(q.x - o.x, q.y - o.y) < R) damage(W, q, dps * h, o.s, hk);
+        return o.t <= 0;
+      }
+      case 'm':
+        o.arm -= h;
+        if (o.tr < 0 && o.arm <= 0 && W.ps.some((q) => q.alive && q.tm !== o.tm && Math.hypot(q.x - o.x, q.y - o.y) < 1.5)) o.tr = 0.3;
+        if (o.tr >= 0) { o.tr -= h; if (o.tr < 0) { explode(W, o.x, o.y, 2.2, 110, o.s, o.tm, hk); return true; } }
+        return o.t <= 0;
+      case 's':
+        for (const q of W.ps) if (q.alive && q.tm !== o.tm && Math.hypot(q.x - o.x, q.y - o.y) < 3.2) q.rv = Math.max(q.rv, 0.4);
+        return o.t <= 0;
+      case 'q': {
+        if (Math.hypot(o.vx, o.vy) > 0.6) return o.t <= 0;
+        o.pt -= h;
+        if (o.pt <= 0) { o.pt = 0.13; const a = Math.random() * 7, d = 0.6 + Math.random() * 1.8; paint(o.x + Math.cos(a) * d, o.y + Math.sin(a) * d, 0.7); }
+        for (const q of W.ps) if (q.alive && q.tm !== o.tm && Math.hypot(q.x - o.x, q.y - o.y) < 1.6) damage(W, q, 14 * h, o.s, hk);
+        return o.t <= 0;
+      }
+      case 'k': case 't': {
+        if (o.k === 't') { // home in on the nearest enemy the torpedo can see (not hidden under ink)
+          let best = null, bd = 6;
+          for (const q of W.ps) { if (!q.alive || q.tm === o.tm || hiddenFrom(o, q)) continue; const d = Math.hypot(q.x - o.x, q.y - o.y); if (d < bd && los(T, o.x, o.y, q.x, q.y)) { bd = d; best = q; } }
+          if (best) { const d = Math.hypot(best.x - o.x, best.y - o.y) || 1; o.vx += ((best.x - o.x) / d * 5.5 - o.vx) * Math.min(1, h * 4); o.vy += ((best.y - o.y) / d * 5.5 - o.vy) * Math.min(1, h * 4); }
+        }
+        const nx = o.x + o.vx * h, ny = o.y + o.vy * h, tt = T[cellAt(nx, ny)];
+        if (nx < 0.3 || ny < 0.3 || nx > MW - 0.3 || ny > MH - 0.3 || solid(tt) || tt === LW) { o.vx = 0; o.vy = 0; if (o.k === 't') o.t = Math.min(o.t, 0.15); }
+        else { o.x = nx; o.y = ny; }
+        o.pt -= h; if (o.pt <= 0) { o.pt = 0.08; paint(o.x, o.y, 0.6); }
+        if (W.ps.some((q) => q.alive && q.tm !== o.tm && Math.hypot(q.x - o.x, q.y - o.y) < 0.9)) o.t = Math.min(o.t, 0);
+        if (o.t <= 0) { if (o.k === 'k') explode(W, o.x, o.y, 2.2, 110, o.s, o.tm, hk); else explode(W, o.x, o.y, 1.8, 100, o.s, o.tm, hk); return true; }
+        return false;
+      }
+      case 'w': case 'd': return o.t <= 0;
+      case 'A':
+        o.pt -= h;
+        if (o.pt <= 0 && o.n > 0) { o.pt = 0.45; o.n--; const a = Math.random() * 7, d = Math.random() * 2.5; W.obs.push({ k: 'a', x: clamp(o.x + Math.cos(a) * d, 0.5, MW - 0.5), y: clamp(o.y + Math.sin(a) * d, 0.5, MH - 0.5), t: 0.8, tm: o.tm, s: o.s }); }
+        return o.n <= 0 || o.t <= 0;
+      case 'a': if (o.t <= 0) { explode(W, o.x, o.y, 1.8, 95, o.s, o.tm, hk); return true; } return false;
+      case 'o': {
+        const r = (1 - Math.max(0, o.t) / 0.9) * 6; o.e = r;
+        for (let k = 0; k < 10; k++) { const a = k * 0.628 + o.t * 3; paint(o.x + Math.cos(a) * r, o.y + Math.sin(a) * r, 0.75); }
+        for (const q of W.ps) if (q.alive && q.tm !== o.tm && !(o.hit & (1 << q.seat)) && Math.abs(Math.hypot(q.x - o.x, q.y - o.y) - r) < 0.7) { o.hit |= 1 << q.seat; damage(W, q, 90, o.s, hk); }
+        return o.t <= 0;
+      }
+    }
+    return o.t <= 0;
+  }
+  function stepMode(W, h) {
+    if (W.mode === 'zone') {
+      const Z = W.geo.zone; let a = 0, b = 0;
+      for (const i of Z) { if (W.grid[i] === 1) a++; else if (W.grid[i] === 2) b++; }
+      const need = Z.length * 0.6, c = a >= need ? 0 : b >= need ? 1 : -1;
+      if (c !== W.zc) { W.zc = c; pushEv(W, ['z', c]); }
+      if (c >= 0) { W.zs[c] += h; if (W.zs[c] >= ZONE_WIN && W.ko < 0) W.ko = c; }
+    } else if (W.mode === 'tower') {
+      const [tx, ty] = towerPos(W, W.tw), on = [0, 0];
+      for (const q of W.ps) if (q.alive && !(q.air > 0) && Math.hypot(q.x - tx, q.y - ty) < 1.4) on[q.tm]++;
+      const P = W.geo.path;
+      if (P && on[0] !== on[1] && (on[0] === 0 || on[1] === 0)) {
+        const t = on[0] ? 0 : 1, prev = W.tw;
+        const dir = t === 0 ? -1 : 1, off = (W.tw - W.geo.c0) * dir, half = dir < 0 ? W.geo.c0 : P.length - 1 - W.geo.c0;
+        const boost = off > 0 ? 1 + 1.5 * clamp(off / Math.max(1, half), 0, 1) : 1; // pushing deeper into the enemy half speeds the tower up
+        W.tw = clamp(W.tw + dir * TOWER_V * boost * h, 0, P.length - 1);
+        paintAt(W, tx, ty, 1.3, t + 1);
+        W.tb[0] = Math.max(W.tb[0], W.geo.c0 - W.tw); W.tb[1] = Math.max(W.tb[1], W.tw - W.geo.c0);
+        if (W.ko < 0 && ((W.tw <= 0 && prev > 0) || (W.tw >= P.length - 1 && prev < P.length - 1))) W.ko = t;
+      }
+      W.ton = on[0] && !on[1] ? 1 : on[1] && !on[0] ? 2 : on[0] && on[1] ? 3 : 0;
+    }
+  }
+  function stepWorld(W, h, hk) {
+    W.t += h;
+    for (const p of W.ps) stepPlayer(W, p, h, hk);
+    const T = W.map.T;
+    for (let i = W.shots.length - 1; i >= 0; i--) {
+      const b = W.shots[i], p = W.ps[b.s];
+      const paint = (x, y, r) => { if (p) paintBy(W, p, x, y, r); };
+      let gone = false, boom = false;
+      if (b.kd === 1) { // bucket lob: flies over walls, splashes on landing
+        b.age += h; const k = Math.min(1, b.age / b.tt);
+        b.x = b.sx + (b.tx - b.sx) * k; b.y = b.sy + (b.ty - b.sy) * k;
+        if (k >= 1) {
+          paint(b.x, b.y, b.pr);
+          const inDome = W.obs.some((o) => o.k === 'd' && o.tm !== b.tm && Math.hypot(b.x - o.x, b.y - o.y) < 2.6);
+          if (!inDome) for (const q of W.ps) { if (!q.alive || q.tm === b.tm) continue; const d = Math.hypot(q.x - b.x, q.y - b.y); if (d < b.pr) damage(W, q, b.d * (1 - (d / b.pr) * 0.5), b.s, hk); }
+          gone = true;
+        }
+        if (gone) W.shots.splice(i, 1);
+        continue;
+      }
+      const nx = b.x + b.vx * h, ny = b.y + b.vy * h, ci = cellAt(nx, ny);
+      if (nx < 0 || ny < 0 || nx >= MW || ny >= MH || Math.abs(nx - b.ox) > VH || Math.abs(ny - b.oy) > VH) { paint(b.x, b.y, b.pr * 0.7); gone = true; boom = true; }
+      else if (solid(T[ci])) { hitDoor(W, ci, b.d * 0.5); paint(b.x, b.y, b.pr * 0.7); gone = true; boom = true; }
+      else if (guardHit(W, b.tm, nx, ny, b.d)) { gone = true; }
+      else {
+        b.x = nx; b.y = ny;
+        for (const q of W.ps) {
+          if (!q.alive || q.tm === b.tm) continue;
+          if (Math.hypot(q.x - b.x, q.y - b.y) < 0.6) {
+            if (!canopy(q, b.x - b.vx * 0.05, b.y - b.vy * 0.05, b.d)) { damage(W, q, b.d, b.s, hk); paint(b.x, b.y, 0.7); }
+            gone = true; boom = true; break;
+          }
+        }
+        if (!gone && b.tr) { b.ta += Math.hypot(b.vx, b.vy) * h; if (b.ta > 1.6) { b.ta = 0; paint(b.x, b.y, 0.55); } }
+        b.l -= h;
+        if (!gone && b.l <= 0) { paint(b.x, b.y, b.pr); gone = true; boom = true; }
+      }
+      if (gone && boom && b.kd === 2) explode(W, b.x, b.y, 1.7, 60, b.s, b.tm, hk);
+      if (gone) W.shots.splice(i, 1);
+    }
+    for (let i = W.obs.length - 1; i >= 0; i--) if (stepObj(W, W.obs[i], h, hk)) W.obs.splice(i, 1);
+    stepMode(W, h);
+  }
+  function counts(grid) { const c = [0, 0, 0]; for (let i = 0; i < N; i++) c[grid[i]]++; return c; }
+
+  /* ----- AI (sees exactly what a human sees: its own VIEW box, walls block aim, swimmers hidden) ----- */
+  const AIC = {
+    1: { rate: 0.75, err: 0.32, react: 0.6, lead: 0, refill: 8, full: 55, swim: false, spWait: 5, subP: 0.15, chg: 0.55, dodge: 0.2, ret: 0, cover: false, flank: 0, smart: false, prio: 0, spread: 0.8 },
+    2: { rate: 0.9, err: 0.22, react: 0.5, lead: 0.3, refill: 12, full: 65, swim: true, spWait: 3, subP: 0.35, chg: 0.75, dodge: 0.5, ret: 30, cover: false, flank: 0.4, smart: false, prio: 0.2, spread: 0.8 },
+    3: { rate: 0.3, err: 0.05, react: 0.15, lead: 1, refill: 28, full: 95, swim: true, spWait: 0.3, subP: 0.6, chg: 1, dodge: 1.6, ret: 30, cover: true, flank: 1, smart: true, prio: 1, spread: 0.3, spSmart: true, kite: true, paintAim: true },
+  };
+  /* retreat: step to a nearby walkable cell away from the enemy, preferring own ink and (hard) cells the enemy can't see */
+  function aiRetreat(W, p, e, C) {
+    const T = W.map.T, cx = Math.floor(p.x), cy = Math.floor(p.y);
+    let best = null, bs = -1e9;
+    for (let oy = -3; oy <= 3; oy++) for (let ox = -3; ox <= 3; ox++) {
+      const x = cx + ox, y = cy + oy; if (x < 0 || y < 0 || x >= MW || y >= MH || (!ox && !oy)) continue;
+      const i = y * MW + x; if (!walkFor(T[i], p.tm) || T[i] === JP) continue;
+      const px = x + 0.5, py = y + 0.5;
+      if (!los(T, p.x, p.y, px, py)) continue;
+      let v = (W.grid[i] === p.tm + 1 ? 3 : W.grid[i] ? -3 : 0) + Math.hypot(px - e.x, py - e.y) * 0.8 - Math.hypot(ox, oy) * 0.3;
+      if (C.cover && !los(T, e.x, e.y, px, py)) v += 4;
+      if (v > bs) { bs = v; best = [px, py]; }
+    }
+    const own = W.grid[cellAt(p.x, p.y)] === p.tm + 1;
+    let dx = best ? best[0] - p.x : p.x - e.x, dy = best ? best[1] - p.y : p.y - e.y; const d = Math.hypot(dx, dy) || 1;
+    p.mx = dx / d; p.my = dy / d;
+    const hid = !C.cover || !los(T, e.x, e.y, p.x, p.y) || Math.hypot(e.x - p.x, e.y - p.y) > 4;
+    if (own && (d < 0.6 || hid)) { p.dive = true; p.fire = false; if (d < 0.6) { p.mx *= 0.2; p.my *= 0.2; } return; }
+    p.dive = false;
+    // not on own ink: paint an escape lane under our feet while backing off (unless out of ink)
+    const a = Math.atan2(e.y - p.y, e.x - p.x); p.ax = Math.cos(a); p.ay = Math.sin(a); p.a = a;
+    p.fire = p.ink > 3 && Math.hypot(e.x - p.x, e.y - p.y) < FAMS[famOf(p)].range + 0.6;
+  }
+  function aiThink(W, p, mem, lv, dt) {
+    const C = AIC[lv] || AIC[2];
+    if (!p.alive) { p.fire = false; p.dive = false; mem.path = null; return; }
+    mem.t = (mem.t || 0) - dt; mem.st = (mem.st || 0) + dt; mem.rt = (mem.rt || 0) - dt; mem.sw = (mem.sw || 0) - dt;
+    if (mem.st > 1.3) { if (p.moved < 0.6) { mem.path = null; mem.t = 0; mem.rand = 1; } mem.st = 0; p.moved = 0; }
+    const T = W.map.T, gv = W.grid[cellAt(p.x, p.y)], own = gv === p.tm + 1;
+    const fam = famOf(p), F = FAMS[fam], wp = WEP[p.w];
+    if (p.air > 0) return;
+    // target selection (with reaction delay): only enemies on its screen and in line of sight
+    if (mem.rt <= 0) {
+      mem.rt = C.react * (0.7 + Math.random() * 0.6);
+      let best = null, bd = 1e9;
+      for (const q of enemiesOf(W, p)) {
+        if (!inView(p, q)) continue;
+        const d = Math.hypot(q.x - p.x, q.y - p.y);
+        if (d < bd && (fam === 'bucket' || los(T, p.x, p.y, q.x, q.y))) { bd = d; best = q; }
+      }
+      mem.tg = best ? best.seat : -1;
+      mem.err = (Math.random() - 0.5) * 2 * C.err;
+    }
+    let e = mem.tg >= 0 ? W.ps[mem.tg] : null;
+    if (e && !inView(p, e)) { e = null; mem.tg = -1; }
+    if (p.ink < C.refill) mem.refill = true;
+    if (mem.refill && p.ink >= C.full) mem.refill = false;
+    const ed = e ? Math.hypot(e.x - p.x, e.y - p.y) : 99;
+    // special
+    if (p.sp >= wp.spMax && !(p.spAct > 0)) {
+      mem.spT = (mem.spT == null ? C.spWait * (0.5 + Math.random()) : mem.spT) - dt;
+      const sp = wp.sp;
+      let ok = sp === 'rush' ? (!e || ed < 7) : sp === 'ring' ? ed < 5 || mem.spT < -6 : sp === 'dome' ? !!e || mem.spT < -6 : sp === 'barrage' || sp === 'bigbomb' ? !!e || mem.spT < -3 : true;
+      if (C.spSmart) { // hard: save it for a fight (or to break a stall), never waste it while hiding at full health
+        let nv = 0; for (const q of enemiesOf(W, p)) if (inView(p, q) && Math.hypot(q.x - p.x, q.y - p.y) < 9) nv++;
+        const late = W.T && W.t > W.T - 25;
+        ok = (sp === 'rush' || sp === 'ring') ? (nv >= 1 || late || mem.spT < -4)
+          : sp === 'dome' ? (nv >= 1 && (p.hp < 70 || nv >= 2)) || late || mem.spT < -6
+          : true;
+      }
+      if (mem.spT <= 0 && ok) { mem.spT = null; if (e) { p.ax = e.x - p.x; p.ay = e.y - p.y; p.a = Math.atan2(p.ay, p.ax); } p.dive = false; p.spN++; return; }
+    }
+    if (e) {
+      const d = ed;
+      // retreat & heal/refill: hurt, dry, or (hard) outnumbered
+      if (C.ret) {
+        let nv = 0, na = 0;
+        if (C.smart) { for (const q of enemiesOf(W, p)) if (inView(p, q) && Math.hypot(q.x - p.x, q.y - p.y) < 8) nv++; for (const q of W.ps) if (q !== p && q.alive && q.tm === p.tm && Math.hypot(q.x - p.x, q.y - p.y) < 8) na++; }
+        if (p.hp < C.ret || p.ink < (C.smart ? 12 : 6) || nv >= na + 3) mem.ret = 1.2 + Math.random() * 0.6;
+      }
+      if (mem.ret > 0 && !(W.mode === 'tower' && teamSlot(W, p) % 2 === 0 && p.hp > 30)) {
+        mem.ret -= dt; if (p.hp >= 90 && p.ink > 40) mem.ret = 0;
+        else mem.ret = Math.max(mem.ret, p.hp < C.ret ? 0.3 : 0);
+        aiRetreat(W, p, e, C); return;
+      }
+      const lead = C.lead * (d / 18);
+      const tx = e.x + e.vx * lead, ty = e.y + e.vy * lead;
+      const an = Math.atan2(ty - p.y, tx - p.x) + mem.err * (fam === 'charger' ? 0.5 : 1);
+      p.ax = Math.cos(an); p.ay = Math.sin(an); p.a = an;
+      p.dive = false;
+      const ux = (e.x - p.x) / (d || 1), uy = (e.y - p.y) / (d || 1);
+      if (mem.sw <= 0) {
+        mem.sw = 0.7 + Math.random() * 0.8; mem.sd = Math.random() < 0.5 ? -1 : 1;
+        if (C.flank && Math.random() < C.flank) { // circle away from the nearest teammate on the same target -> pincer
+          let m = null, md = 9; for (const q of W.ps) if (q !== p && q.alive && q.tm === p.tm && inBox(p, q.x, q.y)) { const k = Math.hypot(q.x - e.x, q.y - e.y); if (k < md) { md = k; m = q; } }
+          if (m) { const cr = (m.x - e.x) * uy - (m.y - e.y) * ux; mem.sd = cr > 0 ? 1 : -1; }
+        }
+        if (C.cover) { const sx = p.x - uy * mem.sd * 1.2, sy = p.y + ux * mem.sd * 1.2; if (sx < 0 || sy < 0 || sx >= MW || sy >= MH || !walkFor(T[cellAt(sx, sy)], p.tm)) mem.sd = -mem.sd; }
+      }
+      let want = F.want;
+      if (C.kite && F.ai !== 'roll') { // play your range: kite shorter weapons, rush longer ones
+        const er = FAMS[famOf(e)].range;
+        want = er < F.range - 0.8 ? Math.max(F.want, F.range - 0.9) : er > F.range + 0.8 ? Math.min(F.want, F.range - 2) : F.want;
+      }
+      let fwd = d > want + 1 ? 1 : d < want - 1.5 ? -0.8 : 0;
+      if ((fam === 'charger' || fam === 'gatling') && p.chg > 0) fwd *= 0.3;
+      p.mx = ux * fwd - uy * mem.sd * 0.6; p.my = uy * fwd + ux * mem.sd * 0.6;
+      if (F.ai === 'roll') {
+        p.mx = ux; p.my = uy; mem.fl = (mem.fl || 0) - dt;
+        const fr = fam === 'roller' ? 3.8 : 2.6;
+        if (d < fr && mem.fl <= 0) { p.fire = !p.fire; if (p.fire) mem.fl = fam === 'roller' ? 0.6 : 0.22; } else if (d >= fr) p.fire = p.ink > 6;
+      } else if (F.ai === 'charge') {
+        if (p.chg >= C.chg - (Math.random() < 0.02 ? 0.3 : 0) && d < boxLen(ux, uy, 7 + 6 * p.chg)) p.fire = false;
+        else p.fire = p.ink > 10;
+      } else if (F.ai === 'gat') {
+        if (p.burst > 0) p.fire = false;
+        else if (p.chg < Math.min(0.95, C.chg)) p.fire = p.ink > 8;
+        else p.fire = !(d < F.range + 1);
+      } else p.fire = d < F.range + 0.6 && p.ink > 2;
+      if (W.mode === 'tower' && teamSlot(W, p) % 2 === 0) { // riders fight from the tower instead of leaving it
+        const [tx, ty] = towerPos(W, W.tw), td = Math.hypot(tx - p.x, ty - p.y);
+        if (td < 12) { const k = td > 0.6 ? 1 / td : 0; p.mx = (tx - p.x) * k * 0.9 + p.mx * 0.15; p.my = (ty - p.y) * k * 0.9 + p.my * 0.15; }
+      }
+      if (fam === 'dualie' && p.fire && p.dgCd <= 0 && Math.random() < C.dodge * dt) { p.dive = true; p.mx = -uy * mem.sd; p.my = ux * mem.sd; }
+      if (p.ink > 75 && d < 7 && Math.random() < C.subP * dt) { p.subN++; }
+      if (p.ink < 5 && own && C.swim) { p.dive = true; p.fire = false; p.mx = -ux; p.my = -uy; }
+      return;
+    }
+    // remembered / revealed enemies (minimap) are not shot at, they only steer painting
+    // tower mode: every other bot rides the tower
+    mem.ride = W.mode === 'tower' && teamSlot(W, p) % 2 === 0;
+    if (mem.ride) {
+      const [tx, ty] = towerPos(W, W.tw), d = Math.hypot(tx - p.x, ty - p.y);
+      if (d < 1.0) { // on top: hold position, keep painting around
+        p.mx = (tx - p.x) * 0.8; p.my = (ty - p.y) * 0.8; p.dive = false;
+        const aa = W.t * 1.7 + p.seat; p.ax = Math.cos(aa); p.ay = Math.sin(aa);
+        p.fire = F.ai === 'roll' ? false : F.ai === 'charge' ? (W.t * 2 + p.seat) % 2 < 1.5 : F.ai === 'gat' ? (p.burst > 0 ? false : p.chg < 1) : p.ink > 20;
+        if (mem.refill) p.fire = false;
+        return;
+      }
+      mem.tcell = cellAt(tx, ty);
+    } else mem.tcell = -1;
+    // painting / travelling
+    mem.ret = 0; mem.prio = C.prio; mem.spread = C.spread;
+    if (mem.t <= 0 || !mem.path || mem.k >= mem.path.length) { mem.t = C.rate * (0.75 + Math.random() * 0.5); planAI(W, p, mem); }
+    let tx = p.x, ty = p.y, nextOwn = false;
+    if (mem.path && mem.path.length) {
+      while (mem.k < mem.path.length) { const c = mem.path[mem.k]; if (Math.hypot((c % MW) + 0.5 - p.x, ((c / MW) | 0) + 0.5 - p.y) < 0.7) mem.k++; else break; }
+      const c = mem.path[Math.min(mem.path.length - 1, mem.k + 1)];
+      if (c != null) { tx = (c % MW) + 0.5; ty = ((c / MW) | 0) + 0.5; nextOwn = W.grid[c] === p.tm + 1; }
+    }
+    let dx = tx - p.x, dy = ty - p.y; const dd = Math.hypot(dx, dy);
+    if (dd > 0.05) { p.mx = dx / dd; p.my = dy / dd; } else { p.mx = 0; p.my = 0; }
+    if (lv === 1) { mem.wob = ((mem.wob || 0) + (Math.random() - 0.5) * 0.4) * 0.92; const a = Math.atan2(p.my, p.mx) + mem.wob; if (dd > 0.05) { p.mx = Math.cos(a); p.my = Math.sin(a); } }
+    if (mem.refill) {
+      p.fire = false;
+      p.dive = own;
+      if (own && (!mem.path || mem.path.length < 2)) { mem.ang = (mem.ang || 0) + dt * 2; p.mx = Math.cos(mem.ang) * 0.5; p.my = Math.sin(mem.ang) * 0.5; }
+      return;
+    }
+    const travel = C.swim && own && nextOwn && mem.path && mem.path.length - mem.k > 4;
+    if (travel) { p.dive = true; p.fire = false; return; }
+    p.dive = false;
+    const ga = mem.goal >= 0 ? Math.atan2(((mem.goal / MW) | 0) + 0.5 - p.y, (mem.goal % MW) + 0.5 - p.x) : Math.atan2(p.my, p.mx);
+    let aa = F.ai === 'roll' ? Math.atan2(p.my, p.mx) : ga + Math.sin(W.t * 3 + p.seat) * 0.35;
+    if (C.paintAim && F.ai !== 'roll') { // hard: sweep toward the arc with the most unclaimed floor in reach
+      mem.pa = (mem.pa || 0) - dt;
+      if (mem.pa <= 0) {
+        mem.pa = 0.25; let bv = -1, ba = aa; const r = Math.min(F.range, 7) * 0.75;
+        for (let k = 0; k < 12; k++) {
+          const a = (k / 12) * Math.PI * 2, x = p.x + Math.cos(a) * r, y = p.y + Math.sin(a) * r;
+          if (!los(T, p.x, p.y, x, y)) continue;
+          let v = 0; for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) { const cx = Math.floor(x) + ox, cy = Math.floor(y) + oy; if (cx < 0 || cy < 0 || cx >= MW || cy >= MH) continue; const i = cy * MW + cx; if (paintable(T[i])) v += W.grid[i] === p.tm + 1 ? 0 : W.grid[i] ? 1.4 : 1; }
+          v -= Math.abs(wrapA(a - ga)) * 0.6;
+          if (v > bv) { bv = v; ba = a; }
+        }
+        mem.pv = bv; mem.pang = ba;
+      }
+      aa = mem.pang + Math.sin(W.t * 4 + p.seat) * 0.2;
+    }
+    p.ax = Math.cos(aa); p.ay = Math.sin(aa);
+    if (F.ai === 'roll') p.fire = p.ink > 4;
+    else if (F.ai === 'charge') { mem.cc = (mem.cc || 0) + dt; if (mem.cc > 0.55) { p.fire = false; mem.cc = 0; } else p.fire = p.ink > 15; }
+    else if (F.ai === 'gat') p.fire = p.burst > 0 ? false : p.chg < 0.7 && p.ink > 15;
+    else p.fire = p.ink > 12;
+    if (C.paintAim && mem.pv != null && mem.pv < 0.5 && F.ai !== 'roll') p.fire = false; // nothing to claim there: save ink
+    if ((wp.sub === 'q' || wp.sub === 'k' || wp.sub === 's') && p.ink > 92 && Math.random() < C.subP * 0.25 * dt) p.subN++;
+  }
+  function planAI(W, p, mem) {
+    const T = W.map.T, g = W.grid;
+    const start = cellAt(p.x, p.y);
+    const dist = new Int16Array(N).fill(-1), par = new Int32Array(N).fill(-1), q = new Int32Array(N);
+    let qh = 0, qt = 0; dist[start] = 0; q[qt++] = start;
+    const mates = W.ps.filter((o) => o !== p && o.tm === p.tm && o._goal >= 0).map((o) => o._goal);
+    const random = mem.rand; mem.rand = 0;
+    const tc = mem.tcell >= 0 ? mem.tcell : -1;
+    const rp = tc >= 0 ? tc : random ? Math.floor(Math.random() * N) : -1;
+    const ownV = p.tm + 1, refill = mem.refill, zs = W.mode === 'zone' ? W.geo.zset : null;
+    // contest vs paint: when behind (or the zone is theirs) weigh enemy ink more; lv-scaled
+    let ew = 1.35, zw = 3.5;
+    if (mem.prio) {
+      if (W.mode === 'zone') { if (W.zc !== p.tm) zw += 3 * mem.prio; }
+      else { const c = counts(g), mine = c[ownV], th = c[3 - ownV]; if (th > mine) ew += mem.prio * (0.6 + 1.2 * Math.min(1, W.t / 120)); }
+    }
+    // enemies this bot knows about (on its screen or revealed): avoid painting right into them when low, drift toward when healthy
+    let best = -1, bs = -1;
+    while (qh < qt) {
+      const c = q[qh++], cx = c % MW, cy = (c / MW) | 0, dc = dist[c];
+      if (dc > 0) {
+        let v;
+        if (rp >= 0 && !refill) v = 1 / (Math.abs(cx - (rp % MW)) + Math.abs(cy - ((rp / MW) | 0)) + 1);
+        else if (refill) v = g[c] === ownV ? 1 / (dc + 1) : 0;
+        else {
+          v = 0;
+          for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+            const x = cx + ox, y = cy + oy; if (x < 0 || y < 0 || x >= MW || y >= MH) continue;
+            const i = y * MW + x; if (!paintable(T[i])) continue;
+            v += g[i] === ownV ? 0 : g[i] ? ew : 1;
+          }
+          if (zs && zs[c]) v = v * zw + 2;
+          for (const m of mates) if (Math.abs((m % MW) - cx) + Math.abs(((m / MW) | 0) - cy) < 7) v *= mem.spread;
+          v = v / (dc + 4);
+        }
+        if (v > bs) { bs = v; best = c; }
+      }
+      if (dc > 70) continue;
+      const nb = [cx > 0 ? c - 1 : -1, cx < MW - 1 ? c + 1 : -1, cy > 0 ? c - MW : -1, cy < MH - 1 ? c + MW : -1];
+      for (const n of nb) if (n >= 0 && dist[n] < 0 && walkFor(T[n], p.tm) && T[n] !== JP) { dist[n] = dc + 1; par[n] = c; q[qt++] = n; }
+    }
+    mem.goal = best; p._goal = best;
+    if (best < 0) { mem.path = null; return; }
+    const path = [];
+    for (let c = best; c >= 0 && c !== start; c = par[c]) path.push(c);
+    path.reverse(); mem.path = path; mem.k = 0;
+  }
+
+  /* ----- codec ----- */
+  function packGrid(g) {
+    let s = '';
+    for (let i = 0; i < N; i += 3) s += ALPH[(g[i] | 0) + 3 * (g[i + 1] | 0) + 9 * (g[i + 2] | 0)];
+    return s;
+  }
+  function unpackGrid(s, out) {
+    if (typeof s !== 'string' || s.length < Math.ceil(N / 3)) return false;
+    for (let k = 0; k < s.length; k++) {
+      let v = ALPH.indexOf(s[k]); if (v < 0) v = 0;
+      const i = k * 3; out[i] = v % 3; if (i + 1 < N) out[i + 1] = ((v / 3) | 0) % 3; if (i + 2 < N) out[i + 2] = ((v / 9) | 0) % 3;
+    }
+    return true;
+  }
+  const b36 = (v, k) => { let s = Math.max(0, Math.round(v)).toString(36); while (s.length < k) s = '0' + s; return s.slice(-k); };
+  const A = (v) => ALPH[clamp(Math.round(v), 0, 63)];
+  // flags: 1 alive 2 swim 4 roll 8 small 16 special 32 spawn-guard 64 canopy 128 airborne 256 armor 512 dodge 1024 revealed 2048 bursting
+  const flagsOf = (p) => (p.alive ? 1 : 0) | (p.sm ? 2 : 0) | (p.roll ? 4 : 0) | (p.crit ? 8 : 0) | (p.spAct > 0 ? 16 : 0) | (p.inv > 0 ? 32 : 0)
+    | (p.shOn ? 64 : 0) | (p.air > 0 ? 128 : 0) | (p.ar > 0 ? 256 : 0) | (p.dg > 0 ? 512 : 0) | (p.rv > 0 ? 1024 : 0) | (p.burst > 0 ? 2048 : 0);
+  /* 0 = not holding; else 1 + whole seconds of hold time left */
+  const holdLeft = (p) => (!p.alive && p.hold && p.holdT < HOLD_MAX ? 1 + Math.ceil(HOLD_MAX - p.holdT) : 0);
+  function encP(p) {
+    const ai = Math.round(((wrapA(p.a) + Math.PI) / (Math.PI * 2)) * 64) % 64, f = flagsOf(p);
+    const spf = Math.floor((p.sp / WEP[p.w].spMax) * 50);
+    return b36(p.x * 25, 2) + b36(p.y * 25, 2) + ALPH[ai] + A(f & 63) + A(f >> 6) + A(p.hp / 2) + A(p.ink / 2) + A(spf) + A(p.w) + A(p.chg * 20) + A(Math.ceil(p.rsp)) + (p.spK === 'beam' ? 'B' : p.spK === 'rush' ? 'R' : '-') + A(p.vis > 0 || p.rv > 0 ? 1 : 0) + A(holdLeft(p));
+  }
+  function decP(s) {
+    if (typeof s !== 'string' || s.length < 15) return null;
+    const I = (c) => Math.max(0, ALPH.indexOf(c));
+    return { x: parseInt(s.slice(0, 2), 36) / 25, y: parseInt(s.slice(2, 4), 36) / 25, a: (I(s[4]) / 64) * Math.PI * 2 - Math.PI, fl: I(s[5]) | (I(s[6]) << 6),
+      hp: I(s[7]) * 2, ink: I(s[8]) * 2, spf: I(s[9]) / 50, w: clamp(I(s[10]), 0, WEP.length - 1), chg: I(s[11]) / 20, rsp: I(s[12]), spK: s[13] === 'B' ? 'beam' : s[13] === 'R' ? 'rush' : '', vis: I(s[14]), hl: s.length > 15 ? I(s[15]) : 0 };
+  }
+  const encShots = (W) => W.shots.slice(0, 70).map((b) => b36(b.x * 25, 2) + b36(b.y * 25, 2) + (b.tm + 2 * (b.kd || 0))).join('');
+  function decShots(s) { const out = []; s = String(s || ''); for (let i = 0; i + 5 <= s.length; i += 5) { const v = +s[i + 4] || 0; out.push({ x: parseInt(s.slice(i, i + 2), 36) / 25, y: parseInt(s.slice(i + 2, i + 4), 36) / 25, tm: v % 2, kd: (v / 2) | 0 }); } return out; }
+  const objE = (o) => (o.k === 'w' ? Math.round(((wrapA(o.a) + Math.PI) / (Math.PI * 2)) * 64) % 64 : o.k === 'o' ? o.e * 8 : 0);
+  const encObs = (W) => W.obs.filter((o) => o.k !== 'A').slice(0, 30).map((o) => o.k + b36(o.x * 25, 2) + b36(o.y * 25, 2) + o.tm + A(o.t * 5) + A(objE(o))).join('');
+  function decObs(s) {
+    const out = []; s = String(s || '');
+    for (let i = 0; i + 8 <= s.length; i += 8) {
+      const e = Math.max(0, ALPH.indexOf(s[i + 7])), k = s[i];
+      out.push({ k, x: parseInt(s.slice(i + 1, i + 3), 36) / 25, y: parseInt(s.slice(i + 3, i + 5), 36) / 25, tm: +s[i + 5] || 0, t: Math.max(0, ALPH.indexOf(s[i + 6])) / 5, a: k === 'w' ? (e / 64) * Math.PI * 2 - Math.PI : 0, e: k === 'o' ? e / 8 : 0 });
+    }
+    return out;
+  }
+  function modeSnap(W) {
+    if (W.mode === 'zone') return [W.zc, Math.round(W.zs[0] * 10), Math.round(W.zs[1] * 10)];
+    if (W.mode === 'tower') return [Math.round(W.tw * 20), Math.round(W.tb[0] * 10), Math.round(W.tb[1] * 10), W.ton || 0];
+    return 0;
+  }
+  function snapshot(W, key, q, iq) {
+    return { k: key, q, t: Math.round(W.t * 100) / 100, g: packGrid(W.grid), p: W.ps.map(encP), b: encShots(W), o: encObs(W), ev: W.evs.slice(), iq, m: modeSnap(W), d: W.dopen.slice(0, 40) };
+  }
+
+  /* ======================= pure game interface ======================= */
+  function init(players, opts) {
+    const o = opts || {};
+    const n = players.length;
+    const mp = STYLE_KEYS.includes(o.map) ? o.map : STYLE_KEYS[U.rand(STYLE_KEYS.length)];
+    const mode = MODE_KEYS.includes(o.mode) ? o.mode : 'turf';
+    return {
+      rid: 1 + U.rand(99999), n, nm: players.map((p) => String((p && p.name) || '').slice(0, 10)),
+      mp, mode, sd: 1 + U.rand(2147483646), T: [120, 180, 240].includes(o.time) ? o.time : 180,
+      ph: 'count', res: null, tot: 0,
+    };
+  }
+  /* final scores per mode: turf = painted cells, zone = seconds held, tower = cells pushed (ties → painted cells) */
+  function finalRes(W) {
+    const c = counts(W.grid);
+    if (W.mode === 'zone') return { res: [Math.round(W.zs[0] * 10) / 10, Math.round(W.zs[1] * 10) / 10], paint: [c[1], c[2]] };
+    if (W.mode === 'tower') return { res: [Math.round(W.tb[0] * 10) / 10, Math.round(W.tb[1] * 10) / 10], paint: [c[1], c[2]] };
+    return { res: [c[1], c[2]], paint: [c[1], c[2]] };
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !Array.isArray(s.res) || s.res.length < 2) return null;
+    const tot = Math.max(1, s.tot || 1);
+    const pc = (v) => Math.round((v / tot) * 1000) / 10 + '%';
+    const mode = s.mode || 'turf';
+    let [a, b] = s.res;
+    let stats;
+    if (Array.isArray(s.pst) && s.pst.length === s.n) {
+      const col = (j) => s.pst.map((r) => (Array.isArray(r) ? String(r[j] | 0) : '-'));
+      stats = [{ label: '팀', values: s.pst.map((r, i) => TEAMN[i % 2].replace(' 팀', '')) }, { label: '무기', values: s.pst.map((r) => (Array.isArray(r) && WEP[r[4]] ? WEP[r[4]].name : '-')) }, { label: '칠한 칸', values: col(0) }, { label: '처치', values: col(1) }, { label: '쓰러짐', values: col(2) }, { label: '스페셜 사용', values: col(3) }];
+    }
+    const pa = Array.isArray(s.paint) ? s.paint : s.res;
+    let text;
+    if (mode === 'zone') text = '거점 점령 시간\n' + TEAMN[0] + '  ' + a + '초\n' + TEAMN[1] + '  ' + b + '초';
+    else if (mode === 'tower') text = '잉크 탑을 옮긴 거리\n' + TEAMN[0] + '  ' + a + '칸\n' + TEAMN[1] + '  ' + b + '칸';
+    else text = TEAMN[0] + '  ' + pc(a) + '\n' + TEAMN[1] + '  ' + pc(b);
+    if (s.ko >= 0) text = (mode === 'zone' ? TEAMN[s.ko] + '이 거점을 ' + ZONE_WIN + '초 지켰어요!' : TEAMN[s.ko] + '이 탑을 상대 기지까지 옮겼어요!') + '\n' + text;
+    if (mode !== 'turf') { text += '\n(칠한 넓이 ' + pc(pa[0]) + ' : ' + pc(pa[1]) + ')'; if (a === b) { a = pa[0]; b = pa[1]; } }
+    if (s.ko >= 0) { a = s.ko === 0 ? 1 : 0; b = 1 - a; }
+    if (a === b) { const all = []; for (let i = 0; i < s.n; i++) all.push(i); return { winners: all, stats, title: '무승부!', text }; }
+    const wt = a > b ? 0 : 1, winners = [];
+    for (let i = 0; i < s.n; i++) if (i % 2 === wt) winners.push(i);
+    return { winners, stats, title: TEAMN[wt] + ' 승리!', text };
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const WKEY = 'lounge.paint.weapon';
+  const loadW = () => { try { const v = +localStorage.getItem(WKEY); return v >= 0 && v < WEP.length && v === Math.floor(v) ? v : 0; } catch (e) { return 0; } };
+  const saveW = (v) => { try { localStorage.setItem(WKEY, String(v)); } catch (e) {} };
+
+  function firstHint(root, id, lines) {
+    const k = 'lounge.hint.' + id;
+    try { if (localStorage.getItem(k)) return null; localStorage.setItem(k, '1'); } catch (e) { return null; }
+    try { if (getComputedStyle(root).position === 'static') root.style.position = 'relative'; } catch (e) {}
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.setAttribute('aria-label', '조작 안내 닫기');
+    el.style.cssText = 'position:absolute;left:50%;top:58px;transform:translateX(-50%);z-index:5;max-width:calc(100% - 24px);min-height:44px;min-width:44px;padding:10px 14px;border:1px solid rgba(227,174,69,.6);border-radius:14px;background:rgba(23,19,31,.92);color:#f2e9d8;font:600 13px/1.5 inherit;text-align:center;cursor:pointer;transition:opacity .3s';
+    el.innerHTML = lines.map((t, i) => '<div' + (i ? ' style="color:#e3ae45"' : '') + '>' + t + '</div>').join('') + '<div style="opacity:.6;font-size:11px;margin-top:3px">눌러서 닫기</div>';
+    let gone = false;
+    const close = () => { if (gone) return; gone = true; el.style.opacity = '0'; setTimeout(() => el.remove(), 320); };
+    el.addEventListener('pointerdown', (e) => { e.stopPropagation(); close(); });
+    setTimeout(close, 6000);
+    root.appendChild(el);
+    return { close };
+  }
+
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    let st = null, key = null, W = null, phase = 'wait', cd = 0, endT = 0, bestDone = false;
+    const P = (s) => api.players[s] || { name: '?', color: '#888', ai: true };
+    const name = (s) => (st && st.nm && st.nm[s]) || P(s).name || (s + 1) + '번';
+    const simHere = (s) => { const p = api.players[s]; if (!p) return false; if (!api.online) return true; if (api.isHost) return !!p.ai || !!p.local; return !p.ai && !!p.local; };
+    const host = () => !api.online || api.isHost;
+    const mySeat = () => { const m = api.mySeats(); return m.length ? m[0] : -1; };
+    const myTm = () => (mySeat() >= 0 ? mySeat() % 2 : 0);
+    const input = { mx: 0, my: 0, ax: 0, ay: 0, fire: false, dive: false, subN: 0, spN: 0, w: loadW(), hold: false, rdy: false };
+    let hintBox = null, aiMem = [], parts = [], floats = [], feed = [], beams = [], shake = 0, lastSfx = {}, acc = 0;
+    let pubT = 0, hsQ = 0, inQ = 0, lastInSig = '', inT = 0;
+    const iqOf = {};
+    let snaps = [], lastSnapQ = -1, gGrid = null, gShots = [], gObs = [], gT = 0, gTat = 0, me = null, seenEv = {}, myInfo = null;
+    let lay = null, staticC = null, paintC = null, paintCtx = null, drawn = null, cam = null;
+    const PX = 8;
+    let selFam = WEP[input.w].fam, doorN = 0, gMode = 0;
+
+    const humanSeats = () => { const o = []; for (let s = 0; s < ((st && st.n) || 0); s++) { const p = api.players[s]; if (p && !p.ai) o.push(s); } return o; };
+    function curKey() { return st ? st.rid + '' : null; }
+    function startRound() {
+      const ws = [];
+      for (let s = 0; s < st.n; s++) ws.push(api.players[s] && api.players[s].ai ? U.rand(WEP.length) : (s === mySeat() ? input.w : 0));
+      W = newWorld({ mp: st.mp, mode: st.mode, sd: st.sd, n: st.n, T: st.T, ws });
+      selFam = WEP[input.w].fam; doorN = 0;
+      aiMem = W.ps.map(() => ({}));
+      parts = []; floats = []; feed = []; beams = []; snaps = []; lastSnapQ = -1; seenEv = {}; myInfo = null;
+      gGrid = W.grid.slice(); gShots = []; gObs = []; gT = 0; gTat = performance.now();
+      const ms = mySeat();
+      me = ms >= 0 ? Object.assign({}, W.ps[ms], { hc: {} }) : null;
+      phase = st.ph === 'count' ? 'count' : st.ph;
+      input.hold = false; input.rdy = false;
+      cd = humanSeats().length ? COUNT_H : COUNT; endT = END_T; acc = 0; bestDone = false;
+      staticC = null; drawn = null; cam = null;
+    }
+
+    /* ----- layout ----- */
+    function layout() {
+      const w = cv.w, h = cv.h, k = (L.ui && L.ui.ctlScale ? L.ui.ctlScale() : 1) || 1;
+      if (lay && lay.w === w && lay.h === h && lay.k === k) return lay;
+      const human = mySeat() >= 0;
+      let top = 48;
+      lay = { w, h, k, human, top, land: false, hud: { cx: w / 2, bx: 10, bw: w - 20, ly: 17 } };
+      if (human) {
+        // same world for every screen: VIEW×VIEW cells, zoomed to fit; leftover space is frame + controls
+        const csL = Math.max(4, Math.min((w - 8) / VIEW, (h - 12) / VIEW)), side = (w - csL * VIEW) / 2;
+        if (side >= 140) { // landscape: HUD and controls go to the side margins
+          lay.land = true; top = lay.top = 6;
+          lay.cs = csL; lay.vs = csL * VIEW; lay.vx = side; lay.vy = (h - lay.vs) / 2;
+          lay.hud = { cx: side / 2, bx: 8, bw: side - 16, ly: 58 };
+        } else {
+          const cs = Math.max(4, Math.min((w - 8) / VIEW, (h - top - 6) / VIEW)), vs = cs * VIEW;
+          const portrait = h - top - vs > 150;
+          lay.cs = cs; lay.vs = vs; lay.vx = (w - vs) / 2; lay.vy = portrait ? top : top + (h - top - vs) / 2;
+        }
+      } else {
+        const cs = Math.max(4, Math.min((w - 12) / MW, (h - 64) / MH));
+        lay.cs = cs; lay.vs = 0; lay.vx = 0; lay.vy = 0;
+      }
+      const R = (r) => Math.max(22, r * k);
+      lay.btn = {
+        dive: { x: w - 14 - R(36), y: h - 14 - R(36), r: R(36), label: '잠수' },
+        sub: { x: w - 14 - R(36) * 2 - 16 - R(27), y: h - 14 - R(27), r: R(27), label: '서브' },
+        sp: { x: w - 14 - R(36), y: h - 14 - R(36) * 2 - 14 - R(30), r: R(30), label: '스페셜' },
+      };
+      // minimap: under the view (portrait), in the left margin (landscape), else over the view's corner
+      const below = h - (lay.vy + lay.vs), side = lay.vx;
+      let mh, mw, mx2, my2;
+      if (human && below >= 130) { mh = Math.min(118, below - 14); mw = (mh * MW) / MH; mx2 = 8; my2 = lay.vy + lay.vs + 8; }
+      else if (human && side >= 64) { const y0 = lay.land ? 72 : top + 6; mw = Math.min(side - 16, 110); mh = Math.min((mw * MH) / MW, h - y0 - 8); mw = (mh * MW) / MH; mx2 = (side - mw) / 2; my2 = y0; }
+      else { mh = Math.min(118, h * 0.19); mw = (mh * MW) / MH; mx2 = (lay.vx || 0) + 6; my2 = (lay.vy || 52) + 6; }
+      lay.mini = { x: mx2, y: my2, w: mw, h: mh };
+      staticC = null; drawn = null;
+      return lay;
+    }
+    function buildStatic() {
+      const S = PX;
+      staticC = document.createElement('canvas'); staticC.width = MW * S; staticC.height = MH * S;
+      const c = staticC.getContext('2d');
+      c.fillStyle = '#3b3a44'; c.fillRect(0, 0, MW * S, MH * S);
+      const T = W.map.T;
+      for (let y = 0; y < MH; y++) for (let x = 0; x < MW; x++) {
+        const t = T[y * MW + x];
+        if ((x + y) & 1) { c.fillStyle = 'rgba(255,255,255,.03)'; c.fillRect(x * S, y * S, S, S); }
+        if (t === GR) { c.fillStyle = '#23232b'; c.fillRect(x * S, y * S, S, S); c.strokeStyle = '#6a6a78'; c.lineWidth = 1; for (let k = 2; k < S; k += 3) { c.beginPath(); c.moveTo(x * S + k, y * S); c.lineTo(x * S + k, y * S + S); c.stroke(); } }
+        if (t === PAD0 || t === PAD1) { c.fillStyle = TEAMC[t - PAD0]; c.globalAlpha = 0.55; c.fillRect(x * S, y * S, S, S); c.globalAlpha = 1; c.strokeStyle = 'rgba(255,255,255,.35)'; c.strokeRect(x * S + 0.5, y * S + 0.5, S - 1, S - 1); }
+        if (t === HW || t === LW || t === DR) { c.fillStyle = '#18161e'; c.fillRect(x * S, y * S, S, S); }
+        if (t === JP) { c.fillStyle = '#2b2a35'; c.fillRect(x * S, y * S, S, S); c.fillStyle = '#e3ae45'; c.beginPath(); c.arc(x * S + S / 2, y * S + S / 2, S * 0.38, 0, 7); c.fill(); c.fillStyle = '#17131f'; c.beginPath(); c.arc(x * S + S / 2, y * S + S / 2, S * 0.18, 0, 7); c.fill(); }
+        if (isRail(t)) {
+          c.fillStyle = '#2f3a3f'; c.fillRect(x * S, y * S, S, S);
+          const [dx, dy] = RDIR[t - RL], mx = x * S + S / 2, my = y * S + S / 2;
+          c.strokeStyle = '#7fd0c4'; c.lineWidth = 1.2; c.beginPath();
+          c.moveTo(mx - dx * 2.5 - dy * 2.5, my - dy * 2.5 - dx * 2.5); c.lineTo(mx + dx * 2.5, my + dy * 2.5); c.lineTo(mx - dx * 2.5 + dy * 2.5, my - dy * 2.5 + dx * 2.5); c.stroke();
+        }
+      }
+      c.strokeStyle = 'rgba(0,0,0,.2)'; c.lineWidth = 1;
+      for (let i = 0; i <= MW; i += 4) { c.beginPath(); c.moveTo(i * S + 0.5, 0); c.lineTo(i * S + 0.5, MH * S); c.stroke(); }
+      for (let i = 0; i <= MH; i += 4) { c.beginPath(); c.moveTo(0, i * S + 0.5); c.lineTo(MW * S, i * S + 0.5); c.stroke(); }
+      paintC = document.createElement('canvas'); paintC.width = MW * S; paintC.height = MH * S; paintCtx = paintC.getContext('2d');
+      drawn = new Int8Array(N).fill(-1);
+    }
+    function syncPaint(grid) {
+      if (!staticC) buildStatic();
+      for (let i = 0; i < N; i++) {
+        const o = grid[i];
+        if (drawn[i] === o) continue;
+        drawn[i] = o;
+        const x = (i % MW) * PX, y = ((i / MW) | 0) * PX;
+        paintCtx.clearRect(x, y, PX, PX);
+        if (!o) continue;
+        paintCtx.fillStyle = TEAMC[o - 1]; paintCtx.fillRect(x, y, PX, PX);
+        const hsh = ((i * 2654435761) >>> 0) % 9;
+        if (hsh < 2) { paintCtx.fillStyle = 'rgba(255,255,255,.16)'; paintCtx.beginPath(); paintCtx.arc(x + 3, y + 3, 1.6, 0, 7); paintCtx.fill(); }
+        else if (hsh > 6) { paintCtx.fillStyle = 'rgba(0,0,0,.12)'; paintCtx.fillRect(x, y + PX - 2, PX, 2); }
+      }
+    }
+
+    /* ----- input ----- */
+    const inp = api.input || null;
+    let joy = null, aim = null, mouse = null, padAim = false; // touch sticks / mouse
+    const JR = () => 48 * (lay ? lay.k : 1);
+    let lastKbdAim = 0;
+    function refreshInput() {
+      let x = 0, y = 0;
+      if (joy) { const dx = joy.x - joy.x0, dy = joy.y - joy.y0, d = Math.hypot(dx, dy), jr = JR(); if (d > 6) { const m = Math.min(1, (d - 6) / (jr - 6)); x = (dx / d) * m; y = (dy / d) * m; } }
+      if (inp) { const kx = inp.axis('L', 'R'), ky = inp.axis('U', 'D'); if (kx || ky) { const m = Math.hypot(kx, ky); x = kx / Math.max(1, m); y = ky / Math.max(1, m); } }
+      input.mx = Math.round(x * 100) / 100; input.my = Math.round(y * 100) / 100;
+      let ax = 0, ay = 0, fire = false;
+      if (aim) { const dx = aim.x - aim.x0, dy = aim.y - aim.y0, d = Math.hypot(dx, dy); if (d > 8) { ax = dx / d; ay = dy / d; aim.last = [ax, ay]; } else if (aim.last) { ax = aim.last[0]; ay = aim.last[1]; } fire = true; }
+      if (mouse && mouse.on && cam && lay) {
+        const mp = scrOf(meNow());
+        if (mp) { const dx = mouse.x - mp.x, dy = mouse.y - mp.y, d = Math.hypot(dx, dy); if (d > 4) { ax = dx / d; ay = dy / d; } }
+        if (mouse.down) fire = true;
+      }
+      padAim = false;
+      if (inp) {
+        const kx = inp.axis('AL', 'AR'), ky = inp.axis('AU', 'AD');
+        if (Math.hypot(kx, ky) > 0.3) { const m = Math.hypot(kx, ky); ax = kx / m; ay = ky / m; padAim = true; lastKbdAim = performance.now(); }
+        if (inp.held('FIRE')) fire = true;
+        input.dive = inp.held('DIVE') || diveTouch;
+      } else input.dive = diveTouch;
+      input.ax = Math.round(ax * 100) / 100; input.ay = Math.round(ay * 100) / 100; input.fire = fire;
+    }
+    let diveTouch = false, diveId = null;
+    const meNow = () => { const s = scene(performance.now()); return s ? s.ps[mySeat()] : null; };
+    function hitBtn(x, y) {
+      if (!lay || !lay.human) return null;
+      for (const k of ['dive', 'sub', 'sp']) { const b = lay.btn[k]; if (Math.hypot(x - b.x, y - b.y) < Math.max(b.r, 26) + 6) return k; }
+      return null;
+    }
+    /* weapon picker: family tabs (10) + the family's two variants. Shown in the countdown and while knocked out. */
+    function weaponPanel() {
+      if (!lay || !lay.human || !W) return null;
+      const ms = mySeat(), meP = scene(performance.now()).ps[ms];
+      const show = (phase === 'count' && st.ph === 'count') || (meP && !(meP.fl & 1) && st.ph === 'play');
+      if (!show) return null;
+      const w = cv.w, h = cv.h, pw = Math.min(w - 16, 520), one = pw >= FAM_KEYS.length * 44 + (FAM_KEYS.length - 1) * 4;
+      const cols = one ? FAM_KEYS.length : 5, rows = one ? 1 : 2, tg = 4;
+      const tw = (pw - (cols - 1) * tg) / cols, th = 46, ch = 66, hd = 18;
+      const H = hd + rows * th + (rows - 1) * tg + 8 + ch;
+      const x0 = (w - pw) / 2, y0 = h - H - 10;
+      const tabs = FAM_KEYS.map((f, i) => ({ f, x: x0 + (i % cols) * (tw + tg), y: y0 + hd + Math.floor(i / cols) * (th + tg), w: tw, h: th }));
+      const cy = y0 + hd + rows * th + (rows - 1) * tg + 8, cw = (pw - 8) / 2;
+      const cards = [];
+      WEP.forEach((wp, i) => { if (wp.fam === selFam) cards.push({ i, x: x0 + cards.length * (cw + 8), y: cy, w: cw, h: ch }); });
+      const aw = Math.min(pw, 250), dead = st.ph === 'play';
+      const act = { x: (w - aw) / 2, y: y0 - 58, w: aw, h: 46, dead };
+      return { x: x0, y: y0, w: pw, h: H, tabs, cards, act };
+    }
+    function pickW(i) { input.w = clamp(i, 0, WEP.length - 1); selFam = WEP[input.w].fam; saveW(input.w); }
+    function pressSub() { input.subN++; }
+    function pressSp() { input.spN++; }
+    function onDown(e) {
+      if (mySeat() < 0) return;
+      const p = cv.local(e);
+      e.preventDefault();
+      if (hintBox && hintBox.close) hintBox.close();
+      const wpP = weaponPanel(), inR = (c) => p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h;
+      if (wpP) {
+        if (inR(wpP.act)) { if (wpP.act.dead) input.hold = !input.hold; else input.rdy = !input.rdy; api.sfx('chip'); api.buzz(12, 'ui'); return; }
+        if (wpP.act.dead && (wpP.tabs.some(inR) || wpP.cards.some(inR))) input.hold = true; // choosing a weapon pauses the respawn
+        for (const c of wpP.tabs) if (inR(c)) { selFam = c.f; api.sfx('chip'); api.buzz(8, 'ui'); return; }
+        for (const c of wpP.cards) if (inR(c)) { pickW(c.i); api.sfx('chip'); api.buzz(10, 'ui'); return; }
+        if (inR(wpP)) return;
+      }
+      if (e.pointerType === 'mouse') {
+        const b = hitBtn(p.x, p.y);
+        if (b && e.button === 0) { if (b === 'sub') pressSub(); else if (b === 'sp') pressSp(); else { diveTouch = true; diveId = e.pointerId; } return; }
+        mouse = mouse || {}; mouse.on = true; mouse.x = p.x; mouse.y = p.y;
+        if (e.button === 0) mouse.down = true; else if (e.button === 2) pressSub();
+        refreshInput(); return;
+      }
+      const b = hitBtn(p.x, p.y);
+      if (b) {
+        if (b === 'dive') { diveTouch = true; diveId = e.pointerId; }
+        else if (b === 'sub') pressSub(); else pressSp();
+        api.buzz(8, 'ui'); refreshInput(); return;
+      }
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      if (p.x < cv.w / 2) { if (!joy) joy = { id: e.pointerId, x0: p.x, y0: p.y, x: p.x, y: p.y }; }
+      else if (!aim) { const m = meNow(); const a0 = m ? m.a : -Math.PI / 2; aim = { id: e.pointerId, x0: p.x, y0: p.y, x: p.x, y: p.y, last: [Math.cos(a0), Math.sin(a0)] }; }
+      refreshInput();
+    }
+    function onMove(e) {
+      const p = cv.local(e);
+      if (e.pointerType === 'mouse' && mySeat() >= 0) { mouse = mouse || {}; mouse.on = true; mouse.x = p.x; mouse.y = p.y; }
+      if (joy && joy.id === e.pointerId) {
+        joy.x = p.x; joy.y = p.y;
+        const dx = joy.x - joy.x0, dy = joy.y - joy.y0, d = Math.hypot(dx, dy), jr = JR();
+        if (d > jr * 1.5) { joy.x0 = joy.x - (dx / d) * jr * 1.5; joy.y0 = joy.y - (dy / d) * jr * 1.5; }
+      }
+      if (aim && aim.id === e.pointerId) {
+        aim.x = p.x; aim.y = p.y;
+        const dx = aim.x - aim.x0, dy = aim.y - aim.y0, d = Math.hypot(dx, dy), jr = JR();
+        if (d > jr) { aim.x0 = aim.x - (dx / d) * jr; aim.y0 = aim.y - (dy / d) * jr; }
+      }
+      refreshInput();
+    }
+    function onUp(e) {
+      if (joy && joy.id === e.pointerId) joy = null;
+      if (aim && aim.id === e.pointerId) aim = null;
+      if (diveId === e.pointerId) { diveTouch = false; diveId = null; }
+      if (e.pointerType === 'mouse' && mouse) { if (e.button === 0 || e.type !== 'pointerup') mouse.down = false; }
+      refreshInput();
+    }
+    const offIn = inp ? inp.on((type, id) => {
+      if (type === 'down') { if (id === 'SUB') pressSub(); else if (id === 'SP') pressSp(); else if (id === 'WP' || id === 'WN') { pickW((input.w + (id === 'WN' ? 1 : -1) + WEP.length) % WEP.length); }
+        else if (id === 'RDY') { const wq = weaponPanel(); if (wq) { if (wq.act.dead) input.hold = !input.hold; else input.rdy = !input.rdy; api.sfx('chip'); } } }
+      refreshInput();
+    }) : () => {};
+    const releaseAll = () => { joy = null; aim = null; diveTouch = false; if (mouse) mouse.down = false; refreshInput(); };
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    cv.cv.addEventListener('lostpointercapture', onUp);
+    cv.cv.addEventListener('contextmenu', noCtx);
+    window.addEventListener('blur', releaseAll);
+
+    /* ----- feedback ----- */
+    function sfx(n, gap) { const t = performance.now(); if (t - (lastSfx[n] || 0) < (gap || 50)) return; lastSfx[n] = t; api.sfx(n); }
+    function splash(x, y, col, n, sp) {
+      for (let k = 0; k < n; k++) { const a = Math.random() * 7, v = (0.5 + Math.random()) * (sp || 6); parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: 0.35 + Math.random() * 0.4, c: col, r: 0.12 + Math.random() * 0.2 }); }
+      if (parts.length > 400) parts.splice(0, parts.length - 400);
+    }
+    const near = (x, y) => { const m = me || (mySeat() >= 0 && W ? W.ps[mySeat()] : null); return !m || Math.hypot(m.x - x, m.y - y) < 14; };
+    function onEvent(e) {
+      const ms = mySeat(), t = e[1];
+      if (t === 'k') {
+        const x = e[2] / 10, y = e[3] / 10, v = e[4], k = e[5];
+        splash(x, y, TEAMC[(k >= 0 ? k : v + 1) % 2], 30, 9);
+        feed.push({ a: k, b: v, t: 4 }); if (feed.length > 4) feed.shift();
+        if (near(x, y)) { sfx('pop'); noise(0.3, 0.12, 900); }
+        if (v === ms) { api.buzz(80, 'hit'); shake = 1; floats.push({ text: '쓰러졌어요!', col: '#ee6a55', t: 1.4 }); tone(200, 0.5, 'sawtooth', 0.06, 70); }
+        else if (k === ms) { api.buzz(30, 'hit'); floats.push({ text: '처치! ' + name(v), col: TEAMC[ms % 2], t: 1.3 }); tone(880, 0.15, 'square', 0.05, 1320); }
+      } else if (t === 'x') {
+        const x = e[2] / 10, y = e[3] / 10, r = e[4] / 10;
+        splash(x, y, TEAMC[e[5] % 2], Math.round(r * 9), r * 4);
+        if (near(x, y)) { noise(0.35, 0.16, 500); shake = Math.max(shake, 0.35); }
+      } else if (t === 'l') {
+        beams.push({ x0: e[2] / 10, y0: e[3] / 10, x1: e[4] / 10, y1: e[5] / 10, tm: e[6], big: e[7], t: e[7] ? 0.6 : 0.25 });
+        if (near(e[2] / 10, e[3] / 10)) { if (e[7]) { noise(0.6, 0.18, 1800); tone(120, 0.6, 'sawtooth', 0.07, 60); shake = Math.max(shake, 0.6); } else tone(1500, 0.12, 'triangle', 0.05, 500); }
+      } else if (t === 's') {
+        const s = e[4], sp = SPS[e[5]];
+        if (sp) floats.push({ text: (s === ms ? '' : name(s) + ' · ') + sp.name + '!', col: TEAMC[s % 2], t: 1.4 });
+        if (near(e[2] / 10, e[3] / 10)) { sfx('whoosh'); tone(330, 0.4, 'triangle', 0.06, 990); }
+        if (s === ms) api.buzz(40, 'alert');
+      } else if (t === 'd') {
+        staticC = null;
+        splash(e[2] + 0.5, e[3] + 0.5, '#e3ae45', 16, 5);
+        if (near(e[2], e[3])) { noise(0.4, 0.14, 400); floats.push({ text: '문이 열렸어요!', col: '#e3ae45', t: 1.2 }); }
+      } else if (t === 'z') {
+        const c = e[2];
+        floats.push({ text: c >= 0 ? TEAMN[c] + ' 거점 점령!' : '거점이 중립이 됐어요', col: c >= 0 ? TEAMC[c] : '#f2e9d8', t: 1.5 });
+        if (c >= 0) { tone(c === myTm() ? 660 : 330, 0.3, 'triangle', 0.06, c === myTm() ? 990 : 220); if (ms >= 0) api.buzz(30, 'alert'); }
+      }
+    }
+    const hooks = { hit(q) { if (q.seat === mySeat()) { api.buzz(15, 'hit'); shake = Math.max(shake, 0.25); } } };
+    function drainEvents(evs) {
+      for (const e of evs || []) { if (!Array.isArray(e) || seenEv[e[0]]) continue; seenEv[e[0]] = 1; onEvent(e); }
+      const ks = Object.keys(seenEv); if (ks.length > 80) for (const k of ks.slice(0, 40)) delete seenEv[k];
+    }
+
+    /* ----- host flow ----- */
+    function hostFlow(dt) {
+      if (!host() || !st || !W) return;
+      if (st.ph === 'count' && phase === 'play') { api.setState(Object.assign({}, st, { ph: 'play' })); return; }
+      if (st.ph === 'play' && (W.t >= st.T || W.ko >= 0)) {
+        const fr = finalRes(W);
+        api.setState(Object.assign({}, st, { ph: 'end', res: fr.res, paint: fr.paint, ko: W.ko, tot: W.map.tot, pst: W.ps.map((p) => [Math.round(p.pc), p.kills, p.deaths, p.spUse, p.w]) }));
+      } else if (st.ph === 'end') {
+        endT -= dt;
+        if (endT <= 0) { endT = 1e9; api.setState(Object.assign({}, st, { ph: 'done' })); }
+      }
+    }
+
+    /* ----- online ----- */
+    function applyInput(p, o) {
+      p.mx = clamp(+o.mx || 0, -1, 1); p.my = clamp(+o.my || 0, -1, 1);
+      p.ax = clamp(+o.ax || 0, -1, 1); p.ay = clamp(+o.ay || 0, -1, 1);
+      p.fire = !!o.fire; p.dive = !!o.dive; p.hold = !!o.hold; p.rdy = !!o.rdy;
+      if (fin(o.subN)) p.subN = o.subN | 0;
+      if (fin(o.spN)) p.spN = o.spN | 0;
+      if (Number.isInteger(o.w) && o.w >= 0 && o.w < WEP.length) { p.wantW = o.w; if (st.ph === 'count') { p.w = o.w; } }
+    }
+    function pollHost() {
+      if (!api.online || !api.isHost || !W) return;
+      let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+      if (!rem || typeof rem !== 'object') return;
+      for (const k in rem) {
+        const s = +k, o = rem[k];
+        if (!(s >= 0 && s < W.ps.length) || simHere(s) || !o || o.k !== key) continue;
+        const p = W.ps[s];
+        if (o.fs == null) continue;
+        if (p._fs == null) { p._fs = 1; p.subSeen = o.subN | 0; p.spSeen = o.spN | 0; }
+        applyInput(p, o);
+        if (fin(o.q)) iqOf[s] = o.q;
+      }
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !W) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || typeof hs !== 'object' || hs.k !== key || hs.q === lastSnapQ) return;
+      lastSnapQ = hs.q;
+      if (phase === 'count' && fin(hs.cd) && hs.cd > 0) cd = hs.cd;
+      const ps = Array.isArray(hs.p) ? hs.p.map(decP) : [];
+      snaps.push({ at: now, p: ps }); if (snaps.length > 4) snaps.shift();
+      gT = +hs.t || 0; gTat = now;
+      const tmp = new Array(N); if (unpackGrid(hs.g, tmp)) gGrid = tmp;
+      gShots = decShots(hs.b); gObs = decObs(hs.o);
+      if (Array.isArray(hs.d) && hs.d.length > doorN) { for (const i of hs.d) if (W.map.T[i] === DR) { W.map.T[i] = FL; W.map.tot++; } doorN = hs.d.length; staticC = null; }
+      gMode = hs.m;
+      drainEvents(hs.ev);
+      const ms = mySeat();
+      if (ms >= 0 && me && ps[ms]) {
+        const sp = ps[ms];
+        myInfo = sp;
+        const wasAlive = me.alive;
+        me.alive = !!(sp.fl & 1); me.w = sp.w; me.tm = ms % 2; me.spK = sp.spK; me.spAct = sp.fl & 16 ? 1 : 0; me.chg = sp.chg;
+        const ex = sp.x - me.x, ey = sp.y - me.y, e = Math.hypot(ex, ey);
+        if (e > 3 || !wasAlive || !me.alive) { me.x = sp.x; me.y = sp.y; }
+        else { me.x += ex * 0.18; me.y += ey * 0.18; }
+      }
+    }
+    function guestTime(now) { return gT + Math.min(0.5, (now - gTat) / 1000); }
+    function predictMe(dt) {
+      if (!me || !me.alive) return;
+      me.mx = input.mx; me.my = input.my; me.ax = input.ax; me.ay = input.ay; me.fire = input.fire; me.dive = input.dive;
+      me.roll = (WEP[me.w].fam === 'roller' || WEP[me.w].fam === 'brush') && input.fire && !input.dive;
+      moveP({ map: W.map, grid: gGrid || W.grid }, me, dt);
+    }
+    function publish(rdt, now) {
+      if (!api.online || !W) return;
+      pubT -= rdt; inT -= rdt;
+      try {
+        if (api.isHost) {
+          if (pubT > 0) return;
+          pubT = 1 / 11;
+          hsQ = (hsQ + 1) % 100000;
+          api.net.hostSend(Object.assign(snapshot(W, key, hsQ, Object.assign({}, iqOf)), { cd: phase === 'count' ? Math.round(cd * 10) / 10 : 0 }));
+        } else {
+          if (mySeat() < 0) return;
+          const sig = [input.mx, input.my, input.ax, input.ay, input.fire, input.dive, input.subN, input.spN, input.w, input.hold, input.rdy].join('|');
+          const urgent = sig.split('|').slice(4).join() !== lastInSig.split('|').slice(4).join();
+          if (sig === lastInSig && inT > 0) return;
+          if (!urgent && inT > 0.18) return; // ~15 Hz cap for stick noise
+          lastInSig = sig; inT = 0.25;
+          inQ = (inQ + 1) % 100000;
+          api.net.publish({ k: key, q: inQ, fs: 1, mx: input.mx, my: input.my, ax: input.ax, ay: input.ay, fire: input.fire, dive: input.dive, subN: input.subN, spN: input.spN, w: input.w, hold: input.hold, rdy: input.rdy });
+        }
+      } catch (e) {}
+    }
+
+    /* ----- main loop ----- */
+    let shotSnd = 0, pbar = null, pkForce = false;
+    function frame(dt, now) {
+      if (!st || !W) return;
+      if (phase === 'count') {
+        const prevN = Math.ceil(cd); cd -= dt; const nowN = Math.ceil(cd);
+        if (nowN !== prevN && nowN > 0 && nowN <= 3) api.sfx('tick');
+        if (cd <= 0) { phase = 'play'; api.sfx('pop'); api.buzz(20); }
+        // everyone pressed 「준비 완료」 → start in READY_T s (host decides; guests follow the host's countdown)
+        if (host() && cd > READY_T) { const hs = humanSeats(); if (hs.length && hs.every((s) => (s === mySeat() ? input.rdy : W.ps[s] && W.ps[s].rdy))) cd = READY_T; }
+        // 라운드 44: 사람이 모두 준비할 때까지 READY_T 앞에서 멈춤(제한 시간 없음). 방장 「지금 시작」 → 바로 READY_T.
+        const rdyOk = (s) => (s === mySeat() ? !!input.rdy : !!(W.ps[s] && W.ps[s].rdy)) || !!(L.debug && L.debug.autoplay);
+        if (!pbar && st.ph === 'count') pbar = api.pickBar({ style: { bottom: 'auto', top: '52px' }, picked: rdyOk, onForce: () => { pkForce = true; } });
+        if (host() && pkForce) { pkForce = false; if (cd > READY_T) cd = READY_T; }
+        else if (host() && L.pick.waiting(api.players, rdyOk).length) cd = Math.max(cd, READY_T + 0.05);
+      }
+      if (phase !== 'count' && pbar) { pbar.destroy(); pbar = null; }
+      if (input.hold && phase === 'play') { const m0 = scene(now).ps[mySeat()]; if (m0 && (m0.fl & 1)) input.hold = false; }
+      if (!hintBox && phase === 'play' && mySeat() >= 0) hintBox = firstHint(root, 'paint2', ['왼쪽: 끌어서 이동 · 오른쪽: 끌어서 조준하며 발사', '「잠수」를 누르고 있으면 내 색 잉크 속을 빠르게 헤엄치며 잉크가 차요']) || 1;
+      const ms = mySeat();
+      if (host()) {
+        pollHost();
+        if (ms >= 0 && !(L.debug && L.debug.autoplay)) { const p = W.ps[ms]; if (p && simHere(ms)) { if (p._fs == null) { p._fs = 1; p.subSeen = input.subN; p.spSeen = input.spN; } applyInput(p, input); } }
+        if (phase === 'play' && st.ph === 'play' && W.t < st.T) {
+          W.ps.forEach((p, i) => {
+            const pl = api.players[i];
+            if (!pl || !simHere(i)) return;
+            if (pl.ai || (L.debug && L.debug.autoplay && i === ms)) aiThink(W, p, aiMem[i], pl.ai ? (pl.lv || 2) : 2, dt);
+          });
+          const before = W.evId;
+          stepWorld(W, dt, hooks);
+          if (W.evId !== before) drainEvents(W.evs);
+          const tl = st.T - W.t, tp = tl + dt;
+          if (Math.ceil(tl) !== Math.ceil(tp) && tl > 0 && tl <= 10) api.sfx('tick');
+        }
+        hostFlow(dt);
+      } else {
+        pollGuest(now);
+        if (phase === 'play' && st.ph === 'play') predictMe(dt);
+      }
+      // my firing sound (local feel, both host and guest)
+      if (ms >= 0 && phase === 'play' && st.ph === 'play') {
+        const m = scene(now).ps[ms];
+        shotSnd -= dt;
+        if (m && (m.fl & 1) && input.fire && !input.dive && m.ink > 2) {
+          const f = WEP[m.w].fam;
+          if (shotSnd > 0) { /* wait */ }
+          else if (f === 'shooter' || f === 'dualie') { shotSnd = f === 'dualie' ? 0.09 : 0.125; noise(0.05, 0.05, 2600); }
+          else if ((f === 'roller' || f === 'brush') && (m.fl & 4)) { shotSnd = 0.22; noise(0.12, 0.04, f === 'brush' ? 1400 : 700); }
+          else if ((f === 'charger' || f === 'gatling') && m.chg > 0 && m.chg < 1) { shotSnd = 0.1; tone(300 + m.chg * 900, 0.08, 'sine', 0.025); }
+          else if (f === 'sprink') { shotSnd = 0.12; noise(0.06, 0.04, 3200); }
+          else if (f === 'bucket' || f === 'brella' || f === 'blaster') { shotSnd = f === 'bucket' ? 0.65 : f === 'brella' ? 0.6 : 0.75; noise(0.14, 0.07, f === 'blaster' ? 500 : 1100); }
+        }
+        if (m && (m.fl & 2048) && shotSnd <= 0) { shotSnd = 0.075; noise(0.04, 0.045, 2900); }
+      }
+      for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.t -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.9; p.vy *= 0.9; if (p.t <= 0) parts.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t -= dt; if (floats[i].t <= 0) floats.splice(i, 1); }
+      for (let i = feed.length - 1; i >= 0; i--) { feed[i].t -= dt; if (feed[i].t <= 0) feed.splice(i, 1); }
+      for (let i = beams.length - 1; i >= 0; i--) { beams[i].t -= dt; if (beams[i].t <= 0) beams.splice(i, 1); }
+      shake = Math.max(0, shake - dt * 3);
+    }
+
+    let scCache = null, scAt = -1;
+    function scene(now) {
+      if (scAt === now && scCache) return scCache;
+      scAt = now;
+      if (host()) {
+        scCache = { t: W.t, grid: W.grid, shots: W.shots, obs: W.obs, ps: W.ps.map((p) => ({ seat: p.seat, x: p.x, y: p.y, a: p.a, fl: flagsOf(p), hp: p.hp, ink: p.ink, spf: p.sp / WEP[p.w].spMax, w: p.w, chg: p.chg, rsp: p.rsp, spK: p.spK, vis: p.vis > 0 || p.rv > 0 ? 1 : 0, hl: holdLeft(p), ma: p.ma, sp: Math.hypot(p.vx, p.vy) })) };
+        return scCache;
+      }
+      const ms = mySeat(), ps = [];
+      let Aa = null, B = null, k = 1;
+      if (snaps.length) {
+        const rt = now - 110;
+        B = snaps[snaps.length - 1];
+        for (let i = snaps.length - 1; i > 0; i--) if (snaps[i - 1].at <= rt) { Aa = snaps[i - 1]; B = snaps[i]; break; }
+        if (Aa) k = clamp((rt - Aa.at) / Math.max(1, B.at - Aa.at), 0, 1.2);
+      }
+      for (let s = 0; s < st.n; s++) {
+        const b = B && B.p[s], a = Aa && Aa.p[s];
+        if (s === ms && me) {
+          const inf = myInfo || {};
+          ps.push({ seat: s, x: me.x, y: me.y, a: me.a, fl: (me.alive ? 1 : 0) | (me.sm ? 2 : 0) | (me.roll ? 4 : 0) | (me.crit ? 8 : 0) | ((inf.fl || 0) & 48), hp: inf.hp != null ? inf.hp : 100, ink: inf.ink != null ? inf.ink : 100, spf: inf.spf || 0, w: inf.w != null ? inf.w : input.w, chg: inf.chg || 0, rsp: inf.rsp || 0, spK: inf.spK || '', vis: 0, hl: inf.hl || 0, ma: me.ma, sp: Math.hypot(me.vx, me.vy) });
+          continue;
+        }
+        if (!b) { const p = W.ps[s]; ps.push({ seat: s, x: p.x, y: p.y, a: p.a, fl: 1, hp: 100, ink: 100, spf: 0, w: p.w, chg: 0, rsp: 0, spK: '', vis: 0, ma: p.a, sp: 0 }); continue; }
+        if (!a || !(a.fl & 1) !== !(b.fl & 1)) { ps.push(Object.assign({ seat: s, ma: b.a, sp: 0 }, b)); continue; }
+        const x = a.x + (b.x - a.x) * k, y = a.y + (b.y - a.y) * k;
+        ps.push(Object.assign({}, b, { seat: s, x, y, a: a.a + wrapA(b.a - a.a) * k, ma: Math.atan2(b.y - a.y, b.x - a.x), sp: Math.hypot(b.x - a.x, b.y - a.y) * 10 }));
+      }
+      scCache = { t: guestTime(now), grid: gGrid || W.grid, shots: gShots, obs: gObs, ps };
+      return scCache;
+    }
+    function scrOf(q) { if (!q || !cam || !lay) return null; return { x: cam.ox + (q.x - cam.x) * lay.cs, y: cam.oy + (q.y - cam.y) * lay.cs }; }
+
+    /* ----- drawing ----- */
+    function modeInfo() { // {zc, zs:[a,b]} or {tw, tb:[a,b], on}
+      if (!W || W.mode === 'turf') return null;
+      if (host()) return W.mode === 'zone' ? { zc: W.zc, zs: W.zs } : { tw: W.tw, tb: W.tb, on: W.ton || 0 };
+      const m = Array.isArray(gMode) ? gMode : null;
+      if (W.mode === 'zone') return { zc: m ? m[0] : -1, zs: m ? [m[1] / 10, m[2] / 10] : [0, 0] };
+      return { tw: m ? m[0] / 20 : W.geo.c0, tb: m ? [m[1] / 10, m[2] / 10] : [0, 0], on: m ? m[3] : 0 };
+    }
+    function draw(now) {
+      if (!W || !st) { cv.clear(); return; }
+      const l = layout(), sc = scene(now), ms = mySeat(), cs = l.cs, w = cv.w, h = cv.h;
+      if (!staticC) buildStatic();
+      syncPaint(sc.grid);
+      const mine = ms >= 0 ? sc.ps[ms] : null;
+      const fxk = FX(), sx = shake > 0 ? (Math.random() - 0.5) * shake * 7 * fxk : 0, sy = shake > 0 ? (Math.random() - 0.5) * shake * 7 * fxk : 0;
+      // camera: a human's camera is centred exactly on their spirit (= the sight box); spectators see the whole field
+      if (l.human && mine) cam = { x: mine.x, y: mine.y, ox: l.vx + l.vs / 2 + sx, oy: l.vy + l.vs / 2 + sy };
+      else if (l.human) cam = cam || { x: MW / 2, y: MH / 2, ox: l.vx + l.vs / 2, oy: l.vy + l.vs / 2 };
+      else cam = { x: MW / 2, y: MH / 2, ox: w / 2 + sx, oy: 30 + (h - 30) / 2 + sy };
+      const X = (x) => cam.ox + (x - cam.x) * cs, Y = (y) => cam.oy + (y - cam.y) * cs;
+      ctx.fillStyle = '#121017'; ctx.fillRect(0, 0, w, h);
+      ctx.save();
+      if (l.human) { // sight box
+        ctx.fillStyle = '#0b0910'; ctx.fillRect(l.vx, l.vy, l.vs, l.vs);
+        ctx.beginPath(); ctx.rect(l.vx, l.vy, l.vs, l.vs); ctx.clip();
+      }
+      // floor + paint
+      ctx.imageSmoothingEnabled = false;
+      ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(X(0) - 4, Y(0) - 4, MW * cs + 8, MH * cs + 8);
+      ctx.drawImage(staticC, X(0), Y(0), MW * cs, MH * cs);
+      ctx.drawImage(paintC, X(0), Y(0), MW * cs, MH * cs);
+      ctx.imageSmoothingEnabled = true;
+      const hw = l.human ? VH + 1 : MW, hh = l.human ? VH + 1 : MH;
+      const x0 = Math.max(0, Math.floor(cam.x - hw) - 1), x1 = Math.min(MW - 1, Math.ceil(cam.x + hw) + 1);
+      const y0 = Math.max(0, Math.floor(cam.y - hh) - 1), y1 = Math.min(MH - 1, Math.ceil(cam.y + hh) + 2);
+      const T = W.map.T;
+      // low walls
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        if (T[y * MW + x] !== LW) continue;
+        const px = X(x), py = Y(y), lift = cs * 0.22;
+        ctx.fillStyle = '#4c4656'; ctx.fillRect(px, py - lift, cs, cs + lift * 0.4);
+        ctx.fillStyle = '#7b7287'; ctx.fillRect(px, py - lift, cs, cs * 0.8);
+        ctx.fillStyle = 'rgba(255,255,255,.12)'; ctx.fillRect(px, py - lift, cs, 2);
+      }
+      // mode marks
+      const mi = modeInfo();
+      if (W.mode === 'zone') {
+        const zc = mi ? mi.zc : -1;
+        ctx.strokeStyle = zc >= 0 ? TEAMC[zc] : 'rgba(242,233,216,.8)'; ctx.lineWidth = Math.max(2, cs * 0.12); ctx.setLineDash([cs * 0.5, cs * 0.3]);
+        ctx.strokeRect(X(MW / 2 - 4), Y(MH / 2 - 3), cs * 8, cs * 6); ctx.setLineDash([]);
+      }
+      if (W.mode === 'tower' && W.geo.path) {
+        ctx.strokeStyle = 'rgba(227,174,69,.45)'; ctx.lineWidth = Math.max(2, cs * 0.1); ctx.setLineDash([cs * 0.2, cs * 0.3]); ctx.beginPath();
+        W.geo.path.forEach(([x, y], i) => (i ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.stroke(); ctx.setLineDash([]);
+        for (const [gi, tm] of [[0, 0], [W.geo.path.length - 1, 1]]) { const [gx, gy] = W.geo.path[gi]; ctx.fillStyle = TEAMC[1 - tm]; ctx.globalAlpha = 0.5; ctx.beginPath(); ctx.arc(X(gx), Y(gy), cs * 0.7, 0, 7); ctx.fill(); ctx.globalAlpha = 1; }
+      }
+      // objects (ground)
+      for (const o of sc.obs) drawObj(o, X, Y, cs, now);
+      if (W.mode === 'tower') drawTower(mi, X, Y, cs, now);
+      // players
+      const order = sc.ps.slice().sort((a, b) => a.y - b.y);
+      for (const q of order) drawSpirit(q, X, Y, cs, now, sc);
+      // shots
+      for (const b of sc.shots) {
+        const r = b.kd === 1 ? Math.max(4, cs * 0.3) : b.kd === 2 ? Math.max(3.5, cs * 0.24) : Math.max(2.5, cs * 0.16), up = b.kd === 1 ? cs * 0.5 : 0;
+        if (b.kd === 1) { ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.beginPath(); ctx.arc(X(b.x), Y(b.y) + cs * 0.1, r * 0.8, 0, 7); ctx.fill(); }
+        ctx.fillStyle = TEAMC[b.tm]; ctx.beginPath(); ctx.arc(X(b.x), Y(b.y) - up, r, 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.55)'; ctx.beginPath(); ctx.arc(X(b.x) - 1, Y(b.y) - 1 - up, Math.max(1, r * 0.33), 0, 7); ctx.fill();
+      }
+      for (const b of beams) {
+        const k = b.t / (b.big ? 0.6 : 0.25);
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = TEAMC[b.tm]; ctx.globalAlpha = Math.min(1, k * 1.5); ctx.lineWidth = (b.big ? 1.8 : 0.32) * cs * (0.6 + k * 0.4);
+        ctx.beginPath(); ctx.moveTo(X(b.x0), Y(b.y0)); ctx.lineTo(X(b.x1), Y(b.y1)); ctx.stroke();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth *= 0.35; ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      // high walls and doors (drawn over players for depth)
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const t = T[y * MW + x];
+        if (t !== HW && t !== DR) continue;
+        const px = X(x), py = Y(y), lift = cs * 0.5;
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(px + 3, py + 3, cs, cs);
+        if (t === DR) {
+          ctx.fillStyle = '#5a4630'; ctx.fillRect(px, py - lift + cs * 0.4, cs, cs + lift - cs * 0.4);
+          ctx.fillStyle = '#b08a4a'; ctx.fillRect(px, py - lift, cs, cs * 0.92);
+          ctx.strokeStyle = '#17131f'; ctx.lineWidth = Math.max(1, cs * 0.08);
+          ctx.beginPath(); ctx.moveTo(px + cs * 0.2, py - lift + cs * 0.2); ctx.lineTo(px + cs * 0.8, py - lift + cs * 0.7); ctx.moveTo(px + cs * 0.8, py - lift + cs * 0.2); ctx.lineTo(px + cs * 0.2, py - lift + cs * 0.7); ctx.stroke();
+          continue;
+        }
+        ctx.fillStyle = '#3e3a48'; ctx.fillRect(px, py - lift + cs * 0.4, cs, cs + lift - cs * 0.4);
+        ctx.fillStyle = '#8a8098'; ctx.fillRect(px, py - lift, cs, cs * 0.92);
+        ctx.strokeStyle = 'rgba(227,174,69,.25)'; ctx.lineWidth = 1; ctx.strokeRect(px + 0.5, py - lift + 0.5, cs - 1, cs * 0.92 - 1);
+      }
+      for (const p of parts) { ctx.globalAlpha = Math.min(1, p.t * 2.5); ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), Math.max(1.5, p.r * cs), 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      if (l.human) { ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 2; ctx.strokeRect(l.vx - 1, l.vy - 1, l.vs + 2, l.vs + 2); }
+      drawHud(sc, now, l, mi);
+    }
+    function drawTower(mi, X, Y, cs, now) {
+      const [tx, ty] = towerPos(W, mi ? mi.tw : W.geo.c0), px = X(tx), py = Y(ty), on = mi ? mi.on : 0;
+      const col = on === 1 ? TEAMC[0] : on === 2 ? TEAMC[1] : '#d8cfc0';
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(px, py + cs * 0.3, cs * 1.3, cs * 0.6, 0, 0, 7); ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.arc(px, py, cs * 1.4, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#2b2533'; ctx.fillRect(px - cs * 0.55, py - cs * 1.5, cs * 1.1, cs * 1.6);
+      ctx.fillStyle = col; ctx.fillRect(px - cs * 0.45, py - cs * 1.4, cs * 0.9, cs * 0.3); ctx.fillRect(px - cs * 0.45, py - cs * 0.85, cs * 0.9, cs * 0.3);
+      const bob = Math.sin(now / 200) * cs * 0.08;
+      ctx.beginPath(); ctx.moveTo(px, py - cs * 2.3 + bob); ctx.bezierCurveTo(px + cs * 0.4, py - cs * 1.9, px + cs * 0.4, py - cs * 1.55, px, py - cs * 1.5); ctx.bezierCurveTo(px - cs * 0.4, py - cs * 1.55, px - cs * 0.4, py - cs * 1.9, px, py - cs * 2.3 + bob); ctx.fill();
+    }
+    function drawObj(o, X, Y, cs, now) {
+      const px = X(o.x), py = Y(o.y), col = TEAMC[o.tm];
+      const mineTm = myTm();
+      const ball = (r, mark) => {
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(px, py + cs * 0.2, cs * r, cs * r * 0.5, 0, 0, 7); ctx.fill();
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, cs * r, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#17131f'; ctx.lineWidth = 2; ctx.stroke();
+        if (mark) { ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(px, py, cs * r * 0.33, 0, 7); ctx.fill(); }
+      };
+      const blink = Math.floor(now / 120) % 2 === 1;
+      if (o.k === 'b' || o.k === 'c') ball(0.3, o.k === 'b' && blink);
+      else if (o.k === 'g') { ball(0.55, blink); ctx.strokeStyle = col; ctx.globalAlpha = 0.5; ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.arc(px, py, cs * 4.2, 0, 7); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1; }
+      else if (o.k === 'k' || o.k === 't') {
+        ball(o.k === 'k' ? 0.32 : 0.26, blink);
+        if (o.k === 't') { ctx.fillStyle = '#17131f'; for (const sd of [-1, 1]) { ctx.beginPath(); ctx.arc(px + sd * cs * 0.1, py - cs * 0.06, cs * 0.05, 0, 7); ctx.fill(); } }
+      } else if (o.k === 's') {
+        ball(0.24, false);
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.6;
+        const k = (now / 900) % 1; ctx.beginPath(); ctx.arc(px, py, cs * 3.2 * k, 0, 7); ctx.stroke();
+        ctx.globalAlpha = 0.25; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.arc(px, py, cs * 3.2, 0, 7); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      } else if (o.k === 'q') {
+        ball(0.3, false);
+        ctx.strokeStyle = col; ctx.lineWidth = 2; const a = now / 120;
+        for (let i = 0; i < 3; i++) { const aa = a + i * 2.09; ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + Math.cos(aa) * cs * 0.6, py + Math.sin(aa) * cs * 0.6); ctx.stroke(); }
+      } else if (o.k === 'm') {
+        if (o.tm !== mineTm && mySeat() >= 0) return; // enemy mines are hidden
+        ctx.globalAlpha = 0.85; ctx.fillStyle = col; ctx.beginPath();
+        for (let i = 0; i < 12; i++) { const a = (i * Math.PI) / 6, r = i % 2 ? cs * 0.22 : cs * 0.34; ctx.lineTo(px + Math.cos(a) * r, py + Math.sin(a) * r); }
+        ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+        ctx.fillStyle = '#17131f'; ctx.beginPath(); ctx.arc(px, py, cs * 0.1, 0, 7); ctx.fill();
+      } else if (o.k === 'w') {
+        const ca = Math.cos(o.a), sa = Math.sin(o.a), L2 = cs * 1.3;
+        ctx.lineCap = 'round'; ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = cs * 0.5; ctx.beginPath(); ctx.moveTo(px - ca * L2 + 3, py - sa * L2 + 3); ctx.lineTo(px + ca * L2 + 3, py + sa * L2 + 3); ctx.stroke();
+        ctx.strokeStyle = col; ctx.lineWidth = cs * 0.42; ctx.globalAlpha = 0.6 + Math.min(0.4, o.t * 0.2); ctx.beginPath(); ctx.moveTo(px - ca * L2, py - sa * L2); ctx.lineTo(px + ca * L2, py + sa * L2); ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 2; ctx.stroke(); ctx.globalAlpha = 1; ctx.lineCap = 'butt';
+      } else if (o.k === 'd') {
+        const R = 2.6 * cs, g = ctx.createRadialGradient(px, py, R * 0.4, px, py, R);
+        g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(1, col);
+        ctx.globalAlpha = 0.35 + 0.05 * Math.sin(now / 200); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, R, 0, 7); ctx.fill();
+        ctx.globalAlpha = 0.8; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(px, py, R, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+      } else if (o.k === 'a') {
+        const k = clamp(1 - o.t / 0.8, 0, 1), R = 1.8 * cs;
+        ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.globalAlpha = 0.85; ctx.beginPath(); ctx.arc(px, py, R, 0, 7); ctx.stroke();
+        ctx.fillStyle = col; ctx.globalAlpha = 0.25 + k * 0.3; ctx.beginPath(); ctx.arc(px, py, R * k, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.moveTo(px - 6, py); ctx.lineTo(px + 6, py); ctx.moveTo(px, py - 6); ctx.lineTo(px, py + 6); ctx.stroke();
+      } else if (o.k === 'o') {
+        ctx.strokeStyle = col; ctx.lineWidth = cs * 0.45; ctx.globalAlpha = 0.75; ctx.beginPath(); ctx.arc(px, py, Math.max(1, o.e * cs), 0, 7); ctx.stroke();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke(); ctx.globalAlpha = 1;
+      } else if (o.k === 'f' || o.k === 'r') {
+        const R = (o.k === 'f' ? 2.0 : 3.5) * cs;
+        ctx.globalAlpha = 0.22 + 0.06 * Math.sin(now / 150);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(px, py, R, 0, 7); ctx.fill();
+        ctx.globalAlpha = 0.7; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.setLineDash([6, 5]); ctx.stroke(); ctx.setLineDash([]);
+        if (o.k === 'r') {
+          ctx.globalAlpha = 0.8; ctx.strokeStyle = col; ctx.lineWidth = 2;
+          for (let i = 0; i < 10; i++) { const a = i * 2.4 + now / 400, d = ((i * 37 + now / 6) % (R * 0.95)); const xx = px + Math.cos(a) * d, yy = py + Math.sin(a) * d; ctx.beginPath(); ctx.moveTo(xx, yy - 6); ctx.lineTo(xx - 2, yy + 4); ctx.stroke(); }
+          ctx.globalAlpha = 0.9; ctx.fillStyle = '#4a4458'; ctx.beginPath(); ctx.ellipse(px, py - R * 0.25, R * 0.45, R * 0.18, 0, 0, 7); ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+    /* same rule the engine uses (hiddenFrom): swimmers are invisible unless revealed/hit or within 2.2 cells */
+    function hiddenForMe(q, sc) {
+      const ms = mySeat(); if (ms < 0 || q.seat % 2 === ms % 2) return false;
+      if (!(q.fl & 2) || q.vis) return false;
+      const m = sc.ps[ms]; return !(m && Math.hypot(m.x - q.x, m.y - q.y) < PEEK);
+    }
+    function drawWeapon(q, rr, col) {
+      const f = WEP[q.w] ? WEP[q.w].fam : 'shooter', dark = '#2a2433';
+      ctx.save(); ctx.translate(0, 0);
+      if (f === 'roller' || f === 'brush') {
+        ctx.fillStyle = dark; ctx.fillRect(rr * 0.6, -rr * 0.1, rr * 0.7, rr * 0.2);
+        if (f === 'roller') { ctx.fillStyle = col; ctx.fillRect(rr * 1.15, -rr * 1.3, rr * 0.5, rr * 2.6); ctx.strokeStyle = '#17131f'; ctx.lineWidth = 1.5; ctx.strokeRect(rr * 1.15, -rr * 1.3, rr * 0.5, rr * 2.6); }
+        else { ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(rr * 1.2, -rr * 0.45); ctx.quadraticCurveTo(rr * 2.1, 0, rr * 1.2, rr * 0.45); ctx.closePath(); ctx.fill(); }
+      } else if (f === 'charger' || f === 'gatling') {
+        ctx.fillStyle = dark; ctx.fillRect(rr * 0.4, -rr * 0.11, rr * 2.0, rr * 0.22);
+        if (f === 'gatling') { ctx.fillRect(rr * 0.4, -rr * 0.32, rr * 1.7, rr * 0.16); ctx.fillRect(rr * 0.4, rr * 0.16, rr * 1.7, rr * 0.16); }
+        ctx.fillStyle = col; ctx.fillRect(rr * 0.5, -rr * 0.24, rr * 0.7, rr * 0.48);
+      } else if (f === 'bucket') {
+        ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(rr * 0.6, -rr * 0.45); ctx.lineTo(rr * 1.5, -rr * 0.55); ctx.lineTo(rr * 1.35, rr * 0.55); ctx.lineTo(rr * 0.7, rr * 0.45); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = '#17131f'; ctx.lineWidth = 1.5; ctx.stroke();
+      } else if (f === 'dualie') {
+        for (const sd of [-1, 1]) { ctx.fillStyle = dark; ctx.fillRect(rr * 0.5, sd * rr * 0.45 - rr * 0.13, rr * 0.9, rr * 0.26); ctx.fillStyle = col; ctx.fillRect(rr * 0.5, sd * rr * 0.45 - rr * 0.2, rr * 0.3, rr * 0.4); }
+      } else if (f === 'brella') {
+        ctx.fillStyle = dark; ctx.fillRect(rr * 0.5, -rr * 0.1, rr * 0.9, rr * 0.2);
+        ctx.fillStyle = (q.fl & 64) ? col : shade(col, -0.35); ctx.beginPath(); ctx.arc(rr * 1.2, 0, rr * ((q.fl & 64) ? 1.3 : 0.8), -1.2, 1.2); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = '#17131f'; ctx.lineWidth = 1.5; ctx.stroke();
+      } else if (f === 'sprink') {
+        ctx.fillStyle = dark; ctx.beginPath(); ctx.arc(rr * 0.9, 0, rr * 0.35, 0, 7); ctx.fill();
+        ctx.fillStyle = col; for (let i = 0; i < 4; i++) { const a = i * 1.57 + performance.now() / 150; ctx.beginPath(); ctx.arc(rr * 0.9 + Math.cos(a) * rr * 0.4, Math.sin(a) * rr * 0.4, rr * 0.13, 0, 7); ctx.fill(); }
+      } else if (f === 'blaster') {
+        ctx.fillStyle = dark; ctx.fillRect(rr * 0.5, -rr * 0.24, rr * 1.0, rr * 0.48);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(rr * 1.55, 0, rr * 0.32, 0, 7); ctx.fill();
+      } else { // shooter
+        ctx.fillStyle = dark; ctx.fillRect(rr * 0.5, -rr * 0.2, rr * 1.1, rr * 0.4);
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(rr * 0.75, -rr * 0.35, rr * 0.28, 0, 7); ctx.fill();
+      }
+      ctx.restore();
+    }
+    function drawSpirit(q, X, Y, cs, now, sc) {
+      if (!(q.fl & 1)) return;
+      const ms = mySeat(), tm = q.seat % 2, col = TEAMC[tm], px0 = X(q.x), py0 = Y(q.y), r = cs * 0.42;
+      const enemy = ms >= 0 && tm !== ms % 2;
+      const sub = q.fl & 2, crit = q.fl & 8, air = q.fl & 128;
+      if (sub) {
+        if (hiddenForMe(q, sc)) return;
+        ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 1.5;
+        const k = (now / 500 + q.seat * 0.3) % 1;
+        ctx.globalAlpha = 1 - k; ctx.beginPath(); ctx.ellipse(px0, py0, r * (0.6 + k), r * (0.35 + k * 0.5), 0, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+        ctx.fillStyle = '#fff';
+        for (const sd of [-1, 1]) { ctx.beginPath(); ctx.arc(px0 + sd * r * 0.28, py0, r * 0.14, 0, 7); ctx.fill(); }
+        if (q.seat === ms) drawInkGauge(q, px0, py0, r, cs);
+        return;
+      }
+      const lift = air ? cs * 0.9 : 0, px = px0, py = py0 - lift;
+      const flick = (q.fl & 32) && Math.floor(now / 90) % 2;
+      if (flick) ctx.globalAlpha = 0.55;
+      const s = crit ? 0.72 : air ? 1.15 : 1, rr = r * s;
+      const ca = Math.cos(q.a), sa = Math.sin(q.a);
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(px0, py0 + r * 0.7, rr * (air ? 0.7 : 1.05), rr * (air ? 0.3 : 0.45), 0, 0, 7); ctx.fill();
+      const wpn = () => {
+        if (crit) return;
+        const f = WEP[q.w] ? WEP[q.w].fam : '';
+        ctx.save(); ctx.translate(px, py); ctx.rotate((f === 'roller' || f === 'brush') && (q.fl & 4) ? q.ma : q.a);
+        drawWeapon(q, rr, col);
+        ctx.restore();
+      };
+      if (sa < 0) wpn();
+      const wob = Math.sin(now / 160 + q.seat) * 0.06;
+      ctx.beginPath();
+      ctx.moveTo(px, py - rr * (1.55 + wob));
+      ctx.bezierCurveTo(px + rr * 0.35, py - rr * 1.1, px + rr * 1.05, py - rr * 0.45, px + rr, py + rr * 0.15);
+      ctx.bezierCurveTo(px + rr * 0.95, py + rr * 0.9, px - rr * 0.95, py + rr * 0.9, px - rr, py + rr * 0.15);
+      ctx.bezierCurveTo(px - rr * 1.05, py - rr * 0.45, px - rr * 0.35, py - rr * 1.1, px, py - rr * (1.55 + wob));
+      const g = ctx.createRadialGradient(px - rr * 0.3, py - rr * 0.4, rr * 0.1, px, py, rr * 1.3);
+      g.addColorStop(0, shade(col, 0.4)); g.addColorStop(1, shade(col, -0.3));
+      ctx.fillStyle = g; ctx.fill();
+      ctx.lineWidth = q.seat === ms ? 2.5 : 1.5; ctx.strokeStyle = q.seat === ms ? '#f2e9d8' : shade(col, -0.55); ctx.stroke();
+      if (q.spK === 'rush') { ctx.strokeStyle = shade(col, 0.5); ctx.lineWidth = 3; ctx.globalAlpha = 0.6 + 0.3 * Math.sin(now / 60); ctx.beginPath(); ctx.arc(px, py, rr * 1.6, 0, 7); ctx.stroke(); ctx.globalAlpha = flick ? 0.55 : 1; }
+      if (q.fl & 256) { ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 2; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(px, py - rr * 0.2, rr * 1.35, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
+      if (q.fl & 512) { ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, rr * 1.2, q.a + 2, q.a + 4.2); ctx.stroke(); }
+      for (const sd of [-1, 1]) {
+        const ex = px + sd * rr * 0.36 + ca * rr * 0.12, ey = py - rr * 0.15 + sa * rr * 0.1;
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(ex, ey, rr * 0.2, rr * 0.25, 0, 0, 7); ctx.fill();
+        ctx.fillStyle = '#17131f'; ctx.beginPath(); ctx.arc(ex + ca * rr * 0.08, ey + sa * rr * 0.1, rr * 0.11, 0, 7); ctx.fill();
+      }
+      if (sa >= 0) wpn();
+      ctx.globalAlpha = 1;
+      const f = WEP[q.w] ? WEP[q.w].fam : '';
+      if (f === 'charger' && q.chg > 0 && !crit) { // laser sight, cut at the edge of the shooter's sight box
+        const len = boxLen(ca, sa, 7 + 6 * q.chg) * cs;
+        ctx.strokeStyle = col; ctx.globalAlpha = 0.35 + q.chg * 0.5; ctx.lineWidth = q.chg >= 1 ? 2.5 : 1.2;
+        ctx.setLineDash(q.chg >= 1 ? [] : [4, 4]); ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + ca * len, py + sa * len); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+      }
+      if (f === 'gatling' && q.chg > 0 && !crit) { ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(px, py, rr * 1.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * q.chg); ctx.stroke(); }
+      if (q.spK === 'beam') { const len = boxLen(ca, sa, 46) * cs; ctx.strokeStyle = '#fff'; ctx.globalAlpha = 0.5 + 0.4 * Math.sin(now / 40); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + ca * len, py + sa * len); ctx.stroke(); ctx.globalAlpha = 1; }
+      if (q.hp < 99) {
+        const bw = cs * 0.9;
+        ctx.fillStyle = 'rgba(15,10,20,.8)'; ctx.fillRect(px - bw / 2, py - rr * 1.9 - 5, bw, 4);
+        ctx.fillStyle = q.hp > 50 ? '#8fd18a' : q.hp > 25 ? '#e3ae45' : '#ee6a55'; ctx.fillRect(px - bw / 2, py - rr * 1.9 - 5, (bw * q.hp) / 100, 4);
+      }
+      if (q.seat !== ms && cs > 12) {
+        ctx.font = '700 10px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(15,10,20,.8)'; ctx.strokeText(name(q.seat), px, py - rr * 1.9 - 7);
+        ctx.fillStyle = enemy ? shade(col, 0.4) : '#f2e9d8'; ctx.fillText(name(q.seat), px, py - rr * 1.9 - 7);
+      }
+      if (q.seat === ms) drawInkGauge(q, px, py, rr, cs);
+    }
+    function drawInkGauge(q, px, py, r, cs) {
+      const gh = cs * 0.95, gx = px + cs * 0.62, gy = py - gh / 2 - r * 0.3;
+      ctx.fillStyle = 'rgba(15,10,20,.75)'; rrect(ctx, gx - 1, gy - 1, 7, gh + 2, 3); ctx.fill();
+      const k = clamp(q.ink / 100, 0, 1);
+      ctx.fillStyle = k < 0.2 ? '#ee6a55' : TEAMC[q.seat % 2]; ctx.fillRect(gx, gy + gh * (1 - k), 5, gh * k);
+      if (k < 0.15) { ctx.font = '700 10px ' + FONT; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(15,10,20,.85)'; ctx.strokeText('잉크 부족!', gx + 9, gy + gh / 2); ctx.fillStyle = '#ee6a55'; ctx.fillText('잉크 부족!', gx + 9, gy + gh / 2); }
+    }
+    function drawHud(sc, now, l, mi) {
+      const w = cv.w, h = cv.h, ms = mySeat();
+      const c = counts(sc.grid), tot = Math.max(1, W.map.tot);
+      const left = Math.max(0, st.T - (st.ph === 'count' ? 0 : sc.t));
+      const tStr = Math.floor(left / 60) + ':' + String(Math.floor(left % 60)).padStart(2, '0');
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const H = l.hud;
+      rrect(ctx, H.cx - 40, 4, 80, 26, 13); ctx.fillStyle = left <= 30 && st.ph === 'play' ? 'rgba(238,106,85,.92)' : 'rgba(34,28,46,.92)'; ctx.fill();
+      ctx.font = '700 16px ' + MONO; ctx.fillStyle = '#f2e9d8'; ctx.fillText(tStr, H.cx, 17.5);
+      // team bar: paint share (turf) / zone seconds (zone) / tower track (tower)
+      const bx = H.bx, bw = H.bw, by = 34, bh = 12;
+      rrect(ctx, bx, by, bw, bh, 6); ctx.fillStyle = '#2e2640'; ctx.fill();
+      ctx.save(); rrect(ctx, bx, by, bw, bh, 6); ctx.clip();
+      let lt, rt;
+      if (W.mode === 'zone' && mi) {
+        const k0 = clamp(mi.zs[0] / ZONE_WIN, 0, 1), k1 = clamp(mi.zs[1] / ZONE_WIN, 0, 1);
+        ctx.fillStyle = TEAMC[0]; ctx.fillRect(bx, by, (bw / 2) * k0, bh);
+        ctx.fillStyle = TEAMC[1]; ctx.fillRect(bx + bw - (bw / 2) * k1, by, (bw / 2) * k1, bh);
+        lt = (bw < 300 ? '' : '거점 ') + Math.floor(mi.zs[0]) + '초'; rt = Math.floor(mi.zs[1]) + '초' + (bw < 300 ? '' : ' 거점');
+      } else if (W.mode === 'tower' && mi && W.geo.path) {
+        const P = W.geo.path.length - 1, c0 = W.geo.c0, k = clamp(mi.tw / Math.max(1, P), 0, 1);
+        // team 0 pushes toward index 0 (right side of the bar = their goal), team 1 toward the end (left)
+        const bxk = (i) => bx + bw - (i / Math.max(1, P)) * bw;
+        ctx.fillStyle = TEAMC[0]; ctx.globalAlpha = 0.45; ctx.fillRect(bxk(c0 - mi.tb[0]), by, bxk(c0) - bxk(c0 - mi.tb[0]), bh);
+        ctx.fillStyle = TEAMC[1]; ctx.fillRect(bxk(c0), by, bxk(c0 + mi.tb[1]) - bxk(c0) + 0.01, bh); ctx.globalAlpha = 1;
+        ctx.fillStyle = mi.on === 1 ? TEAMC[0] : mi.on === 2 ? TEAMC[1] : '#f2e9d8'; ctx.fillRect(bx + bw - k * bw - 3, by, 6, bh);
+        const sh = bw < 300; lt = (sh ? '' : TEAMN[1].replace(' 팀', '') + ' 목표 ') + mi.tb[1].toFixed(0) + '칸'; rt = mi.tb[0].toFixed(0) + '칸' + (sh ? '' : ' ' + TEAMN[0].replace(' 팀', '') + ' 목표');
+      } else {
+        ctx.fillStyle = TEAMC[0]; ctx.fillRect(bx, by, (c[1] / tot) * bw, bh);
+        ctx.fillStyle = TEAMC[1]; ctx.fillRect(bx + bw - (c[2] / tot) * bw, by, (c[2] / tot) * bw, bh);
+        lt = Math.round((c[1] / tot) * 100) + '%'; rt = Math.round((c[2] / tot) * 100) + '%';
+      }
+      ctx.restore();
+      ctx.fillStyle = 'rgba(242,233,216,.5)'; ctx.fillRect(bx + bw / 2 - 0.5, by - 2, 1, bh + 4);
+      ctx.font = '700 11px ' + (W.mode === 'turf' ? MONO : FONT); ctx.textBaseline = 'middle';
+      ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(15,10,20,.8)'; ctx.fillStyle = '#fff';
+      ctx.textAlign = 'left'; ctx.strokeText(lt, bx + 4, by + bh / 2 + 0.5); ctx.fillText(lt, bx + 4, by + bh / 2 + 0.5);
+      ctx.textAlign = 'right'; ctx.strokeText(rt, bx + bw - 4, by + bh / 2 + 0.5); ctx.fillText(rt, bx + bw - 4, by + bh / 2 + 0.5);
+      ctx.font = '600 11px ' + FONT; ctx.fillStyle = '#ab9fb8'; ctx.textAlign = 'left';
+      const lw = l.land ? H.bw : w / 2 - 50;
+      ctx.fillText(fit((MODES[W.mode] ? MODES[W.mode].name + ' · ' : '') + (STYLES[st.mp] ? STYLES[st.mp].name : ''), lw), H.bx, H.ly);
+      if (ms >= 0) { ctx.textAlign = 'right'; ctx.fillStyle = TEAMC[ms % 2]; ctx.font = '700 12px ' + FONT; ctx.fillText(fit('나: ' + TEAMN[ms % 2], lw), w - 10, 17); }
+      const meP = ms >= 0 ? sc.ps[ms] : null;
+      // minimap: same knowledge as a bot — enemies on my screen (not hidden) or revealed by a sensor/scan
+      if (l.human) {
+        const m = l.mini;
+        ctx.fillStyle = 'rgba(15,10,20,.7)'; ctx.fillRect(m.x - 2, m.y - 2, m.w + 4, m.h + 4);
+        ctx.globalAlpha = 0.9; ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(staticC, m.x, m.y, m.w, m.h); ctx.drawImage(paintC, m.x, m.y, m.w, m.h);
+        ctx.imageSmoothingEnabled = true; ctx.globalAlpha = 1;
+        const k = m.w / MW;
+        if (W.mode === 'zone') { ctx.strokeStyle = mi && mi.zc >= 0 ? TEAMC[mi.zc] : '#f2e9d8'; ctx.lineWidth = 1; ctx.strokeRect(m.x + (MW / 2 - 4) * k, m.y + (MH / 2 - 3) * k, 8 * k, 6 * k); }
+        if (W.mode === 'tower' && mi) { const [tx, ty] = towerPos(W, mi.tw); ctx.fillStyle = '#f2e9d8'; ctx.fillRect(m.x + tx * k - 3, m.y + ty * k - 3, 6, 6); }
+        for (const q of sc.ps) {
+          if (!(q.fl & 1)) continue;
+          const enemy = q.seat % 2 !== ms % 2;
+          if (enemy && !(q.fl & 1024) && !(meP && Math.abs(q.x - meP.x) <= VH && Math.abs(q.y - meP.y) <= VH && !hiddenForMe(q, sc))) continue;
+          ctx.fillStyle = q.seat === ms ? '#fff' : TEAMC[q.seat % 2]; ctx.strokeStyle = '#17131f'; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.arc(m.x + q.x * k, m.y + q.y * k, q.seat === ms ? 3 : 2.4, 0, 7); ctx.fill(); ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(242,233,216,.5)'; ctx.lineWidth = 1;
+        ctx.strokeRect(m.x + (cam.x - VH) * k, m.y + (cam.y - VH) * k, VIEW * k, VIEW * k);
+      }
+      // kill feed
+      ctx.font = '600 11px ' + FONT; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      feed.forEach((f, i) => {
+        const y = 62 + i * 18; ctx.globalAlpha = Math.min(1, f.t);
+        const t = (f.a >= 0 && f.a !== f.b ? name(f.a) + ' → ' : '') + name(f.b);
+        const tw = ctx.measureText(t).width;
+        rrect(ctx, w - 14 - tw, y - 8, tw + 8, 16, 6); ctx.fillStyle = 'rgba(15,10,20,.7)'; ctx.fill();
+        ctx.fillStyle = TEAMC[(f.a >= 0 ? f.a : f.b + 1) % 2]; ctx.fillText(t, w - 10, y);
+      });
+      ctx.globalAlpha = 1;
+      const wpP = weaponPanel();
+      if (l.human && meP && st.ph !== 'done') {
+        if (joy) drawStick(joy, 'rgba(242,233,216,.9)');
+        if (aim) drawStick(aim, TEAMC[ms % 2]);
+        if (!joy && !aim && phase === 'play' && sc.t < 12 && !wpP) {
+          ctx.globalAlpha = 0.45; ctx.font = '600 11px ' + FONT; ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'center';
+          ctx.fillText('← 끌어서 이동', w * 0.25, h - 26); ctx.fillText('끌어서 조준·발사 →', w * 0.58, h - 26 - l.btn.dive.r * 2);
+          ctx.globalAlpha = 1;
+        }
+        const alive = meP.fl & 1, wp = WEP[meP.w] || WEP[0];
+        if (!wpP) {
+          const subOk = alive && meP.ink >= SUBS[wp.sub].cost, spOk = alive && meP.spf >= 0.999;
+          btn(l.btn.dive, wp.fam === 'dualie' && input.fire ? '구르기' : '잠수', (meP.fl & 2) ? TEAMC[ms % 2] : null, input.dive, '🌀');
+          btn(l.btn.sub, SUBS[wp.sub].name.split(' ').pop(), subOk ? '#e3ae45' : null, false, SUBS[wp.sub].icon, !subOk);
+          const b = l.btn.sp;
+          btn(b, SPS[wp.sp].name.split(' ').pop(), spOk ? TEAMC[ms % 2] : null, false, SPS[wp.sp].icon, !spOk);
+          ctx.strokeStyle = spOk ? '#fff' : TEAMC[ms % 2]; ctx.lineWidth = 4; ctx.lineCap = 'round';
+          ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * clamp(meP.spf, 0, 1)); ctx.stroke(); ctx.lineCap = 'butt';
+          if (L.ui.keyLabel) for (const [k, a] of [['dive', 'DIVE'], ['sub', 'SUB'], ['sp', 'SP']]) { const q = l.btn[k]; L.ui.drawKeyBadge(ctx, q.x + q.r * 0.95, q.y + q.r * 0.95, L.ui.keyLabel('paint', a), 0.9); }
+          if (spOk && Math.floor(now / 300) % 2) { ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 8, 0, 7); ctx.stroke(); }
+        }
+        if (!alive && st.ph === 'play') {
+          ctx.fillStyle = 'rgba(15,10,20,.45)'; ctx.fillRect(0, 0, w, h);
+          const yb = wpP ? Math.min(h * 0.4, wpP.act.y - 28) : h * 0.4;
+          if (meP.hl > 0) banner('⏸ 부활 대기 중 · ' + Math.max(1, Math.ceil(meP.rsp)) + '초 남음 (대기 ' + (meP.hl - 1) + '초 더)', '#e3ae45', yb, 16);
+          else banner(Math.max(1, Math.ceil(meP.rsp)) + '초 뒤 기지에서 다시 나와요', '#f2e9d8', yb, 18);
+        }
+      }
+      if (wpP) drawPanel(wpP, ms);
+      floats.forEach((f, i) => { ctx.globalAlpha = Math.min(1, f.t * 2); banner(f.text, f.col, Math.max(70, (l.human ? l.vy + l.vs * 0.25 : h * 0.22)) + i * 26, 17); });
+      ctx.globalAlpha = 1;
+      if (phase === 'count' && st.ph === 'count') {
+        const yTop = wpP ? wpP.act.y : h;
+        const ny = Math.max(l.land ? 60 : 110, Math.min(h * 0.38, yTop - 70)), n = Math.max(1, Math.ceil(cd)), kk = 1 + (cd % 1) * 0.3;
+        ctx.save(); ctx.translate(w / 2, ny); ctx.scale(kk, kk);
+        ctx.font = '60px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(10,8,16,.8)'; ctx.strokeText(String(n), 0, 0); ctx.fillStyle = '#f2e9d8'; ctx.fillText(String(n), 0, 0);
+        ctx.restore();
+        const goal = W.mode === 'zone' ? '가운데 거점을 칠해 지켜요!' : W.mode === 'tower' ? '잉크 탑에 올라 상대 기지로!' : Math.round(st.T / 60) + '분 동안 바닥을 우리 팀 색으로!';
+        banner(goal, '#e3ae45', Math.max(l.land ? 22 : 66, Math.min(h * 0.24, ny - 56)), 17);
+      }
+      if (st.ph === 'end' || (st.ph === 'play' && sc.t >= st.T)) banner('경기 끝!', '#f2e9d8', h * 0.45, 38);
+    }
+    function drawPanel(P, ms) {
+      const myW = WEP[input.w], A = P.act, on = A.dead ? input.hold : input.rdy;
+      rrect(ctx, A.x, A.y, A.w, A.h, 12); ctx.fillStyle = on ? 'rgba(227,174,69,.95)' : 'rgba(34,28,46,.95)'; ctx.fill();
+      ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '700 15px ' + FONT; ctx.fillStyle = on ? '#17131f' : '#f2e9d8';
+      ctx.fillText(fit(A.dead ? (on ? '▶ 부활' : '⏸ 부활 대기') : (on ? '✔ 준비됨 · 다른 사람 기다리는 중' : '✔ 준비 완료'), A.w - 12), A.x + A.w / 2, A.y + A.h / 2);
+      if (L.ui.keyLabel) L.ui.drawKeyBadge(ctx, A.x + A.w - 4, A.y + A.h - 4, L.ui.keyLabel('paint', 'RDY'));
+      rrect(ctx, P.x - 6, P.y - 4, P.w + 12, P.h + 10, 12); ctx.fillStyle = 'rgba(18,14,26,.94)'; ctx.fill();
+      ctx.strokeStyle = 'rgba(227,174,69,.45)'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.font = '700 12px ' + FONT; ctx.fillStyle = ms >= 0 ? TEAMC[ms % 2] : '#f2e9d8';
+      ctx.fillText(fit((ms >= 0 ? TEAMN[ms % 2] + ' · ' : '') + '무기 고르기 (계열 ' + FAM_KEYS.length + ' · ' + WEP.length + '종)', P.w - 10), P.x + 2, P.y + 8);
+      if (L.ui.keyLabel) { const k1 = L.ui.keyLabel('paint', 'WP'), k2 = L.ui.keyLabel('paint', 'WN'); if (k1 && k2) L.ui.drawKeyBadge(ctx, P.x + P.w, P.y + 15, '◀ ' + k1 + ' · ' + k2 + ' ▶'); }
+      for (const t of P.tabs) {
+        const F = FAMS[t.f], on = t.f === selFam, eq = t.f === myW.fam;
+        rrect(ctx, t.x, t.y, t.w, t.h, 8); ctx.fillStyle = on ? 'rgba(227,174,69,.9)' : 'rgba(42,35,56,.95)'; ctx.fill();
+        ctx.strokeStyle = eq ? '#fff' : 'rgba(227,174,69,.35)'; ctx.lineWidth = eq ? 2 : 1; ctx.stroke();
+        ctx.textAlign = 'center'; ctx.font = '17px ' + FONT; ctx.fillStyle = on ? '#17131f' : '#f2e9d8'; ctx.fillText(F.icon, t.x + t.w / 2, t.y + 15);
+        ctx.font = '700 10px ' + FONT; ctx.fillText(fit(F.kind, t.w - 4), t.x + t.w / 2, t.y + 35);
+      }
+      for (const c of P.cards) {
+        const wp = WEP[c.i], sel = input.w === c.i;
+        rrect(ctx, c.x, c.y, c.w, c.h, 10); ctx.fillStyle = sel ? 'rgba(227,174,69,.95)' : 'rgba(34,28,46,.96)'; ctx.fill();
+        ctx.strokeStyle = sel ? '#fff' : 'rgba(227,174,69,.5)'; ctx.lineWidth = sel ? 2 : 1; ctx.stroke();
+        ctx.textAlign = 'left'; ctx.fillStyle = sel ? '#17131f' : '#f2e9d8';
+        ctx.font = '700 13px ' + FONT; ctx.fillText(fit((sel ? '✔ ' : '') + wp.name, c.w - 14), c.x + 8, c.y + 15);
+        ctx.font = '600 11px ' + FONT; ctx.fillStyle = sel ? '#3a2a10' : '#cfc4dc';
+        ctx.fillText(fit('서브 ' + SUBS[wp.sub].icon + ' ' + SUBS[wp.sub].name, c.w - 14), c.x + 8, c.y + 35);
+        ctx.fillText(fit('스페셜 ' + SPS[wp.sp].icon + ' ' + SPS[wp.sp].name, c.w - 14), c.x + 8, c.y + 53);
+      }
+    }
+    function drawStick(s, col) {
+      const jr = JR();
+      ctx.beginPath(); ctx.arc(s.x0, s.y0, jr, 0, 7); ctx.fillStyle = 'rgba(23,19,31,.4)'; ctx.fill(); ctx.strokeStyle = 'rgba(242,233,216,.35)'; ctx.lineWidth = 2; ctx.stroke();
+      const dx = s.x - s.x0, dy = s.y - s.y0, d = Math.hypot(dx, dy), k = d > jr ? jr / d : 1;
+      ctx.beginPath(); ctx.arc(s.x0 + dx * k, s.y0 + dy * k, 20 * (lay ? lay.k : 1), 0, 7); ctx.fillStyle = col; ctx.globalAlpha = 0.8; ctx.fill(); ctx.globalAlpha = 1;
+    }
+    function btn(b, label, col, on, icon, dim) {
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7);
+      ctx.fillStyle = on ? 'rgba(242,233,216,.35)' : col ? 'rgba(34,28,46,.88)' : 'rgba(34,28,46,.6)'; ctx.fill();
+      ctx.strokeStyle = col || 'rgba(242,233,216,.3)'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.globalAlpha = dim ? 0.5 : 1;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = Math.round(b.r * 0.6) + 'px ' + FONT; ctx.fillStyle = '#f2e9d8'; ctx.fillText(icon, b.x, b.y - b.r * 0.17);
+      ctx.font = '700 ' + Math.max(10, Math.round(b.r * 0.3)) + 'px ' + FONT; ctx.fillText(label, b.x, b.y + b.r * 0.5);
+      ctx.globalAlpha = 1;
+    }
+    function fit(t, maxW) { if (ctx.measureText(t).width <= maxW) return t; while (t.length > 1 && ctx.measureText(t + '…').width > maxW) t = t.slice(0, -1); return t + '…'; }
+    function banner(text, col, y, size) {
+      ctx.font = (size || 18) + 'px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(10,8,16,.8)'; ctx.strokeText(text, cv.w / 2, y);
+      ctx.fillStyle = col || '#f2e9d8'; ctx.fillText(text, cv.w / 2, y);
+    }
+
+    // test hook: what part of the world this screen shows (cells), to check every screen sees the same box
+    try { if (L.debug) L.debug.paintView = () => (lay && cam ? { w: cv.w, h: cv.h, cs: +lay.cs.toFixed(3), cellsX: +((lay.vs || cv.w) / lay.cs).toFixed(3), cellsY: +((lay.vs || cv.h) / lay.cs).toFixed(3),
+      left: +(cam.x - (cam.ox - lay.vx) / lay.cs).toFixed(2), right: +(cam.x + (lay.vx + lay.vs - cam.ox) / lay.cs).toFixed(2), me: mySeat() >= 0 && W ? [+W.ps[mySeat()].x.toFixed(2), +W.ps[mySeat()].y.toFixed(2)] : null } : null); } catch (e) {}
+    const STEP = 1 / 60;
+    const stopLoop = U.loop((rdt, now) => {
+      try { refreshInput(); } catch (e) {}
+      acc += Math.min(0.25, rdt) * SPD();
+      let n = 0;
+      try { while (acc >= STEP && n < 40) { frame(STEP, now); acc -= STEP; n++; } } catch (e) { console.error(e); }
+      if (n >= 40) acc = 0;
+      try { publish(rdt, now); } catch (e) {}
+      try { draw(now); } catch (e) { console.error(e); }
+    });
+
+    return {
+      update(next) {
+        if (!next) return;
+        const prev = st;
+        st = next;
+        const k = curKey();
+        if (k !== key) { key = k; lay = null; startRound(); }
+        if (st.ph === 'play' && phase === 'count' && !host()) { phase = 'play'; cd = 0; }
+        if (st.ph === 'end' && (!prev || prev.ph !== 'end')) {
+          endT = END_T;
+          api.sfx('whoosh');
+          const ms = mySeat();
+          if (ms >= 0 && Array.isArray(st.res)) {
+            const wt = st.res[0] > st.res[1] ? 0 : st.res[1] > st.res[0] ? 1 : -1;
+            if (wt === ms % 2) { api.sfx('win'); api.buzz(60, 'win'); }
+            if (!bestDone && Array.isArray(st.pst) && st.pst[ms] && !(api.players[ms] && api.players[ms].ai)) {
+              bestDone = true;
+              try { api.best('cells', st.pst[ms][0] | 0, { label: '한 판에 칠한 칸', unit: '칸' }); api.best('kills', st.pst[ms][1] | 0, { label: '한 판 최다 처치', unit: '명' }); } catch (e) {}
+            }
+          }
+        }
+      },
+      destroy() {
+        if (pbar) pbar.destroy();
+        if (hintBox && hintBox.close) hintBox.close();
+        stopLoop();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('lostpointercapture', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        offIn();
+        window.removeEventListener('blur', releaseAll);
+        cv.destroy();
+      },
+      _dbg: () => ({ W, st, phase, input, me }),
+    };
+  }
+
+  /* ---------- helpers ---------- */
+  const FX = () => { try { return L.fx ? +L.fx() : 1; } catch (e) { return 1; } };
+  let AC = null;
+  const vol = () => { try { return L.audio && L.audio.sfx ? L.audio.sfx() : 1; } catch (e) { return 1; } };
+  function tone(f, d, type, v0, slide) {
+    try {
+      const v = vol() * (v0 || 0.1); if (v <= 0) return;
+      AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+      const o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime;
+      o.type = type || 'sine'; o.frequency.setValueAtTime(f, t); if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + d);
+      g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+      o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + d + 0.02);
+    } catch (e) {}
+  }
+  function noise(d, v0, freq) {
+    try {
+      const v = vol() * (v0 || 0.1); if (v <= 0) return;
+      AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+      const n = Math.floor(AC.sampleRate * d), buf = AC.createBuffer(1, n, AC.sampleRate), ch = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / n);
+      const src = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain(), t = AC.currentTime;
+      src.buffer = buf; f.type = 'lowpass'; f.frequency.value = freq || 1200; g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + d);
+      src.connect(f); f.connect(g); g.connect(AC.destination); src.start(t);
+    } catch (e) {}
+  }
+  function rrect(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+  function shade(hex, k) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    const f = (c) => Math.round(k >= 0 ? c + (255 - c) * k : c * (1 + k));
+    return 'rgb(' + f(n >> 16) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  const SUBK = Object.keys(SUBS), SPK = Object.keys(SPS);
+  L.register({
+    id: 'paint', name: '잉크 영토전', tag: '실시간 팀 땅따먹기', cat: '아케이드',
+    blurb: '잉크 정령이 되어 무기 20종으로 잉크를 쏘고 헤엄치며 바닥을 우리 팀 색으로! 영토전·거점 점령·탑 운반. 한 기기에 한 명씩.',
+    tint: '#5a2a6e', time: '4분',
+    icon: '<path d="M28 6c4 6 14 14 14 24a14 14 0 0 1-28 0C14 20 24 12 28 6z" fill="currentColor"/><circle cx="23" cy="30" r="3" fill="#000" opacity=".55"/><circle cx="33" cy="30" r="3" fill="#000" opacity=".55"/><path d="M6 50c8-4 14 2 22-2s14 2 22-2" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" opacity=".55"/>',
+    minPlayers: 2, maxPlayers: 8, defaultPlayers: 8, hidden: false, realtime: true, aiDelay: 0,
+    controls: [
+      { id: 'U', label: '위로 이동', keys: ['KeyW'], pad: ['up', 'ly-'] },
+      { id: 'D', label: '아래로 이동', keys: ['KeyS'], pad: ['down', 'ly+'] },
+      { id: 'L', label: '왼쪽으로 이동', keys: ['KeyA'], pad: ['left', 'lx-'] },
+      { id: 'R', label: '오른쪽으로 이동', keys: ['KeyD'], pad: ['right', 'lx+'] },
+      { id: 'AU', label: '위로 조준', keys: ['ArrowUp'], pad: ['ry-'] },
+      { id: 'AD', label: '아래로 조준', keys: ['ArrowDown'], pad: ['ry+'] },
+      { id: 'AL', label: '왼쪽으로 조준', keys: ['ArrowLeft'], pad: ['rx-'] },
+      { id: 'AR', label: '오른쪽으로 조준', keys: ['ArrowRight'], pad: ['rx+'] },
+      { id: 'FIRE', label: '발사(마우스 왼쪽도)', keys: ['KeyJ'], pad: ['rt'] },
+      { id: 'DIVE', label: '잠수(누르고 있기)', keys: ['ShiftLeft', 'Space'], pad: ['lt'] },
+      { id: 'SUB', label: '서브(마우스 오른쪽도)', keys: ['KeyQ'], pad: ['rb'] },
+      { id: 'SP', label: '스페셜', keys: ['KeyE'], pad: ['y'] },
+      { id: 'WP', label: '무기 고르기: 이전', keys: ['Digit1', 'BracketLeft'], pad: ['lb'] },
+      { id: 'WN', label: '무기 고르기: 다음', keys: ['Digit2', 'BracketRight'], pad: ['b'] },
+      { id: 'RDY', label: '준비 완료 · 부활', keys: ['Enter'], pad: ['start'] },
+    ],
+    options: [
+      { id: 'mode', label: '규칙', tip: '이기는 방법.', choices: MODE_KEYS.map((k) => ({ v: k, label: MODES[k].name, tip: { turf: '시간 끝에 바닥을 더 많이 칠한 팀.', zone: '거점을 오래 칠해 지키는 팀.', tower: '잉크 탑을 상대 쪽으로 운반.' }[k] })), def: 'turf' },
+      { id: 'time', label: '시간', choices: [{ v: 120, label: '2분' }, { v: 180, label: '3분' }, { v: 240, label: '4분' }], def: 180 },
+      { id: 'map', label: '경기장', choices: [{ v: 'rand', label: '무작위' }].concat(STYLE_KEYS.map((k) => ({ v: k, label: STYLES[k].name }))), def: 'rand' },
+    ],
+    quick: [
+      '두 팀으로 나뉘어 잉크를 쏘아 바닥을 우리 팀 색으로 칠해요. 무기는 10계열 ' + WEP.length + '종.',
+      '내 색 잉크 속에 잠수하면 빨리 헤엄치고 잉크가 채워지고 숨을 수 있어요. 상대를 맞혀 쓰러뜨리면 잠시 기지로 돌아가요.',
+      '기본 규칙(영토전)은 시간이 끝났을 때 더 넓게 칠한 팀이 승리. 「거점 점령」·「잉크 탑 운반」 규칙도 있어요.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '자리 순서대로 번갈아 주황 팀과 남보라 팀으로 나뉘어요(1·3·5·7번 주황, 2·4·6·8번 남보라). 빈자리는 AI가 채워요.',
+        '규칙은 설정에서 골라요(기본: 영토전).',
+      ].concat(MODE_KEYS.map((k) => '「' + MODES[k].name + '」 ' + MODES[k].desc)) },
+      { h: '시야 (모두 같아요)', p: [
+        '폰·태블릿·PC 어느 화면이든, 가로든 세로든 모두 내 캐릭터를 가운데 둔 가로 ' + VIEW + '칸 × 세로 ' + VIEW + '칸만 보여요. 화면이 크면 크게 보일 뿐 더 넓게 보이진 않아요.',
+        'AI도 똑같이 자기 둘레 ' + VIEW + '×' + VIEW + '칸 안의 상대만 알아채고, 높은 벽 뒤는 겨누지 않으며, 잠수한 상대는 못 봐요.',
+        '잉크(총알·줄기·던지기)도 쏜 사람의 시야 밖으로는 날아가지 않아요.',
+        '작은 지도에는 내 시야 안의 상대와, 탐지 구슬·탐조등으로 드러난 상대만 표시돼요.',
+      ] },
+      { h: '조작', p: [
+        '왼쪽 화면을 누른 채 끌면 이동, 오른쪽 화면을 누른 채 끌면 그 방향으로 조준하며 발사해요. 오른쪽을 살짝 누르기만 하면 바라보는 쪽으로 쏴요.',
+        '「잠수」 버튼을 누르고 있으면 잠수해요(쌍권총은 쏘는 중에 누르면 구르기). 「서브」는 보조 무기, 「스페셜」은 게이지가 꽉 차면 쓸 수 있어요.',
+        'PC: WASD 이동 · 마우스로 조준하고 왼쪽 클릭 발사 · 오른쪽 클릭(Q) 서브 · E 스페셜 · Shift/Space 잠수 · 방향키로도 조준·J 발사 · 1/2 무기 바꾸기. 게임패드: 왼스틱 이동, 오른스틱 조준, RT 발사, LT 잠수, RB 서브, Y 스페셜. 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '잉크와 잠수', p: [
+        '쏠 때마다 잉크 탱크(내 캐릭터 옆 세로 막대)가 줄어요. 가만히 두면 천천히, 내 색 잉크 속에 잠수하면 아주 빨리 차요.',
+        '내 색 잉크 속에서 잠수하면 빠르게 헤엄치고(약 1.8배), 체력도 빨리 회복되고, 상대 눈에 안 보여요(' + PEEK + '칸 안으로 오거나 맞거나 드러나면 들켜요). 잠수 중엔 쏠 수 없어요.',
+        '상대 색 잉크 위에서는 느려지고 체력이 조금씩 깎여요(체력 40 아래로는 안 깎여요).',
+      ] },
+      { h: '쓰러짐·부활', p: [
+        '체력은 100. 0이 되면 쓰러지고 ' + RESPAWN + '초 뒤 우리 기지에서 다시 나와요. 쓰러지면 스페셜 게이지가 절반으로 줄어요.',
+        '상대 기지 발판에는 들어갈 수 없어요. 막 나온 직후 ' + INV + '초 동안은 다치지 않아요(깜빡임).',
+      ] },
+      { h: '무기 고르기', p: [
+        '시작 전(모두 「✔ 준비 완료」를 누르면 ' + READY_T + '초 뒤 시작 — 그때까지 기다려요. 방장은 「지금 시작」 가능), 그리고 쓰러져 있는 동안 화면 아래에서 계열 탭을 누르고 무기 카드를 골라요. 같은 계열의 두 무기는 서브·스페셜이 달라요.',
+        '쓰러져 있을 때 「⏸ 부활 대기」를 누르거나 무기를 고르기 시작하면 부활 시간이 멈춰요(한 번에 최대 ' + HOLD_MAX + '초). 다 고르면 「▶ 부활」. 멈춘 동안 우리 팀은 한 명이 빠진 채 싸워요.',
+        '계열: ' + FAM_KEYS.map((f) => FAMS[f].icon + FAMS[f].kind).join(' · ') + '. 자세한 수치는 「📖 도감」에.',
+      ] },
+      { h: '경기장', p: [
+        '판마다 새로 만들어져요(기본: 무작위). 두 팀에 똑같이 공평하게 뒤집힌 대칭 모양이에요.',
+        '높은 벽: 못 지나가고 잉크도 시야도 막아요. 낮은 담: 못 지나가지만 잉크는 넘어가요. 철망 바닥: 지나갈 수 있지만 칠할 수 없어요.',
+        '점프대(노란 동그라미): 밟으면 가던 방향으로 6칸 날아가요(벽도 넘어요). 잉크 레일(화살표 줄): 올라서면 화살표 쪽으로 빠르게 실려 가요. 나무 문(X 무늬): 잉크를 맞히면(내구 60) 부서져 열리고 칠할 수 있는 바닥이 돼요.',
+      ] },
+      { h: 'AI · 함께 하기', p: [
+        'AI 난이도는 자리마다 쉬움·보통·어려움으로 골라요. AI는 무기 ' + WEP.length + '종 중 하나를 골라 쓰고, 거점에서는 거점을 칠하고, 탑 운반에서는 절반이 탑에 올라타요.',
+        '실시간 게임이라 한 기기에 한 명씩이에요. 혼자 하면 나머지는 AI, 친구와는 온라인 방이나 LAN 방으로 해요.',
+      ] },
+    ],
+    codex: [
+      { h: '계열', p: ['무기 계열 ' + FAM_KEYS.length + '가지. 계열마다 쏘는 방식이 달라요.'], rows: FAM_KEYS.map((f) => ({ icon: FAMS[f].icon, name: FAMS[f].kind, tag: '계열 · ' + WEP.filter((w) => w.fam === f).map((w) => w.name).join(', '), desc: FAMS[f].desc + ' · ' + FAMS[f].stat })) },
+      { h: '무기', p: ['같은 계열은 성능이 같고 서브·스페셜이 달라요.'], rows: WEP.map((w) => ({ icon: w.icon, name: w.name, tag: w.kind, desc: '서브: ' + SUBS[w.sub].name + ' · 스페셜: ' + SPS[w.sp].name + '(게이지 ' + w.spMax + '칸) · ' + w.stat })) },
+      { h: '서브', p: ['잉크 탱크를 써서 던지거나 깔아요.'], rows: SUBK.map((k) => ({ icon: SUBS[k].icon, name: SUBS[k].name, tag: '서브 · 잉크 ' + SUBS[k].cost + '%', desc: SUBS[k].desc + ' (' + WEP.filter((w) => w.sub === k).map((w) => w.name).join(', ') + ')' })) },
+      { h: '스페셜', p: ['칠한 칸 수만큼 게이지가 차요. 쓰러지면 절반이 사라져요.'], rows: SPK.map((k) => ({ icon: SPS[k].icon, name: SPS[k].name, tag: '스페셜', desc: SPS[k].desc + ' (' + WEP.filter((w) => w.sp === k).map((w) => w.name + ' · ' + w.spMax + '칸').join(', ') + ')' })) },
+      { h: '경기장', p: ['판마다 배치가 새로 만들어져요(두 팀 대칭). 장치가 두 가지 이상 섞여 나와요.'], rows: STYLE_KEYS.map((k) => ({ icon: { open: '⬜', alley: '🧱', tower: '⛰️' }[k], name: STYLES[k].name, tag: '경기장', desc: STYLES[k].desc })).concat([
+        { icon: '🟡', name: '점프대', tag: '장치', desc: '밟으면 가던 방향으로 6칸 날아가요. 벽과 낮은 담도 넘어요.' },
+        { icon: '➡️', name: '잉크 레일', tag: '장치', desc: '올라서면 화살표 쪽으로 초당 5.5칸씩 실려 가요. 칠할 수 없어요.' },
+        { icon: '🚪', name: '나무 문', tag: '장치', desc: '높은 벽처럼 막지만 잉크를 맞히면(내구 60, 맞힌 피해의 절반) 부서져 바닥이 돼요.' },
+      ]) },
+      { h: '규칙', p: ['설정의 「규칙」에서 골라요.'], rows: MODE_KEYS.map((k) => ({ icon: { turf: '🎨', zone: '🚩', tower: '🗼' }[k], name: MODES[k].name, tag: '규칙', desc: MODES[k].desc })) },
+      { h: '수치', p: ['시야 ' + VIEW + '×' + VIEW + '칸(모든 화면·AI 같음) · 걷기 ' + V_WALK + '칸/초 · 헤엄 ' + V_SWIM + '칸/초 · 작은 모습 ' + V_CRIT + '칸/초 · 상대 잉크 위 ×' + ENEMY_SLOW, '체력 100 · 상대 잉크 위 초당 10 피해(40까지) · 부활 ' + RESPAWN + '초 · 부활 무적 ' + INV + '초', '잉크 회복: 가만히 초당 8% · 잠수 중 초당 40% · 경기장 ' + MW + '×' + MH + '칸'], rows: [] },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { genMap, newWorld, stepWorld, aiThink, counts, packGrid, unpackGrid, snapshot, encP, decP, finalRes, STYLE_KEYS, MODE_KEYS, N, WEP, FAMS, VIEW, inView, DR, JP, RL },
+  });
+})();

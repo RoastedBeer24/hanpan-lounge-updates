@@ -1,0 +1,812 @@
+/* 다트 — 301 더블 아웃. Accurate board geometry, parabolic drag-aim (slingshot) throw, checkout-aware AI. */
+(function () {
+  const L = window.Lounge, U = L.util;
+
+  /* invisible box over a canvas region so the first-play tutorial (sel) can spotlight it.
+     set(x, y, w, h) in stage px; set(null) takes it out of the DOM (the tutorial then shows no ring). */
+  function tutSpot(root, cls) {
+    const e = L.h('div', { class: 'tut-spot ' + cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none', left: '0px', top: '0px', width: '0px', height: '0px' } });
+    let key = '';
+    const set = (x, y, w, h) => {
+      if (x == null || !(w > 0 && h > 0)) { if (e.parentNode) e.remove(); key = ''; return; }
+      if (!e.parentNode) root.append(e);
+      const v = [x, y, w, h].map(Math.round), k = v.join(',');
+      if (k === key) return; key = k;
+      Object.assign(e.style, { left: v[0] + 'px', top: v[1] + 'px', width: v[2] + 'px', height: v[3] + 'px' });
+    };
+    set.el = e;
+    return set;
+  }
+
+  /* ---------- board geometry (mm, x right, y down, origin = bull) ---------- */
+  const SECT = [20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5];
+  const R_BULL = 6.35, R_OBULL = 15.9, R_TIN = 99, R_TOUT = 107, R_DIN = 162, R_DOUT = 170;
+  const R_NUM = 196, R_SURR = 226;
+  const ROUNDS = 10, START = 301;
+  const DEG = Math.PI / 180;
+
+  /* Score a landing point. Boundaries are inclusive on the inner (higher-value) side; the
+     drawing uses the exact same radii and angles, so what you see is what you score.
+     m === 2 means "counts as a double" (outer ring or inner bull). */
+  function score(x, y) {
+    const r = Math.hypot(x, y);
+    if (!(r <= R_DOUT)) return { p: 0, m: 0, n: 0, l: '빗나감' };
+    if (r <= R_BULL) return { p: 50, m: 2, n: 25, l: '불 50' };
+    if (r <= R_OBULL) return { p: 25, m: 1, n: 25, l: '25' };
+    let a = Math.atan2(x, -y) / DEG; // degrees clockwise from top
+    a = ((a % 360) + 360) % 360;
+    const i = Math.floor(((a + 9) % 360) / 18) % 20;
+    const n = SECT[i];
+    const m = r >= R_DIN ? 2 : (r >= R_TIN && r <= R_TOUT) ? 3 : 1;
+    const p = n * m;
+    return { p, m, n, l: m === 3 ? 'T' + n + ' · ' + p : m === 2 ? 'D' + n + ' · ' + p : String(n) };
+  }
+  /* centre of a bed: sector index i, radius r */
+  function bedXY(i, r) { const a = i * 18 * DEG; return { x: r * Math.sin(a), y: -r * Math.cos(a) }; }
+  const T20 = bedXY(0, 103), T19 = bedXY(SECT.indexOf(19), 103);
+
+  /* ---------- double-out checkout table ---------- */
+  // every distinct dart: label, points, isDouble, preference cost
+  const DPREF = [20, 16, 18, 10, 8, 12, 14, 6, 4, 19, 17, 15, 13, 11, 9, 7, 5, 3, 2, 1];
+  const DARTS = (() => {
+    const d = [];
+    for (let n = 1; n <= 20; n++) {
+      d.push({ l: String(n), p: n, dbl: false, c: 1 + (20 - n) * 0.01 });
+      d.push({ l: 'T' + n, p: 3 * n, dbl: false, c: 2 + (20 - n) * 0.02 });
+      d.push({ l: 'D' + n, p: 2 * n, dbl: true, c: 3 + (20 - n) * 0.02, fc: DPREF.indexOf(n) * 0.15 });
+    }
+    d.push({ l: '25', p: 25, dbl: false, c: 2.6 });
+    d.push({ l: '불', p: 50, dbl: true, c: 3.2, fc: 3.5 });
+    return d;
+  })();
+  // CO[k][r] = best path (array of labels) finishing r in exactly <= k darts, or null
+  const CO = (() => {
+    const best = [null, [], [], []]; // best[k][r] = {c, path}
+    for (let k = 1; k <= 3; k++) best[k] = new Array(171).fill(null);
+    for (const f of DARTS) if (f.dbl) {
+      const cand = { c: 10 + f.fc, path: [f.l] };
+      if (!best[1][f.p] || cand.c < best[1][f.p].c) best[1][f.p] = cand;
+    }
+    for (let k = 2; k <= 3; k++) {
+      for (let r = 2; r <= 170; r++) {
+        let b = best[k - 1][r]; // fewer darts always wins (cost includes 10 per dart)
+        for (const s of DARTS) {
+          const rest = r - s.p;
+          if (rest < 2) continue;
+          const sub = best[k - 1][rest];
+          if (!sub) continue;
+          const c = sub.c + 10 + s.c;
+          if (!b || c < b.c - 1e-9) b = { c, path: [s.l].concat(sub.path) };
+        }
+        best[k][r] = b;
+      }
+    }
+    return best.map((row) => row && row.map((e) => (e ? e.path : null)));
+  })();
+  /* standard published 3-dart checkout chart (validated against the solver at load; '불' = inner bull) */
+  const STD = '170 T20 T20 B|167 T20 T19 B|164 T20 T18 B|161 T20 T17 B|160 T20 T20 D20|158 T20 T20 D19|157 T20 T19 D20|156 T20 T20 D18|155 T20 T19 D19|154 T20 T18 D20|153 T20 T19 D18|152 T20 T20 D16|151 T20 T17 D20|150 T20 T18 D18|149 T20 T19 D16|148 T20 T16 D20|147 T20 T17 D18|146 T20 T18 D16|145 T20 T15 D20|144 T20 T20 D12|143 T20 T17 D16|142 T20 T14 D20|141 T20 T19 D12|140 T20 T20 D10|139 T20 T13 D20|138 T20 T18 D12|137 T20 T19 D10|136 T20 T20 D8|135 T20 T17 D12|134 T20 T14 D16|133 T20 T19 D8|132 T20 T16 D12|131 T20 T13 D16|130 T20 T20 D5|129 T19 T16 D12|128 T18 T14 D16|127 T20 T17 D8|126 T19 T19 D6|125 25 T20 D20|124 T20 T16 D14|123 T19 T16 D9|122 T18 T20 D4|121 T20 T11 D14|120 T20 20 D20|119 T19 T12 D13|118 T20 18 D20|117 T20 17 D20|116 T20 16 D20|115 T20 15 D20|114 T20 14 D20|113 T20 13 D20|112 T20 12 D20|111 T20 11 D20|110 T20 10 D20|109 T20 9 D20|108 T20 16 D16|107 T19 10 D20|106 T20 6 D20|105 T20 13 D16|104 T18 18 D16|103 T19 6 D20|102 T20 10 D16|101 T17 10 D20|100 T20 D20|99 T19 10 D16|98 T20 D19|97 T19 D20|96 T20 D18|95 T19 D19|94 T18 D20|93 T19 D18|92 T20 D16|91 T17 D20|90 T20 D15|89 T19 D16|88 T16 D20|87 T17 D18|86 T18 D16|85 T15 D20|84 T20 D12|83 T17 D16|82 T14 D20|81 T19 D12|80 T20 D10|79 T19 D11|78 T18 D12|77 T19 D10|76 T20 D8|75 T17 D12|74 T14 D16|73 T19 D8|72 T16 D12|71 T13 D16|70 T18 D8|69 T19 D6|68 T20 D4|67 T17 D8|66 T10 D18|65 T19 D4|64 T16 D8|63 T13 D12|62 T10 D16|61 T15 D8|60 20 D20|59 19 D20|58 18 D20|57 17 D20|56 16 D20|55 15 D20|54 14 D20|53 13 D20|52 12 D20|51 11 D20|49 9 D20|48 16 D16|47 15 D16|46 6 D20|45 13 D16|44 12 D16|43 3 D20|42 10 D16|41 9 D16|39 7 D16|37 5 D16|35 3 D16|33 1 D16|31 15 D8|29 13 D8|27 11 D8|25 9 D8|23 7 D8|21 5 D8|19 3 D8|17 1 D8|15 7 D4|13 5 D4|11 3 D4|9 1 D4|7 3 D2|5 1 D2|3 1 D1';
+  const STD_OK = {};
+  (() => {
+    const pts = {}; DARTS.forEach((d) => { pts[d.l] = d; });
+    for (const row of STD.split('|')) {
+      const [r, ...path] = row.split(' ').map((x, i) => (i === 0 ? +x : x === 'B' ? '불' : x));
+      let left = r, ok = path.every((l, i) => { const d = pts[l]; if (!d) return false; left -= d.p; return i === path.length - 1 ? left === 0 && d.dbl : left >= 2; });
+      // only use a chart route when it needs no more darts than the shortest finish
+      if (ok && path.length === CO[3][r].length) { STD_OK[r] = path; CO[3][r] = path; if (path.length <= 2) CO[2][r] = path; }
+    }
+  })();
+  function checkout(rem, darts) {
+    darts = darts == null ? 3 : darts;
+    if (darts < 1 || rem < 2 || rem > 170) return null;
+    return CO[Math.min(3, darts)][rem];
+  }
+  const minDarts = (r) => (r >= 2 && r <= 170 ? (CO[1][r] ? 1 : CO[2][r] ? 2 : CO[3][r] ? 3 : 9) : 9);
+
+  const r1 = (v) => Math.round(v * 10) / 10;
+  function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  /* ---------- pure logic ---------- */
+  function init(players) {
+    const n = players.length;
+    return { n, rem: players.map(() => START), lv: players.map(() => null), t: 0, d: 0, r: 1, st: START, v: [], fin: null, over: false, seq: 0, last: null };
+  }
+  function actor(s) { return s.fin != null || s.over ? null : s.t; }
+  /* bust reasons: 1 = below zero, 2 = one left, 3 = zero without a double */
+  function apply(s, seat, a) {
+    if (actor(s) !== seat) throw new Error('not your turn');
+    if (!a || a.type !== 'throw') throw new Error('bad action');
+    // typeof check: JSON turns NaN/Infinity into null and Number(null) would be 0 (a bullseye)
+    if (typeof a.x !== 'number' || typeof a.y !== 'number' || !isFinite(a.x) || !isFinite(a.y)) throw new Error('bad coords');
+    let x = a.x, y = a.y;
+    x = r1(U.clamp(x, -260, 260)); y = r1(U.clamp(y, -260, 260));
+    const sc = score(x, y);
+    const before = s.rem[seat];
+    const nr = before - sc.p;
+    let e = 0, br = 0;
+    s.v.push([x, y]);
+    if (!s.k) s.k = s.rem.map(() => [0, 0, 0, 0]);   // stats per seat: darts, trebles, best visit, busts
+    const K = s.k[seat]; K[0]++; if (sc.m === 3) K[1]++;
+    if (nr < 0) br = 1; else if (nr === 1) br = 2; else if (nr === 0 && sc.m !== 2) br = 3;
+    if (br) { s.rem[seat] = s.st; e = 2; s.lv[seat] = -1; }
+    else if (nr === 0) { s.rem[seat] = 0; e = 3; s.fin = seat; s.lv[seat] = s.st; }
+    else { s.rem[seat] = nr; if (s.d >= 2) { e = 1; s.lv[seat] = s.st - nr; } }
+    if (br) K[3]++; else if (e) K[2] = Math.max(K[2], s.st - s.rem[seat]);
+    s.seq++;
+    s.last = { id: s.seq, s: seat, x, y, p: sc.p, l: sc.l, e, d: s.d, vd: e ? s.v.slice() : null };
+    if (br) s.last.b = br;
+    if (e) {
+      s.v = []; s.d = 0;
+      if (e !== 3) {
+        s.t = (s.t + 1) % s.n;
+        if (s.t === 0) { s.r++; if (s.r > ROUNDS) { s.r = ROUNDS; s.over = true; } }
+        s.st = s.rem[s.t];
+      }
+    } else s.d++;
+    return s;
+  }
+  function result(s) {
+    const r = result0(s);
+    if (r) try {
+      const K = s.k || s.rem.map(() => [0, 0, 0, 0]), P = K.map((x, i) => i);
+      r.stats = [
+        { label: '던진 다트', values: P.map((i) => String(K[i][0])) },
+        { label: '트리플', values: P.map((i) => String(K[i][1])) },
+        { label: '최고 한 차례', values: P.map((i) => String(K[i][2])) },
+        { label: '버스트', values: P.map((i) => String(K[i][3])) },
+      ];
+    } catch (e) {}
+    return r;
+  }
+  function result0(s) {
+    if (s.fin != null) {
+      if (s.n === 1) return { winners: [s.fin], title: '301 더블 아웃!', text: s.r + '라운드 만에 더블로 0점을 딱 맞췄어요.' };
+      return { winners: [s.fin], text: s.r + '라운드에 더블로 남은 점수를 0으로 맞췄어요.' };
+    }
+    if (!s.over) return null;
+    if (s.n === 1) return { winners: [], title: ROUNDS + '라운드 종료', text: '남은 점수 ' + s.rem[0] + '점. 다시 도전해 보세요!' };
+    const lo = Math.min(...s.rem);
+    const w = []; s.rem.forEach((v, i) => { if (v === lo) w.push(i); });
+    return { winners: w, text: '아무도 끝내지 못해 남은 점수가 가장 적은 쪽이 이겼어요.\n남은 점수: ' + s.rem.join(' / ') };
+  }
+
+  /* ---------- AI ---------- */
+  const SIGMA = [14, 15, 16, 14.5];
+  const GOODD = { 20: 6, 16: 8, 8: 5, 18: 4, 10: 4, 12: 3, 4: 2, 14: 1, 2: -3, 1: -8 };
+  const CANDS = (() => {
+    const c = [{ x: 0, y: 0 }, bedXY(0, 11)]; // bull, outer bull (above centre)
+    for (let i = 0; i < 20; i++) for (const r of [58, 103, 134, 166]) c.push(bedXY(i, r));
+    return c;
+  })();
+  /* heuristic value of having `r` left with `dl` darts still to throw this visit */
+  function leaveVal(r, dl) {
+    let v = -0.35 * r;
+    const md = minDarts(r);
+    if (r <= 40 && r % 2 === 0) v += 22 + (GOODD[r / 2] || 0);
+    else if (md <= 2) v += 10;
+    else if (md === 3) v += 4;
+    else if (r <= 170) v -= 6; // bogey number
+    if (r < 40 && r % 2 === 1) v -= 3;
+    if (dl > 0 && md <= dl) v += [0, 30, 14, 6][md];
+    return v;
+  }
+  /* per-seat level: 1 쉬움 = shaky hand + rough planning, 2 보통, 3 어려움 = steady hand + finer planning */
+  const LVK = { 1: { k: 1.5, N: 16 }, 2: { k: 1, N: 56 }, 3: { k: 0.62, N: 96 } };
+  function ai(s, seat, lv) {
+    const rem = s.rem[seat];
+    const L_ = LVK[lv] || LVK[2];
+    const sig = SIGMA[seat % SIGMA.length] * L_.k;
+    const dl = 3 - s.d; // darts left including this one
+    let tgt = T20;
+    if (rem > 230) {
+      const clutter = s.v.filter((v) => Math.hypot(v[0] - T20.x, v[1] - T20.y) < 7).length;
+      if (clutter >= 2) tgt = T19;
+    } else {
+      // Monte Carlo over candidate beds with common random offsets
+      const N = L_.N, off = [];
+      for (let k = 0; k < N; k++) off.push([gauss() * sig, gauss() * sig]);
+      const bustV = leaveVal(s.st, 0) - 8;
+      let best = -1e9;
+      for (const c of CANDS) {
+        let u = 0;
+        for (const o of off) {
+          const sc = score(c.x + o[0], c.y + o[1]);
+          const left = rem - sc.p;
+          if (left === 0 && sc.m === 2) u += 200;
+          else if (left < 2) u += bustV;
+          else u += leaveVal(left, dl - 1);
+        }
+        if (u > best) { best = u; tgt = c; }
+      }
+    }
+    return { type: 'throw', x: r1(tgt.x + gauss() * sig), y: r1(tgt.y + gauss() * sig) };
+  }
+
+  /* ---------- aim model (shared by preview and throw) ---------- */
+  const AIM = { lmin: 22, grab: 46, thMax: 38 * DEG, xMax: 230, yLo: 200, yHi: -200, sig: 4.5, swayAfter: 2.5, swayFull: 5, swayA: 7, gLo: 0.32, gHi: 1.35 };
+  /* pull vector (finger - anchor, px) → predicted landing point in mm (before sway/spread) */
+  function aimFromPull(dx, dy, span) {
+    const len = Math.hypot(dx, dy);
+    if (len < AIM.lmin || dy <= 0) return null;
+    // direction measured from a virtual pivot 50px above the anchor, so short pulls aren't twitchy
+    const th = U.clamp(Math.atan2(-dx, dy + 50), -AIM.thMax, AIM.thMax); // pull left → flies right
+    const f = U.clamp((len - AIM.lmin) / span, 0, 1);
+    return { x: (th / AIM.thMax) * AIM.xMax, y: U.lerp(AIM.yLo, AIM.yHi, f), f };
+  }
+  /* quadratic arc in screen space from launch A to landing B (perspective: decelerates, shrinks) */
+  function arcPt(A, B, t) {
+    const h = 34 + 0.28 * Math.max(0, A.y - B.y);
+    const C = { x: (A.x + B.x) / 2, y: Math.min(A.y, B.y) - h };
+    const u = 1 - Math.pow(1 - t, 1.45);
+    const a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u;
+    return { x: a * A.x + b * C.x + c * B.x, y: a * A.y + b * C.y + c * B.y, s: U.lerp(2.1, 1, u) };
+  }
+
+  /* ---------- view ---------- */
+  // three darts in one visit totalling 180 (T20 ×3); vd carries the visit's darts when it ends
+  function is180(l) { return !!(l && l.e === 1 && l.vd && l.vd.length === 3 && l.vd.reduce((a, v) => a + score(v[0], v[1]).p, 0) === 180); }
+  function mount(root, api) {
+    const cv = U.canvas(root);
+    const ctx = cv.ctx;
+    let st = null, hudSt = null, G = null, boardImg = null;
+    let disp = [];          // stuck darts [{x,y,c}]
+    let anim = null;        // flying/holding dart
+    let pops = [];          // score popups
+    let shownId = 0, busy = false, time = 0;
+    let ptr = null;         // active pull gesture {id, ax, ay, x, y, t0}
+    let hintFlash = 0;
+    let myLaunch = null;    // screen point our last throw left from (for the replay arc)
+    let waitSeq = -1, waitUntil = 0; // after a throw, ignore input until the resulting state arrives (online guest)
+    let animTimer = 0;               // fallback in case rAF is paused (background tab) so busy never sticks
+
+    const top = L.h('div', { class: 'hud top dt-top', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px', alignItems: 'stretch' } });
+    root.append(top);
+    // invisible boxes over canvas regions for the first-play tutorial spotlight
+    const spBoard = tutSpot(root, 'dt-board'), spDart = tutSpot(root, 'dt-dart'), spInfo = tutSpot(root, 'dt-info');
+
+    function setBusy(b) { busy = b; api.setBusy(b); }
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      const topH = 84;
+      // the pull runs from the dart's rest point straight down: reserve lmin + span below it
+      const span = Math.round(U.clamp(H * 0.2, 108, 150));
+      const restY = H - 12 - AIM.lmin - span;
+      const zoneTop = restY - 46, zoneH = H - zoneTop;
+      const availH = zoneTop - topH;
+      const R = Math.max(60, Math.min(W / 2 - 22, availH / 2 - 16));
+      const k = R / (R_SURR + 4);
+      G = { W, H, topH, zoneH, zoneTop, R, k, cx: W / 2, cy: topH + availH / 2, rest: { x: W / 2, y: restY }, span };
+      spBoard(G.cx - R, G.cy - R, R * 2, R * 2);
+      spDart(W / 2 - 70, restY - 34, 140, Math.min(H - 6, restY + 70) - (restY - 34));
+      spInfo(8, zoneTop + 6, W - 16, 30);
+      buildBoard();
+    }
+    const px = (x) => G.cx + x * G.k, py = (y) => G.cy + y * G.k;
+
+    /* ---- board pre-render ---- */
+    function buildBoard() {
+      const pad = 16;
+      const size = Math.ceil((G.R + pad) * 2);
+      const c = document.createElement('canvas');
+      c.width = Math.round(size * cv.dpr); c.height = Math.round(size * cv.dpr);
+      const b = c.getContext('2d');
+      b.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+      const o = size / 2, k = G.k;
+      // cabinet back (dark wood square with bevel)
+      const cab = G.R + pad - 2;
+      const wg = b.createLinearGradient(o - cab, 0, o + cab, 0);
+      wg.addColorStop(0, '#2a1a12'); wg.addColorStop(0.5, '#3a2418'); wg.addColorStop(1, '#24160f');
+      b.fillStyle = wg; rr(b, o - cab, o - cab, cab * 2, cab * 2, 14); b.fill();
+      b.save(); rr(b, o - cab, o - cab, cab * 2, cab * 2, 14); b.clip();
+      b.strokeStyle = 'rgba(0,0,0,.18)'; b.lineWidth = 1;
+      for (let i = 0; i < 40; i++) { const xx = o - cab + (i / 40) * cab * 2 + Math.sin(i * 7.3) * 3; b.beginPath(); b.moveTo(xx, o - cab); b.bezierCurveTo(xx + 6, o - cab / 2, xx - 6, o + cab / 2, xx + 2, o + cab); b.stroke(); }
+      const ig = b.createRadialGradient(o, o, G.R * 0.6, o, o, cab * 1.35);
+      ig.addColorStop(0, 'rgba(0,0,0,0)'); ig.addColorStop(1, 'rgba(0,0,0,.55)');
+      b.fillStyle = ig; b.fillRect(o - cab, o - cab, cab * 2, cab * 2);
+      b.restore();
+      b.strokeStyle = 'rgba(227,174,69,.25)'; b.lineWidth = 2; rr(b, o - cab + 1, o - cab + 1, cab * 2 - 2, cab * 2 - 2, 13); b.stroke();
+      // board shadow + surround
+      b.fillStyle = 'rgba(0,0,0,.55)'; b.beginPath(); b.arc(o + 3, o + 6, R_SURR * k + 2, 0, 7); b.fill();
+      const sg = b.createRadialGradient(o - R_SURR * k * 0.3, o - R_SURR * k * 0.4, 0, o, o, R_SURR * k);
+      sg.addColorStop(0, '#2b2b2b'); sg.addColorStop(1, '#0f0f0f');
+      b.fillStyle = sg; b.beginPath(); b.arc(o, o, R_SURR * k, 0, 7); b.fill();
+      // sectors
+      const BLACK = '#161514', CREAM = '#efe1bf', RED = '#d23a2c', GREEN = '#1f8a4c';
+      function wedge(i, r0, r1_, col) {
+        const a0 = (-90 + i * 18 - 9) * DEG, a1 = (-90 + i * 18 + 9) * DEG;
+        b.fillStyle = col; b.beginPath(); b.arc(o, o, r1_ * k, a0, a1); b.arc(o, o, r0 * k, a1, a0, true); b.closePath(); b.fill();
+      }
+      for (let i = 0; i < 20; i++) {
+        const dark = i % 2 === 0;
+        wedge(i, R_OBULL, R_DOUT, dark ? BLACK : CREAM);
+        wedge(i, R_TIN, R_TOUT, dark ? RED : GREEN);
+        wedge(i, R_DIN, R_DOUT, dark ? RED : GREEN);
+      }
+      b.fillStyle = GREEN; b.beginPath(); b.arc(o, o, R_OBULL * k, 0, 7); b.fill();
+      b.fillStyle = RED; b.beginPath(); b.arc(o, o, R_BULL * k, 0, 7); b.fill();
+      // sisal texture
+      b.save(); b.beginPath(); b.arc(o, o, R_DOUT * k, 0, 7); b.clip();
+      for (let i = 0; i < 900; i++) {
+        const a = Math.random() * 7, rr_ = Math.sqrt(Math.random()) * R_DOUT * k;
+        b.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,.05)' : 'rgba(0,0,0,.08)';
+        b.fillRect(o + Math.cos(a) * rr_, o + Math.sin(a) * rr_, 1, 1);
+      }
+      b.restore();
+      // wires
+      const wire = (w) => { b.strokeStyle = '#c9ccd2'; b.lineWidth = w; };
+      wire(Math.max(0.7, k * 1.1));
+      for (let i = 0; i < 20; i++) {
+        const a = (-90 + i * 18 - 9) * DEG;
+        b.beginPath(); b.moveTo(o + Math.cos(a) * R_OBULL * k, o + Math.sin(a) * R_OBULL * k);
+        b.lineTo(o + Math.cos(a) * R_DOUT * k, o + Math.sin(a) * R_DOUT * k); b.stroke();
+      }
+      for (const r of [R_BULL, R_OBULL, R_TIN, R_TOUT, R_DIN, R_DOUT]) { b.beginPath(); b.arc(o, o, r * k, 0, 7); b.stroke(); }
+      // number ring wire
+      wire(Math.max(1, k * 1.6)); b.beginPath(); b.arc(o, o, (R_DOUT + 6) * k, 0, 7); b.stroke();
+      // numbers
+      b.fillStyle = '#f3ead6'; b.textAlign = 'center'; b.textBaseline = 'middle';
+      b.font = '700 ' + Math.max(9, Math.round(k * 21)) + 'px "IBM Plex Sans KR", "IBM Plex Mono", system-ui, sans-serif';
+      for (let i = 0; i < 20; i++) {
+        const a = (-90 + i * 18) * DEG;
+        b.fillText(String(SECT[i]), o + Math.cos(a) * R_NUM * k, o + Math.sin(a) * R_NUM * k + 0.5);
+      }
+      // subtle top-left sheen
+      const sh = b.createRadialGradient(o - R_DOUT * k * 0.5, o - R_DOUT * k * 0.6, 0, o, o, R_SURR * k);
+      sh.addColorStop(0, 'rgba(255,255,255,.08)'); sh.addColorStop(0.6, 'rgba(255,255,255,0)');
+      b.fillStyle = sh; b.beginPath(); b.arc(o, o, R_SURR * k, 0, 7); b.fill();
+      boardImg = { c, size, o };
+    }
+    function rr(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+
+    /* ---- dart sprite: tip at (x,y), body angled toward the viewer ---- */
+    function drawDart(x, y, s, col, shadow) {
+      const dx = 0.42, dy = 1; const len = 30 * s;
+      const n = Math.hypot(dx, dy), ux = dx / n, uy = dy / n, nx = -uy, ny = ux;
+      ctx.save();
+      ctx.lineCap = 'round';
+      if (shadow) { ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 3 * s; ctx.beginPath(); ctx.moveTo(x + 1, y + 2); ctx.lineTo(x + 1 + ux * len * 0.85 + 6 * s, y + 2 + uy * len * 0.55); ctx.stroke(); }
+      const p = (t, o2) => [x + ux * len * t + nx * o2, y + uy * len * t + ny * o2];
+      // point
+      ctx.strokeStyle = '#d9dde3'; ctx.lineWidth = 1.2 * s;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(...p(0.22, 0)); ctx.stroke();
+      // barrel
+      ctx.strokeStyle = '#7c838d'; ctx.lineWidth = 3.6 * s;
+      ctx.beginPath(); ctx.moveTo(...p(0.22, 0)); ctx.lineTo(...p(0.52, 0)); ctx.stroke();
+      ctx.strokeStyle = '#c8ced6'; ctx.lineWidth = 1.2 * s;
+      ctx.beginPath(); ctx.moveTo(...p(0.24, -0.8 * s)); ctx.lineTo(...p(0.5, -0.8 * s)); ctx.stroke();
+      // shaft
+      ctx.strokeStyle = '#1e1a24'; ctx.lineWidth = 2 * s;
+      ctx.beginPath(); ctx.moveTo(...p(0.52, 0)); ctx.lineTo(...p(0.78, 0)); ctx.stroke();
+      // flights
+      ctx.fillStyle = col; ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 0.8;
+      for (const sd of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(...p(0.66, 0)); ctx.lineTo(...p(0.8, sd * 6.5 * s)); ctx.lineTo(...p(1, sd * 6.5 * s)); ctx.lineTo(...p(1, 0)); ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+      ctx.beginPath(); ctx.moveTo(...p(0.7, 0)); ctx.lineTo(...p(1.02, 0)); ctx.strokeStyle = col; ctx.lineWidth = 2.2 * s; ctx.stroke();
+      ctx.restore();
+    }
+
+    function swayAt(t) {
+      // hand gets shaky after holding too long
+      const held = ptr ? (t - ptr.t0) : 0;
+      const A = AIM.swayA * U.clamp((held - AIM.swayAfter) / (AIM.swayFull - AIM.swayAfter), 0, 1);
+      if (!A) return { x: 0, y: 0, a: 0 };
+      return { x: A * (0.75 * Math.sin(1.3 * t) + 0.25 * Math.sin(3.1 * t + 0.7)), y: A * (0.75 * Math.sin(1.9 * t + 0.4) + 0.25 * Math.sin(2.7 * t + 2.1)), a: A };
+    }
+    function humanTurn() {
+      const a = st ? actor(st) : null;
+      if (a == null || !api.canAct(a) || anim) return false;
+      return !(st.seq === waitSeq && performance.now() < waitUntil);
+    }
+    /* current aim (mm) for the active pull, or null if the pull is in the cancel zone */
+    function curAim() {
+      if (!ptr) return null;
+      if (Math.hypot(ptr.x - ptr.ax, ptr.y - ptr.ay) < AIM.lmin) return null; // finger back on the dart: cancel
+      const a = aimFromPull(ptr.vx, ptr.vy, G.span);
+      if (!a) return null;
+      const sw = swayAt(time);
+      return { x: a.x + sw.x, y: a.y + sw.y, f: a.f, shaky: sw.a > 0.5 };
+    }
+
+    /* ---- drawing ---- */
+    function draw() {
+      cv.clear();
+      if (!G || !boardImg) return;
+      const { W, H } = G;
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, '#1d1727'); bg.addColorStop(1, '#120e18');
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+      // board
+      ctx.drawImage(boardImg.c, G.cx - boardImg.o, G.cy - boardImg.o, boardImg.size, boardImg.size);
+      // stuck darts
+      for (const d of disp) drawDart(px(d.x), py(d.y), 1, d.c, true);
+      const human = humanTurn();
+      drawZone(human);
+      if (human && ptr) drawAim();
+      // flying dart
+      if (anim && anim.phase === 'fly') {
+        const p = Math.min(1, anim.t / anim.dur);
+        const q = arcPt(anim.A, { x: px(anim.x), y: py(anim.y) }, p);
+        drawDart(q.x, q.y, q.s, anim.c, false);
+      }
+      // popups
+      for (const pp of pops) {
+        const a = pp.t < 0.15 ? pp.t / 0.15 : pp.t > pp.life - 0.3 ? Math.max(0, (pp.life - pp.t) / 0.3) : 1;
+        const rise = Math.min(1, pp.t / 0.25) * 18;
+        const x = U.clamp(U.lerp(W / 2, pp.x, 0.35), 90, W - 90), y = G.zoneTop + 84 - rise;
+        ctx.save(); ctx.globalAlpha = a;
+        ctx.font = '400 22px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+        const tw = ctx.measureText(pp.text).width;
+        ctx.font = '700 13px "IBM Plex Sans KR", sans-serif';
+        const sw2 = pp.sub ? ctx.measureText(pp.sub).width : 0;
+        const bw = Math.max(tw, sw2) + 24, bh = pp.sub ? 50 : 34;
+        ctx.fillStyle = 'rgba(18,14,24,.6)'; rr(ctx, x - bw / 2, y - bh / 2, bw, bh, 12); ctx.fill();
+        ctx.strokeStyle = pp.col; ctx.lineWidth = 2; ctx.stroke();
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = pp.col; ctx.font = '400 22px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+        ctx.fillText(pp.text, x, y - (pp.sub ? 8 : 0) + 1);
+        if (pp.sub) { ctx.fillStyle = '#ab9fb8'; ctx.font = '700 13px "IBM Plex Sans KR", sans-serif'; ctx.fillText(pp.sub, x, y + 16); }
+        ctx.restore();
+      }
+    }
+
+    function drawAim() {
+      const seat = actor(st), col = api.players[seat].color;
+      const an = { x: ptr.ax, y: ptr.ay };
+      const aim = curAim();
+      const A = aim ? { x: an.x + ptr.vx, y: an.y + ptr.vy } : { x: ptr.x, y: ptr.y };
+      // anchor + cancel ring
+      ctx.save();
+      ctx.setLineDash([3, 4]); ctx.lineWidth = 1.5;
+      ctx.strokeStyle = aim ? 'rgba(171,159,184,.45)' : 'rgba(238,106,85,.9)';
+      ctx.beginPath(); ctx.arc(an.x, an.y, AIM.lmin, 0, 7); ctx.stroke();
+      ctx.setLineDash([]);
+      // elastic band
+      ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(an.x - 14, an.y); ctx.lineTo(A.x, A.y); ctx.lineTo(an.x + 14, an.y); ctx.stroke();
+      ctx.restore();
+      if (aim) {
+        const B = { x: px(aim.x), y: py(aim.y) };
+        // dotted parabola
+        const N = 26;
+        for (let i = 1; i <= N; i++) {
+          const t = i / N, q = arcPt(A, B, t);
+          ctx.fillStyle = 'rgba(255,233,176,' + (0.9 - 0.45 * t).toFixed(2) + ')';
+          ctx.beginPath(); ctx.arc(q.x, q.y, U.lerp(3.2, 1.4, t), 0, 7); ctx.fill();
+        }
+        // uncertainty circle (≈86% of throws land inside: radius 2σ)
+        const rc = 2 * AIM.sig * G.k;
+        ctx.fillStyle = aim.shaky ? 'rgba(238,106,85,.18)' : 'rgba(255,233,176,.16)'; ctx.beginPath(); ctx.arc(B.x, B.y, rc, 0, 7); ctx.fill();
+        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.beginPath(); ctx.arc(B.x, B.y, rc, 0, 7); ctx.stroke();
+        ctx.lineWidth = 1.5; ctx.strokeStyle = aim.shaky ? '#ee6a55' : '#ffe9b0'; ctx.beginPath(); ctx.arc(B.x, B.y, rc, 0, 7); ctx.stroke();
+        ctx.lineWidth = 1.2; ctx.beginPath(); ctx.moveTo(B.x - 4, B.y); ctx.lineTo(B.x + 4, B.y); ctx.moveTo(B.x, B.y - 4); ctx.lineTo(B.x, B.y + 4); ctx.stroke();
+        // predicted bed chip
+        const sc = score(aim.x, aim.y);
+        const lab = sc.m === 3 ? 'T' + sc.n : sc.m === 2 ? (sc.p === 50 ? '불' : 'D' + sc.n) : sc.p === 0 ? '빗나감' : String(sc.p);
+        ctx.font = '700 13px "IBM Plex Mono", "IBM Plex Sans KR", monospace';
+        const tw = ctx.measureText(lab).width + 14;
+        let lx = B.x + rc + 8, ly = B.y - 11;
+        if (lx + tw > G.W - 4) lx = B.x - rc - 8 - tw;
+        ly = U.clamp(ly, G.topH + 2, G.zoneTop - 24);
+        ctx.fillStyle = 'rgba(18,14,24,.88)'; rr(ctx, lx, ly, tw, 22, 8); ctx.fill();
+        ctx.strokeStyle = 'rgba(227,174,69,.7)'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.fillStyle = '#ffe9b0'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(lab, lx + tw / 2, ly + 11.5);
+      }
+      drawDart(A.x, A.y, 1.9, col, false);
+    }
+
+    function drawZone(human) {
+      const { W, zoneTop, zoneH } = G;
+      // oche ledge
+      const lg = ctx.createLinearGradient(0, zoneTop, 0, zoneTop + zoneH);
+      lg.addColorStop(0, '#2a2236'); lg.addColorStop(1, '#1a1522');
+      ctx.fillStyle = lg; ctx.fillRect(0, zoneTop, W, zoneH);
+      ctx.fillStyle = 'rgba(227,174,69,.55)'; ctx.fillRect(0, zoneTop, W, 2);
+      ctx.fillStyle = 'rgba(0,0,0,.3)'; ctx.fillRect(0, zoneTop + 2, W, 3);
+      if (!st || !hudSt) return;
+      const hs = hudSt, cur = actor(hs);
+      // status line: round (left) · checkout (centre) · this visit (right)
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left'; ctx.fillStyle = '#ab9fb8'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      ctx.fillText('R', 14, zoneTop + 20);
+      ctx.fillStyle = '#f2e9d8'; ctx.font = '600 14px "IBM Plex Mono", monospace';
+      ctx.fillText(hs.r + '/' + ROUNDS, 26, zoneTop + 20);
+      if (cur != null) {
+        const visit = hs.st - hs.rem[cur];
+        ctx.textAlign = 'right'; ctx.fillStyle = '#f2e9d8'; ctx.font = '600 14px "IBM Plex Mono", monospace';
+        const vt = '+' + visit;
+        ctx.fillText(vt, W - 14, zoneTop + 20);
+        const vw = ctx.measureText(vt).width;
+        ctx.fillStyle = '#ab9fb8'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+        if (W >= 380) ctx.fillText('이번 차례', W - 18 - vw, zoneTop + 20);
+        const co = checkout(hs.rem[cur], 3 - hs.d);
+        if (co) {
+          const t = co.join(' · ');
+          ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+          const w1 = ctx.measureText('체크아웃 ').width;
+          ctx.font = '600 13px "IBM Plex Mono", monospace';
+          const w2 = ctx.measureText(t).width;
+          const tw = w1 + w2 + 22;
+          const x0 = W / 2 - tw / 2;
+          ctx.fillStyle = 'rgba(227,174,69,.16)'; rr(ctx, x0, zoneTop + 8, tw, 25, 13); ctx.fill();
+          ctx.strokeStyle = 'rgba(227,174,69,.7)'; ctx.lineWidth = 1; ctx.stroke();
+          ctx.textAlign = 'left';
+          ctx.fillStyle = '#ab9fb8'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif'; ctx.fillText('체크아웃 ', x0 + 11, zoneTop + 21);
+          ctx.fillStyle = '#e3ae45'; ctx.font = '600 13px "IBM Plex Mono", monospace'; ctx.fillText(t, x0 + 11 + w1, zoneTop + 21);
+        } else if (hs.rem[cur] <= 170 && hs.rem[cur] > 1 && hs.rem[cur] > 0) {
+          const md = minDarts(hs.rem[cur]);
+          if (md > 3 || md > 3 - hs.d) {
+            ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(171,159,184,.8)'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+            ctx.fillText(md > 3 ? '이 점수는 3개로 못 끝내요' : '이번엔 마무리 불가 · 세팅', W / 2, zoneTop + 21);
+          }
+        }
+      }
+      const restY = G.rest.y;
+      if (human) {
+        if (!ptr) {
+          drawDart(G.rest.x - 12, restY, 1.9, api.players[actor(st)].color, false);
+          // pull-down chevrons
+          ctx.strokeStyle = 'rgba(227,174,69,' + (0.35 + 0.3 * Math.sin(time * 4)) + ')'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+          for (let i = 0; i < 2; i++) { const yy = restY + 12 + i * 9 + Math.sin(time * 4) * 2; ctx.beginPath(); ctx.moveTo(G.rest.x + 34, yy); ctx.lineTo(G.rest.x + 42, yy + 6); ctx.lineTo(G.rest.x + 50, yy); ctx.stroke(); }
+        }
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+        let hint, colr = '#ab9fb8';
+        if (!ptr) { hint = hintFlash > 0 ? '다트를 잡고 아래로 당겼다 놓으세요' : '다트를 잡고 아래로 당겨 조준 · 놓으면 던지기'; if (hintFlash > 0) colr = '#ee6a55'; }
+        else if (!curAim()) { hint = '여기서 놓으면 취소'; colr = '#ee6a55'; }
+        else if (swayAt(time).a > 0.5) { hint = '손이 떨려요 · 빨리 놓으세요'; colr = '#ee6a55'; }
+        else hint = '천천히 = 미세 조정 · 길이 = 높이';
+        ctx.fillStyle = colr;
+        if (!ptr) ctx.fillText(hint, W / 2, G.H - 14);
+        else { // thumb covers the bottom while pulling: put the hint up beside the dart
+          ctx.textAlign = 'left';
+          const words = hint.split(' · ');
+          words.forEach((w, i) => ctx.fillText(w, 14, zoneTop + 46 + i * 16));
+        }
+      } else if (cur != null && !st.fin && !st.over && !pops.length) {
+        const p = api.players[actor(st)];
+        if (p) {
+          ctx.textAlign = 'center'; ctx.fillStyle = '#ab9fb8'; ctx.font = '700 14px "IBM Plex Sans KR", sans-serif';
+          ctx.fillText(p.name + (p.ai ? ' 조준 중…' : ' 차례'), W / 2, zoneTop + zoneH / 2 + 18);
+        }
+      }
+    }
+
+    /* ---- HUD ---- */
+    function renderTop() {
+      top.innerHTML = '';
+      const s = hudSt;
+      if (!s) return;
+      const cur = actor(s);
+      for (let i = 0; i < s.n; i++) {
+        const p = api.players[i], on = cur === i;
+        let sub;
+        if (on) sub = L.h('div', { class: 'mono', style: { fontSize: '13px', letterSpacing: '2px', color: p.color, lineHeight: 1 }, text: '●'.repeat(3 - s.d) + '○'.repeat(s.d), 'aria-label': '남은 다트 ' + (3 - s.d) });
+        else sub = L.h('div', { class: 'muted', style: { fontSize: '11px', lineHeight: 1, whiteSpace: 'nowrap' }, text: s.lv[i] == null ? '대기' : s.lv[i] < 0 ? '직전 버스트' : '직전 ' + s.lv[i] });
+        top.append(L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '3px', opacity: on || cur == null ? 1 : 0.62, borderColor: on ? p.color : '', boxShadow: on ? '0 0 0 1px ' + p.color + ' inset' : '' } },
+          L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', fontWeight: 700, minWidth: 0 } },
+            L.h('span', { class: 'dot', style: { '--c': p.color, flex: 'none' } }),
+            L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, text: p.name })),
+          L.h('div', { class: 'mono', style: { fontSize: s.n > 3 ? '24px' : '28px', fontWeight: 600, lineHeight: 1, color: s.rem[i] === 0 ? 'var(--brass)' : 'var(--ink)' }, text: String(s.rem[i]) }),
+          sub));
+      }
+    }
+
+    /* ---- animation ---- */
+    const BUST_WHY = ['', '0 아래로 내려감', '1점이 남음', '더블로 끝내야 해요'];
+    function startAnim(last, prev) {
+      const col = api.players[last.s] ? api.players[last.s].color : '#e3ae45';
+      const all = last.vd || st.v || [];
+      disp = all.slice(0, -1).map((v) => ({ x: v[0], y: v[1], c: col }));
+      hudSt = prev || st;
+      const A = myLaunch || { x: G.rest.x + (Math.random() - 0.5) * 24, y: G.rest.y + 40 };
+      myLaunch = null;
+      anim = { phase: 'fly', t: 0, dur: 0.42 / L.debug.speed, x: last.x, y: last.y, A, c: col, last };
+      setBusy(true);
+      api.sfx('whoosh');
+      clearTimeout(animTimer);
+      animTimer = setTimeout(() => { if (anim && anim.last === last) finishAnim(); }, (0.42 + 1.0) / L.debug.speed * 1000 + 1500);
+    }
+    function land() {
+      const l = anim.last;
+      disp.push({ x: l.x, y: l.y, c: anim.c });
+      hudSt = st; renderTop();
+      api.sfx('thud'); api.buzz(18);
+      let text = l.l, sub = null, col = '#f2e9d8';
+      if (l.p === 0) col = '#ab9fb8';
+      else if (l.p >= 50 || l.l[0] === 'T') col = '#e3ae45';
+      if (l.e === 2) { sub = l.l + ' · ' + (BUST_WHY[l.b || 1]); text = '버스트!'; col = '#ee6a55'; setTimeout(() => api.sfx('lose'), 120); }
+      else if (l.e === 3) { sub = l.l; text = '더블 아웃!'; col = '#e3ae45'; setTimeout(() => api.sfx('win'), 120); }
+      else if (is180(l)) { text = '180!'; sub = '한 차례 최고점'; col = '#f2c230'; setTimeout(() => { api.sfx('win'); api.sfx('pop'); }, 100); api.haptic('win', [30, 50, 30, 50, 70]); }
+      else if (l.p === 50) { text = '불!'; sub = '정중앙 50'; col = '#f2c230'; setTimeout(() => { api.sfx('pop'); api.sfx('chip'); }, 80); api.haptic('hit', [25, 40, 40]); }
+      else if (l.l[0] === 'T' || l.p >= 50) setTimeout(() => api.sfx('pop'), 80);
+      if (l.e === 3) api.haptic('win', [40, 60, 80]);
+      pops = [{ text, sub, col, x: px(l.x), y: py(l.y), t: 0, life: (l.e ? 1.3 : 0.95) / Math.sqrt(L.debug.speed) }];
+      anim.phase = 'hold'; anim.t = 0; anim.dur = (l.e ? 1.0 : 0.4) / L.debug.speed;
+    }
+    function finishAnim() {
+      if (!anim) return;
+      if (anim.phase === 'fly') land();
+      anim = null; clearTimeout(animTimer);
+      disp = (st.v || []).map((v) => ({ x: v[0], y: v[1], c: api.players[st.t] ? api.players[st.t].color : '#fff' }));
+      hudSt = st; renderTop();
+      setBusy(false);
+    }
+
+    const stopLoop = U.loop((dt) => {
+      time += dt;
+      if (hintFlash > 0) hintFlash -= dt;
+      if (anim) {
+        // slow-mo on the final approach of a bull / 180-closing dart (view only; result already in state)
+        const big = anim.phase === 'fly' && anim.last && (anim.last.p === 50 || is180(anim.last)) && anim.t > anim.dur * 0.55;
+        anim.t += big ? dt * 0.3 : dt;
+        if (anim.t >= anim.dur) { if (anim.phase === 'fly') land(); else finishAnim(); }
+      }
+      for (const p of pops) p.t += dt;
+      pops = pops.filter((p) => p.t < p.life);
+      draw();
+    });
+
+    /* ---- input: slingshot pull ---- */
+    const el = cv.cv;
+    let wasAiming = false;
+    function onDown(ev) {
+      // a new primary pointer always starts a fresh gesture (a lost pointerup can't wedge input); extra fingers are ignored
+      if (!G || !ev.isPrimary || !humanTurn()) return;
+      const p = cv.local(ev);
+      // grab the dart (generous radius) — anything else just shows the hint
+      if (Math.hypot(p.x - G.rest.x, p.y - (G.rest.y + 14)) > AIM.grab) { if (p.y >= G.zoneTop) { hintFlash = 1.6; api.sfx('click'); } return; }
+      try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      const tt = ev.timeStamp || performance.now();
+      ptr = { id: ev.pointerId, ax: G.rest.x, ay: G.rest.y, x: p.x, y: p.y, sx: p.x, sy: p.y, moved: false, t0: time,
+        vx: 0, vy: 0, lt: tt, hist: [] };
+      wasAiming = false;
+      api.sfx('tick'); api.buzz(10);
+      ev.preventDefault();
+    }
+    function onMove(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      const p = cv.local(ev);
+      const tt = ev.timeStamp || performance.now();
+      const dx = p.x - ptr.x, dy = p.y - ptr.y, dt = Math.max(4, tt - ptr.lt);
+      // precision drag: slow finger = fine adjust (~1/3 gain), quick pull = covers ground fast
+      const g = U.clamp(AIM.gLo + (Math.hypot(dx, dy) / dt) * 1.1, AIM.gLo, AIM.gHi);
+      // ...but the glass ends: when the finger heads for a screen edge, the gain rises just enough that the rest of the
+      // usable pull still fits in the room that is left (slow fine-tuning near an edge never gets stuck)
+      let gx = g, gy = g;
+      const r = el.getBoundingClientRect(), bx0 = -r.left + 3, by1 = (window.innerHeight || G.H) - r.top - 3, bx1 = (window.innerWidth || G.W) - r.left - 3;
+      if (dy > 0) gy = Math.max(g, Math.min(3, Math.max(0, AIM.lmin + G.span - ptr.vy) / Math.max(6, by1 - ptr.y)));
+      if (dx !== 0) {
+        const xm = Math.tan(AIM.thMax) * (Math.max(ptr.vy, AIM.lmin) + 50); // sideways pull that already gives the widest angle
+        const rem = dx < 0 ? ptr.vx + xm : xm - ptr.vx, room = dx < 0 ? ptr.x - bx0 : bx1 - ptr.x;
+        gx = Math.max(g, Math.min(3, Math.max(0, rem) / Math.max(6, room)));
+      }
+      ptr.vx += dx * gx; ptr.vy += dy * gy;
+      ptr.x = p.x; ptr.y = p.y; ptr.lt = tt;
+      const fl = Math.hypot(p.x - ptr.ax, p.y - ptr.ay);
+      if (fl < AIM.lmin) { ptr.vx = p.x - ptr.ax; ptr.vy = p.y - ptr.ay; } // re-sync inside the cancel ring
+      else { // keep the virtual pull within the usable range
+        const maxL = AIM.lmin + G.span, vl = Math.hypot(ptr.vx, ptr.vy);
+        if (vl > maxL) { ptr.vx *= maxL / vl; ptr.vy *= maxL / vl; }
+        if (vl < AIM.lmin + 1 && fl >= AIM.lmin) { const k = (AIM.lmin + 1) / Math.max(1, vl); ptr.vx *= k; ptr.vy = Math.max(1, ptr.vy * k); }
+      }
+      ptr.hist.push({ t: tt, vx: ptr.vx, vy: ptr.vy });
+      if (ptr.hist.length > 30) ptr.hist.shift();
+      if (Math.hypot(p.x - ptr.sx, p.y - ptr.sy) > 8) ptr.moved = true;
+      const aiming = !!curAim();
+      if (aiming !== wasAiming) { wasAiming = aiming; api.buzz(aiming ? 12 : 8); if (!aiming) api.sfx('click'); }
+    }
+    function onUp(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      // lifting a thumb wiggles it: use the pull as it was ~60ms before release
+      const tu = ev.timeStamp || performance.now();
+      for (let i = ptr.hist.length - 1; i >= 0; i--) { const h = ptr.hist[i]; if (tu - h.t >= 60 || i === 0) { if (tu - h.t < 400) { ptr.vx = h.vx; ptr.vy = h.vy; } break; } }
+      const aim = curAim(), g = ptr;
+      ptr = null;
+      if (ev.type === 'pointercancel' || !humanTurn()) return;
+      if (!aim || !g.moved) {
+        if (!g.moved) hintFlash = 1.6; // a plain tap: explain
+        api.sfx('click');
+        return;
+      }
+      myLaunch = { x: g.ax + g.vx, y: g.ay + g.vy };
+      waitSeq = st.seq; waitUntil = performance.now() + 2500;
+      api.buzz(20);
+      api.act({ type: 'throw', x: r1(aim.x + gauss() * AIM.sig), y: r1(aim.y + gauss() * AIM.sig) });
+    }
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+
+    cv.onresize = () => { layout(); };
+    layout();
+
+    return {
+      update(next, prev) {
+        st = next;
+        if (prev && prev !== next && next.fin != null && prev.fin == null && api.canAct(next.fin) && api.best('rd', next.r, { label: '301 최소 라운드', lower: true, unit: '라운드' })) api.toast('🏆 새 최고 기록! ' + next.r + '라운드');
+        const l = next.last;
+        if (l && l.id !== shownId && prev && prev !== next && G) {
+          if (anim) finishAnim();
+          shownId = l.id;
+          startAnim(l, prev);
+        } else {
+          shownId = l ? l.id : 0;
+          if (!anim) {
+            disp = (next.v || []).map((v) => ({ x: v[0], y: v[1], c: api.players[next.t] ? api.players[next.t].color : '#fff' }));
+            hudSt = next;
+          }
+        }
+        if (!humanTurn()) ptr = null;
+        renderTop();
+      },
+      destroy() {
+        stopLoop(); clearTimeout(animTimer);
+        el.removeEventListener('pointerdown', onDown);
+        el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', onUp);
+        el.removeEventListener('pointercancel', onUp);
+        cv.destroy(); top.remove(); [spBoard, spDart, spInfo].forEach((s) => s.el.remove());
+        if (busy) api.setBusy(false);
+      },
+    };
+  }
+
+  L.register({
+    id: 'darts', name: '다트', tag: '301 더블 아웃',
+    blurb: '301점에서 시작해 다트 3개씩 던져 정확히 0을 만들되, 마지막 다트는 더블(바깥 고리) 또는 불(50)이어야 해요. 0 아래·1점 남김·더블 아닌 0은 버스트. 10라운드 안에 못 끝내면 남은 점수가 적은 쪽이 이겨요.',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2, hidden: false, aiDelay: 600,
+    quick: [
+      '모두 301점에서 시작해요. 맞힌 점수만큼 빼서 남은 점수를 정확히 0으로 만들면 이겨요.',
+      '내 차례: 아래쪽 다트를 잡고 아래로 당겼다 놓아요. 한 차례에 3개를 던져요.',
+      '마지막 다트는 꼭 더블(바깥 가는 고리)이나 한가운데 불(50)이어야 해요. 10라운드 뒤엔 남은 점수가 적은 사람이 이겨요.',
+    ],
+    rules: [
+      { h: '그림으로 보기', fig: [{"svg": "<svg viewBox=\"0 0 340 150\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"sans-serif\"><rect width=\"340\" height=\"150\" rx=\"10\" fill=\"#1f2a24\"/><path d=\"M74.4 39.4A36 36 0 0 1 85.6 39.4L81.4 66.1A9 9 0 0 0 78.6 66.1Z\" fill=\"#efe2c0\"/><path d=\"M73.3 32.5A43 43 0 0 1 86.7 32.5L85.6 39.4A36 36 0 0 0 74.4 39.4Z\" fill=\"#2e8b57\"/><path d=\"M71.1 18.7A57 57 0 0 1 88.9 18.7L86.7 32.5A43 43 0 0 0 73.3 32.5Z\" fill=\"#efe2c0\"/><path d=\"M70.0 11.8A64 64 0 0 1 90.0 11.8L88.9 18.7A57 57 0 0 0 71.1 18.7Z\" fill=\"#2e8b57\"/><path d=\"M85.6 39.4A36 36 0 0 1 96.3 42.9L84.1 67.0A9 9 0 0 0 81.4 66.1Z\" fill=\"#1b1b1b\"/><path d=\"M86.7 32.5A43 43 0 0 1 99.5 36.7L96.3 42.9A36 36 0 0 0 85.6 39.4Z\" fill=\"#c0392b\"/><path d=\"M88.9 18.7A57 57 0 0 1 105.9 24.2L99.5 36.7A43 43 0 0 0 86.7 32.5Z\" fill=\"#1b1b1b\"/><path d=\"M90.0 11.8A64 64 0 0 1 109.1 18.0L105.9 24.2A57 57 0 0 0 88.9 18.7Z\" fill=\"#c0392b\"/><path d=\"M96.3 42.9A36 36 0 0 1 105.5 49.5L86.4 68.6A9 9 0 0 0 84.1 67.0Z\" fill=\"#efe2c0\"/><path d=\"M99.5 36.7A43 43 0 0 1 110.4 44.6L105.5 49.5A36 36 0 0 0 96.3 42.9Z\" fill=\"#2e8b57\"/><path d=\"M105.9 24.2A57 57 0 0 1 120.3 34.7L110.4 44.6A43 43 0 0 0 99.5 36.7Z\" fill=\"#efe2c0\"/><path d=\"M109.1 18.0A64 64 0 0 1 125.3 29.7L120.3 34.7A57 57 0 0 0 105.9 24.2Z\" fill=\"#2e8b57\"/><path d=\"M105.5 49.5A36 36 0 0 1 112.1 58.7L88.0 70.9A9 9 0 0 0 86.4 68.6Z\" fill=\"#1b1b1b\"/><path d=\"M110.4 44.6A43 43 0 0 1 118.3 55.5L112.1 58.7A36 36 0 0 0 105.5 49.5Z\" fill=\"#c0392b\"/><path d=\"M120.3 34.7A57 57 0 0 1 130.8 49.1L118.3 55.5A43 43 0 0 0 110.4 44.6Z\" fill=\"#1b1b1b\"/><path d=\"M125.3 29.7A64 64 0 0 1 137.0 45.9L130.8 49.1A57 57 0 0 0 120.3 34.7Z\" fill=\"#c0392b\"/><path d=\"M112.1 58.7A36 36 0 0 1 115.6 69.4L88.9 73.6A9 9 0 0 0 88.0 70.9Z\" fill=\"#efe2c0\"/><path d=\"M118.3 55.5A43 43 0 0 1 122.5 68.3L115.6 69.4A36 36 0 0 0 112.1 58.7Z\" fill=\"#2e8b57\"/><path d=\"M130.8 49.1A57 57 0 0 1 136.3 66.1L122.5 68.3A43 43 0 0 0 118.3 55.5Z\" fill=\"#efe2c0\"/><path d=\"M137.0 45.9A64 64 0 0 1 143.2 65.0L136.3 66.1A57 57 0 0 0 130.8 49.1Z\" fill=\"#2e8b57\"/><path d=\"M115.6 69.4A36 36 0 0 1 115.6 80.6L88.9 76.4A9 9 0 0 0 88.9 73.6Z\" fill=\"#1b1b1b\"/><path d=\"M122.5 68.3A43 43 0 0 1 122.5 81.7L115.6 80.6A36 36 0 0 0 115.6 69.4Z\" fill=\"#c0392b\"/><path d=\"M136.3 66.1A57 57 0 0 1 136.3 83.9L122.5 81.7A43 43 0 0 0 122.5 68.3Z\" fill=\"#1b1b1b\"/><path d=\"M143.2 65.0A64 64 0 0 1 143.2 85.0L136.3 83.9A57 57 0 0 0 136.3 66.1Z\" fill=\"#c0392b\"/><path d=\"M115.6 80.6A36 36 0 0 1 112.1 91.3L88.0 79.1A9 9 0 0 0 88.9 76.4Z\" fill=\"#efe2c0\"/><path d=\"M122.5 81.7A43 43 0 0 1 118.3 94.5L112.1 91.3A36 36 0 0 0 115.6 80.6Z\" fill=\"#2e8b57\"/><path d=\"M136.3 83.9A57 57 0 0 1 130.8 100.9L118.3 94.5A43 43 0 0 0 122.5 81.7Z\" fill=\"#efe2c0\"/><path d=\"M143.2 85.0A64 64 0 0 1 137.0 104.1L130.8 100.9A57 57 0 0 0 136.3 83.9Z\" fill=\"#2e8b57\"/><path d=\"M112.1 91.3A36 36 0 0 1 105.5 100.5L86.4 81.4A9 9 0 0 0 88.0 79.1Z\" fill=\"#1b1b1b\"/><path d=\"M118.3 94.5A43 43 0 0 1 110.4 105.4L105.5 100.5A36 36 0 0 0 112.1 91.3Z\" fill=\"#c0392b\"/><path d=\"M130.8 100.9A57 57 0 0 1 120.3 115.3L110.4 105.4A43 43 0 0 0 118.3 94.5Z\" fill=\"#1b1b1b\"/><path d=\"M137.0 104.1A64 64 0 0 1 125.3 120.3L120.3 115.3A57 57 0 0 0 130.8 100.9Z\" fill=\"#c0392b\"/><path d=\"M105.5 100.5A36 36 0 0 1 96.3 107.1L84.1 83.0A9 9 0 0 0 86.4 81.4Z\" fill=\"#efe2c0\"/><path d=\"M110.4 105.4A43 43 0 0 1 99.5 113.3L96.3 107.1A36 36 0 0 0 105.5 100.5Z\" fill=\"#2e8b57\"/><path d=\"M120.3 115.3A57 57 0 0 1 105.9 125.8L99.5 113.3A43 43 0 0 0 110.4 105.4Z\" fill=\"#efe2c0\"/><path d=\"M125.3 120.3A64 64 0 0 1 109.1 132.0L105.9 125.8A57 57 0 0 0 120.3 115.3Z\" fill=\"#2e8b57\"/><path d=\"M96.3 107.1A36 36 0 0 1 85.6 110.6L81.4 83.9A9 9 0 0 0 84.1 83.0Z\" fill=\"#1b1b1b\"/><path d=\"M99.5 113.3A43 43 0 0 1 86.7 117.5L85.6 110.6A36 36 0 0 0 96.3 107.1Z\" fill=\"#c0392b\"/><path d=\"M105.9 125.8A57 57 0 0 1 88.9 131.3L86.7 117.5A43 43 0 0 0 99.5 113.3Z\" fill=\"#1b1b1b\"/><path d=\"M109.1 132.0A64 64 0 0 1 90.0 138.2L88.9 131.3A57 57 0 0 0 105.9 125.8Z\" fill=\"#c0392b\"/><path d=\"M85.6 110.6A36 36 0 0 1 74.4 110.6L78.6 83.9A9 9 0 0 0 81.4 83.9Z\" fill=\"#efe2c0\"/><path d=\"M86.7 117.5A43 43 0 0 1 73.3 117.5L74.4 110.6A36 36 0 0 0 85.6 110.6Z\" fill=\"#2e8b57\"/><path d=\"M88.9 131.3A57 57 0 0 1 71.1 131.3L73.3 117.5A43 43 0 0 0 86.7 117.5Z\" fill=\"#efe2c0\"/><path d=\"M90.0 138.2A64 64 0 0 1 70.0 138.2L71.1 131.3A57 57 0 0 0 88.9 131.3Z\" fill=\"#2e8b57\"/><path d=\"M74.4 110.6A36 36 0 0 1 63.7 107.1L75.9 83.0A9 9 0 0 0 78.6 83.9Z\" fill=\"#1b1b1b\"/><path d=\"M73.3 117.5A43 43 0 0 1 60.5 113.3L63.7 107.1A36 36 0 0 0 74.4 110.6Z\" fill=\"#c0392b\"/><path d=\"M71.1 131.3A57 57 0 0 1 54.1 125.8L60.5 113.3A43 43 0 0 0 73.3 117.5Z\" fill=\"#1b1b1b\"/><path d=\"M70.0 138.2A64 64 0 0 1 50.9 132.0L54.1 125.8A57 57 0 0 0 71.1 131.3Z\" fill=\"#c0392b\"/><path d=\"M63.7 107.1A36 36 0 0 1 54.5 100.5L73.6 81.4A9 9 0 0 0 75.9 83.0Z\" fill=\"#efe2c0\"/><path d=\"M60.5 113.3A43 43 0 0 1 49.6 105.4L54.5 100.5A36 36 0 0 0 63.7 107.1Z\" fill=\"#2e8b57\"/><path d=\"M54.1 125.8A57 57 0 0 1 39.7 115.3L49.6 105.4A43 43 0 0 0 60.5 113.3Z\" fill=\"#efe2c0\"/><path d=\"M50.9 132.0A64 64 0 0 1 34.7 120.3L39.7 115.3A57 57 0 0 0 54.1 125.8Z\" fill=\"#2e8b57\"/><path d=\"M54.5 100.5A36 36 0 0 1 47.9 91.3L72.0 79.1A9 9 0 0 0 73.6 81.4Z\" fill=\"#1b1b1b\"/><path d=\"M49.6 105.4A43 43 0 0 1 41.7 94.5L47.9 91.3A36 36 0 0 0 54.5 100.5Z\" fill=\"#c0392b\"/><path d=\"M39.7 115.3A57 57 0 0 1 29.2 100.9L41.7 94.5A43 43 0 0 0 49.6 105.4Z\" fill=\"#1b1b1b\"/><path d=\"M34.7 120.3A64 64 0 0 1 23.0 104.1L29.2 100.9A57 57 0 0 0 39.7 115.3Z\" fill=\"#c0392b\"/><path d=\"M47.9 91.3A36 36 0 0 1 44.4 80.6L71.1 76.4A9 9 0 0 0 72.0 79.1Z\" fill=\"#efe2c0\"/><path d=\"M41.7 94.5A43 43 0 0 1 37.5 81.7L44.4 80.6A36 36 0 0 0 47.9 91.3Z\" fill=\"#2e8b57\"/><path d=\"M29.2 100.9A57 57 0 0 1 23.7 83.9L37.5 81.7A43 43 0 0 0 41.7 94.5Z\" fill=\"#efe2c0\"/><path d=\"M23.0 104.1A64 64 0 0 1 16.8 85.0L23.7 83.9A57 57 0 0 0 29.2 100.9Z\" fill=\"#2e8b57\"/><path d=\"M44.4 80.6A36 36 0 0 1 44.4 69.4L71.1 73.6A9 9 0 0 0 71.1 76.4Z\" fill=\"#1b1b1b\"/><path d=\"M37.5 81.7A43 43 0 0 1 37.5 68.3L44.4 69.4A36 36 0 0 0 44.4 80.6Z\" fill=\"#c0392b\"/><path d=\"M23.7 83.9A57 57 0 0 1 23.7 66.1L37.5 68.3A43 43 0 0 0 37.5 81.7Z\" fill=\"#1b1b1b\"/><path d=\"M16.8 85.0A64 64 0 0 1 16.8 65.0L23.7 66.1A57 57 0 0 0 23.7 83.9Z\" fill=\"#c0392b\"/><path d=\"M44.4 69.4A36 36 0 0 1 47.9 58.7L72.0 70.9A9 9 0 0 0 71.1 73.6Z\" fill=\"#efe2c0\"/><path d=\"M37.5 68.3A43 43 0 0 1 41.7 55.5L47.9 58.7A36 36 0 0 0 44.4 69.4Z\" fill=\"#2e8b57\"/><path d=\"M23.7 66.1A57 57 0 0 1 29.2 49.1L41.7 55.5A43 43 0 0 0 37.5 68.3Z\" fill=\"#efe2c0\"/><path d=\"M16.8 65.0A64 64 0 0 1 23.0 45.9L29.2 49.1A57 57 0 0 0 23.7 66.1Z\" fill=\"#2e8b57\"/><path d=\"M47.9 58.7A36 36 0 0 1 54.5 49.5L73.6 68.6A9 9 0 0 0 72.0 70.9Z\" fill=\"#1b1b1b\"/><path d=\"M41.7 55.5A43 43 0 0 1 49.6 44.6L54.5 49.5A36 36 0 0 0 47.9 58.7Z\" fill=\"#c0392b\"/><path d=\"M29.2 49.1A57 57 0 0 1 39.7 34.7L49.6 44.6A43 43 0 0 0 41.7 55.5Z\" fill=\"#1b1b1b\"/><path d=\"M23.0 45.9A64 64 0 0 1 34.7 29.7L39.7 34.7A57 57 0 0 0 29.2 49.1Z\" fill=\"#c0392b\"/><path d=\"M54.5 49.5A36 36 0 0 1 63.7 42.9L75.9 67.0A9 9 0 0 0 73.6 68.6Z\" fill=\"#efe2c0\"/><path d=\"M49.6 44.6A43 43 0 0 1 60.5 36.7L63.7 42.9A36 36 0 0 0 54.5 49.5Z\" fill=\"#2e8b57\"/><path d=\"M39.7 34.7A57 57 0 0 1 54.1 24.2L60.5 36.7A43 43 0 0 0 49.6 44.6Z\" fill=\"#efe2c0\"/><path d=\"M34.7 29.7A64 64 0 0 1 50.9 18.0L54.1 24.2A57 57 0 0 0 39.7 34.7Z\" fill=\"#2e8b57\"/><path d=\"M63.7 42.9A36 36 0 0 1 74.4 39.4L78.6 66.1A9 9 0 0 0 75.9 67.0Z\" fill=\"#1b1b1b\"/><path d=\"M60.5 36.7A43 43 0 0 1 73.3 32.5L74.4 39.4A36 36 0 0 0 63.7 42.9Z\" fill=\"#c0392b\"/><path d=\"M54.1 24.2A57 57 0 0 1 71.1 18.7L73.3 32.5A43 43 0 0 0 60.5 36.7Z\" fill=\"#1b1b1b\"/><path d=\"M50.9 18.0A64 64 0 0 1 70.0 11.8L71.1 18.7A57 57 0 0 0 54.1 24.2Z\" fill=\"#c0392b\"/><circle cx=\"80\" cy=\"75\" r=\"9\" fill=\"#2e8b57\"/><circle cx=\"80\" cy=\"75\" r=\"4\" fill=\"#c0392b\"/><text x=\"160\" y=\"26\" font-size=\"12\" fill=\"#f2a0a0\" text-anchor=\"start\">바깥 띠 = 더블 ×2</text><text x=\"160\" y=\"48\" font-size=\"12\" fill=\"#9fd59f\" text-anchor=\"start\">안쪽 띠 = 트리플 ×3</text><text x=\"160\" y=\"70\" font-size=\"12\" fill=\"#f3ead2\" text-anchor=\"start\">가운데 불 50 · 바깥 불 25</text><text x=\"160\" y=\"98\" font-size=\"12\" fill=\"#e3ae45\" text-anchor=\"start\">301에서 빼서 딱 0으로,</text><text x=\"160\" y=\"116\" font-size=\"12\" fill=\"#e3ae45\" text-anchor=\"start\" font-weight=\"700\">마지막 한 발은 더블·불!</text></svg>", "cap": "점수 = 칸 숫자 × 띠 배수"}] },
+      { h: '목표', p: ['모두 301점에서 시작해요. 다트를 맞힌 점수만큼 남은 점수에서 빼요.',
+        '남은 점수를 정확히 0으로 만들면 그 자리에서 이겨요.',
+        '단, 0을 만드는 마지막 다트는 꼭 「더블」이어야 해요(더블 아웃). 바깥쪽 가는 고리나 한가운데 빨간 불(50점)이 더블이에요.'] },
+      { h: '차례에 할 일', p: ['① 다트 3개를 한 개씩 던져요. 위쪽 내 칸의 ●가 남은 다트예요.',
+        '② 맞힌 점수만큼 남은 점수가 줄어요. 화면 아래 오른쪽 「+」가 이번 차례에 딴 점수예요.',
+        '③ 3개를 다 던지면(또는 버스트가 나면) 다음 사람 차례예요.'] },
+      { h: '조작 (손가락)', p: ['① 화면 아래쪽에 놓인 다트를 손가락으로 누르세요.',
+        '② 누른 채로 아래로 당기세요. 다트가 날아갈 점선 포물선과 꽂힐 예상 원이 보여요.',
+        '③ 좌우는 반대로 움직여요: 왼쪽 아래로 당기면 오른쪽으로, 오른쪽 아래로 당기면 왼쪽으로 날아가요.',
+        '④ 위아래는 당긴 길이로 정해요: 많이 당길수록 높이 날아가요.',
+        '⑤ 손가락을 떼면 던져요. 다트 자리의 점선 원 안으로 되돌아와서 떼면 취소예요.',
+        '천천히 움직이면 조준이 손가락보다 덜 움직여서(약 1/3) 미세하게 맞출 수 있어요. 화면 끝에 가까워지면 조준이 조금 더 빨리 따라와서, 끝까지 못 당기는 일은 없어요.',
+        '예상 원은 실제 오차 범위예요. 다트는 대부분(약 86%) 원 안 어딘가에 꽂혀요.',
+        '2초 넘게 들고 있으면 손이 떨려요(원이 빨갛게 변해요). 조준했으면 바로 놓으세요. 손을 떼는 순간의 흔들림은 무시돼요.'] },
+      { h: '점수판 읽기', p: ['바깥 숫자(1~20)가 그 부채꼴의 점수예요.',
+        '바깥쪽 가는 고리 = 더블(×2). 예: 20 칸의 바깥 고리 = D20 = 40점.',
+        '가운데 가는 고리 = 트리플(×3). 예: T20 = 60점(한 번에 얻는 최고 점수).',
+        '가운데 초록 고리 = 25점(더블 아님). 한가운데 빨간 불 = 50점(더블로 쳐요).',
+        '판 바깥(숫자가 적힌 검은 테 포함)에 맞으면 0점이에요.'] },
+      { h: '점수·승리', p: ['남은 점수를 더블로 정확히 0을 만든 사람이 바로 이겨요.',
+        '10라운드(한 사람당 10차례) 안에 아무도 못 끝내면 남은 점수가 가장 적은 사람이 이겨요. 같으면 공동 승리.',
+        '혼자 할 때는 10라운드 안에 더블로 0을 만드는 게 목표예요.'] },
+      { h: '버스트 (조심!)', p: ['이럴 때 버스트예요: ① 0 아래로 내려감 ② 1점이 남음(1은 더블로 끝낼 수 없어서) ③ 더블이 아닌 다트로 0이 됨.',
+        '버스트가 나면 이번 차례에 딴 점수가 모두 취소돼요. 차례를 시작할 때 점수로 돌아가고, 남은 다트 없이 바로 다음 사람 차례예요.'] },
+      { h: '예시', p: ['남은 점수 81, 다트 3개 → T19(57점)를 맞혀 24가 남음 → D12(24점)로 0! 더블로 끝났으니 승리.',
+        '남은 점수 40 → D20 한 개로 바로 끝낼 수 있어요. 그런데 싱글 20을 맞히면 20이 남고, 다음 다트로 D10을 노려요.',
+        '버스트 예: 남은 20에서 T7(21점) → 0 아래라 버스트. 남은 20에서 싱글 19 → 1이 남아 버스트. 남은 20에서 싱글 20 → 0이지만 더블이 아니라 버스트. 셋 다 이번 차례 시작 점수로 되돌아가요.',
+        '끝낼 수 있는 점수가 되면 화면 아래 「체크아웃」에 추천 경로가 떠요(예: 81 → T19 · D12, 170 → T20 · T20 · 불).'] },
+      { h: '화면', p: ['위쪽 칸: 각자의 남은 점수. 차례인 사람은 남은 다트(●), 나머지는 직전 차례 점수나 「직전 버스트」가 나와요.',
+        '아래 줄: 왼쪽 R은 라운드, 가운데는 체크아웃 힌트, 오른쪽 +는 이번 차례에 딴 점수예요.'] },
+      { h: 'AI', p: ['AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(손 떨림과 체크아웃 계산 실력이 달라요).'] },
+    ],
+    tutorial: [
+      { sel: '.dt-board', text: '이 다트판을 맞혀요. 바깥 숫자가 그 칸의 점수예요. 바깥쪽 가는 고리는 ×2(더블), 가운데 가는 고리는 ×3(트리플)이에요.' },
+      { sel: '.dt-top', text: '위 칸은 각자 남은 점수예요. 모두 301에서 시작해 맞힌 만큼 줄어요. ●는 이번 차례에 남은 다트(3개)예요.' },
+      { sel: '.dt-dart', text: '던지기: 아래 다트를 손가락으로 누른 채 아래로 당기세요. 날아갈 점선과 꽂힐 예상 원이 보여요. 손가락을 떼면 던져요.' },
+      { sel: '.dt-dart', text: '좌우는 반대예요. 왼쪽 아래로 당기면 오른쪽으로 날아가요. 많이 당길수록 높이 날아가요. 다트 자리로 되돌아와 떼면 취소!' },
+      { sel: '.dt-dart', text: '천천히 움직이면 미세하게 조준돼요. 하지만 2초 넘게 들고 있으면 손이 떨려요(원이 빨개져요). 조준했으면 바로 놓으세요.' },
+      { sel: '.dt-board', text: '마지막엔 정확히 0으로! 그 마지막 다트는 더블(바깥 고리)이나 한가운데 불(50)이어야 해요. 넘치거나 1이 남으면 버스트 — 이번 차례 점수가 취소돼요.' },
+      { sel: '.dt-info', text: '끝낼 수 있는 점수가 되면 여기에 「체크아웃」 추천 경로(예: T19 · D12)가 떠요. 그럼 던져 볼까요?' },
+    ],
+    init, actor, apply, ai, result, mount,
+    score, checkout, _co: CO,
+  });
+})();

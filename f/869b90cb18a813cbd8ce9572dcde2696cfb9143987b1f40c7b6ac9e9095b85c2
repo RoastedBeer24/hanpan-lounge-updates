@@ -1,0 +1,1796 @@
+/* 한 줄 결투 (lineduel) — 한 줄 위에서 공격 타일을 예약해 두었다가 한 번에 실행하는 턴제 로그라이크.
+   구성: ① 자료(타일 · 적 · 장신구 · 강화 · 사건) ② 전투 엔진(순수 로직, 무작위 없음 → AI가 그대로 내다봄)
+         ③ 판 진행(전투 → 보상 → 갈림길 → 우두머리) ④ AI ⑤ 화면 ⑥ 등록(규칙 · 도감).
+   상태: s.f = 전투(없으면 고르기 화면 s.ch), s.last = {id, ev:[…]} 직전 행동의 사건 목록(화면이 차례로 재생). */
+(function () {
+  'use strict';
+  const G0 = typeof window !== 'undefined' ? window : globalThis;
+  const L = G0.Lounge, U = (L && L.util) || {};
+  const ID = 'lineduel';
+  const rnd = (n) => Math.floor(Math.random() * n);
+  const pick = (a) => a[rnd(a.length)];
+  const shuf = (a) => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = rnd(i + 1); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; };
+  const sgn = Math.sign, abs = Math.abs, max = Math.max, min = Math.min;
+  const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  /* ================= ① 자료 ================= */
+  /* 키워드: n 이름 · f 수치 꼴 · c 색 · d 설명(명사형). 타일 글 · 도감 · 규칙이 모두 이 표를 씀 */
+  const KW = {
+    push: { n: '밀치기', f: 1, c: '#f6d58a', d: '수치만큼의 칸을 밀어냄. 벽이나 다른 이에 막히면 충돌' },
+    pull: { n: '끌기', f: 1, c: '#f6d58a', d: '수치만큼의 칸을 끌어옴. 바로 앞까지' },
+    col: { n: '충돌', c: '#f6d58a', d: '밀려나다 막히면 피해 1. 부딪힌 상대도 피해 1' },
+    stun: { n: '기절', f: 1, c: '#ffe066', d: '수치만큼의 박자 동안 행동하지 못하고, 준비하던 공격도 풀림. 깨어난 뒤 2박자는 다시 기절하지 않음' },
+    poi: { n: '독', f: 1, c: '#9be07a', d: '박자가 끝날 때마다 수치만큼 피해를 받고 1씩 줄어듦. 다시 받으면 쌓임' },
+    burn: { n: '화상', f: 1, c: '#ff9a4a', d: '수치만큼의 박자 동안, 박자가 끝날 때마다 피해 1' },
+    mark: { n: '표식', f: 1, c: '#ffd76a', d: '다음에 받는 타격의 피해가 수치만큼 늘고 사라짐' },
+    weak: { n: '약화', f: 1, c: '#a8c8e8', d: '수치만큼의 박자 동안 주는 피해 −1' },
+    root: { n: '속박', f: 1, c: '#c8b08a', d: '수치만큼의 박자 동안 자리를 옮기지 못함. 공격과 돌아서기는 가능' },
+    flip: { n: '돌려세우기', c: '#f6d58a', d: '대상을 반대쪽으로 돌려세움. 준비하던 공격도 반대쪽으로 나감' },
+    blk: { n: '막기', f: 1, c: '#9fc7ff', d: '이번 박자에 받는 피해를 수치만큼 줄임. 박자가 끝나면 사라짐' },
+    ctr: { n: '받아치기', f: 1, c: '#9fc7ff', d: '이번 박자에 맞는 첫 근접 공격을 흘리고, 공격한 쪽에 수치만큼 피해' },
+    foc: { n: '집중', f: 1, c: '#5fd0f0', d: '다음에 피해를 주는 타일의 피해가 수치만큼 늘고 사라짐' },
+    lt: { n: '가벼움', c: '#a0e8d0', d: '예약 칸에 올릴 때 박자를 쓰지 않음' },
+    once: { n: '소모', c: '#c8d0d8', d: '한 전투에 한 번만 쓸 수 있음' },
+    exe: { n: '처형', f: 1, c: '#ff8f98', d: '맞은 뒤 체력이 수치 이하로 남은 적을 쓰러뜨림. 우두머리에게는 듣지 않음' },
+    bs: { n: '뒤치기', f: 1, c: '#f6d58a', d: '등 뒤에서 치면 피해가 수치만큼 늘어남' },
+    combo: { n: '연계', f: 1, c: '#5fd0f0', d: '같은 실행에서 앞서 쓴 타일 하나마다 피해가 수치만큼 늘어남' },
+    last: { n: '끝맺음', f: 1, c: '#5fd0f0', d: '둘 이상을 실행할 때 마지막 순서면 피해가 수치만큼 늘어남' },
+    far: { n: '먼 거리', f: 1, c: '#f6d58a', d: '떨어진 칸 하나마다 피해 +1. 수치는 늘어나는 한도' },
+    leech: { n: '흡수', f: 1, c: '#ff8f98', d: '피해를 주면 체력을 수치만큼 회복' },
+    sp: { n: '번짐', f: 1, c: '#ff9a4a', d: '맞은 칸의 양옆 칸에도 수치만큼 피해' },
+    haste: { n: '재촉', f: 1, c: '#a0e8d0', d: '쉬고 있는 다른 타일의 대기를 수치만큼 줄임' },
+    sh: { n: '앞막이', f: 1, c: '#9fc7ff', d: '앞에서 받는 타격의 피해를 수치만큼 줄임(최소 1). 뒤 · 독 · 화상 · 충돌에는 듣지 않음' },
+    arm: { n: '갑옷', f: 1, c: '#9fc7ff', d: '받는 타격의 피해를 수치만큼 줄임(최소 1). 독 · 화상 · 충돌에는 듣지 않음' },
+    thorn: { n: '가시', f: 1, c: '#c8ee6a', d: '근접 공격으로 때린 쪽이 수치만큼 피해를 받음' },
+    heavy: { n: '무거움', c: '#c8b08a', d: '밀리거나 끌리지 않고, 자리가 바뀌지 않음' },
+    fast: { n: '날램', c: '#a0e8d0', d: '한 박자에 두 칸을 움직임' },
+    slow: { n: '굼뜸', c: '#c8d0d8', d: '두 박자에 한 번만 걸음을 옮김' },
+    agile: { n: '눈썰미', c: '#a0e8d0', d: '박자를 쓰지 않고 돌아섬. 등을 잡기 어려움' },
+    split: { n: '분열', c: '#9be07a', d: '쓰러지면 작은 것들이 나옴' },
+    boom: { n: '폭발', f: 1, c: '#ff9a4a', d: '쓰러지면 양옆 칸에 수치만큼 피해' },
+    drum: { n: '북소리', c: '#ffd76a', d: '살아 있는 동안 다른 적의 피해 +1' },
+    rage: { n: '격앙', c: '#ff8f98', d: '체력이 절반 이하가 되면 피해 +1' },
+  };
+  const kwLab = (id, n) => KW[id].n + (KW[id].f && n != null ? ': ' + n : '');
+  const KW_BY = {}; for (const k in KW) KW_BY[KW[k].n] = k;
+  const KW_RE = new RegExp('(' + Object.keys(KW_BY).sort((a, b) => b.length - a.length).join('|') + ')(: [+−-]?\\d+)?', 'g');
+  /* 글 속 키워드를 굵게(esc를 거친 글에만). 한 글자 이름(독)은 수치가 붙었을 때만 */
+  const kwH = (t) => esc(t).replace(KW_RE, (m, nm, num) => (nm.length < 2 && !num ? m : '<b class="ld-kw" style="color:' + KW[KW_BY[nm]].c + '">' + m + '</b>'));
+  function kwsIn(t) { const out = []; String(t).replace(KW_RE, (m, nm, num) => { if (nm.length < 2 && !num) return m; const id = KW_BY[nm]; if (!out.includes(id)) out.push(id); return m; }); return out; }
+
+  /* 타일. g 갈래(bl 날붙이 · sh 사격 · th 투척 · mv 이동 · ct 제어 · st 자세) · sh 닿는 꼴 · r 거리 · d 피해 · cd 대기 · pw AI가 매기는 값
+     sh: mel 앞 r칸 / shot 앞줄 / bshot 뒷줄 / both 양쪽 줄 / side 양옆 r칸 / back 뒤 r칸 / lob 앞 r번째 칸 / thru 뚫고 지나감 / trap 덫 / self 자신
+     pm 'dash' 먼저 달려듦 · am 'swap' 'vault' 'blink' 'back' 치고 난 뒤의 움직임 */
+  const TL = {
+    stab: { n: '찌르기', g: 'bl', sh: 'mel', r: 1, d: 2, cd: 2, pw: 2 },
+    spear: { n: '긴 창', g: 'bl', sh: 'mel', r: 2, prc: 1, d: 2, cd: 3, pw: 3 },
+    sweep: { n: '휩쓸기', g: 'bl', sh: 'side', r: 1, d: 2, cd: 3, pw: 3 },
+    cleave: { n: '내려치기', g: 'bl', sh: 'mel', r: 1, d: 4, cd: 5, pw: 3 },
+    twin: { n: '쌍날', g: 'bl', sh: 'mel', r: 1, d: 1, hits: 2, cd: 3, pw: 3 },
+    backstab: { n: '등 찌르기', g: 'bl', sh: 'mel', r: 1, d: 2, bs: 3, cd: 3, pw: 3 },
+    rear: { n: '뒤베기', g: 'bl', sh: 'back', r: 1, d: 3, cd: 3, pw: 2 },
+    whirl: { n: '회전 베기', g: 'bl', sh: 'side', r: 2, d: 2, cd: 5, pw: 4 },
+    finish: { n: '마무리 일격', g: 'bl', sh: 'mel', r: 1, d: 2, exe: 3, cd: 4, pw: 3 },
+    chain: { n: '연속 베기', g: 'bl', sh: 'mel', r: 1, d: 1, combo: 1, cd: 2, pw: 3 },
+    closer: { n: '매듭 베기', g: 'bl', sh: 'mel', r: 2, prc: 1, d: 2, last: 3, cd: 4, pw: 3 },
+    leech: { n: '피 마시는 날', g: 'bl', sh: 'mel', r: 1, d: 2, leech: 1, cd: 5, pw: 3 },
+    arrow: { n: '화살', g: 'sh', sh: 'shot', d: 2, cd: 3, pw: 3 },
+    bolt: { n: '쇠뇌', g: 'sh', sh: 'shot', prc: 1, d: 2, cd: 5, pw: 4 },
+    knife: { n: '던지는 칼', g: 'sh', sh: 'shot', r: 3, d: 1, lt: 1, cd: 2, pw: 3 },
+    long: { n: '먼 겨냥', g: 'sh', sh: 'shot', d: 1, far: 3, cd: 4, pw: 3 },
+    dart: { n: '독침', g: 'sh', sh: 'shot', d: 1, poi: 2, cd: 3, pw: 3 },
+    farrow: { n: '불화살', g: 'sh', sh: 'shot', d: 1, burn: 3, cd: 4, pw: 3 },
+    marker: { n: '표식 화살', g: 'sh', sh: 'shot', d: 0, mark: 3, lt: 1, cd: 3, pw: 3 },
+    parting: { n: '뒤쏘기', g: 'sh', sh: 'bshot', d: 2, cd: 3, pw: 2 },
+    twinshot: { n: '양쪽 쏘기', g: 'sh', sh: 'both', d: 1, cd: 3, pw: 3 },
+    bomb: { n: '불단지', g: 'th', sh: 'lob', r: 2, d: 2, sp: 1, burn: 1, cd: 5, pw: 4 },
+    sling: { n: '돌팔매', g: 'th', sh: 'lob', r: 3, d: 2, stun: 1, cd: 5, pw: 3 },
+    venom: { n: '독 안개', g: 'th', sh: 'lob', r: 2, d: 0, sp: 0, spk: 1, poi: 2, cd: 5, pw: 3 },
+    trap: { n: '덫', g: 'th', sh: 'trap', r: 1, d: 3, root: 1, cd: 4, pw: 3 },
+    ember: { n: '불씨 뿌리기', g: 'th', sh: 'side', r: 1, d: 0, burn: 2, cd: 3, pw: 2 },
+    dash: { n: '돌진', g: 'mv', sh: 'mel', r: 1, pm: 'dash', d: 2, cd: 4, pw: 3 },
+    swap: { n: '자리 바꾸기', g: 'mv', sh: 'mel', r: 2, am: 'swap', d: 0, cd: 3, pw: 3 },
+    vault: { n: '뛰어넘기', g: 'mv', sh: 'mel', r: 1, am: 'vault', d: 1, cd: 3, pw: 3 },
+    backstep: { n: '물러서기', g: 'mv', sh: 'self', am: 'back', mv: 2, lt: 1, cd: 3, pw: 2 },
+    blink: { n: '그림자 걸음', g: 'mv', sh: 'shot', am: 'blink', d: 0, foc: 2, cd: 4, pw: 3 },
+    pdash: { n: '꿰뚫는 돌진', g: 'mv', sh: 'thru', r: 3, d: 2, cd: 5, pw: 4 },
+    shove: { n: '밀치기', g: 'ct', sh: 'mel', r: 1, d: 1, push: 2, cd: 3, pw: 3 },
+    hook: { n: '갈고리', g: 'ct', sh: 'shot', r: 4, d: 1, pull: 4, cd: 4, pw: 3 },
+    bash: { n: '방패 치기', g: 'ct', sh: 'mel', r: 1, d: 1, stun: 1, cd: 4, pw: 3 },
+    trip: { n: '발 걸기', g: 'ct', sh: 'mel', r: 1, d: 1, flip: 1, cd: 3, pw: 3 },
+    kick: { n: '걷어차기', g: 'ct', sh: 'mel', r: 1, d: 0, push: 3, lt: 1, cd: 4, pw: 2 },
+    shout: { n: '함성', g: 'ct', sh: 'side', r: 2, d: 0, push: 1, weak: 2, cd: 5, pw: 3 },
+    bola: { n: '올가미', g: 'ct', sh: 'shot', r: 4, d: 1, root: 2, cd: 4, pw: 2 },
+    guard: { n: '막기', g: 'st', sh: 'self', blk: 3, lt: 1, cd: 4, pw: 3 },
+    parry: { n: '받아치기', g: 'st', sh: 'self', ctr: 3, cd: 4, pw: 3 },
+    breath: { n: '숨 고르기', g: 'st', sh: 'self', haste: 1, lt: 1, cd: 5, pw: 2 },
+    bandage: { n: '붕대', g: 'st', sh: 'self', heal: 3, once: 1, cd: 0, pw: 3 },
+    focus: { n: '집중', g: 'st', sh: 'self', foc: 2, lt: 1, cd: 3, pw: 3 },
+    echo: { n: '되풀이', g: 'st', sh: 'self', echo: 1, cd: 5, pw: 3 },
+    /* 적 전용(e) */
+    e_smash: { n: '후려치기', e: 1, sh: 'mel', r: 1 },
+    e_stab: { n: '찌르기', e: 1, sh: 'mel', r: 1 },
+    e_bite: { n: '물기', e: 1, sh: 'mel', r: 1 },
+    e_leech: { n: '빨아들이기', e: 1, sh: 'mel', r: 1, leech: 1 },
+    e_lunge: { n: '창 내지르기', e: 1, sh: 'mel', r: 2, prc: 1 },
+    e_torch: { n: '횃불 휘두르기', e: 1, sh: 'mel', r: 1, burn: 2 },
+    e_bashp: { n: '방패 밀기', e: 1, sh: 'mel', r: 1, push: 1 },
+    e_twin: { n: '두 번 베기', e: 1, sh: 'mel', r: 1, hits: 2 },
+    e_shot: { n: '쏘기', e: 1, sh: 'shot' },
+    e_bolt: { n: '쇠뇌 쏘기', e: 1, sh: 'shot', prc: 1 },
+    e_net: { n: '그물 던지기', e: 1, sh: 'shot', r: 3, root: 2 },
+    e_curse: { n: '저주', e: 1, sh: 'shot', weak: 2, mark: 1 },
+    e_hook: { n: '갈고리', e: 1, sh: 'shot', r: 4, pull: 4 },
+    e_tongue: { n: '혀 낚기', e: 1, sh: 'shot', r: 5, pull: 5 },
+    e_slam: { n: '내리찍기', e: 1, sh: 'side', r: 1 },
+    e_quake: { n: '땅 울림', e: 1, sh: 'side', r: 2 },
+    e_breath: { n: '불 내뿜기', e: 1, sh: 'mel', r: 3, prc: 1, burn: 2 },
+    e_aim: { n: '겨냥 포격', e: 1, sh: 'aim' },
+    e_spit: { n: '독 뱉기', e: 1, sh: 'aim', poi: 2 },
+    e_rain: { n: '재의 비', e: 1, sh: 'aim', sp: 2, burn: 1 },
+    e_beam: { n: '빛줄기', e: 1, sh: 'shot', prc: 1 },
+    e_charge: { n: '들이받기', e: 1, sh: 'mel', r: 1, pm: 'dash', push: 1 },
+    e_pdash: { n: '꿰뚫는 돌격', e: 1, sh: 'thru', r: 5 },
+    e_vault: { n: '뛰어넘기', e: 1, sh: 'mel', r: 1, am: 'vault' },
+    e_fuse: { n: '자폭', e: 1, sh: 'side', r: 1, sui: 1 },
+    e_stance: { n: '받아칠 자세', e: 1, sh: 'self', ctr: 3 },
+    e_summon: { n: '부르기', e: 1, sh: 'sum' },
+    e_mend: { n: '치료', e: 1, sh: 'mend' },
+    e_blink: { n: '숨어들기', e: 1, sh: 'eblink' },
+  };
+  for (const k in TL) TL[k].id = k;
+  const TILE_IDS = Object.keys(TL).filter((k) => !TL[k].e);
+  const GRP = { bl: ['날붙이', '#e8a45a'], sh: ['사격', '#8fc0e8'], th: ['투척', '#e88a6a'], mv: ['이동', '#9fe0b0'], ct: ['제어', '#d8b8f0'], st: ['자세', '#e8d890'] };
+  const GICON = { bl: 'blade', sh: 'feather', th: 'flame', mv: 'boot', ct: 'ring', st: 'shield' };
+  const CAP = 8;   // 가질 수 있는 타일 수
+
+  /* 강화: ok(기본 타일 + 지금까지의 강화) → 붙일 수 있는지 · ap 더하는 값 */
+  const UPS = {
+    edge: { n: '날 세우기', d: '피해 +1', ok: (T) => T.d > 0, ap: { d: 1 } },
+    grip: { n: '손잡이 깎기', d: '대기 −1', ok: (T) => T.cd >= 2, ap: { cd: -1 } },
+    venom: { n: '독 바르기', d: '독: +1', ok: (T) => T.d > 0 && T.sh !== 'trap', ap: { poi: 1 } },
+    flame: { n: '불 먹이기', d: '화상: +2', ok: (T) => T.d > 0 && T.sh !== 'trap', ap: { burn: 2 } },
+    reach: { n: '자루 늘이기', d: '거리 +1', ok: (T) => (T.sh === 'mel' && !T.pm && !T.am) || T.sh === 'side' || T.sh === 'back' || (T.sh === 'shot' && T.r) || T.sh === 'thru', ap: { r: 1 } },
+    quick: { n: '손에 익히기', d: '가벼움 부여', ok: (T) => !T.lt && T.cd >= 3, ap: { lt: 1 } },
+    force: { n: '무게 싣기', d: '밀치기: +1', ok: (T) => T.push > 0, ap: { push: 1 } },
+    daze: { n: '머리 겨누기', d: '기절: +1', ok: (T) => T.stun > 0 && T.stun < 2, ap: { stun: 1 } },
+    brand: { n: '낙인 새기기', d: '표식: +1', ok: (T) => T.d > 0 && T.sh !== 'trap' && !T.hits, ap: { mark: 1 } },
+  };
+  const UP_MAX = 3;
+  function eff(inst, K) {
+    const T = Object.assign({}, TL[inst.id]);
+    for (const u of inst.u) { const ap = UPS[u].ap; for (const k in ap) T[k] = (T[k] || 0) + ap[k]; }
+    if (K) { if (K.glass && T.cd >= 4) T.cd--; if (K.stirrup && T.g === 'mv') T.cd--; }
+    if (TL[inst.id].cd > 0) T.cd = max(1, T.cd);
+    T.up = inst.u.length;
+    return T;
+  }
+  const tName = (inst) => TL[inst.id].n + (inst.u.length ? ' +' + inst.u.length : '');
+
+  /* 장신구 */
+  const TK = {
+    plate: { n: '낡은 흉갑', d: '최대 체력 +3', ic: 'armor' },
+    whet: { n: '숫돌', d: '전투마다 처음 피해를 주는 타일의 피해 +2', ic: 'blade' },
+    boots: { n: '가죽 장화', d: '전투마다 처음 두 번의 이동은 박자를 쓰지 않음', ic: 'boot' },
+    belt: { n: '넓은 허리띠', d: '예약 칸 +1', ic: 'ring' },
+    glass: { n: '금 간 모래시계', d: '대기가 4 이상인 타일의 대기 −1', ic: 'clock' },
+    vial: { n: '독 단지', d: '독을 줄 때 독: +1', ic: 'drop' },
+    flint: { n: '부싯돌', d: '화상을 줄 때 화상: +1', ic: 'flame' },
+    spikes: { n: '가시 갑옷', d: '근접 공격에 맞으면 때린 적에게 피해 1', ic: 'armor' },
+    sack: { n: '전리품 자루', d: '전투에서 얻는 은화 +50%', ic: 'bag' },
+    herb: { n: '약초 주머니', d: '전투가 끝날 때 체력 1 회복', ic: 'herb' },
+    eye: { n: '사냥꾼의 눈', d: '3칸 이상 떨어진 적에게 사격 타일 피해 +1', ic: 'eye' },
+    weight: { n: '무게추', d: '충돌 피해 +1', ic: 'ring' },
+    whistle: { n: '파수꾼의 호각', d: '새 무리가 한 박자 늦게 도착', ic: 'flag' },
+    feather: { n: '피 묻은 깃', d: '적을 쓰러뜨릴 때마다 집중: 1', ic: 'feather' },
+    wrist: { n: '쇠 손목 보호대', d: '전투마다 처음 받는 피해를 한 번 막음', ic: 'shield' },
+    third: { n: '세 겹 매듭', d: '한 번에 실행한 셋째 타일부터 피해 +2', ic: 'ring' },
+    sheath: { n: '빈 칼집', d: '타일을 하나만 실행하면 피해 +1', ic: 'blade' },
+    nail: { n: '굽은 못', d: '등 뒤에서 치면 피해 +1', ic: 'blade' },
+    charm: { n: '수호 부적', d: '체력이 3 이하일 때 받는 피해 −1(최소 1)', ic: 'shield' },
+    phoenix: { n: '잿불 깃', d: '쓰러질 때 체력 4로 일어섬. 한 번 쓰면 사라짐', ic: 'feather' },
+    dice: { n: '내기꾼의 주화', d: '전투 보상의 선택지 +1', ic: 'coin' },
+    hammer: { n: '장인의 망치', d: '대장간에서 강화를 두 번 고름', ic: 'hammer' },
+    pivot: { n: '가벼운 발목끈', d: '박자마다 첫 돌아서기는 박자를 쓰지 않음', ic: 'boot' },
+    cloak: { n: '무거운 망토', d: '대기하면 막기: 1', ic: 'armor' },
+    chime: { n: '놋쇠 종', d: '전투를 집중: 2로 시작', ic: 'ring' },
+    caltrop: { n: '마름쇠 주머니', d: '새로 도착한 적에게 피해 1', ic: 'bag' },
+    scale: { n: '은 저울', d: '행상의 값 −25%', ic: 'coin' },
+    redband: { n: '붉은 띠', d: '체력이 절반 이하일 때 피해 +1', ic: 'flag' },
+    glove: { n: '처형인의 장갑', d: '기절한 적에게 피해 +2', ic: 'blade' },
+    map: { n: '낡은 지도', d: '갈림길의 선택지 +1', ic: 'map' },
+    lring: { n: '거머리 반지', d: '정예나 우두머리를 쓰러뜨리면 체력 3 회복', ic: 'ring' },
+    stirrup: { n: '등자', d: '이동 타일의 대기 −1', ic: 'boot' },
+    lens: { n: '겨냥 유리', d: '표식을 줄 때 표식: +1', ic: 'eye' },
+    brace: { n: '버팀쇠', d: '막기를 얻을 때 막기: +1', ic: 'shield' },
+  };
+  for (const k in TK) TK[k].id = k;
+  const TRK_IDS = Object.keys(TK);
+
+  /* 주인공. hid = 숨은 인물(해금 조건 u) */
+  const CLS = {
+    patrol: { n: '순찰병', hp: 13, tiles: ['stab', 'sweep', 'guard'], p: '굳은 몸 — 전투가 끝날 때 체력 1 회복', d: '성벽길을 지키던 병사. 찌르고, 휩쓸고, 막는다.', g: { w: 'sword', hd: 'helm', c: '#e3ae45' } },
+    hunter: { n: '사냥꾼', hp: 11, tiles: ['arrow', 'knife', 'backstep'], p: '먼 눈 — 3칸 이상 떨어진 적에게 사격 타일 피해 +1', d: '거리를 벌리고 쏜다. 다가오면 물러선다.', g: { w: 'bow', hd: 'hood', c: '#8fc0e8' } },
+    bulwark: { n: '방패잡이', hp: 15, tiles: ['bash', 'shove', 'stab'], p: '밀어붙이기 — 충돌 피해 +1', d: '밀치고 부딪쳐 줄을 무너뜨린다.', g: { w: 'shield', hd: 'helm', c: '#c8b08a', k: 1.2 } },
+    shadow: { n: '그림자발', hp: 10, tiles: ['backstab', 'vault', 'swap'], p: '등을 노림 — 등 뒤에서 치면 피해 +1', d: '자리를 바꾸고 넘어가 등을 찌른다.', hid: 1, u: '어느 길이로든 한 번 완주', g: { w: 'dagger', hd: 'hood', c: '#b48cff', k: 0.9 } },
+    kindler: { n: '불씨지기', hp: 11, tiles: ['farrow', 'ember', 'stab'], p: '부채질 — 화상을 입은 적에게 피해 +1', d: '불을 붙이고 타는 것을 친다.', hid: 1, u: '한 판에서 적 40을 쓰러뜨리기', g: { w: 'torch', hd: 'bare', c: '#ff9a4a' } },
+    brewer: { n: '약제사', hp: 11, tiles: ['dart', 'venom', 'stab'], p: '진한 독 — 독을 줄 때 독: +1', d: '독을 쌓고 시간을 번다.', hid: 1, u: '「보통」이나 「길게」를 완주', g: { w: 'staff', hd: 'hat', c: '#9be07a' } },
+  };
+  const CLS_IDS = Object.keys(CLS);
+  const UKEY = 'lounge.lineduel.unl';
+  function unlocked() { try { const a = JSON.parse((G0.localStorage && G0.localStorage.getItem(UKEY)) || '[]'); return Array.isArray(a) ? a.filter((c) => CLS[c] && CLS[c].hid) : []; } catch (e) { return []; } }
+  function unlock(c) { try { const a = unlocked(); if (a.includes(c) || !CLS[c] || !CLS[c].hid) return false; a.push(c); G0.localStorage.setItem(UKEY, JSON.stringify(a)); return true; } catch (e) { return false; } }
+
+  /* 적. t 단계 · c 무게(무리 짜기) · br 움직임(mel 다가옴 · rng 거리 둠 · shy 피함 · stat 제자리) · rc 다가가는 거리
+     at: [타일, 피해, 준비 박자, 쉬는 박자, {추가}] 앞에서부터 먼저 씀 · tr 특성 · g 그림 */
+  const C1 = '#e07a5a', C2 = '#8fca6a', C3 = '#8ab8e8', CB = '#f0c050';
+  const EN = {
+    club: { n: '몽둥이꾼', t: 1, c: 1, hp: 4, at: [['e_smash', 2, 1, 1]], g: { w: 'club', hd: 'bare', c: C1 }, d: '다가와 크게 휘두른다.' },
+    spearman: { n: '창잡이', t: 1, c: 2, hp: 4, rc: 2, at: [['e_lunge', 2, 1, 2]], g: { w: 'spear', hd: 'hat', c: C1 }, d: '두 칸 밖에서 찌른다. 옆으로 붙거나 뒤로 돌 것.' },
+    slinger: { n: '돌팔매꾼', t: 1, c: 1, hp: 3, br: 'rng', at: [['e_shot', 1, 1, 1]], g: { w: 'sling', hd: 'bare', c: C1, k: 0.9 }, d: '멀리서 던진다. 사이에 다른 적을 두면 못 던진다.' },
+    shieldman: { n: '방패지기', t: 1, c: 2, hp: 5, tr: { sh: 2 }, at: [['e_bashp', 1, 0, 2]], g: { w: 'shield', hd: 'helm', c: C1, k: 1.15 }, d: '앞은 단단하다. 뒤를 잡거나 밀어서 부딪칠 것.' },
+    dog: { n: '들개', t: 1, c: 1, hp: 2, tr: { fast: 1 }, at: [['e_bite', 1, 0, 1]], g: { b: 'dog', c: C1 }, d: '빠르게 달려와 준비 없이 문다.' },
+    knifer: { n: '단검잡이', t: 1, c: 2, hp: 3, at: [['e_vault', 0, 0, 3], ['e_stab', 2, 0, 1]], g: { w: 'dagger', hd: 'hood', c: C1, k: 0.9 }, d: '넘어가서 등 뒤를 찌른다.' },
+    torch: { n: '횃불꾼', t: 1, c: 1, hp: 3, at: [['e_torch', 1, 1, 2]], g: { w: 'torch', hd: 'bare', c: C1 }, d: '맞으면 불이 붙는다.' },
+    drummer: { n: '북잡이', t: 1, c: 2, hp: 4, br: 'shy', tr: { drum: 1 }, at: [], g: { w: 'drum', hd: 'hat', c: C1 }, d: '싸우지 않지만 무리를 사납게 만든다. 먼저 쓰러뜨릴 것.' },
+    netter: { n: '그물꾼', t: 1, c: 2, hp: 3, at: [['e_net', 0, 1, 4], ['e_smash', 1, 1, 1]], g: { w: 'net', hd: 'hood', c: C1 }, d: '그물로 발을 묶는다.' },
+    xbow: { n: '쇠뇌수', t: 1, c: 2, hp: 3, br: 'rng', at: [['e_bolt', 2, 1, 3]], g: { w: 'xbow', hd: 'helm', c: C1 }, d: '줄 위의 모두를 꿰뚫는다. 같은 편도 맞는다.' },
+    boar: { n: '멧돼지', t: 2, c: 3, hp: 6, tr: { rage: 1 }, at: [['e_charge', 3, 1, 3], ['e_bite', 2, 0, 2]], g: { b: 'boar', c: C2 }, d: '멀리서 들이받는다. 줄에서 비켜설 수 없으니 사이에 다른 것을 둘 것.' },
+    toad: { n: '독두꺼비', t: 2, c: 2, hp: 5, br: 'rng', at: [['e_spit', 1, 1, 2, { rr: 3 }], ['e_bite', 1, 0, 1]], g: { b: 'toad', c: C2 }, d: '서 있던 칸에 독을 뱉는다. 칸을 옮기면 빗나간다.' },
+    thorn: { n: '가시등', t: 2, c: 3, hp: 6, tr: { thorn: 1 }, at: [['e_slam', 2, 1, 2]], g: { b: 'bug', c: C2 }, d: '가까이서 치면 찔린다. 양옆을 함께 찍는다.' },
+    leech: { n: '늪거머리', t: 2, c: 1, hp: 3, tr: { fast: 1 }, at: [['e_leech', 1, 0, 1]], g: { b: 'worm', c: C2 }, d: '물면서 제 체력을 채운다.' },
+    sac: { n: '알주머니', t: 2, c: 2, hp: 4, br: 'stat', tr: { split: 'leech', sn: 2 }, at: [], g: { b: 'sac', c: C2 }, d: '터지면 늪거머리 둘이 나온다.' },
+    bomber: { n: '폭약꾼', t: 2, c: 2, hp: 3, tr: { boom: 2 }, at: [['e_fuse', 3, 2, 0]], g: { w: 'bomb', hd: 'hood', c: C2 }, d: '붙어서 심지를 태운다. 두 박자 안에 떨어지거나 밀어낼 것.' },
+    duelist: { n: '쌍검잡이', t: 2, c: 3, hp: 7, at: [['e_twin', 1, 0, 2], ['e_slam', 2, 1, 3]], g: { w: 'twin', hd: 'bare', c: C2 }, d: '준비 없이 두 번 벤다.' },
+    hooker: { n: '갈고리잡이', t: 2, c: 3, hp: 6, at: [['e_hook', 1, 0, 4], ['e_smash', 3, 1, 1]], g: { w: 'hook', hd: 'hat', c: C2, k: 1.1 }, d: '끌어당긴 뒤 크게 친다.' },
+    herbal: { n: '약초꾼', t: 2, c: 2, hp: 4, br: 'shy', at: [['e_mend', 0, 0, 2, { hl: 3 }]], g: { w: 'staff', hd: 'hood', c: C2, k: 0.9 }, d: '다친 적을 고친다.' },
+    heavy: { n: '중갑병', t: 2, c: 4, hp: 9, tr: { arm: 1, heavy: 1, slow: 1 }, at: [['e_smash', 4, 1, 2]], g: { w: 'axe', hd: 'helm', c: C2, k: 1.3 }, d: '느리고 단단하다. 독과 화상은 갑옷을 지나친다.' },
+    archer: { n: '장궁수', t: 2, c: 2, hp: 4, br: 'rng', at: [['e_shot', 2, 1, 2]], g: { w: 'bow', hd: 'hood', c: C2 }, d: '멀리서 쏜다. 붙으면 물러난다.' },
+    bandit: { n: '길도둑', t: 2, c: 3, hp: 5, tr: { agile: 1 }, at: [['e_vault', 1, 0, 3], ['e_stab', 2, 0, 1]], g: { w: 'dagger', hd: 'mask', c: C2 }, d: '넘어 다니며 찌른다. 등을 내주지 않는다.' },
+    golem: { n: '돌 수호상', t: 3, c: 5, hp: 11, tr: { heavy: 1, arm: 1, slow: 1 }, at: [['e_slam', 3, 1, 3]], g: { b: 'statue', c: C3, k: 1.3 }, d: '밀리지 않는다. 양옆을 함께 찍는다.' },
+    firestatue: { n: '불 뿜는 상', t: 3, c: 4, hp: 7, rc: 3, tr: { heavy: 1 }, at: [['e_breath', 2, 1, 3]], g: { b: 'statue', w: 'flame', c: '#ff9a4a' }, d: '앞 세 칸을 태운다. 뒤로 돌 것.' },
+    jar: { n: '벼락 항아리', t: 3, c: 3, hp: 6, br: 'stat', tr: { heavy: 1 }, at: [['e_aim', 3, 1, 2]], g: { b: 'jar', c: C3 }, d: '움직이지 않는다. 서 있던 칸에 벼락을 떨군다.' },
+    mirror: { n: '거울 방패병', t: 3, c: 3, hp: 6, tr: { sh: 3 }, at: [['e_smash', 2, 1, 1]], g: { w: 'shield', hd: 'mask', c: C3, k: 1.15 }, d: '앞에서는 거의 다치지 않는다. 뒤 · 독 · 화상 · 충돌로.' },
+    headsman: { n: '처형인', t: 3, c: 4, hp: 9, at: [['e_smash', 5, 2, 3]], g: { w: 'axe', hd: 'mask', c: C3, k: 1.25 }, d: '두 박자를 들여 크게 내려친다.' },
+    scout: { n: '안개 척후', t: 3, c: 3, hp: 5, at: [['e_blink', 0, 0, 4], ['e_stab', 2, 0, 1]], g: { b: 'wraith', w: 'dagger', c: C3 }, d: '등 뒤에 나타나 찌른다.' },
+    horn: { n: '나팔수', t: 3, c: 4, hp: 6, br: 'shy', at: [['e_summon', 0, 1, 5, { sum: 'dog', cap: 2 }]], g: { w: 'horn', hd: 'helm', c: C3 }, d: '들개를 불러들인다.' },
+    hexer: { n: '주술꾼', t: 3, c: 3, hp: 5, br: 'rng', at: [['e_curse', 0, 1, 3]], g: { b: 'wraith', w: 'staff', c: C3 }, d: '약하게 만들고 표식을 남긴다.' },
+    lancer: { n: '창기수', t: 3, c: 4, hp: 7, rc: 4, at: [['e_pdash', 3, 1, 3], ['e_stab', 2, 0, 2]], g: { w: 'spear', hd: 'helm', c: C3, k: 1.15 }, d: '줄을 뚫고 지나간다. 지나간 칸의 모두가 맞는다.' },
+    warden: { n: '사슬 파수', t: 3, c: 4, hp: 8, at: [['e_hook', 1, 0, 3], ['e_quake', 2, 1, 3]], g: { w: 'hook', hd: 'helm', c: C3, k: 1.25 }, d: '끌어당기고 땅을 울린다.' },
+    /* 우두머리 */
+    chief: { n: '큰도끼 두목', boss: 1, t: 1, hp: 18, tr: { rage: 1 }, at: [['e_summon', 0, 1, 7, { sum: 'club', cap: 2, ic: 3 }], ['e_slam', 2, 1, 3], ['e_smash', 4, 1, 1]], adds: ['dog'], g: { w: 'axe', hd: 'horn', c: CB, k: 1.35 }, d: '약탈 무리의 우두머리. 몽둥이꾼을 부르고 크게 내려친다.' },
+    houndmaster: { n: '사냥개 몰이꾼', boss: 1, t: 1, hp: 15, br: 'rng', tr: { rage: 1 }, at: [['e_summon', 0, 1, 7, { sum: 'dog', cap: 2, ic: 4 }], ['e_shot', 2, 1, 1]], adds: ['dog', 'dog'], g: { w: 'bow', hd: 'hat', c: CB, k: 1.2 }, d: '들개를 풀고 뒤에서 쏜다. 개보다 주인을 먼저.' },
+    mother: { n: '늪의 어미', boss: 1, t: 2, hp: 24, tr: { heavy: 1, rage: 1 }, at: [['e_summon', 0, 1, 8, { sum: 'sac', cap: 1, ic: 4 }], ['e_tongue', 1, 0, 4], ['e_slam', 3, 1, 2], ['e_spit', 1, 1, 3]], adds: ['leech'], g: { b: 'toad', c: CB, k: 1.5 }, d: '혀로 끌어와 내리찍는다. 알주머니를 낳는다.' },
+    captain: { n: '용병대장', boss: 1, t: 2, hp: 22, tr: { sh: 1, rage: 1 }, at: [['e_stance', 0, 0, 5], ['e_charge', 3, 1, 4], ['e_twin', 2, 0, 2]], adds: ['archer'], g: { w: 'twin', hd: 'helm', c: CB, k: 1.3 }, d: '받아칠 자세를 잡는다. 자세가 보이면 근접으로 치지 말 것.' },
+    colossus: { n: '봉화 수호상', boss: 1, t: 3, hp: 32, tr: { heavy: 1, arm: 1, rage: 1 }, at: [['e_beam', 4, 2, 4], ['e_quake', 3, 1, 3]], adds: ['jar'], g: { b: 'statue', c: CB, k: 1.6 }, d: '두 박자를 모아 줄 전체를 태운다. 뒤로 돌 것.' },
+    twinA: { n: '창 파수', boss: 1, t: 3, hp: 15, rc: 2, tr: { rage: 1 }, at: [['e_lunge', 3, 1, 2]], adds: ['twinB'], g: { w: 'spear', hd: 'helm', c: CB, k: 1.25 }, d: '쌍둥이 파수의 하나. 한쪽이 쓰러지면 남은 쪽이 사나워진다.' },
+    twinB: { n: '활 파수', boss: 1, t: 0, hp: 13, br: 'rng', tr: { rage: 1 }, at: [['e_shot', 2, 1, 1]], g: { w: 'bow', hd: 'helm', c: CB, k: 1.15 }, d: '쌍둥이 파수의 하나. 멀리서 쏜다.' },
+    priest: { n: '재의 사제', boss: 1, t: 3, hp: 24, br: 'rng', tr: { rage: 1 }, at: [['e_summon', 0, 1, 7, { sum: 'torch', cap: 2, ic: 2 }], ['e_rain', 3, 1, 2], ['e_blink', 0, 0, 5, { away: 1 }]], adds: ['torch'], g: { b: 'wraith', w: 'staff', c: CB, k: 1.35 }, d: '서 있던 칸과 양옆에 재를 내린다. 붙으면 멀리 사라진다.' },
+    storm: { n: '폭풍 창기장', boss: 1, t: 3, hp: 26, rc: 2, tr: { fast: 1, rage: 1 }, at: [['e_pdash', 3, 1, 3], ['e_lunge', 3, 1, 2]], adds: ['lancer'], g: { w: 'spear', hd: 'horn', c: CB, k: 1.4 }, d: '줄을 뚫고 오가며 찌른다.' },
+  };
+  for (const k in EN) { EN[k].id = k; EN[k].tr = EN[k].tr || {}; EN[k].br = EN[k].br || 'mel'; }
+  const EN_IDS = Object.keys(EN).filter((k) => !EN[k].boss), BOSS_IDS = Object.keys(EN).filter((k) => EN[k].boss && EN[k].t > 0);
+  const SUPPORT = { drummer: 1, herbal: 1, horn: 1, sac: 1 };
+
+  /* 판 길이: tiers 막마다의 단계 · S 막마다의 구간 수(우두머리 앞까지) */
+  const LEN = {
+    s: { n: '짧게', tiers: [1, 2], S: 4 },
+    n: { n: '보통', tiers: [1, 2, 3], S: 5 },
+    l: { n: '길게', tiers: [1, 2, 3, 3], S: 5 },
+  };
+  const ACT_NAME = ['바깥 성벽', '물길 다리', '봉화 능선', '꺼진 봉화대'];
+  const NODE = {
+    fight: { n: '전투', d: '적 무리와 싸움. 이기면 은화와 타일 보상', ic: 'blade' },
+    elite: { n: '정예 전투', d: '노련한 적이 섞인 무리. 이기면 장신구도 고름', ic: 'flag' },
+    rest: { n: '쉼터', d: '체력을 회복하거나 타일 하나를 강화', ic: 'herb' },
+    forge: { n: '대장간', d: '강화 넷 가운데 하나를 고름', ic: 'hammer' },
+    shop: { n: '행상', d: '은화로 타일 · 장신구 · 치료를 삼', ic: 'coin' },
+    event: { n: '길 위의 일', d: '무슨 일이 있을지 모름', ic: 'map' },
+    boss: { n: '우두머리', d: '이 막의 마지막 싸움', ic: 'flag' },
+  };
+  /* 길 위의 일. fx: ['hp',n] ['mhp',n] ['coin',n] ['trk'] ['tile'] ['up'] ['upx',강화 id] ['bet',n] ['luck'] */
+  const EVENTS = [
+    { n: '무너진 초소', tx: '지붕이 내려앉은 초소. 들보 밑에 궤짝 하나가 깔려 있다.', o: [{ lab: '들보를 들어 올린다', d: '체력 −2 · 장신구 하나', fx: [['hp', -2], ['trk']] }, { lab: '지나간다', d: '아무 일도 없음', fx: [] }] },
+    { n: '다친 짐꾼', tx: '짐꾼 하나가 벽에 기대앉아 있다. 다리에 감은 천이 젖어 있다.', o: [{ lab: '물과 약을 나눈다', d: '체력 −2 · 그가 무기를 손봐 줌(강화 하나)', fx: [['hp', -2], ['up']] }, { lab: '짐을 가져간다', d: '은화 +18 · 최대 체력 −1', fx: [['coin', 18], ['mhp', -1]] }, { lab: '지나간다', d: '아무 일도 없음', fx: [] }] },
+    { n: '옛 훈련장', tx: '허수아비와 무기 걸이가 남아 있다. 쓸 만한 것이 몇 있다.', o: [{ lab: '한나절 익힌다', d: '새 타일 셋 가운데 하나', fx: [['tile']] }, { lab: '날을 간다', d: '강화 하나', fx: [['up']] }] },
+    { n: '돌 틈의 샘', tx: '성벽 돌 틈에서 물이 흘러나온다. 차고 맑다.', o: [{ lab: '마시고 쉰다', d: '체력 +4', fx: [['hp', 4]] }, { lab: '몸을 씻고 채비를 고친다', d: '최대 체력 +1', fx: [['mhp', 1]] }] },
+    { n: '주사위 사내', tx: '모닥불 옆의 사내가 주사위 둘을 굴려 보인다. 말은 없다.', o: [{ lab: '은화 10을 건다', d: '절반의 확률로 은화 +25, 아니면 잃음', fx: [['bet', 10]] }, { lab: '거절한다', d: '아무 일도 없음', fx: [] }] },
+    { n: '버려진 수레', tx: '바퀴 빠진 수레. 덮개 밑이 불룩하다.', o: [{ lab: '덮개를 걷는다', d: '절반의 확률로 장신구, 아니면 덫(체력 −3)', fx: [['luck']] }, { lab: '바닥의 은화만 줍는다', d: '은화 +10', fx: [['coin', 10]] }] },
+    { n: '봉화지기의 무덤', tx: '돌무더기 위에 녹슨 투구가 놓여 있다.', o: [{ lab: '돌 하나를 얹는다', d: '체력 +2', fx: [['hp', 2]] }, { lab: '투구를 챙긴다', d: '최대 체력 +2 · 체력 −2', fx: [['mhp', 2], ['hp', -2]] }] },
+    { n: '떠돌이 대장장이', tx: '등짐에 모루를 진 노인. 값을 먼저 말한다.', o: [{ lab: '은화 15를 낸다', d: '강화 둘', fx: [['coin', -15], ['up'], ['up']] }, { lab: '지나간다', d: '아무 일도 없음', fx: [] }] },
+    { n: '독초 군락', tx: '벽 아래 그늘에 검푸른 풀이 무성하다. 손끝이 저리다.', o: [{ lab: '즙을 내어 바른다', d: '체력 −1 · 공격 타일 하나에 독 바르기', fx: [['hp', -1], ['upx', 'venom']] }, { lab: '지나간다', d: '아무 일도 없음', fx: [] }] },
+  ];
+
+  /* ================= ② 전투 엔진 =================
+     g = { f 전투, hr 주인공(타일 · 장신구), T 타일 실효값 배열, K 장신구 표, ev 사건 목록(없으면 기록 안 함), S 통계(없으면 안 셈) }
+     무작위를 쓰지 않음 — 같은 상태 · 같은 행동이면 같은 결과(AI 내다보기 · 미리 보기가 실제와 같음) */
+  const DUSK = 80;   // 이 박자부터 5박자마다 체력 1을 잃음(끝없이 끄는 싸움 막기)
+  const ST0 = () => ({ stun: 0, sr: 0, poi: 0, burn: 0, mark: 0, weak: 0, root: 0, blk: 0, ctr: 0, foc: 0 });
+  function mkG(s, f, ev) {
+    const K = {}; for (const t of s.hero.trk) K[t] = 1;
+    return { f: f || s.f, hr: s.hero, K, T: s.hero.tiles.map((t) => eff(t, K)), ev: ev || null, S: ev ? s.st : null };
+  }
+  const E = (g, e) => { if (g.ev) g.ev.push(e); };
+  function at(f, x) { const u = f.u; for (let i = 0; i < u.length; i++) if (u[i].x === x && u[i].hp > 0) return u[i]; return null; }
+  const inb = (f, x) => x >= 0 && x < f.n;
+  const foes = (f) => f.u.length - 1;
+  function fover(f) { if (f.u[0].hp <= 0) return 'L'; if (f.u.length === 1 && !f.inc && !f.wv.length) return 'W'; return null; }
+  function mkUnit(f, k, x, face, el) {
+    const D = EN[k]; let hp = D.hp; if (!D.boss && f.hs > 1) hp = Math.ceil(hp * f.hs); if (el) hp = Math.ceil(hp * 1.5) + 1;
+    return { i: f.nid++, k, x, f: face, hp, mh: hp, el: el ? 1 : 0, rg: 0, it: null, cd: D.at.map((a) => (a[4] && a[4].ic) || 0), st: ST0() };
+  }
+  /* 닿는 칸. c 칸(가까운 순서) · sp 번지는 칸 · first: 1 가장 가까운 하나만, 2 방향마다 하나 */
+  function reach(f, u, T, tx) {
+    const x = u.x, d = u.f, c = [], sp = []; let first = 0;
+    const line = (dir, r) => { for (let k = 1; k <= r; k++) { const y = x + dir * k; if (y < 0 || y >= f.n) break; c.push(y); } };
+    switch (T.sh) {
+      case 'mel': line(d, T.r || 1); first = T.prc ? 0 : 1; break;
+      case 'shot': line(d, T.r || 99); first = T.prc ? 0 : 1; break;
+      case 'bshot': line(-d, T.r || 99); first = T.prc ? 0 : 1; break;
+      case 'both': line(d, 99); line(-d, 99); first = 2; break;
+      case 'back': line(-d, T.r || 1); break;
+      case 'side': line(d, T.r || 1); line(-d, T.r || 1); break;
+      case 'thru': line(d, T.r || 1); break;
+      case 'lob': case 'aim': {
+        const y = T.sh === 'aim' ? tx : x + d * T.r;
+        if (y != null && inb(f, y)) { c.push(y); if (T.sp != null) { if (inb(f, y - 1)) sp.push(y - 1); if (inb(f, y + 1)) sp.push(y + 1); } }
+        break;
+      }
+    }
+    return { c, sp, first };
+  }
+  function targets(f, u, T, tx) {
+    const R = reach(f, u, T, tx), main = [];
+    if (R.first) {
+      const seen = {};
+      for (const y of R.c) { const side = R.first === 2 ? sgn(y - u.x) : 1; if (seen[side]) continue; const v = at(f, y); if (v && v !== u) { seen[side] = 1; main.push(v); } }
+    } else for (const y of R.c) { const v = at(f, y); if (v && v !== u) main.push(v); }
+    const sp = []; for (const y of R.sp) { const v = at(f, y); if (v && v !== u) sp.push(v); }
+    return { main, sp, R };
+  }
+  function moveTo(g, u, x) {
+    const f = g.f; u.x = x; E(g, ['m', u.i, x, u.f]);
+    if (u.k !== 'H' && f.gr[x]) { const d = f.gr[x]; delete f.gr[x]; E(g, ['g', x, 0]); addSt(g, u, 'root', 1); hurt(g, u, d, null, 3); }
+  }
+  function addSt(g, u, k, n) {
+    if (n <= 0 || u.hp <= 0) return;
+    if (k === 'stun') { if (u.st.sr > 0 || u.st.stun > 0) return; u.st.stun = n; }
+    else if (k === 'burn' || k === 'weak' || k === 'root') u.st[k] = max(u.st[k], n);
+    else u.st[k] += n;
+    E(g, ['e', u.i, k, u.st[k]]);
+  }
+  function heal(g, u, n) { const v = min(n, u.mh - u.hp); if (v > 0 && u.hp > 0) { u.hp += v; E(g, ['x', u.i, v, u.hp]); } }
+  /* kind: 0 타격 · 1 독 · 2 화상 · 3 충돌/덫/폭발 · 5 되받음 */
+  function hurt(g, u, n, src, kind) {
+    const f = g.f; if (u.hp <= 0) return 0;
+    if (n > 0 && u.st.blk > 0 && kind !== 1 && kind !== 2) { const b = min(n, u.st.blk); u.st.blk -= b; n -= b; if (!n) E(g, ['e', u.i, 'blk', u.st.blk]); }
+    if (u.k === 'H' && n > 0) {
+      if (g.K.wrist && !f.wg) { f.wg = 1; n = 0; E(g, ['p', u.i, '보호대']); }
+      else if (g.K.charm && u.hp <= 3) n = max(1, n - 1);
+    }
+    u.hp -= n; E(g, ['h', u.i, n, max(0, u.hp), kind]);
+    if (n > 0 && u.k !== 'H') f.np = 0;
+    if (g.S) { if (u.k === 'H') g.S.dt += n; else if (!src || src.k === 'H') g.S.dd += min(n, n + u.hp); }
+    if (u.hp <= 0) die(g, u);
+    return n;
+  }
+  function die(g, u, quiet) {
+    const f = g.f;
+    if (u.k === 'H') { if (g.K.phoenix && !f.px) { f.px = 1; u.hp = 4; E(g, ['x', u.i, 4, 4]); E(g, ['p', u.i, '잿불 깃']); } return; }
+    const ix = f.u.indexOf(u); if (ix >= 0) f.u.splice(ix, 1);
+    E(g, ['d', u.i]);
+    if (g.S) { g.S.k++; if (EN[u.k].boss) g.S.bk++; }
+    const tr = EN[u.k].tr, h = f.u[0];
+    if (g.K.feather) addSt(g, h, 'foc', 1);
+    if ((u.el || EN[u.k].boss) && g.K.lring) heal(g, h, 3);
+    if (u.k === 'twinA' || u.k === 'twinB') for (const v of f.u) if (v.k === 'twinA' || v.k === 'twinB') { v.rg = 2; E(g, ['p', v.i, '격앙']); }
+    if (tr.boom && !quiet) for (const y of [u.x - 1, u.x + 1]) { const v = at(f, y); if (v) hurt(g, v, tr.boom, null, 3); }
+    if (tr.split) { let n = tr.sn || 2; for (const y of [u.x, u.x - 1, u.x + 1, u.x - 2, u.x + 2]) { if (n <= 0) break; if (inb(f, y) && !at(f, y)) { spawn(g, tr.split, y); n--; } } }
+  }
+  function spawn(g, k, x, el) {
+    const f = g.f, h = f.u[0], v = mkUnit(f, k, x, sgn(h.x - x) || 1, el);
+    f.u.push(v); E(g, ['s', v.i, k, x, v.f, v.hp, v.el]);
+    return v;
+  }
+  function push(g, u, dir, n, src) {
+    const f = g.f; if (u.hp <= 0 || (u.k !== 'H' && EN[u.k].tr.heavy)) { if (u.hp > 0) E(g, ['p', u.i, '버팀']); return; }
+    while (n-- > 0 && u.hp > 0) {
+      const y = u.x + dir, v = inb(f, y) ? at(f, y) : null;
+      if (!inb(f, y) || v) {
+        const c = 1 + (src && src.k === 'H' ? (g.K.weight ? 1 : 0) + (g.hr.c === 'bulwark' ? 1 : 0) : 0);
+        E(g, ['b', u.i, dir]); hurt(g, u, c, src, 3); if (v) hurt(g, v, c, src, 3);
+        return;
+      }
+      moveTo(g, u, y);
+    }
+  }
+  function pull(g, u, src, n) {
+    const f = g.f; if (u.hp <= 0 || (u.k !== 'H' && EN[u.k].tr.heavy)) return;
+    const dir = sgn(src.x - u.x);
+    while (n-- > 0 && u.hp > 0) { const y = u.x + dir; if (y === src.x || !inb(f, y) || at(f, y)) return; moveTo(g, u, y); }
+  }
+  const isMelee = (T) => T.sh === 'mel' || T.sh === 'side' || T.sh === 'back' || T.sh === 'thru';
+  function hbonus(g, h, tgt, T, cx) {
+    const f = g.f, K = g.K, c = g.hr.c; let b = 0;
+    if (h.st.foc) { b += h.st.foc; cx.fu = 1; }
+    if (T.combo) b += T.combo * cx.idx;
+    if (T.last && cx.n >= 2 && cx.idx === cx.n - 1) b += T.last;
+    const dist = abs(tgt.x - h.x), behind = sgn(h.x - tgt.x) !== tgt.f;
+    if (T.far) b += min(T.far, dist - 1);
+    if (T.bs && behind) b += T.bs;
+    if (K.whet && !f.fa) { b += 2; cx.fa = 1; }
+    if (K.sheath && cx.n === 1) b += 1;
+    if (K.third && cx.idx >= 2) b += 2;
+    if (K.redband && h.hp * 2 <= h.mh) b += 1;
+    if (T.g === 'sh' && dist >= 3) b += (K.eye ? 1 : 0) + (c === 'hunter' ? 1 : 0);
+    if (K.glove && tgt.st.stun > 0) b += 2;
+    if (behind) b += (K.nail ? 1 : 0) + (c === 'shadow' ? 1 : 0);
+    if (c === 'kindler' && tgt.st.burn > 0) b += 1;
+    return b;
+  }
+  function ebonus(g, e) {
+    const f = g.f, tr = EN[e.k].tr; let b = e.el + e.rg;
+    if (tr.rage && e.hp * 2 <= e.mh) b++;
+    for (const v of f.u) if (v !== e && v.k !== 'H' && EN[v.k].tr.drum) { b++; break; }
+    return b;
+  }
+  /* 한 대상에 타일 효과를 입힘. sp: 번진 칸의 대상 */
+  function strike(g, src, tgt, T, cx, sp) {
+    if (tgt.hp <= 0 || src.hp <= 0) return;
+    const f = g.f, isH = src.k === 'H';
+    let d = sp ? T.sp : T.d;
+    if (d > 0) {
+      if (isH) d += hbonus(g, src, tgt, T, cx);
+      if (src.st.weak > 0) d = max(0, d - 1);
+      if (tgt.st.ctr > 0 && isMelee(T) && abs(src.x - tgt.x) === 1) {
+        const c = tgt.st.ctr; tgt.st.ctr = 0; E(g, ['e', tgt.i, 'ctr', 0]); E(g, ['p', tgt.i, '받아침']); hurt(g, src, c, tgt, 5); return;
+      }
+      if (tgt.st.mark > 0) { d += tgt.st.mark; tgt.st.mark = 0; E(g, ['e', tgt.i, 'mark', 0]); }
+      if (tgt.k !== 'H') { const tr = EN[tgt.k].tr; let cut = (tr.sh && sgn(src.x - tgt.x) === tgt.f ? tr.sh : 0) + (tr.arm || 0); if (cut) d = max(min(d, 1), d - cut); }
+      const got = hurt(g, tgt, d, src, 0);
+      if (isMelee(T) && src.hp > 0 && abs(src.x - tgt.x) === 1) {
+        if (tgt.k !== 'H' && EN[tgt.k].tr.thorn) hurt(g, src, EN[tgt.k].tr.thorn, tgt, 5);
+        else if (tgt.k === 'H' && g.K.spikes) hurt(g, src, 1, tgt, 5);
+      }
+      if (T.leech && got > 0) heal(g, src, T.leech);
+      if (T.exe && tgt.hp > 0 && tgt.hp <= T.exe && tgt.k !== 'H' && !EN[tgt.k].boss) { E(g, ['p', tgt.i, '처형']); hurt(g, tgt, tgt.hp, src, 0); }
+    }
+    if (tgt.hp <= 0) return;
+    if (sp && !T.spk && !T.burn) return;
+    const toH = tgt.k === 'H' ? 1 : 0;
+    if (T.stun && !sp) addSt(g, tgt, 'stun', T.stun);
+    if (T.poi) addSt(g, tgt, 'poi', T.poi + (isH ? (g.K.vial ? 1 : 0) + (g.hr.c === 'brewer' ? 1 : 0) : 0));
+    if (T.burn) addSt(g, tgt, 'burn', T.burn + (isH && g.K.flint ? 1 : 0));
+    if (sp && !T.spk) return;
+    if (T.mark) addSt(g, tgt, 'mark', T.mark + (isH && g.K.lens ? 1 : 0));
+    if (T.weak) addSt(g, tgt, 'weak', T.weak + toH);
+    if (T.root) addSt(g, tgt, 'root', T.root + toH);
+    if (T.flip && !(tgt.k !== 'H' && EN[tgt.k].tr.heavy)) { tgt.f = -tgt.f; E(g, ['t', tgt.i, tgt.f]); }
+    if (T.push) push(g, tgt, sgn(tgt.x - src.x) || src.f, T.push, src);
+    if (T.pull) pull(g, tgt, src, T.pull);
+  }
+  /* 타일 하나를 실행. u 쓰는 이 · cx {idx 순서, n 실행 개수, tx 겨냥 칸} */
+  function resolve(g, u, T, cx) {
+    const f = g.f; if (u.hp <= 0) return;
+    const free = (y) => inb(f, y) && !at(f, y);
+    if (T.pm === 'dash' && !u.st.root) { let k = 0; while (k < 5 && free(u.x + u.f)) { moveTo(g, u, u.x + u.f); k++; if (u.hp <= 0) return; } }
+    if (T.sh === 'trap') { const y = u.x + u.f; E(g, ['a', u.i, T.id, [y]]); if (free(y)) { f.gr[y] = T.d; E(g, ['g', y, T.d]); } return; }
+    if (T.sh === 'thru') {
+      const R = reach(f, u, T); let land = -1; for (const y of R.c) if (!at(f, y)) land = y;
+      if (land < 0 || u.st.root) { E(g, ['a', u.i, T.id, []]); return; }
+      const cells = R.c.filter((y) => (y - u.x) * u.f <= (land - u.x) * u.f);
+      E(g, ['a', u.i, T.id, cells]);
+      const hit = cells.map((y) => at(f, y)).filter(Boolean);
+      moveTo(g, u, land);
+      for (const v of hit) strike(g, u, v, T, cx, 0);
+      return;
+    }
+    if (T.sh === 'self') {
+      E(g, ['a', u.i, T.id, []]);
+      if (T.blk) addSt(g, u, 'blk', T.blk + (u.k === 'H' ? (g.K.brace ? 1 : 0) : 0));
+      if (T.ctr) addSt(g, u, 'ctr', T.ctr);
+      if (T.heal) heal(g, u, T.heal);
+      if (T.haste && u.k === 'H') { for (let i = 0; i < f.cd.length; i++) if (f.cd[i] > 0 && f.cd[i] < 90) f.cd[i] = max(0, f.cd[i] - T.haste); E(g, ['p', u.i, '재촉']); }
+      if (T.am === 'back' && !u.st.root) { let k = T.mv || 1; while (k-- > 0 && free(u.x - u.f)) moveTo(g, u, u.x - u.f); }
+      if (T.foc) addSt(g, u, 'foc', T.foc);
+      return;
+    }
+    const tg = targets(f, u, T, cx.tx);
+    E(g, ['a', u.i, T.id, tg.R.c.concat(tg.R.sp), tg.main.map((v) => v.i)]);
+    const first = tg.main[0];
+    for (let k = 0; k < (T.hits || 1); k++) {
+      for (const v of tg.main) strike(g, u, v, T, cx, 0);
+      for (const v of tg.sp) strike(g, u, v, T, cx, 1);
+    }
+    if (u.hp <= 0) return;
+    if (T.am && !u.st.root) {
+      if (T.am === 'swap' && first && first.hp > 0 && !(first.k !== 'H' && EN[first.k].tr.heavy)) { const a = u.x, b = first.x; u.x = b; first.x = a; E(g, ['m', u.i, b, u.f]); E(g, ['m', first.i, a, first.f]); }
+      else if (T.am === 'vault' && first) { const y = u.x + 2 * u.f; if (abs(first.x - u.x) === 1 && free(y)) { u.f = -u.f; moveTo(g, u, y); } }
+      else if (T.am === 'blink' && first && first.hp > 0) { const y = first.x + u.f; if (free(y)) { u.f = -u.f; moveTo(g, u, y); } }
+    }
+    if (T.foc && u.k === 'H' && first) addSt(g, u, 'foc', T.foc);
+  }
+  function execQueue(g) {
+    const f = g.f, h = f.u[0], q = f.q.slice(); f.q = []; let prev = null;
+    for (let i = 0; i < q.length; i++) {
+      const T = g.T[q[i]], cx = { idx: i, n: q.length };
+      if (h.hp > 0) {
+        const R = T.echo ? prev : T;
+        if (T.echo) E(g, ['a', h.i, T.id, []]);
+        if (R) { resolve(g, h, R, cx); prev = R; }
+        if (cx.fu) { h.st.foc = 0; E(g, ['e', h.i, 'foc', 0]); }
+        if (cx.fa) f.fa = 1;
+      }
+      f.cd[q[i]] = T.once ? 99 : T.cd + 1;
+    }
+  }
+  /* 주인공의 행동. 박자를 썼으면 true. 못 하는 행동이면 예외 */
+  function heroAct(g, a) {
+    const f = g.f, h = f.u[0];
+    switch (a && a.t) {
+      case 'mv': {
+        const d = a.d === 1 ? 1 : -1, y = h.x + d;
+        if (h.st.root > 0 || !inb(f, y) || at(f, y)) throw new Error('그쪽으로는 갈 수 없음');
+        h.f = d; moveTo(g, h, y);
+        if (g.K.boots && f.fm < 2) { f.fm++; return false; }
+        return true;
+      }
+      case 'turn': h.f = -h.f; E(g, ['t', h.i, h.f]); if (g.K.pivot && !f.ft) { f.ft = 1; return false; } return true;
+      case 'q': {
+        const i = a.i | 0;
+        if (!(i >= 0 && i < f.cd.length) || f.cd[i] > 0 || f.q.includes(i) || f.q.length >= g.hr.qmax) throw new Error('올릴 수 없는 타일');
+        f.q.push(i); E(g, ['q', i]);
+        return !g.T[i].lt;
+      }
+      case 'go': if (!f.q.length) throw new Error('예약한 타일이 없음'); execQueue(g); return true;
+      case 'wait': if (g.K.cloak) addSt(g, h, 'blk', 1); return true;
+    }
+    throw new Error('알 수 없는 행동');
+  }
+  function legal(g) {
+    const f = g.f, h = f.u[0], out = [];
+    for (const d of [h.f, -h.f]) { const y = h.x + d; if (!h.st.root && inb(f, y) && !at(f, y)) out.push({ t: 'mv', d }); }
+    if (f.q.length) out.push({ t: 'go' });
+    if (f.q.length < g.hr.qmax) { const seen = {}; for (let i = 0; i < f.cd.length; i++) { if (f.cd[i] > 0 || f.q.includes(i)) continue; const t = g.hr.tiles[i], k = t.id + '|' + t.u.join(','); if (seen[k]) continue; seen[k] = 1; out.push({ t: 'q', i }); } }
+    out.push({ t: 'turn' }); out.push({ t: 'wait' });
+    return out;
+  }
+  /* 적이 지금 그 공격을 쓸 만한가 */
+  function usable(g, e, a) {
+    const f = g.f, h = f.u[0], B = TL[a[0]], o = a[4] || {}, dx = h.x - e.x, dist = abs(dx), dir = sgn(dx);
+    switch (B.sh) {
+      case 'sum': { let n = 0; for (const v of f.u) if (v.k === o.sum) n++; return n < o.cap && foes(f) < 5 && sumCell(f, e) >= 0; }
+      case 'mend': for (const v of f.u) if (v.k !== 'H' && v !== e && v.hp < v.mh) return true; return false;
+      case 'eblink': return o.away ? dist <= 2 && farCell(f, h) >= 0 : dist > 1 && blinkCell(f, h) >= 0;
+      case 'self': return dist <= 2;
+      case 'aim': return dist <= (o.rr || 99);
+      case 'thru': return e.f === dir && dist <= B.r && !e.st.root;
+    }
+    if (e.f !== dir) return false;
+    if (B.am === 'vault') return dist === 1 && inb(f, h.x + e.f) && !at(f, h.x + e.f) && !e.st.root;
+    if (B.pm === 'dash') { if (dist > 5) return false; for (let y = e.x + dir; y !== h.x; y += dir) if (at(f, y)) return false; return true; }
+    const tg = targets(f, e, B);
+    return tg.main.includes(h) || (B.sh === 'side' && tg.main.includes(h));
+  }
+  function sumCell(f, e) { const h = f.u[0], away = sgn(e.x - h.x) || 1; for (const y of [e.x + away, e.x - away, e.x + 2 * away, e.x - 2 * away]) if (inb(f, y) && !at(f, y)) return y; return -1; }
+  function blinkCell(f, h) { for (const y of [h.x - h.f, h.x + h.f]) if (inb(f, y) && !at(f, y)) return y; return -1; }
+  function farCell(f, h) { const ends = h.x * 2 < f.n ? [f.n - 1, f.n - 2, 0, 1] : [0, 1, f.n - 1, f.n - 2]; for (const y of ends) if (!at(f, y)) return y; return -1; }
+  function eAttack(g, e, a, tx) {
+    const f = g.f, h = f.u[0], B = TL[a[0]], o = a[4] || {};
+    switch (B.sh) {
+      case 'sum': { const y = sumCell(f, e); E(g, ['a', e.i, B.id, []]); if (y >= 0) spawn(g, o.sum, y); return; }
+      case 'mend': { let t = null; for (const v of f.u) if (v.k !== 'H' && v !== e && v.hp < v.mh && (!t || v.mh - v.hp > t.mh - t.hp)) t = v; E(g, ['a', e.i, B.id, []]); if (t) heal(g, t, o.hl || 2); return; }
+      case 'eblink': { const y = o.away ? farCell(f, h) : blinkCell(f, h); E(g, ['a', e.i, B.id, []]); if (y >= 0 && !e.st.root) { e.x = y; e.f = sgn(h.x - y) || 1; E(g, ['m', e.i, y, e.f, 1]); } return; }
+    }
+    const T = Object.assign({}, B, o); T.d = a[1] > 0 ? a[1] + ebonus(g, e) : 0;
+    if (T.sp != null) T.sp = max(1, T.d - 1);
+    resolve(g, e, T, { idx: 0, n: 1, tx });
+    if (B.sui && e.hp > 0) { e.hp = 0; die(g, e, true); }
+  }
+  function doIntent(g, e) {
+    const f = g.f, it = e.it;
+    if (e.st.ctr) { e.st.ctr = 0; E(g, ['e', e.i, 'ctr', 0]); }
+    if (e.st.stun > 0) { e.st.stun--; if (!e.st.stun) e.st.sr = 3; e.it = null; E(g, ['e', e.i, 'stun', e.st.stun]); return; }
+    if (!it) return;
+    switch (it.k) {
+      case 'm': {
+        if (e.f !== it.d) { e.f = it.d; E(g, ['t', e.i, e.f]); }
+        let n = it.n || 1; while (n-- > 0 && e.hp > 0) { const y = e.x + it.d; if (e.st.root > 0 || !inb(f, y) || at(f, y)) break; moveTo(g, e, y); }
+        break;
+      }
+      case 'b': { const y = e.x - e.f; if (!e.st.root && inb(f, y) && !at(f, y)) moveTo(g, e, y); break; }
+      case 't': e.f = -e.f; E(g, ['t', e.i, e.f]); break;
+      case 'w': E(g, ['w', e.i]); break;
+      case 'h': { const a = EN[e.k].at[it.a]; e.cd[it.a] = a[3] + 1; eAttack(g, e, a, it.tx); break; }
+    }
+  }
+  /* 다음 박자의 행동을 정함(예고). m 이동 · b 물러섬 · t 돌아섬 · w 준비 · h 공격 · z 기절 · n 대기 */
+  function plan(g, e) {
+    const f = g.f, h = f.u[0], D = EN[e.k], tr = D.tr;
+    if (e.st.stun > 0) { e.it = { k: 'z' }; return; }
+    const p = e.it;
+    if (p && p.k === 'w') { e.it = p.c > 1 ? { k: 'w', a: p.a, c: p.c - 1 } : { k: 'h', a: p.a, tx: h.x }; return; }
+    const dx = h.x - e.x, dist = abs(dx), dir = sgn(dx) || e.f;
+    if (tr.agile && e.f !== dir) { e.f = dir; E(g, ['t', e.i, e.f]); }
+    for (let i = 0; i < D.at.length; i++) {
+      if (e.cd[i] > 0) continue; const a = D.at[i];
+      if (usable(g, e, a)) { e.it = a[2] > 0 ? { k: 'w', a: i, c: a[2] } : { k: 'h', a: i, tx: h.x }; return; }
+    }
+    if (e.f !== dir) { e.it = { k: 't' }; return; }
+    const back = e.x - dir, canBack = inb(f, back) && !at(f, back) && !e.st.root;
+    if (D.br === 'mel') {
+      if (dist > (D.rc || 1)) e.it = tr.slow && f.t % 2 ? { k: 'n' } : { k: 'm', d: dir, n: tr.fast ? 2 : 1 };
+      else e.it = { k: 'n' };
+    } else if (D.br === 'rng') e.it = dist < 2 && canBack ? { k: 'b' } : { k: 'n' };
+    else if (D.br === 'shy') e.it = dist <= 2 && canBack ? { k: 'b' } : { k: 'n' };
+    else e.it = { k: 'n' };
+  }
+  function spawnWave(g) {
+    const f = g.f, left = [];
+    for (const w of f.inc.u) {
+      let x = -1;
+      if (w[1] < 0) { for (let y = 0; y < f.n; y++) if (!at(f, y)) { x = y; break; } } else for (let y = f.n - 1; y >= 0; y--) if (!at(f, y)) { x = y; break; }
+      if (x < 0 || abs(x - (w[1] < 0 ? 0 : f.n - 1)) > 2) { left.push(w); continue; }
+      const v = spawn(g, w[0], x, w[2]);
+      if (g.K.caltrop) hurt(g, v, 1, null, 3);
+    }
+    f.inc = left.length ? { u: left, c: 1 } : null;
+  }
+  function endBeat(g) {
+    const f = g.f, h = f.u[0];
+    f.t++; f.ft = 0; f.np++; if (g.S) g.S.b++;
+    for (const u of f.u.slice()) {
+      if (u.hp <= 0) continue;
+      const s = u.st;
+      if (s.poi > 0) { const d = s.poi; s.poi--; hurt(g, u, d, null, 1); if (u.hp <= 0) continue; }
+      if (s.burn > 0) { s.burn--; hurt(g, u, 1, null, 2); if (u.hp <= 0) continue; }
+      if (s.weak > 0) s.weak--; if (s.root > 0) s.root--; if (s.sr > 0 && !s.stun) s.sr--;
+      if (u.k === 'H') { s.blk = 0; s.ctr = 0; } else for (let i = 0; i < u.cd.length; i++) if (u.cd[i] > 0) u.cd[i]--;
+    }
+    if (h.hp > 0 && f.t >= DUSK && (f.t - DUSK) % 5 === 0) { E(g, ['p', 0, '땅거미']); hurt(g, h, 1, null, 2); }
+    if (h.hp <= 0) return;
+    for (let i = 0; i < f.cd.length; i++) if (f.cd[i] > 0 && f.cd[i] < 90) f.cd[i]--;
+    if (f.inc) { if (--f.inc.c <= 0) spawnWave(g); }
+    if (!f.inc && f.wv.length && foes(f) <= f.wt) { f.wv = f.wv.slice(); f.inc = { u: f.wv.shift(), c: g.K.whistle ? 2 : 1 }; E(g, ['n']); }
+    for (const e of f.u) if (e.k !== 'H') plan(g, e);
+  }
+  function enemyPhase(g) {
+    const f = g.f, h = f.u[0];
+    const order = f.u.slice(1).sort((a, b) => abs(a.x - h.x) - abs(b.x - h.x) || a.i - b.i);
+    E(g, ['-']);
+    for (const e of order) { if (e.hp <= 0 || h.hp <= 0) continue; doIntent(g, e); }
+    endBeat(g);
+  }
+  /* 적의 예고 공격이 닿는 칸 → { 칸: [피해, 상태만 거는지] } */
+  function threats(g) {
+    const f = g.f, m = {};
+    for (const e of f.u) {
+      if (e.k === 'H' || !e.it || e.it.k !== 'h' || e.st.stun > 0) continue;
+      const a = EN[e.k].at[e.it.a], B = TL[a[0]];
+      if (B.sh === 'sum' || B.sh === 'mend' || B.sh === 'eblink' || B.sh === 'self') continue;
+      const d = a[1] > 0 ? a[1] + ebonus(g, e) : 0, T = Object.assign({}, B, a[4] || {});
+      if (B.pm === 'dash') T.sh = 'shot', T.r = 6;
+      const R = reach(f, e, T, e.it.tx), add = (y, v) => { const c = m[y] || (m[y] = [0, 0]); c[0] += v * (B.hits || 1); if (!v) c[1] = 1; };
+      if (R.first) { const seen = {}; for (const y of R.c) { const side = R.first === 2 ? sgn(y - e.x) : 1; if (seen[side]) continue; add(y, d); if (at(f, y)) seen[side] = 1; } }
+      else for (const y of R.c) add(y, d);
+      for (const y of R.sp) add(y, max(1, d - 1));
+    }
+    return m;
+  }
+  function cloneF(f) {
+    return { fid: f.fid, n: f.n, t: f.t, nid: f.nid, q: f.q.slice(), cd: f.cd.slice(), wv: f.wv, inc: f.inc ? { u: f.inc.u, c: f.inc.c } : null, wt: f.wt, gr: Object.assign({}, f.gr),
+      fa: f.fa, fm: f.fm, ft: f.ft, np: f.np, wg: f.wg, px: f.px, hs: f.hs, kind: f.kind,
+      u: f.u.map((u) => ({ i: u.i, k: u.k, x: u.x, f: u.f, hp: u.hp, mh: u.mh, el: u.el, rg: u.rg, it: u.it, cd: u.cd ? u.cd.slice() : null, st: Object.assign({}, u.st) })) };
+  }
+
+  /* ================= ③ 판 진행 ================= */
+  const BUD = { 1: 3, 2: 5, 3: 8 };
+  const has = (s, k) => s.hero.trk.includes(k);
+  function mkHero(c) { const D = CLS[c]; return { c, hp: D.hp, mhp: D.hp, coin: 0, qmax: 3, tiles: D.tiles.map((id) => ({ id, u: [] })), trk: [] }; }
+  function addTrk(s, id) {
+    const hr = s.hero; if (hr.trk.includes(id)) return;
+    hr.trk.push(id);
+    if (id === 'plate') { hr.mhp += 3; hr.hp += 3; }
+    if (id === 'belt') hr.qmax++;
+  }
+  function genWave(tier, budget, maxN) {
+    const pool = []; for (const k of EN_IDS) { const t = EN[k].t; if (t === tier) pool.push(k, k, k); else if (t === tier - 1) pool.push(k); }
+    const out = []; let sup = 0, guard = 0;
+    while (budget > 0 && out.length < maxN && guard++ < 60) {
+      const k = pick(pool), D = EN[k];
+      if (D.c > budget || (SUPPORT[k] && sup)) continue;
+      if (SUPPORT[k]) sup++;
+      out.push(k); budget -= D.c;
+    }
+    if (!out.some((k) => !SUPPORT[k])) out.push(pick(pool.filter((k) => !SUPPORT[k] && EN[k].c <= 2)));
+    return out;
+  }
+  function genFight(s, kind) {
+    const L0 = LEN[s.len], tier = L0.tiers[s.act], late = s.act >= 3 ? 1 : 0;
+    const n = kind === 'boss' ? 7 + rnd(2) : 6 + rnd(3);
+    const f = { fid: ++s.fc, kind, n, t: 0, nid: 1, q: [], cd: s.hero.tiles.map(() => 0), wv: [], inc: null, wt: s.act === 0 ? 0 : 1, gr: {}, fa: 0, fm: 0, ft: 0, np: 0, wg: 0, px: 0, hs: late ? 1.3 : 1, u: [] };
+    const hx = kind === 'boss' ? 1 + rnd(2) : Math.floor((n - 1) / 2) + (n % 2 ? 0 : rnd(2));
+    f.u.push({ i: 0, k: 'H', x: hx, f: 1, hp: s.hero.hp, mh: s.hero.mhp, el: 0, rg: 0, it: null, cd: null, st: ST0() });
+    const side = () => (rnd(2) ? 1 : -1);
+    let first, elite = -1;
+    if (kind === 'boss') {
+      first = [s.boss].concat(EN[s.boss].adds || []);
+      f.wv = [genWave(tier, BUD[tier] - 1 + late, 2).map((k) => [k, side(), 0])];
+      f.wt = 0;
+    } else {
+      const first0 = s.act === 0 && s.step === 0;
+      const base = BUD[tier] + (s.step >= 2 ? 1 : 0) + late * 2 + (kind === 'elite' ? 1 : 0) - (first0 ? 1 : 0);
+      const nw = s.act === 0 ? 2 : 2 + rnd(2);
+      first = genWave(tier, base, 3);
+      if (kind === 'elite') { elite = 0; for (let i = 1; i < first.length; i++) if (EN[first[i]].c > EN[first[elite]].c && !SUPPORT[first[i]]) elite = i; if (SUPPORT[first[elite]]) elite = first.findIndex((k) => !SUPPORT[k]); }
+      for (let w = 1; w < nw; w++) f.wv.push(genWave(tier, base, 3).map((k) => [k, side(), 0]));
+    }
+    /* 첫 무리: 주인공에게서 두 칸 넘게 떨어진 칸에. 우두머리는 먼 끝에 */
+    const cells = shuf(Array.from({ length: n }, (_, i) => i).filter((x) => abs(x - hx) >= 2));
+    if (kind === 'boss') cells.sort((a, b) => b - a);
+    first.forEach((k, i) => { if (!cells.length) return; const x = cells.shift(); f.u.push(mkUnit(f, k, x, sgn(hx - x) || 1, i === elite)); });
+    s.f = f;
+    const g = mkG(s, f, null);
+    if (g.K.chime) f.u[0].st.foc = 2;
+    for (const e of f.u) if (e.k !== 'H') plan(g, e);
+  }
+  function finish(s, win) { s.res = { w: win ? 1 : 0 }; s.ch = null; s.todo = []; if (win) s.f = null; }
+  function tilePool(s, n) {
+    const own = s.hero.tiles.map((t) => t.id);
+    let pool = shuf(TILE_IDS.filter((k) => !own.includes(k)));
+    return pool.slice(0, n);
+  }
+  function upOpts(s, n, only) {
+    const all = [];
+    s.hero.tiles.forEach((t, i) => {
+      if (t.u.length >= UP_MAX) return;
+      const T = eff(t);
+      for (const u in UPS) { if (only && u !== only) continue; if (UPS[u].ok(T) && t.u.filter((x) => x === u).length < 2 && !(u === 'quick' && t.u.includes('quick'))) all.push({ t: 'up', i, u }); }
+    });
+    return shuf(all).slice(0, n);
+  }
+  function trkOpts(s, n) { return shuf(TRK_IDS.filter((k) => !s.hero.trk.includes(k))).slice(0, n).map((id) => ({ t: 'trk', id })); }
+  function rwChoice(s, coin, title) {
+    const n = 3 + (has(s, 'dice') ? 1 : 0), ups = upOpts(s, 1);
+    const o = tilePool(s, ups.length ? n - 1 : n).map((id) => ({ t: 'tile', id })).concat(ups);
+    o.push({ t: 'coin', n: 5, lab: '넘기기' });
+    return { k: 'rw', t: title || '전투 보상', s: (coin ? '은화 +' + coin + ' · ' : '') + '하나를 고름', o, n: 1 };
+  }
+  function trkChoice(s, title) { const o = trkOpts(s, 3); return o.length ? { k: 'trk', t: title, s: '장신구 하나를 고름', o, n: 1 } : null; }
+  function winFight(s) {
+    const f = s.f, kind = f.kind, hr = s.hero, tier = LEN[s.len].tiers[s.act];
+    hr.hp = f.u[0].hp; if (f.px) hr.trk = hr.trk.filter((k) => k !== 'phoenix');
+    s.st.fw++;
+    if (hr.c === 'patrol') hr.hp = min(hr.mhp, hr.hp + 1);
+    if (has(s, 'herb')) hr.hp = min(hr.mhp, hr.hp + 1);
+    let coin = 7 + tier * 3 + rnd(4); if (kind === 'elite') coin = Math.round(coin * 1.6); if (kind === 'boss') coin = 25; if (has(s, 'sack')) coin = Math.round(coin * 1.5);
+    hr.coin += coin;
+    if (kind === 'boss' && s.act === LEN[s.len].tiers.length - 1) { finish(s, true); return; }
+    s.f = null; s.todo = [];
+    if (kind === 'boss') hr.hp = min(hr.mhp, hr.hp + 5);
+    s.todo.push(rwChoice(s, coin, kind === 'boss' ? '우두머리를 쓰러뜨림' : kind === 'elite' ? '정예 전투 보상' : '전투 보상'));
+    if (kind !== 'fight') { const c = trkChoice(s, kind === 'boss' ? '우두머리의 유품' : '정예의 전리품'); if (c) s.todo.push(c); }
+    next(s);
+  }
+  function next(s) { if (s.todo.length) s.ch = s.todo.shift(); else advance(s); }
+  function startAct(s) {
+    const tier = LEN[s.len].tiers[s.act];
+    s.step = 0;
+    let pool = BOSS_IDS.filter((k) => EN[k].t === tier && !s.ub.includes(k)); if (!pool.length) pool = BOSS_IDS.filter((k) => EN[k].t === tier);
+    s.boss = pick(pool); s.ub.push(s.boss);
+    enter(s, 'fight');
+  }
+  function advance(s) {
+    const L0 = LEN[s.len];
+    if (s.step >= L0.S) { s.act++; startAct(s); return; }
+    const nx = s.step + 1; let o;
+    if (nx === L0.S) o = ['boss'];
+    else if (nx === L0.S - 1) o = ['rest', pick(['forge', 'shop'])];
+    else {
+      const n = 2 + (has(s, 'map') ? 1 : 0);
+      o = [rnd(5) < 2 ? 'elite' : 'fight'];
+      for (const k of shuf(['event', 'shop', 'rest', 'forge', 'event', o[0] === 'elite' ? 'fight' : 'elite'])) { if (o.length >= n) break; if (!o.includes(k)) o.push(k); }
+      o = shuf(o);
+    }
+    s.ch = { k: 'path', t: nx === L0.S ? '우두머리 앞' : '갈림길', s: (s.act + 1) + '막 ' + ACT_NAME[s.act] + ' · ' + (nx + 1) + '번째 구간', o: o.map((nd) => ({ t: 'node', nd })), n: 1 };
+  }
+  const priceOf = (s, o) => Math.max(1, Math.round((o.p || 0) * (has(s, 'scale') ? 0.75 : 1)));
+  function enter(s, nd) {
+    const hr = s.hero;
+    if (nd === 'fight' || nd === 'elite' || nd === 'boss') { genFight(s, nd); return; }
+    if (nd === 'rest') {
+      s.ch = { k: 'rest', t: '쉼터', s: '불을 피우고 쉬어 간다. 하나를 고름', o: [{ t: 'heal', n: Math.ceil(hr.mhp * 0.4) }].concat(upOpts(s, 2)), n: 1 };
+    } else if (nd === 'forge') {
+      const o = upOpts(s, 4);
+      s.ch = { k: 'forge', t: '대장간', s: has(s, 'hammer') ? '강화 둘을 고름' : '강화 하나를 고름', o: o.length ? o : [{ t: 'coin', n: 12, lab: '손볼 것이 없음' }], n: has(s, 'hammer') && o.length > 1 ? 2 : 1 };
+    } else if (nd === 'shop') {
+      const o = tilePool(s, 3).map((id) => ({ t: 'tile', id, p: 18 + TL[id].pw * 4 }))
+        .concat(trkOpts(s, 2).map((x) => (x.p = 42 + rnd(10), x)), upOpts(s, 1).map((x) => (x.p = 24, x)), [{ t: 'heal', n: 4, p: 14 }, { t: 'leave' }]);
+      s.ch = { k: 'shop', t: '행상', s: '값을 치르고 산다. 다 보았으면 떠남', o };
+    } else {
+      let pool = EVENTS.map((_, i) => i).filter((i) => !s.evs.includes(i)); if (!pool.length) { s.evs = []; pool = EVENTS.map((_, i) => i); }
+      const e = pick(pool); s.evs.push(e);
+      s.ch = { k: 'event', e, t: EVENTS[e].n, s: EVENTS[e].tx, o: EVENTS[e].o.map((q, j) => ({ t: 'ev', j, x: q.fx.some((x) => (x[0] === 'coin' && -x[1] > hr.coin) || (x[0] === 'bet' && x[1] > hr.coin)) ? 1 : 0 })), n: 1 };
+    }
+  }
+  function note(s, t) { s.msg = { id: (s.msg ? s.msg.id : 0) + 1, t }; }
+  function runFx(s, fx) {
+    const hr = s.hero, out = [];
+    for (const x of fx) {
+      const n = x[1];
+      switch (x[0]) {
+        case 'hp': if (n < 0) hr.hp = max(1, hr.hp + n); else hr.hp = min(hr.mhp, hr.hp + n); out.push('체력 ' + (n > 0 ? '+' : '−') + abs(n)); break;
+        case 'mhp': hr.mhp = max(4, hr.mhp + n); hr.hp = n > 0 ? hr.hp + n : min(hr.hp, hr.mhp); out.push('최대 체력 ' + (n > 0 ? '+' : '−') + abs(n)); break;
+        case 'coin': hr.coin = max(0, hr.coin + n); out.push('은화 ' + (n > 0 ? '+' : '−') + abs(n)); break;
+        case 'trk': { const o = trkOpts(s, 1)[0]; if (o) { addTrk(s, o.id); out.push('장신구: ' + TK[o.id].n); } else { hr.coin += 20; out.push('은화 +20'); } break; }
+        case 'tile': s.todo.push(rwChoice(s, 0, '새 타일')); break;
+        case 'up': { const o = upOpts(s, 3); if (o.length) s.todo.push({ k: 'forge', t: '손질', s: '강화 하나를 고름', o, n: 1 }); break; }
+        case 'upx': { const o = upOpts(s, 1, n)[0]; if (o) { hr.tiles[o.i].u.push(o.u); out.push(TL[hr.tiles[o.i].id].n + ': ' + UPS[o.u].n); } break; }
+        case 'bet': hr.coin -= n; if (rnd(2)) { hr.coin += 25; out.push('땄다. 은화 +' + (25 - n)); } else out.push('잃었다. 은화 −' + n); break;
+        case 'luck': if (rnd(2)) runFx(s, [['trk']]); else { hr.hp = max(1, hr.hp - 3); note(s, '덫이었다. 체력 −3'); } return;
+      }
+    }
+    if (out.length) note(s, out.join(' · '));
+  }
+  function give(s, o, c, ix) {   // true = 받음, false = 다른 고르기(버릴 타일)로 넘어감
+    const hr = s.hero;
+    switch (o.t) {
+      case 'tile': if (hr.tiles.length >= CAP) { s.ch = { k: 'drop', t: '타일이 가득 참', s: TL[o.id].n + '와 바꿀 타일을 고름(' + CAP + '개까지)', pi: ix, back: c, o: hr.tiles.map((_, i) => ({ t: 'drop', i })).concat([{ t: 'back' }]), n: 1 }; return false; } hr.tiles.push({ id: o.id, u: [] }); break;
+      case 'up': { const t = hr.tiles[o.i]; if (!t || t.u.length >= UP_MAX || !UPS[o.u].ok(eff(t))) throw new Error('강화할 수 없음'); t.u.push(o.u); break; }
+      case 'trk': addTrk(s, o.id); break;
+      case 'heal': hr.hp = min(hr.mhp, hr.hp + o.n); break;
+      case 'coin': hr.coin += o.n; break;
+    }
+    return true;
+  }
+  function reval(s, c) { for (const q of c.o) if (q.t === 'up' && !q.x) { const t = s.hero.tiles[q.i]; if (!t || t.u.length >= UP_MAX || !UPS[q.u].ok(eff(t)) || t.u.filter((x) => x === q.u).length >= 2) q.x = 1; } }
+  function after(s, c) {
+    reval(s, c);
+    c.n = (c.n || 1) - 1;
+    if (c.n > 0 && c.o.some((o) => !o.x && o.t !== 'coin')) s.ch = c; else { s.ch = null; next(s); }
+  }
+  function doPick(s, a) {
+    const c = s.ch, ix = a && a.t === 'pick' ? a.i | 0 : -1, o = c.o[ix], hr = s.hero;
+    if (!o || o.x) throw new Error('고를 수 없음');
+    switch (c.k) {
+      case 'cls': s.hero = mkHero(o.id); s.ch = null; startAct(s); return;
+      case 'path': s.ch = null; s.step++; enter(s, o.nd); return;
+      case 'event': s.ch = null; runFx(s, EVENTS[c.e].o[o.j].fx); next(s); return;
+      case 'drop': {
+        const b = c.back, po = b.o[c.pi];
+        if (o.t === 'back') { s.ch = b; return; }
+        if (b.k === 'shop') { const p = priceOf(s, po); if (hr.coin < p) throw new Error('은화가 모자람'); hr.coin -= p; }
+        hr.tiles[o.i] = { id: po.id, u: [] }; po.x = 1;
+        for (const q of b.o) if (q.t === 'up' && q.i === o.i) q.x = 1;
+        if (b.k === 'shop') s.ch = b; else after(s, b);
+        return;
+      }
+      case 'shop': {
+        if (o.t === 'leave') { s.ch = null; next(s); return; }
+        const p = priceOf(s, o); if (hr.coin < p) throw new Error('은화가 모자람');
+        if (give(s, o, c, ix)) { hr.coin -= p; o.x = 1; reval(s, c); }
+        return;
+      }
+    }
+    if (!give(s, o, c, ix)) return;
+    o.x = 1; after(s, c);
+  }
+  function init(players, opts) {
+    opts = opts || {};
+    const len = LEN[opts.len] ? opts.len : 'n';
+    const s = { v: 1, len, act: 0, step: 0, fc: 0, hero: null, f: null, ch: null, todo: [], last: null, lid: 0, msg: null, boss: null, ub: [], evs: [],
+      st: { k: 0, b: 0, dd: 0, dt: 0, fw: 0, bk: 0 }, res: null };
+    const open = CLS_IDS.filter((c) => !CLS[c].hid).concat(unlocked());
+    if (opts.hero === 'rand') { s.hero = mkHero(pick(open)); startAct(s); }
+    else s.ch = { k: 'cls', t: '누구로 나설까', s: '성벽길 끝의 봉화대까지. 인물마다 처음 가진 타일과 재주가 다름', o: open.map((id) => ({ t: 'cls', id })), n: 1 };
+    return s;
+  }
+  function apply(s, seat, a) {
+    if (s.res) throw new Error('끝난 판');
+    if (s.ch) { doPick(s, a); return s; }
+    if (!s.f) throw new Error('진행할 것이 없음');
+    const g = mkG(s, s.f, []), f = s.f;
+    const beat = heroAct(g, a);
+    let r = fover(f);
+    if (beat && !r) { enemyPhase(g); r = fover(f); }
+    s.last = { id: ++s.lid, fid: f.fid, ev: g.ev };
+    s.hero.hp = max(0, f.u[0].hp);
+    if (r === 'L') finish(s, false); else if (r === 'W') winFight(s);
+    return s;
+  }
+  function result(s) {
+    if (!s.res) return null;
+    const L0 = LEN[s.len], st = s.st, hr = s.hero, win = !!s.res.w;
+    const where = (s.act + 1) + '막 ' + ACT_NAME[s.act] + (s.f && s.f.kind === 'boss' ? ' · 우두머리 ' + EN[s.boss].n : ' · ' + (s.step + 1) + '번째 구간');
+    const hl = [CLS[hr.c].n + ' · ' + L0.n + '(' + L0.tiers.length + '막)'];
+    if (win) hl.push('남은 체력 ' + hr.hp + ' / ' + hr.mhp); else hl.push('쓰러진 곳: ' + where);
+    hl.push('타일 ' + hr.tiles.map(tName).join(', '));
+    if (hr.trk.length) hl.push('장신구 ' + hr.trk.map((k) => TK[k].n).join(', '));
+    return { winners: win ? [0] : [], title: win ? '봉화가 올랐다' : '길 위에서 쓰러졌다', text: win ? '성벽길 끝까지 닿았어요.' : where + '에서 멈췄어요.',
+      highlights: hl,
+      stats: [{ label: '이긴 전투', value: String(st.fw) }, { label: '쓰러뜨린 적', value: String(st.k) }, { label: '쓰러뜨린 우두머리', value: String(st.bk) }, { label: '지나온 박자', value: String(st.b) }, { label: '준 피해', value: String(st.dd) }, { label: '받은 피해', value: String(st.dt) }] };
+  }
+
+  /* ================= ④ AI ================= */
+  function simStep(g, a) {
+    const g2 = { f: cloneF(g.f), hr: g.hr, K: g.K, T: g.T, ev: null, S: null };
+    const beat = heroAct(g2, a);
+    if (beat && !fover(g2.f)) enemyPhase(g2);
+    return { g: g2, beat };
+  }
+  const foeCost = (hp) => hp * 14 + 45;
+  function evalF(g) {
+    const f = g.f, h = f.u[0];
+    if (h.hp <= 0) return -1e5 + f.t;
+    let v = h.hp * (h.hp <= 4 ? 75 : 60) - (h.hp <= 4 ? 0 : 60) - f.t * 0.4 - (f.px ? 300 : 0) - (f.wg ? 20 : 0);
+    if (f.u.length === 1 && !f.inc && !f.wv.length) return 1e4 + v;
+    const th = threats(g)[h.x]; if (th) v -= max(0, th[0] - h.st.blk) * 35 + th[1] * 15;
+    let near = 99;
+    for (let i = 1; i < f.u.length; i++) {
+      const e = f.u[i], s = e.st;
+      const dot = min(e.hp, s.poi * (s.poi + 1) / 2 + s.burn) * 0.7;
+      v -= foeCost(e.hp - dot);
+      if (s.stun > 0) v += 12; if (s.mark) v += s.mark * 6; if (s.weak) v += 5; if (s.root) v += 4;
+      const d = abs(e.x - h.x); if (d < near) near = d;
+    }
+    for (const w of f.wv) for (const q of w) v -= foeCost(EN[q[0]].hp);
+    if (f.inc) for (const q of f.inc.u) v -= foeCost(EN[q[0]].hp);
+    for (let i = 0; i < f.cd.length; i++) { const c = f.cd[i]; const T = g.T[i], on = f.q.includes(i); if (on) v += T.pw * 2; else if (c === 0) v += T.pw * 1.5; else if (c < 90) v -= c * 0.4;
+      if ((on || c === 0) && T.d > 0 && T.sh !== 'trap' && T.sh !== 'thru' && targets(f, h, T).main.length) v += on ? 6 : 3; }
+    { const np = min(f.np, 40); v += h.st.foc * 5 - np * np * 0.6; }
+    if (near < 99) v -= near * 1.5;
+    if (h.x === 0 || h.x === f.n - 1) v -= 6;
+    for (const x in f.gr) v += 6;
+    return v;
+  }
+  function look(g, depth, lvl, beams) {
+    if (depth <= 0.01 || fover(g.f)) return evalF(g);
+    const list = [];
+    for (const a of legal(g)) { let r; try { r = simStep(g, a); } catch (e) { continue; } list.push({ r, v: evalF(r.g) }); }
+    list.sort((x, y) => y.v - x.v);
+    let bv = -Infinity; const n = min(list.length, beams[min(lvl, beams.length - 1)]);
+    for (let i = 0; i < n; i++) { const c = list[i], v = look(c.r.g, depth - (c.r.beat ? 1 : 0.34), lvl + 1, beams); if (v > bv) bv = v; }
+    return bv - min(g.f.np, 30) * 1.5;   // 같은 값이면 먼저 치는 쪽(미루기 방지)
+  }
+  function aiFight(s, lv) {
+    const g = mkG(s, s.f, null);
+    const depth = lv >= 3 ? 3 : lv === 2 ? 2 : 1, beams = lv >= 3 ? [7, 3, 3] : [6, 3, 2], noise = lv >= 3 ? 0 : lv === 2 ? 30 : 110;
+    const list = [];
+    for (const a of legal(g)) { let r; try { r = simStep(g, a); } catch (e) { continue; } list.push({ a, r, v: evalF(r.g) }); }
+    list.sort((x, y) => y.v - x.v);
+    let best = list[0], bv = -Infinity; const n = min(list.length, beams[0]);
+    for (let i = 0; i < n; i++) {
+      const c = list[i]; let v = look(c.r.g, depth - (c.r.beat ? 1 : 0.34), 1, beams) + (noise ? Math.random() * noise : 0);
+      if (c.a.t === 'wait') v -= 2; if (c.a.t === 'turn') v -= 1;
+      if (v > bv) { bv = v; best = c; }
+    }
+    return best ? best.a : { t: 'wait' };
+  }
+  const tileVal = (t) => TL[t.id].pw * 10 + t.u.length * 8;
+  function aiPick(s, lv) {
+    const c = s.ch, hr = s.hero, ok = [];
+    c.o.forEach((o, i) => { if (!o.x && !(c.k === 'shop' && o.t !== 'leave' && priceOf(s, o) > hr.coin)) ok.push(i); });
+    if (c.k === 'cls') return pick(ok);
+    if (lv <= 1) {
+      if (c.k === 'drop') return pick(ok.filter((i) => c.o[i].t === 'drop'));
+      if (c.k === 'shop' && rnd(2)) return c.o.findIndex((o) => o.t === 'leave');
+      return pick(ok);
+    }
+    const ratio = hr.hp / hr.mhp, minOwn = Math.min.apply(null, hr.tiles.map(tileVal)), nDmg = hr.tiles.filter((t) => TL[t.id].d > 0).length;
+    const val = (o) => {
+      switch (o.t) {
+        case 'tile': { const v = TL[o.id].pw * 10 + (TL[o.id].d > 0 && nDmg < 4 ? 8 : 0); return hr.tiles.length >= CAP ? v - minOwn - 12 : v; }
+        case 'up': return 21 + (o.u === 'edge' ? 5 : o.u === 'grip' ? 3 : 0) + TL[hr.tiles[o.i].id].pw;
+        case 'trk': return 30;
+        case 'heal': return min(o.n, hr.mhp - hr.hp) * (ratio < 0.5 ? 9 : 5);
+        case 'coin': return o.n;
+        case 'node': return o.nd === 'fight' ? 18 + ratio * 10 : o.nd === 'elite' ? (ratio > 0.7 ? 34 : 2) : o.nd === 'rest' ? (ratio < 0.55 ? 45 : 14) : o.nd === 'forge' ? 24 : o.nd === 'shop' ? (hr.coin >= 40 ? 27 : 8) : o.nd === 'event' ? 22 : 0;
+        case 'ev': { let v = 0; for (const x of EVENTS[c.e].o[o.j].fx) v += x[0] === 'hp' ? (x[1] < 0 ? x[1] * (ratio < 0.5 ? 12 : 5) : min(x[1], hr.mhp - hr.hp) * 6) : x[0] === 'mhp' ? x[1] * 12 : x[0] === 'coin' ? x[1] : x[0] === 'trk' ? 30 : x[0] === 'tile' ? 20 : x[0] === 'up' ? 22 : x[0] === 'upx' ? 14 : x[0] === 'luck' ? (hr.hp > 6 ? 6 : -10) : -2; return v; }
+        case 'drop': return -tileVal(hr.tiles[o.i]);
+        case 'back': return -(TL[c.back.o[c.pi].id].pw * 10) - 13;
+        case 'leave': return 0;
+      }
+      return 0;
+    };
+    let best = ok[0], bv = -Infinity;
+    for (const i of ok) { const o = c.o[i]; let v = val(o) + (lv === 2 ? Math.random() * 12 : Math.random()); if (c.k === 'shop' && o.t !== 'leave') v = v - priceOf(s, o) * 0.55 - (o.t === 'heal' && ratio > 0.7 ? 30 : 0); if (v > bv) { bv = v; best = i; } }
+    return best;
+  }
+  function ai(s, seat, lv) { lv = lv || 2; return s.ch ? { t: 'pick', i: aiPick(s, lv) } : aiFight(s, lv); }
+  /* ================= ⑤ 글 · 그림 도우미 ================= */
+  function shTxt(T) {
+    const r = T.r || 1;
+    switch (T.sh) {
+      case 'mel': return r === 1 ? '앞 1칸' : T.prc ? '앞 ' + r + '칸 모두' : '앞 ' + r + '칸 안의 첫 대상';
+      case 'shot': return T.r ? '앞 ' + r + '칸 안의 ' + (T.prc ? '모두' : '첫 대상') : T.prc ? '앞줄의 모두' : '앞줄의 첫 대상';
+      case 'bshot': return '뒷줄의 첫 대상';
+      case 'both': return '양쪽 줄의 첫 대상';
+      case 'back': return '뒤 ' + r + '칸';
+      case 'side': return '양옆 ' + r + '칸 모두';
+      case 'lob': return '앞 ' + r + '번째 칸';
+      case 'aim': return '겨냥한 칸';
+      case 'thru': return '앞 ' + r + '칸을 뚫고 지나감';
+      case 'trap': return '앞 칸에 덫';
+      case 'sum': return '곁에 부하를 부름';
+      case 'mend': return '다친 적 하나를 고침';
+      case 'eblink': return '자리를 옮김';
+    }
+    return '자신';
+  }
+  /* 타일 글(자료에서 자동). enemy: 적의 공격이면 피해 수치를 d로 */
+  function tDesc(T, noCd) {
+    const a = [];
+    if (T.pm === 'dash') a.push('막힐 때까지 달려든 뒤 앞 1칸'); else if (T.sh !== 'self') a.push(shTxt(T));
+    if (T.sh === 'trap') a.push('밟은 적에게 피해 ' + T.d + ' · ' + kwLab('root', T.root));
+    else {
+      if (T.d > 0) a.push('피해 ' + T.d + (T.hits > 1 ? ' ×' + T.hits : ''));
+      if (T.sp != null) a.push(T.sp > 0 ? kwLab('sp', T.sp) : '양옆 칸에도');
+      for (const k of ['push', 'pull', 'stun', 'poi', 'burn', 'mark', 'weak', 'root', 'exe', 'bs', 'combo', 'last', 'far', 'leech', 'blk', 'ctr', 'foc', 'haste']) if (T[k]) a.push(kwLab(k, T[k]));
+      if (T.flip) a.push(KW.flip.n);
+      if (T.heal) a.push('체력 +' + T.heal);
+      if (T.am === 'swap') a.push('대상과 자리를 바꿈'); else if (T.am === 'vault') a.push('대상을 넘어가 등 뒤에 섬'); else if (T.am === 'blink') a.push('대상의 뒤로 옮겨 감'); else if (T.am === 'back') a.push('앞을 본 채 뒤로 ' + (T.mv || 1) + '칸');
+      if (T.echo) a.push('같은 실행에서 바로 앞 타일을 한 번 더');
+      if (T.sui) a.push('쓰고 나면 쓰러짐');
+    }
+    if (T.lt) a.push(KW.lt.n);
+    if (T.once) a.push(KW.once.n);
+    if (!noCd && !T.e && !T.once) a.push('대기 ' + T.cd);
+    return a.join(' · ');
+  }
+  function aDesc(a) {   // 적의 공격 한 줄
+    const B = TL[a[0]], o = a[4] || {}, T = Object.assign({}, B, o, { d: a[1] });
+    let t = B.n + ' — ' + (B.sh === 'sum' ? '곁에 부름: ' + EN[o.sum].n + '(최대 ' + o.cap + ')' : B.sh === 'mend' ? '다친 적 하나의 체력 +' + (o.hl || 2) : B.sh === 'eblink' ? (o.away ? '붙으면 먼 끝으로 사라짐' : '등 뒤로 옮겨 옴') : tDesc(T, 1));
+    t += ' · ' + (a[2] ? '준비 ' + a[2] + '박자' : '준비 없음');
+    return t;
+  }
+  function trTxt(tr) { const a = []; for (const k of ['sh', 'arm', 'thorn', 'boom']) if (tr[k]) a.push(kwLab(k, tr[k])); for (const k of ['heavy', 'fast', 'slow', 'agile', 'split', 'drum', 'rage']) if (tr[k]) a.push(KW[k].n); return a.join(' · '); }
+  const GL = {   // 24×24, currentColor
+    armor: '<path d="M6 4l6-2 6 2v8c0 5-3 8-6 10-3-2-6-5-6-10z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 6v12" stroke="currentColor" stroke-width="2"/>',
+    blade: '<path d="M5 19L17 5l3-1-1 3L7 21z" fill="currentColor"/><path d="M4 16l4 4" stroke="currentColor" stroke-width="2.4"/>',
+    boot: '<path d="M8 3h5v10l6 3v4H7z" fill="currentColor"/>',
+    ring: '<circle cx="12" cy="13" r="7" fill="none" stroke="currentColor" stroke-width="2.6"/><path d="M9 5l3-3 3 3-3 3z" fill="currentColor"/>',
+    clock: '<path d="M6 3h12v3l-4 6 4 6v3H6v-3l4-6-4-6z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 19h6l-3-4z" fill="currentColor"/>',
+    drop: '<path d="M12 3c4 6 6 9 6 12a6 6 0 0 1-12 0c0-3 2-6 6-12z" fill="currentColor"/>',
+    flame: '<path d="M12 2c1 4 6 6 6 12a6 6 0 0 1-12 0c0-3 2-4 3-7 1 2 2 2 3-5z" fill="currentColor"/>',
+    bag: '<path d="M8 8h8l3 10a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3z" fill="currentColor"/><path d="M9 7l3-4 3 4" fill="none" stroke="currentColor" stroke-width="2"/>',
+    herb: '<path d="M12 21V9M12 13C7 13 5 9 5 5c5 0 7 3 7 8zM12 11c0-4 2-7 7-7 0 4-2 7-7 7z" fill="none" stroke="currentColor" stroke-width="2"/>',
+    eye: '<path d="M2 12c3-5 7-7 10-7s7 2 10 7c-3 5-7 7-10 7s-7-2-10-7z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3.2" fill="currentColor"/>',
+    flag: '<path d="M6 2v20" stroke="currentColor" stroke-width="2.4"/><path d="M7 3h12l-3 4.5 3 4.5H7z" fill="currentColor"/>',
+    feather: '<path d="M19 3C10 4 6 9 6 16l-2 5 3-3c7 0 11-5 12-15z" fill="currentColor"/>',
+    shield: '<path d="M4 4h16v7c0 5-4 9-8 11-4-2-8-6-8-11z" fill="currentColor"/>',
+    coin: '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M12 8v8M9.5 10h4a1.5 1.5 0 0 1 0 4h-3" fill="none" stroke="currentColor" stroke-width="1.8"/>',
+    hammer: '<path d="M4 6h11v6H4z" fill="currentColor"/><path d="M11 12l8 9" stroke="currentColor" stroke-width="3"/>',
+    map: '<path d="M3 5l6-2 6 2 6-2v16l-6 2-6-2-6 2z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 3v16M15 5v16" stroke="currentColor" stroke-width="1.6"/>',
+    back: '<path d="M14 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="3"/>',
+  };
+  const glyph = (k, sz, col) => '<svg viewBox="0 0 24 24" width="' + (sz || 24) + '" height="' + (sz || 24) + '" style="color:' + (col || '#e3ae45') + '">' + (GL[k] || GL.ring) + '</svg>';
+  /* 타일 얼굴: 작은 줄 그림(주인공 칸 · 닿는 칸 · 움직임). 자료에서 자동 */
+  function tileSvg(T, w, h) {
+    const N = 7, wide = T.sh === 'side' || T.sh === 'back' || T.sh === 'bshot' || T.sh === 'both' || T.am === 'back';
+    const hx = wide ? 3 : 1, f = { n: N, u: [] }, u = { x: hx, f: 1 };
+    let R = { c: [], sp: [] };
+    if (T.sh === 'trap') R.c = [hx + 1]; else if (T.sh !== 'self') R = reach(f, u, T.pm === 'dash' ? Object.assign({}, T, { sh: 'shot', r: 0 }) : T);
+    const cs = 10, gap = 2, W = N * cs + (N - 1) * gap, y0 = 9;
+    let o = '<svg viewBox="0 0 ' + W + ' 22" width="' + w + '" height="' + h + '" preserveAspectRatio="xMidYMid meet">';
+    for (let i = 0; i < N; i++) {
+      const hit = R.c.includes(i), sp = R.sp.includes(i), me = i === hx;
+      const fill = me ? '#f2e9d8' : hit ? (T.d > 0 || T.sh === 'trap' ? '#ee6a55' : '#e3ae45') : sp ? '#b8683a' : '#4d4260';
+      o += '<rect x="' + (i * (cs + gap)) + '" y="' + y0 + '" width="' + cs + '" height="' + cs + '" rx="2" fill="' + fill + '"' + (hit && !T.prc && (T.sh === 'shot' || T.sh === 'bshot' || T.sh === 'both' || (T.sh === 'mel' && T.r > 1)) ? ' opacity="' + (0.95 - 0.12 * abs(i - hx)) + '"' : '') + '/>';
+    }
+    const cx = (i) => i * (cs + gap) + cs / 2, arr = (a, b) => '<path d="M' + cx(a) + ' 4H' + cx(b) + 'M' + (cx(b) - sgn(b - a) * 3) + ' 1.5L' + cx(b) + ' 4L' + (cx(b) - sgn(b - a) * 3) + ' 6.5" fill="none" stroke="#9fe0b0" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>';
+    o += '<path d="M' + (cx(hx) - 2) + ' ' + (y0 + 2.5) + 'l4 2.5-4 2.5z" fill="#17131f"/>';
+    if (T.pm === 'dash') o += arr(hx, hx + 4); else if (T.sh === 'thru') o += arr(hx, min(N - 1, hx + (T.r || 1)));
+    if (T.am === 'back') o += arr(hx, hx - (T.mv || 1)); else if (T.am === 'vault') o += arr(hx, hx + 2); else if (T.am === 'blink') o += arr(hx, hx + 4); else if (T.am === 'swap') o += arr(hx, hx + 1) + arr(hx + 1, hx).replace('M' + cx(hx + 1) + ' 4', 'M' + cx(hx + 1) + ' 4');
+    if (T.push) o += arr(hx + 1, hx + 1 + min(3, T.push)); if (T.pull) o += arr(hx + 4, hx + 1);
+    return o + '</svg>';
+  }
+  /* 인물 그림(캔버스). 발끝 가운데가 원점, 오른쪽을 봄. S = 키 */
+  function shape(c, pts, fill, stroke) { c.beginPath(); c.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) c.lineTo(pts[i], pts[i + 1]); c.closePath(); c.fillStyle = fill; c.fill(); if (stroke) { c.strokeStyle = stroke; c.stroke(); } }
+  function disc(c, x, y, r, fill, stroke) { c.beginPath(); c.arc(x, y, r, 0, 7); c.fillStyle = fill; c.fill(); if (stroke) { c.strokeStyle = stroke; c.stroke(); } }
+  function seg(c, x1, y1, x2, y2, w, col) { c.beginPath(); c.moveTo(x1, y1); c.lineTo(x2, y2); c.lineWidth = w; c.strokeStyle = col; c.stroke(); }
+  const BODY = {
+    man(c, S, bd, ac, sp, rim) {
+      const w = S * 0.16 * (sp.k || 1);
+      c.lineWidth = max(1, S * 0.022);
+      shape(c, [-w * 0.95, 0, -w * 0.4, -S * 0.42, w * 0.6, -S * 0.42, w * 1.05, 0, w * 0.45, 0, w * 0.08, -S * 0.22, -w * 0.3, 0], bd, rim);
+      shape(c, [-w, -S * 0.38, -w * 1.12, -S * 0.72, w * 0.98, -S * 0.75, w * 0.82, -S * 0.38], bd, rim);
+      disc(c, w * 0.12, -S * 0.86, S * 0.105, bd, rim);
+      const hx = w * 0.12, hy = -S * 0.86, r = S * 0.105;
+      switch (sp.hd) {
+        case 'hood': shape(c, [hx - r * 1.25, hy + r * 0.9, hx - r * 0.6, hy - r * 1.35, hx + r * 0.9, hy - r * 1.05, hx + r * 0.2, hy - r * 0.2, hx - r * 0.3, hy + r * 1.0], ac); break;
+        case 'helm': c.beginPath(); c.arc(hx, hy, r * 1.12, Math.PI, 0); c.closePath(); c.fillStyle = ac; c.fill(); seg(c, hx + r * 0.75, hy, hx + r * 0.75, hy + r * 0.7, S * 0.03, ac); break;
+        case 'hat': seg(c, hx - r * 1.7, hy - r * 0.55, hx + r * 1.7, hy - r * 0.55, S * 0.035, ac); shape(c, [hx - r * 0.9, hy - r * 0.6, hx, hy - r * 1.9, hx + r * 0.9, hy - r * 0.6], ac); break;
+        case 'horn': c.beginPath(); c.arc(hx, hy, r * 1.1, Math.PI, 0); c.closePath(); c.fillStyle = ac; c.fill(); shape(c, [hx - r * 1.0, hy - r * 0.5, hx - r * 1.9, hy - r * 1.9, hx - r * 0.4, hy - r * 1.0], ac); shape(c, [hx + r * 1.0, hy - r * 0.5, hx + r * 1.9, hy - r * 1.9, hx + r * 0.4, hy - r * 1.0], ac); break;
+        case 'mask': shape(c, [hx - r * 0.2, hy - r * 0.75, hx + r * 1.05, hy - r * 0.6, hx + r * 1.0, hy + r * 0.75, hx - r * 0.1, hy + r * 0.6], ac); break;
+      }
+      seg(c, w * 0.4, -S * 0.66, S * 0.26, -S * 0.52, S * 0.07, bd);
+    },
+    dog(c, S, bd, ac, sp, rim) {
+      c.lineWidth = max(1, S * 0.02);
+      for (const x of [-0.24, -0.14, 0.14, 0.24]) seg(c, S * x, -S * 0.26, S * (x + (x < 0 ? -0.03 : 0.04)), 0, S * 0.055, bd);
+      c.beginPath(); c.ellipse(0, -S * 0.3, S * 0.3, S * 0.13, -0.08, 0, 7); c.fillStyle = bd; c.fill(); c.lineWidth = max(1, S * 0.02); c.strokeStyle = rim; c.stroke();
+      shape(c, [S * 0.2, -S * 0.36, S * 0.3, -S * 0.56, S * 0.5, -S * 0.44, S * 0.52, -S * 0.36, S * 0.3, -S * 0.3], bd, rim);
+      shape(c, [S * 0.28, -S * 0.54, S * 0.3, -S * 0.68, S * 0.38, -S * 0.52], ac);
+      seg(c, -S * 0.28, -S * 0.34, -S * 0.42, -S * 0.5, S * 0.04, bd);
+      disc(c, S * 0.4, -S * 0.45, S * 0.018, ac);
+    },
+    boar(c, S, bd, ac, sp, rim) {
+      for (const x of [-0.26, -0.14, 0.12, 0.24]) seg(c, S * x, -S * 0.3, S * x, 0, S * 0.07, bd);
+      c.beginPath(); c.ellipse(0, -S * 0.38, S * 0.36, S * 0.22, 0, 0, 7); c.fillStyle = bd; c.fill(); c.lineWidth = max(1, S * 0.02); c.strokeStyle = rim; c.stroke();
+      shape(c, [S * 0.22, -S * 0.52, S * 0.52, -S * 0.36, S * 0.5, -S * 0.22, S * 0.24, -S * 0.2], bd, rim);
+      shape(c, [S * 0.4, -S * 0.26, S * 0.5, -S * 0.42, S * 0.46, -S * 0.24], ac);
+      for (let i = 0; i < 4; i++) shape(c, [-S * 0.24 + i * S * 0.11, -S * 0.56, -S * 0.2 + i * S * 0.11, -S * 0.7, -S * 0.14 + i * S * 0.11, -S * 0.57], ac);
+      disc(c, S * 0.36, -S * 0.42, S * 0.02, ac);
+    },
+    toad(c, S, bd, ac, sp, rim) {
+      c.beginPath(); c.ellipse(0, -S * 0.22, S * 0.36, S * 0.23, 0, 0, 7); c.fillStyle = bd; c.fill(); c.lineWidth = max(1, S * 0.02); c.strokeStyle = rim; c.stroke();
+      shape(c, [-S * 0.34, 0, -S * 0.36, -S * 0.16, -S * 0.16, -S * 0.1, -S * 0.12, 0], bd, rim); shape(c, [S * 0.12, 0, S * 0.16, -S * 0.12, S * 0.36, -S * 0.16, S * 0.4, 0], bd, rim);
+      disc(c, S * 0.12, -S * 0.44, S * 0.07, bd, rim); disc(c, S * 0.27, -S * 0.4, S * 0.06, bd, rim); disc(c, S * 0.14, -S * 0.45, S * 0.028, ac); disc(c, S * 0.29, -S * 0.41, S * 0.024, ac);
+      seg(c, S * 0.1, -S * 0.2, S * 0.34, -S * 0.22, S * 0.02, ac);
+    },
+    bug(c, S, bd, ac, sp, rim) {
+      for (const x of [-0.22, -0.08, 0.08, 0.22]) seg(c, S * x, -S * 0.16, S * x * 1.35, 0, S * 0.04, bd);
+      c.beginPath(); c.arc(0, -S * 0.14, S * 0.32, Math.PI, 0); c.closePath(); c.fillStyle = bd; c.fill(); c.lineWidth = max(1, S * 0.02); c.strokeStyle = rim; c.stroke();
+      for (let i = 0; i < 5; i++) { const a = Math.PI * (0.18 + i * 0.16), x = -Math.cos(a) * S * 0.31, y = -S * 0.14 - Math.sin(a) * S * 0.31; shape(c, [x - S * 0.04, y + S * 0.02, x - Math.cos(a) * S * 0.13, y - Math.sin(a) * S * 0.13, x + S * 0.04, y + S * 0.02], ac); }
+      disc(c, S * 0.25, -S * 0.2, S * 0.025, ac);
+    },
+    worm(c, S, bd, ac, sp, rim) {
+      c.beginPath(); c.moveTo(-S * 0.3, -S * 0.07); c.quadraticCurveTo(-S * 0.1, -S * 0.36, S * 0.05, -S * 0.12); c.quadraticCurveTo(S * 0.16, S * 0.02, S * 0.26, -S * 0.3);
+      c.lineWidth = S * 0.17; c.strokeStyle = rim; c.stroke(); c.lineWidth = S * 0.14; c.strokeStyle = bd; c.stroke();
+      disc(c, S * 0.27, -S * 0.33, S * 0.05, ac);
+    },
+    sac(c, S, bd, ac, sp, rim) {
+      c.beginPath(); c.ellipse(0, -S * 0.3, S * 0.22, S * 0.3, 0, 0, 7); c.fillStyle = bd; c.fill(); c.lineWidth = max(1, S * 0.02); c.strokeStyle = rim; c.stroke();
+      c.lineWidth = S * 0.02; c.strokeStyle = ac; c.beginPath(); c.moveTo(-S * 0.1, -S * 0.5); c.quadraticCurveTo(0, -S * 0.3, -S * 0.12, -S * 0.1); c.moveTo(S * 0.08, -S * 0.52); c.quadraticCurveTo(S * 0.16, -S * 0.3, S * 0.06, -S * 0.08); c.stroke();
+      disc(c, -S * 0.02, -S * 0.3, S * 0.035, ac);
+    },
+    statue(c, S, bd, ac, sp, rim) {
+      const w = S * 0.17 * min(1.25, sp.k || 1);
+      c.lineWidth = max(1, S * 0.022);
+      shape(c, [-w, 0, -w, -S * 0.36, -w * 0.15, -S * 0.36, -w * 0.15, 0], bd, rim); shape(c, [w * 0.15, 0, w * 0.15, -S * 0.36, w, -S * 0.36, w, 0], bd, rim);
+      shape(c, [-w * 1.25, -S * 0.34, -w * 1.25, -S * 0.74, w * 1.25, -S * 0.74, w * 1.25, -S * 0.34], bd, rim);
+      shape(c, [-w * 0.6, -S * 0.74, -w * 0.6, -S * 0.98, w * 0.7, -S * 0.98, w * 0.7, -S * 0.74], bd, rim);
+      shape(c, [w * 1.25, -S * 0.7, w * 1.9, -S * 0.66, w * 1.9, -S * 0.36, w * 1.25, -S * 0.4], bd, rim);
+      seg(c, w * 0.05, -S * 0.87, w * 0.6, -S * 0.87, S * 0.035, ac);
+      seg(c, -w * 0.7, -S * 0.56, w * 0.7, -S * 0.56, S * 0.02, ac);
+    },
+    jar(c, S, bd, ac, sp, rim) {
+      c.lineWidth = max(1, S * 0.022);
+      shape(c, [-S * 0.12, 0, -S * 0.24, -S * 0.3, -S * 0.2, -S * 0.52, -S * 0.1, -S * 0.6, -S * 0.12, -S * 0.68, S * 0.12, -S * 0.68, S * 0.1, -S * 0.6, S * 0.2, -S * 0.52, S * 0.24, -S * 0.3, S * 0.12, 0], bd, rim);
+      c.lineWidth = S * 0.03; c.strokeStyle = ac; c.beginPath(); c.moveTo(-S * 0.04, -S * 0.72); c.lineTo(S * 0.05, -S * 0.86); c.lineTo(-S * 0.03, -S * 0.9); c.lineTo(S * 0.07, -S * 1.04); c.stroke();
+      seg(c, -S * 0.2, -S * 0.4, S * 0.2, -S * 0.4, S * 0.025, ac);
+    },
+    wraith(c, S, bd, ac, sp, rim) {
+      const k = sp.k || 1;
+      c.lineWidth = max(1, S * 0.022);
+      shape(c, [-S * 0.06, -S * 0.04, -S * 0.2 * k, -S * 0.5, -S * 0.14 * k, -S * 0.86, S * 0.02, -S * 0.99, S * 0.16 * k, -S * 0.84, S * 0.17 * k, -S * 0.5, S * 0.1, -S * 0.2, S * 0.02, -S * 0.12], bd, rim);
+      disc(c, S * 0.04, -S * 0.82, S * 0.022, ac); disc(c, S * 0.11, -S * 0.82, S * 0.022, ac);
+      seg(c, S * 0.08, -S * 0.62, S * 0.26, -S * 0.52, S * 0.06, bd);
+    },
+  };
+  const WP = {
+    sword(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.56, -S * 0.9, S * 0.05, ac); seg(c, S * 0.24, -S * 0.6, S * 0.36, -S * 0.52, S * 0.035, ac); },
+    club(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.34, -S * 0.66, S * 0.05, ac); seg(c, S * 0.34, -S * 0.66, S * 0.5, -S * 0.92, S * 0.1, ac); },
+    spear(c, S, ac) { seg(c, -S * 0.12, -S * 0.42, S * 0.66, -S * 0.64, S * 0.035, ac); shape(c, [S * 0.62, -S * 0.7, S * 0.84, -S * 0.69, S * 0.65, -S * 0.58], ac); },
+    dagger(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.48, -S * 0.62, S * 0.045, ac); },
+    twin(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.54, -S * 0.82, S * 0.045, ac); seg(c, S * 0.16, -S * 0.46, S * 0.5, -S * 0.36, S * 0.045, ac); },
+    axe(c, S, ac) { seg(c, S * 0.24, -S * 0.42, S * 0.42, -S * 1.02, S * 0.045, ac); shape(c, [S * 0.38, -S * 0.98, S * 0.62, -S * 1.06, S * 0.66, -S * 0.8, S * 0.42, -S * 0.82], ac); },
+    bow(c, S, ac) { c.beginPath(); c.arc(S * 0.2, -S * 0.56, S * 0.3, -1.15, 1.15); c.lineWidth = S * 0.04; c.strokeStyle = ac; c.stroke(); seg(c, S * 0.2 + Math.cos(1.15) * S * 0.3, -S * 0.56 - Math.sin(1.15) * S * 0.3, S * 0.2 + Math.cos(1.15) * S * 0.3, -S * 0.56 + Math.sin(1.15) * S * 0.3, S * 0.015, ac); },
+    xbow(c, S, ac) { seg(c, S * 0.14, -S * 0.54, S * 0.56, -S * 0.56, S * 0.05, ac); seg(c, S * 0.5, -S * 0.72, S * 0.5, -S * 0.4, S * 0.035, ac); },
+    sling(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.4, -S * 0.9, S * 0.018, ac); disc(c, S * 0.41, -S * 0.93, S * 0.05, ac); },
+    shield(c, S, ac, bd) { shape(c, [S * 0.2, -S * 0.78, S * 0.4, -S * 0.74, S * 0.42, -S * 0.36, S * 0.3, -S * 0.24, S * 0.2, -S * 0.34], ac); seg(c, S * 0.3, -S * 0.7, S * 0.3, -S * 0.34, S * 0.02, bd); },
+    torch(c, S, ac) { seg(c, S * 0.26, -S * 0.5, S * 0.4, -S * 0.82, S * 0.04, ac); disc(c, S * 0.42, -S * 0.9, S * 0.085, '#ff9a4a'); disc(c, S * 0.43, -S * 0.9, S * 0.04, '#ffe08a'); },
+    drum(c, S, ac, bd) { disc(c, S * 0.24, -S * 0.44, S * 0.15, ac); disc(c, S * 0.24, -S * 0.44, S * 0.1, bd); seg(c, S * 0.26, -S * 0.56, S * 0.44, -S * 0.7, S * 0.03, ac); },
+    net(c, S, ac) { c.beginPath(); c.arc(S * 0.42, -S * 0.62, S * 0.16, 0, 7); c.lineWidth = S * 0.02; c.strokeStyle = ac; c.stroke(); seg(c, S * 0.3, -S * 0.72, S * 0.54, -S * 0.52, S * 0.015, ac); seg(c, S * 0.3, -S * 0.52, S * 0.54, -S * 0.72, S * 0.015, ac); },
+    bomb(c, S, ac) { disc(c, S * 0.32, -S * 0.54, S * 0.1, ac); seg(c, S * 0.36, -S * 0.63, S * 0.42, -S * 0.74, S * 0.02, ac); disc(c, S * 0.43, -S * 0.76, S * 0.03, '#ffe08a'); },
+    hook(c, S, ac) { seg(c, S * 0.26, -S * 0.52, S * 0.5, -S * 0.78, S * 0.03, ac); c.beginPath(); c.arc(S * 0.56, -S * 0.72, S * 0.08, Math.PI * 1.2, Math.PI * 0.4); c.lineWidth = S * 0.035; c.strokeStyle = ac; c.stroke(); },
+    staff(c, S, ac) { seg(c, S * 0.3, 0, S * 0.3, -S * 1.0, S * 0.035, ac); disc(c, S * 0.3, -S * 1.04, S * 0.06, ac); },
+    horn(c, S, ac) { shape(c, [S * 0.22, -S * 0.8, S * 0.56, -S * 0.98, S * 0.58, -S * 0.72], ac); },
+    flame(c, S) { shape(c, [S * 0.34, -S * 0.9, S * 0.62, -S * 0.86, S * 0.34, -S * 0.8], '#ff9a4a'); },
+  };
+  const HERO_BD = '#e9dcc0';
+  function drawFig(c, sp, S, flash, hero) {
+    const bd = flash ? '#fff6dc' : hero ? HERO_BD : '#1b1622', ac = flash ? '#fff6dc' : sp.c, rim = flash ? '#fff' : hero ? '#8a6a2a' : sp.c;
+    c.lineJoin = 'round'; c.lineCap = 'round';
+    (BODY[sp.b] || BODY.man)(c, S, bd, ac, sp, rim);
+    if (sp.w && WP[sp.w]) WP[sp.w](c, S, ac, bd);
+  }
+  const figCache = {};
+  function figImg(sp, hero, px) {
+    const key = JSON.stringify(sp) + (hero ? 'H' : '');
+    if (!figCache[key]) {
+      if (typeof document === 'undefined') return '';
+      const cv = document.createElement('canvas'); cv.width = cv.height = 112; const c = cv.getContext('2d');
+      c.translate(46, 104); drawFig(c, sp, sp.b && sp.b !== 'statue' && sp.b !== 'wraith' && sp.b !== 'jar' ? 96 : 84, 0, hero);
+      figCache[key] = cv.toDataURL();
+    }
+    return '<img src="' + figCache[key] + '" width="' + (px || 40) + '" height="' + (px || 40) + '" alt="" style="background:#4a3d5c;border-radius:8px">';
+  }
+  /* 배경: 막마다 다른 하늘과 먼 윤곽 */
+  const SKY = [['#3b3350', '#b9785a'], ['#26384a', '#6f9a94'], ['#2b2a48', '#a0627a'], ['#17182a', '#4a4470']];
+  function backdrop(c, W, H, act, base) {
+    const sk = SKY[act % 4], g = c.createLinearGradient(0, 0, 0, base);
+    g.addColorStop(0, sk[0]); g.addColorStop(1, sk[1]); c.fillStyle = g; c.fillRect(0, 0, W, base);
+    /* 해(달)와 구름 띠 — 하늘이 높을 때 비어 보이지 않게 */
+    const sy = max(34, base - 150 - (act % 4) * 14), sxx = W * (0.24 + 0.14 * (act % 4));
+    c.fillStyle = act % 4 === 3 ? 'rgba(232,226,255,.8)' : 'rgba(255,214,150,.75)'; c.beginPath(); c.arc(sxx, sy, 15, 0, 7); c.fill();
+    c.fillStyle = act % 4 === 3 ? 'rgba(232,226,255,.08)' : 'rgba(255,214,150,.1)'; c.beginPath(); c.arc(sxx, sy, 34, 0, 7); c.fill();
+    c.fillStyle = 'rgba(255,255,255,.07)';
+    for (let i = 0; i < 5; i++) { const y = base - 110 - i * 46; if (y < 14) break; const x = ((i * 137) % max(1, W)) - 30, w = 120 + (i % 3) * 50; c.fillRect(x, y, w, 5); c.fillRect(x + 26, y + 9, w * 0.6, 3); }
+    c.fillStyle = 'rgba(20,16,28,.55)';
+    if (act % 4 === 0) { c.beginPath(); c.moveTo(0, base); for (let x = 0; x <= W; x += 40) c.lineTo(x, base - 46 - 18 * Math.sin(x * 0.011) - 10 * Math.sin(x * 0.031 + 1)); c.lineTo(W, base); c.fill(); for (let x = 6; x < W; x += 34) c.fillRect(x, base - 22, 20, 22); c.fillRect(0, base - 12, W, 12); }
+    else if (act % 4 === 1) { for (let x = -20; x < W; x += 90) { c.beginPath(); c.moveTo(x, base); c.lineTo(x, base - 70); c.arc(x + 45, base - 70, 33, Math.PI, 0, true); c.lineTo(x + 12, base); c.fill(); c.fillRect(x + 78, base - 70, 12, 70); } c.fillRect(0, base - 78, W, 10); c.fillStyle = 'rgba(160,220,210,.18)'; for (let x = 10; x < W; x += 56) c.fillRect(x, base - 8 - (x % 3) * 9, 26, 2); }
+    else if (act % 4 === 2) { c.beginPath(); c.moveTo(0, base); for (let x = 0; x <= W; x += 30) c.lineTo(x, base - 50 - 60 * Math.abs(Math.sin(x * 0.006 + 0.6)) - 12 * Math.sin(x * 0.04)); c.lineTo(W, base); c.fill(); const tx = W * 0.78; c.fillRect(tx, base - 150, 22, 150); c.fillRect(tx - 6, base - 158, 34, 10); c.fillStyle = 'rgba(255,170,90,.75)'; c.beginPath(); c.arc(tx + 11, base - 166, 7, 0, 7); c.fill(); }
+    else { for (let i = 0; i < 26; i++) { c.fillStyle = 'rgba(240,230,255,' + (0.25 + (i % 5) * 0.1) + ')'; c.fillRect((i * 97) % W, (i * 53) % max(20, base - 60), 2, 2); } c.fillStyle = 'rgba(12,10,20,.7)'; const tx = W * 0.5 - 40; c.fillRect(tx, base - 170, 80, 170); c.fillRect(tx - 12, base - 182, 104, 14); for (let x = tx - 12; x < tx + 92; x += 22) c.fillRect(x, base - 194, 12, 12); }
+  }
+  /* ================= ⑥ 화면 ================= */
+  const CSS = '.ld{position:absolute;inset:0;display:flex;flex-direction:column;font-family:var(--f-body);color:#f2e9d8;background:#15111c;user-select:none;-webkit-user-select:none;overflow:hidden;word-break:keep-all}'
+    + '.ld-in{flex:1;display:flex;flex-direction:column;width:100%;max-width:820px;margin:0 auto;min-height:0}'
+    + '.ld-top{flex:none;display:flex;align-items:center;gap:10px;height:44px;padding:0 56px 0 10px;font-size:13px}'
+    + '.ld-hp{display:flex;align-items:center;gap:6px}.ld-lab{font-size:12px;color:#ab9fb8}'
+    + '.ld-bar{width:64px;height:9px;border-radius:5px;background:#3a3149;overflow:hidden}.ld-bar i{display:block;height:100%;background:#e3ae45;border-radius:5px}'
+    + '.ld-bar.low i{background:#ee6a55}.ld-coin{display:flex;align-items:center;gap:3px}.ld-where{flex:1;min-width:0;text-align:right;font-size:12px;color:#cbbfd6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
+    + '.ld .mono{font-family:var(--f-mono);font-weight:700}'
+    + '.ld-field{position:relative;flex:1;min-height:150px}.ld-field canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}'
+    + '.ld-info{flex:none;height:86px;margin:0 8px;padding:6px 8px;font-size:13px;line-height:1.42;display:flex;gap:8px;align-items:flex-start;background:#201a2b;border-radius:10px;overflow:hidden}'
+    + '.ld-it{flex:1;min-width:0;max-height:74px;overflow-y:auto}.ld-it i{font-style:normal;font-size:12px;margin-left:4px}.ld-kx{font-size:12px;color:#ab9fb8;margin-top:2px}.ld-kw{font-weight:700}'
+    + '.ld-info .btn{flex:none;min-width:76px;min-height:48px;padding:6px 10px;font-size:14px;align-self:center}'
+    + '.ld-warn{color:#ff9a8a}.ld-muted{color:#ab9fb8}'
+    + '.ld-qrow{flex:none;display:flex;gap:6px;padding:6px 8px 0;height:56px}'
+    + '.ld-slot{flex:1;min-width:0;border:1px dashed #5a4e6c;border-radius:9px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:12px;color:#8d809c;line-height:1.2;text-align:center;padding:0 2px}'
+    + '.ld-slot.on{border:1px solid var(--gc);border-top-width:3px;background:#2a2238;color:#f2e9d8;font-weight:700}.ld-slot small{font-size:12px;font-weight:400;color:#e3ae45}'
+    + '.ld-go{flex:none;width:96px;min-height:48px;font-size:16px}'
+    + '.ld-hand{flex:none;display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:6px 8px}'
+    + '.ld-tile{position:relative;appearance:none;min-height:60px;border-radius:9px;border:1px solid #4a3f5c;border-top:3px solid var(--gc);background:#2a2238;color:inherit;padding:3px 3px 2px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;font:inherit;cursor:pointer;touch-action:manipulation;min-width:0}'
+    + '.ld-tile.sel{outline:2px solid #e3ae45;outline-offset:1px;background:#352b47}.ld-tile.cool{opacity:.5}.ld-tile.qd{opacity:.6;border-style:dashed}'
+    + '.ld-tn{font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;line-height:1.25}'
+    + '.ld-cool{font-size:13px;color:#e3ae45;font-weight:700;line-height:18px}'
+    + '.ld-tb{display:flex;justify-content:space-between;align-items:center;width:100%;padding:0 3px;font-size:12px;font-family:var(--f-mono);font-weight:700;line-height:1.2}'
+    + '.ld-tb span{display:inline-flex;align-items:center;gap:2px}.ld-tb .d{color:#ff8f7c}.ld-tb .c{color:#cbbfd6}'
+    + '.ld-acts{flex:none;display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:0 8px 8px}.ld-acts .btn{min-height:50px;padding:4px 2px;font-size:14px}'
+    + '.ld .btn.ld-no{opacity:.42}.ld.lock .ld-hand,.ld.lock .ld-acts,.ld.lock .ld-qrow{opacity:.72}'
+    + '.ld-ov{position:absolute;inset:0;background:#17131f;display:flex;flex-direction:column;z-index:5}.ld-ov[hidden]{display:none}'
+    + '.ld-ovin{flex:1;display:flex;flex-direction:column;width:100%;max-width:640px;margin:0 auto;min-height:0}'
+    + '.ld-oh{flex:none;padding:10px 60px 6px 14px}.ld-ot{font-family:var(--f-display);font-size:21px;color:#f6d58a;line-height:1.2}.ld-os{font-size:13px;color:#cbbfd6;margin-top:3px;line-height:1.4}'
+    + '.ld-ost{font-size:12px;color:#ab9fb8;margin-top:4px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.ld-ost b{color:#f2e9d8}'
+    + '.ld-pips{display:flex;gap:4px;align-items:center}.ld-pips i{width:14px;height:6px;border-radius:3px;background:#3a3149}.ld-pips i.dn{background:#8a7a4a}.ld-pips i.nx{background:#e3ae45}.ld-pips i.bs{width:18px;background:#5a2f36}.ld-pips i.bs.nx{background:#ee6a55}'
+    + '.ld-ol{flex:1;overflow-y:auto;padding:4px 10px 8px;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch}'
+    + '.ld-opt{appearance:none;flex:none;display:flex;gap:10px;align-items:center;text-align:left;min-height:60px;padding:7px 10px;border-radius:11px;border:1px solid #4a3f5c;background:#241d30;color:inherit;font:inherit;cursor:pointer;touch-action:manipulation}'
+    + '.ld-opt.sel{border-color:#e3ae45;background:#33293f;box-shadow:0 0 0 1px #e3ae45 inset}.ld-opt.off{opacity:.42}'
+    + '.ld-oi{flex:none;width:58px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}'
+    + '.ld-ob{flex:1;min-width:0}.ld-on{font-size:15px;font-weight:700;line-height:1.3}.ld-on i{font-style:normal;font-size:12px;font-weight:400;color:#ab9fb8;margin-left:6px}.ld-on em{font-style:normal;font-size:12px;color:#f6d58a;margin-left:6px;font-family:var(--f-mono)}'
+    + '.ld-od{font-size:13px;color:#d8cde2;line-height:1.4;margin-top:1px}'
+    + '.ld-own{margin-top:6px;padding:8px 2px 0;border-top:1px solid #33293f}.ld-own h4{margin:0 0 5px;font-size:12px;font-weight:400;color:#ab9fb8}'
+    + '.ld-chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}.ld-chip{appearance:none;min-height:44px;padding:4px 10px;border-radius:9px;border:1px solid #4a3f5c;border-left:3px solid var(--gc,#e3ae45);background:#201a2b;color:#f2e9d8;font:inherit;font-size:13px;cursor:pointer}'
+    + '.ld-chip.sel{border-color:#e3ae45;background:#33293f}.ld-cd{font-size:13px;line-height:1.42;color:#d8cde2;background:#201a2b;border-radius:9px;padding:7px 9px;margin-bottom:8px}'
+    + '.ld-of{flex:none;padding:8px 10px 10px;display:flex;gap:8px;align-items:center;border-top:1px solid #2a2238}'
+    + '.ld-ox{flex:1;min-width:0;font-size:12px;color:#ab9fb8;line-height:1.4;max-height:52px;overflow-y:auto}.ld-of .btn{flex:none;min-width:112px;min-height:50px;font-size:16px}';
+  const TUT = [
+    { text: '한 줄 위의 싸움이에요. 내가 한 번 행동하면 적도 한 번 움직여요. 이 한 번을 「박자」라고 불러요.', sel: '.ld-field' },
+    { text: '적 머리 위의 표시는 다음 박자에 할 행동이에요. 붉게 물든 칸에는 다음 박자에 공격이 떨어져요. 숫자는 피해예요.', sel: '.ld-field' },
+    { text: '타일을 누르면 닿는 칸과 예상 피해가 보여요. 한 번 더 누르면 예약 칸에 올라가요. 올리는 데 한 박자가 들어요.', sel: '.ld-hand' },
+    { text: '「실행」을 누르면 올려 둔 타일이 순서대로, 한 박자에 모두 나가요. 쓴 타일은 「대기」 수만큼 쉬어요.', sel: '.ld-qrow' },
+    { text: '이동 · 돌아서기 · 대기도 한 박자예요. 피할지, 더 올릴지, 터뜨릴지를 박자마다 골라요.', sel: '.ld-acts' },
+  ];
+  const ST_ORDER = ['stun', 'poi', 'burn', 'mark', 'weak', 'root', 'blk', 'ctr', 'foc'];
+  function itText(g, e) {
+    const it = e.it, D0 = EN[e.k];
+    if (e.st.stun > 0 || !it || it.k === 'z') return e.st.stun > 0 ? '기절해 있음' : '살피는 중';
+    if (it.k === 'm') return (it.n > 1 ? '두 칸까지 ' : '') + '다가옴';
+    if (it.k === 'b') return '뒤로 물러섬';
+    if (it.k === 't') return '돌아섬';
+    if (it.k === 'n') return '기다림';
+    const a = D0.at[it.a], B = TL[a[0]], d = a[1] > 0 ? a[1] + ebonus(g, e) : 0;
+    if (it.k === 'w') return B.n + ' 준비 — ' + it.c + '박자 뒤에 공격';
+    return B.n + ' — ' + shTxt(Object.assign({}, B, a[4] || {})) + (d ? ' · 피해 ' + d + (B.hits > 1 ? ' ×' + B.hits : '') : '');
+  }
+  function hintLines(s, seat) {
+    if (!s || s.res) return null;
+    if (s.ch) return [s.ch.t, s.ch.s, '카드를 눌러 살펴보고, 아래 단추로 정해요.'];
+    const f = s.f; if (!f) return null;
+    const g = mkG(s, f, null), h = f.u[0], th = threats(g)[h.x], out = [];
+    out.push(th ? '지금 선 칸에 다음 박자 ' + (th[0] ? '피해 ' + th[0] : '방해 효과') + '가 떨어져요.' : '지금 선 칸은 다음 박자에 안전해요.');
+    out.push(f.q.length ? '예약한 타일 ' + f.q.length + '개 — 「실행」으로 한 박자에 모두 나가요.' : '타일을 눌러 살펴보고, 한 번 더 눌러 예약 칸에 올려요.');
+    const left = f.wv.length + (f.inc ? 1 : 0); out.push(left ? '남은 무리 ' + left + (f.inc ? ' · 다음 박자에 줄 끝으로 도착' : '') : '이 무리가 마지막이에요.');
+    if (f.t >= DUSK - 20) out.push('박자 ' + f.t + ' — ' + DUSK + '박자부터는 5박자마다 체력을 1씩 잃어요.');
+    out.push('적을 누르면 다음 행동과 특성을 볼 수 있어요.');
+    return out;
+  }
+
+  function mount(root, api) {
+    if (!document.getElementById('ld-css')) { const t = document.createElement('style'); t.id = 'ld-css'; t.textContent = CSS; document.head.appendChild(t); }
+    const el = document.createElement('div'); el.className = 'ld'; root.appendChild(el);
+    el.innerHTML = '<div class="ld-in"><div class="ld-top"></div><div class="ld-field"><canvas></canvas></div><div class="ld-info"></div><div class="ld-qrow"></div><div class="ld-hand"></div><div class="ld-acts"></div></div><div class="ld-ov" hidden></div>';
+    const $ = (q) => el.querySelector(q);
+    const top = $('.ld-top'), field = $('.ld-field'), cv = $('canvas'), info = $('.ld-info'), qrow = $('.ld-qrow'), hand = $('.ld-hand'), acts = $('.ld-acts'), ov = $('.ld-ov');
+    const c = cv.getContext('2d');
+    let st = null, sel = null, selU = null, osel = -1, own = null, play = null, seen = 0, seenMsg = 0, W = 0, H = 0, dpr = 1, pv = null, th = {}, G = null, dead = false, resDone = false, ovKey = '', bossShown = 0;
+    const D = { fid: 0, n: 0, u: {}, gr: {}, inc: null, pops: [], proj: [], flash: null, shake: 0 };
+    const spd = () => ((L.debug && L.debug.speed) || 1) * (L.speed ? L.speed() : 1);
+    const fxm = () => (L.fx ? L.fx() : 1);
+    const can = () => !!st && !st.res && !play && api.canAct(0);
+    const sfx = (n, o) => { try { api.sfx(n, o); } catch (e) {} };
+    const act = (a) => { if (can()) api.act(a); };
+
+    function resize() {
+      const r = field.getBoundingClientRect(); W = Math.round(r.width); H = Math.round(r.height); dpr = min(3, G0.devicePixelRatio || 1);
+      cv.width = max(1, Math.round(W * dpr)); cv.height = max(1, Math.round(H * dpr));
+    }
+    function geo() {
+      const n = D.n || 7, base = H - 64, cw = min((W - 10) / n, 104);
+      return { n, cw, x0: (W - cw * n) / 2, base, S: max(30, min(cw * 1.4, base - 50)) };
+    }
+    function syncD() {
+      const f = st && st.f; D.flash = null; D.proj.length = 0;
+      if (!f) { D.n = 0; D.u = {}; D.gr = {}; D.fid = 0; D.inc = null; return; }
+      D.fid = f.fid; D.n = f.n; D.u = {}; D.gr = Object.assign({}, f.gr); D.inc = f.inc;
+      for (const u of f.u) D.u[u.i] = { i: u.i, k: u.k, x: u.x, tx: u.x, f: u.f, hp: u.hp, mh: u.mh, el: u.el, rg: u.rg, it: u.it, st: Object.assign({}, u.st), a: u.hp > 0 ? 1 : 0.3, fl: 0, lunge: 0 };
+    }
+    function pop(x, txt, col, big) { let n = 0; for (const p of D.pops) if (abs(p.x - x) < 0.5 && p.t > 0.55) n++; D.pops.push({ x, txt, col: col || '#f2e9d8', big: big ? 1 : 0, t: 1, o: n * 15 }); }
+    /* 사건 하나를 화면에 반영하고 걸리는 시간(ms)을 돌려줌 */
+    function doEv(e) {
+      const u = D.u[e[1]];
+      switch (e[0]) {
+        case 'm': if (u) { u.tx = e[2]; u.f = e[3]; if (e[4]) { u.x = e[2]; u.a = 0.15; } if (e[1] === 0) sfx('tick', { vol: 0.5 }); } return e[4] ? 110 : 100;
+        case 't': if (u) u.f = e[2]; return 45;
+        case 'a': {
+          if (!u) return 0; u.lunge = 1; D.flash = { c: e[3] || [], t: 1, me: e[1] === 0 };
+          const T = TL[e[2]]; if (T && (T.sh === 'shot' || T.sh === 'bshot' || T.sh === 'both' || T.sh === 'lob' || T.sh === 'aim') && e[3] && e[3].length) { const tg = (e[4] || []).map((i) => D.u[i]).filter(Boolean); if (tg.length) for (const v of tg) D.proj.push({ a: u.x, b: v.x, t: 1, me: e[1] === 0 }); else D.proj.push({ a: u.x, b: e[3][e[3].length - 1], t: 1, me: e[1] === 0 }); }
+          sfx(T && T.sh === 'self' ? 'click' : 'whoosh', { vol: e[1] === 0 ? 0.9 : 0.55, pitch: e[1] === 0 ? 1 : 0.8 });
+          return 125;
+        }
+        case 'h': {
+          if (!u) return 0; u.hp = e[3];
+          if (e[2] > 0) {
+            u.fl = 1; pop(u.x, '−' + e[2], e[4] === 1 ? '#9be07a' : e[4] === 2 ? '#ff9a4a' : e[1] === 0 ? '#ff8f7c' : '#fff2c8', 1);
+            D.shake = max(D.shake, e[1] === 0 ? 1 : min(1, 0.3 + e[2] * 0.12));
+            sfx(e[4] === 1 || e[4] === 2 ? 'tick' : 'hit', { vol: e[1] === 0 ? 1 : 0.8, pitch: e[1] === 0 ? 0.8 : 1 + min(0.3, e[2] * 0.05) });
+            if (e[1] === 0) try { api.buzz(18 + e[2] * 8); } catch (x) {}
+            return e[4] ? 80 : 130;
+          }
+          pop(u.x, '막음', '#9fc7ff'); sfx('tick'); return 70;
+        }
+        case 'd': if (u) u.dead = 1; sfx('thud', { vol: 0.9 }); return 140;
+        case 's': D.u[e[1]] = { i: e[1], k: e[2], x: e[3], tx: e[3], f: e[4], hp: e[5], mh: e[5], el: e[6], rg: 0, it: null, st: ST0(), a: 0, fl: 0, lunge: 0 }; sfx('pop', { vol: 0.6 }); return 130;
+        case 'e': if (u) { const was = u.st[e[2]]; u.st[e[2]] = e[3]; if (e[3] > was && KW[e[2]]) pop(u.x, kwLab(e[2], e[3]), KW[e[2]].c); } return 40;
+        case 'w': if (u) { u.wind = 1; } return 60;
+        case 'x': if (u) { u.hp = e[3]; pop(u.x, '+' + e[2], '#9be07a', 1); sfx('chip', { vol: 0.6 }); } return 80;
+        case 'g': if (e[2]) D.gr[e[1]] = e[2]; else delete D.gr[e[1]]; return 30;
+        case 'p': if (u) pop(u.x, e[2], '#f6d58a'); return 50;
+        case 'b': if (u) u.lunge = 0.6; return 30;
+        case '-': return 90;
+        case 'n': sfx('warn', { vol: 0.5 }); return 40;
+        case 'q': sfx('card', { vol: 0.7 }); return 0;
+      }
+      return 0;
+    }
+    function startPlay(ev) { play = { q: ev.slice(), t: 0 }; api.setBusy(true); el.classList.add('lock'); }
+    function endPlay() { play = null; syncD(); api.setBusy(false); el.classList.remove('lock'); refresh(); }
+    function tick(dt) {
+      const k = spd();
+      if (play) {
+        play.t -= dt * k;
+        let guard = 0;
+        while (play && play.t <= 0 && guard++ < 400) { const e = play.q.shift(); if (!e) { endPlay(); break; } play.t += doEv(e); }
+      }
+      for (const id in D.u) {
+        const u = D.u[id];
+        if (u.x !== u.tx) { const d = u.tx - u.x, s = dt * k / 85; u.x = abs(d) <= s ? u.tx : u.x + sgn(d) * s; }
+        if (u.dead) { u.a -= dt * k / 160; if (u.a <= 0) delete D.u[id]; } else if (u.a < 1 && u.hp > 0) u.a = min(1, u.a + dt * k / 140);
+        if (u.fl > 0) u.fl = max(0, u.fl - dt * k / 150);
+        if (u.lunge > 0) u.lunge = max(0, u.lunge - dt * k / 130);
+      }
+      for (let i = D.pops.length - 1; i >= 0; i--) { D.pops[i].t -= dt / 850; if (D.pops[i].t <= 0) D.pops.splice(i, 1); }
+      for (let i = D.proj.length - 1; i >= 0; i--) { D.proj[i].t -= dt * k / 150; if (D.proj[i].t <= 0) D.proj.splice(i, 1); }
+      if (D.flash) { D.flash.t -= dt * k / 170; if (D.flash.t <= 0) D.flash = null; }
+      if (D.shake > 0) D.shake = max(0, D.shake - dt / 200);
+    }
+    function rr(x, y, w, h, r) { c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }
+    function glyphC(k, x, y, col) {   // 예고 표시의 작은 그림(12×12, 가운데 x,y)
+      c.strokeStyle = col; c.fillStyle = col; c.lineWidth = 2; c.lineCap = 'round'; c.lineJoin = 'round'; c.beginPath();
+      switch (k) {
+        case 'atk': c.moveTo(x - 4, y + 5); c.lineTo(x + 5, y - 5); c.moveTo(x - 5, y + 1); c.lineTo(x - 1, y + 5); c.stroke(); break;
+        case 'wind': c.moveTo(x - 4, y - 5); c.lineTo(x + 4, y - 5); c.lineTo(x - 4, y + 5); c.lineTo(x + 4, y + 5); c.closePath(); c.stroke(); break;
+        case 'left': c.moveTo(x + 4, y); c.lineTo(x - 4, y); c.moveTo(x - 1, y - 4); c.lineTo(x - 5, y); c.lineTo(x - 1, y + 4); c.stroke(); break;
+        case 'right': c.moveTo(x - 4, y); c.lineTo(x + 4, y); c.moveTo(x + 1, y - 4); c.lineTo(x + 5, y); c.lineTo(x + 1, y + 4); c.stroke(); break;
+        case 'turn': c.arc(x, y, 4.5, Math.PI * 0.2, Math.PI * 1.6); c.stroke(); c.beginPath(); c.moveTo(x + 1, y - 7); c.lineTo(x + 4.5, y - 4.5); c.lineTo(x + 1, y - 2); c.stroke(); break;
+        case 'z': c.moveTo(x - 4, y - 4); c.lineTo(x + 4, y - 4); c.lineTo(x - 4, y + 4); c.lineTo(x + 4, y + 4); c.stroke(); break;
+        case 'plus': c.moveTo(x - 5, y); c.lineTo(x + 5, y); c.moveTo(x, y - 5); c.lineTo(x, y + 5); c.stroke(); break;
+        case 'guard': c.moveTo(x - 5, y - 5); c.lineTo(x + 5, y - 5); c.lineTo(x + 5, y); c.lineTo(x, y + 6); c.lineTo(x - 5, y); c.closePath(); c.stroke(); break;
+        case 'jump': c.arc(x, y + 3, 5.5, Math.PI, 0); c.stroke(); c.beginPath(); c.moveTo(x + 2.5, y); c.lineTo(x + 5.5, y + 3.5); c.lineTo(x + 8, y); c.stroke(); break;
+        default: c.arc(x - 4, y, 1.3, 0, 7); c.arc(x, y, 1.3, 0, 7); c.arc(x + 4, y, 1.3, 0, 7); c.fill();
+      }
+    }
+    function badge(cx, y, e) {
+      const it = e.it; if (!it && !(e.st.stun > 0)) return;
+      let bg = 'rgba(28,22,38,.88)', fg = '#cfc4dc', line = null, txt = '', gl = 'dots';
+      if (e.st.stun > 0 || it.k === 'z') { gl = 'z'; fg = '#ffe066'; }
+      else if (it.k === 'h') {
+        const a = EN[e.k].at[it.a], B = TL[a[0]]; bg = '#c9483a'; fg = '#fff';
+        if (a[1] > 0) { gl = 'atk'; txt = String(a[1] + (G ? ebonus(G, e) : 0)) + (B.hits > 1 ? '×' + B.hits : ''); }
+        else { gl = B.sh === 'sum' ? 'plus' : B.sh === 'mend' ? 'plus' : B.sh === 'self' ? 'guard' : B.sh === 'eblink' || B.am ? 'jump' : 'atk'; if (B.sh === 'mend') bg = '#3d7a4a'; if (B.sh === 'self') bg = '#3a5f96'; }
+      } else if (it.k === 'w') { fg = '#f6d58a'; line = '#e3ae45'; gl = 'wind'; txt = String(it.c); }
+      else if (it.k === 'm') gl = it.d > 0 ? 'right' : 'left';
+      else if (it.k === 'b') gl = e.f > 0 ? 'left' : 'right';
+      else if (it.k === 't') gl = 'turn';
+      c.font = '700 13px "IBM Plex Mono", monospace';
+      const tw = txt ? c.measureText(txt).width + 3 : 0, w = 22 + tw;
+      rr(cx - w / 2, y, w, 20, 6); c.fillStyle = bg; c.fill(); if (line) { c.strokeStyle = line; c.lineWidth = 1.5; c.stroke(); }
+      glyphC(gl, cx - w / 2 + 11, y + 10, fg);
+      if (txt) { c.fillStyle = fg; c.textAlign = 'left'; c.textBaseline = 'middle'; c.fillText(txt, cx - w / 2 + 20, y + 10.5); }
+    }
+    function draw(now) {
+      if (!W || !H) return;
+      c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, W, H);
+      const g = geo(), base = g.base, cw = g.cw;
+      const sx = D.shake > 0 ? Math.sin(now * 0.07) * D.shake * 5 * fxm() : 0;
+      c.save(); c.translate(sx, 0);
+      backdrop(c, W + 20, H, st && st.act ? st.act : 0, base);
+      c.fillStyle = '#15111c'; c.fillRect(-12, base, W + 24, H - base + 2);
+      if (!D.n) { c.restore(); return; }
+      const idle = !play, pulse = 0.5 + 0.5 * Math.sin(now * 0.005);
+      for (let i = 0; i < g.n; i++) {
+        const x = g.x0 + i * cw;
+        if (idle && pv && pv.cells[i]) { c.fillStyle = 'rgba(227,174,69,.13)'; c.fillRect(x + 1.5, base - g.S - 6, cw - 3, g.S + 6); }
+        if (D.flash && D.flash.c.includes(i)) { c.fillStyle = (D.flash.me ? 'rgba(255,236,170,' : 'rgba(255,140,120,') + (0.42 * D.flash.t * (0.4 + 0.6 * fxm())) + ')'; c.fillRect(x + 1.5, base - g.S - 6, cw - 3, g.S + 6); }
+        rr(x + 1.5, base, cw - 3, 22, 4); c.fillStyle = '#2d2639'; c.fill();
+        c.fillStyle = '#5c4f70'; c.fillRect(x + 4, base, cw - 8, 2);
+        const t = idle ? th[i] : null;
+        if (t) {
+          rr(x + 1.5, base, cw - 3, 22, 4); c.fillStyle = 'rgba(214,78,60,' + (0.62 + 0.2 * pulse) + ')'; c.fill();
+          c.fillStyle = '#fff'; c.font = '700 14px "IBM Plex Mono", monospace'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText(t[0] ? String(t[0]) : '!', x + cw / 2, base + 11.5);
+        }
+        if (idle && pv && pv.cells[i]) { rr(x + 2.5, base + 1, cw - 5, 20, 4); c.strokeStyle = '#f6d58a'; c.lineWidth = 2; c.stroke(); }
+        if (D.gr[i]) { c.strokeStyle = '#d8c090'; c.lineWidth = 2; c.beginPath(); const y = base - 2; c.moveTo(x + cw * 0.22, y); for (let k = 1; k <= 6; k++) c.lineTo(x + cw * (0.22 + 0.56 * k / 6), y - (k % 2 ? 7 : 0)); c.stroke(); }
+      }
+      if (idle && D.inc) {
+        const cnt = { '-1': 0, 1: 0 }; for (const w of D.inc.u) cnt[w[1] < 0 ? -1 : 1]++;
+        for (const sd of [-1, 1]) {
+          if (!cnt[sd]) continue; const x = sd < 0 ? g.x0 + 2 : g.x0 + g.n * cw - 2, y = base - g.S * 0.5;
+          c.strokeStyle = 'rgba(255,150,130,' + (0.6 + 0.4 * pulse) + ')'; c.lineWidth = 3; c.lineCap = 'round'; c.lineJoin = 'round';
+          for (let k = 0; k < 2; k++) { const xx = x - sd * (4 + k * 9 - 8); c.beginPath(); c.moveTo(xx - sd * -6, y - 9); c.lineTo(xx - sd * -13, y); c.lineTo(xx - sd * -6, y + 9); c.stroke(); }
+          c.fillStyle = '#ffb4a4'; c.font = '700 13px "IBM Plex Sans KR", sans-serif'; c.textAlign = sd < 0 ? 'left' : 'right'; c.textBaseline = 'middle'; c.fillText('도착 ' + cnt[sd], sd < 0 ? g.x0 + 4 : g.x0 + g.n * cw - 4, max(12, base - g.S * 1.3 - 34));
+        }
+      }
+      const us = Object.keys(D.u).map((k) => D.u[k]).sort((a, b) => (a.k === 'H') - (b.k === 'H') || a.x - b.x);
+      for (const u of us) {
+        const hero = u.k === 'H', sp = hero ? CLS[st.hero.c].g : EN[u.k].g, boss = !hero && EN[u.k].boss;
+        const S = min(g.S * (boss ? 1.22 : hero ? 1.04 : 1) * (sp.b === 'statue' || sp.b === 'wraith' || sp.b === 'jar' || !sp.b ? 0.9 : 0.8), base - 30);
+        const cx = g.x0 + (u.x + 0.5) * cw + Math.sin(u.lunge * Math.PI) * cw * 0.28 * u.f;
+        c.save(); c.globalAlpha = max(0, min(1, u.a));
+        c.fillStyle = 'rgba(0,0,0,.35)'; c.beginPath(); c.ellipse(cx, base + 1, cw * 0.3, 4, 0, 0, 7); c.fill();
+        if (u.el) { c.strokeStyle = '#f0c050'; c.lineWidth = 2; c.beginPath(); c.ellipse(cx, base + 1, cw * 0.36, 5.5, 0, 0, 7); c.stroke(); }
+        c.translate(cx, base); c.scale(u.f, 1);
+        if (!hero && u.it && u.it.k === 'w') c.translate(0, Math.sin(now * 0.02) * 1.2);
+        drawFig(c, sp, S, u.fl > 0.45 && fxm() > 0, hero);
+        c.restore();
+        c.save(); c.globalAlpha = max(0, min(1, u.a));
+        const bx = g.x0 + u.x * cw + 4, bw = cw - 8, by = base + 26;
+        rr(bx, by, bw, 6, 3); c.fillStyle = '#3a3149'; c.fill();
+        if (u.hp > 0) { rr(bx, by, max(4, bw * min(1, u.hp / u.mh)), 6, 3); c.fillStyle = hero ? '#e3ae45' : boss ? '#f0c050' : '#e07a5a'; c.fill(); }
+        c.fillStyle = '#f2e9d8'; c.font = '700 13px "IBM Plex Mono", monospace'; c.textAlign = 'center'; c.textBaseline = 'top'; c.fillText(String(max(0, u.hp)), bx + bw / 2, by + 8);
+        let n = 0; const chips = ST_ORDER.filter((k) => u.st[k] > 0).slice(0, 3), cwid = 15, tot = chips.length * (cwid + 2) - 2;
+        for (const k of chips) { const x = bx + bw / 2 - tot / 2 + n * (cwid + 2); rr(x, by + 23, cwid, 15, 3); c.fillStyle = KW[k].c; c.fill(); c.fillStyle = '#17131f'; c.font = '700 12px "IBM Plex Mono", monospace'; c.textBaseline = 'middle'; c.fillText(String(min(9, u.st[k])), x + cwid / 2, by + 31); n++; }
+        if (!hero && idle && u.hp > 0) badge(g.x0 + (u.x + 0.5) * cw, max(2, base - S - 26), u);
+        if (idle && pv && u.hp > 0) {
+          const d = pv.dmg[u.i], kill = pv.dead[u.i];
+          if (d || kill) { const t = kill ? '쓰러짐' : '−' + d; c.font = '700 ' + (kill ? 13 : 16) + 'px "IBM Plex Sans KR", sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.lineWidth = 4; c.strokeStyle = '#17131f'; c.strokeText(t, g.x0 + (u.x + 0.5) * cw, base - S * 0.5); c.fillStyle = hero ? '#ff8f7c' : '#ffe08a'; c.fillText(t, g.x0 + (u.x + 0.5) * cw, base - S * 0.5); }
+        }
+        if (selU === u.i && idle) { c.strokeStyle = 'rgba(246,213,138,.9)'; c.lineWidth = 1.5; c.setLineDash([4, 3]); rr(g.x0 + u.x * cw + 2, max(1, base - S - 4), cw - 4, S + 3, 6); c.stroke(); c.setLineDash([]); }
+        c.restore();
+      }
+      if (idle && pv && pv.hx != null && D.u[0] && pv.hx !== D.u[0].x) {
+        const x = g.x0 + (pv.hx + 0.5) * cw; c.strokeStyle = '#9fe0b0'; c.lineWidth = 2; c.setLineDash([4, 3]); c.beginPath(); c.ellipse(x, base - 3, cw * 0.3, 6, 0, 0, 7); c.stroke(); c.setLineDash([]);
+        c.fillStyle = '#9fe0b0'; c.beginPath(); c.moveTo(x - 6, base - 20); c.lineTo(x + 6, base - 20); c.lineTo(x, base - 11); c.fill();
+      }
+      for (const p of D.proj) { const xa = g.x0 + (p.a + 0.5) * cw, xb = g.x0 + (p.b + 0.5) * cw, y = base - g.S * 0.55, k = 1 - p.t, x1 = xa + (xb - xa) * max(0, k - 0.35), x2 = xa + (xb - xa) * min(1, k + 0.15); c.strokeStyle = p.me ? 'rgba(255,240,190,.95)' : 'rgba(255,150,130,.95)'; c.lineWidth = 3; c.lineCap = 'round'; c.beginPath(); c.moveTo(x1, y); c.lineTo(x2, y); c.stroke(); }
+      for (const p of D.pops) {
+        const x = g.x0 + (p.x + 0.5) * cw, y = base - g.S * 0.95 - (1 - p.t) * 22 - p.o;
+        c.globalAlpha = min(1, p.t * 2.2); c.font = '700 ' + (p.big ? 18 : 13) + 'px "IBM Plex Sans KR", sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.lineWidth = 4; c.strokeStyle = '#17131f'; c.strokeText(p.txt, min(W - 24, max(24, x)), max(10, y)); c.fillStyle = p.col; c.fillText(p.txt, min(W - 24, max(24, x)), max(10, y));
+      }
+      c.globalAlpha = 1; c.restore();
+    }
+    let raf = 0, lastT = 0;
+    function frame(now) { if (dead) return; const dt = lastT ? min(60, now - lastT) : 16; lastT = now; tick(dt); draw(now); raf = requestAnimationFrame(frame); }
+
+    /* 예약한 타일(+ 살펴보는 타일)을 지금 실행하면 어떻게 되는지 */
+    function calcPv() {
+      const f = st && st.f; if (!f || st.res) return null;
+      const q = f.q.slice();
+      if (sel != null && f.cd[sel] === 0 && !q.includes(sel) && q.length < st.hero.qmax) q.push(sel);
+      if (!q.length) return null;
+      const f2 = cloneF(f); f2.q = q; const g2 = mkG(st, f2, null); g2.ev = [];
+      try { execQueue(g2); } catch (e) { return null; }
+      const out = { cells: {}, dmg: {}, dead: {}, hx: f2.u[0].x };
+      for (const e of g2.ev) { if (e[0] === 'a' && e[1] === 0) for (const x of e[3] || []) out.cells[x] = 1; else if (e[0] === 'h' && e[2] > 0) out.dmg[e[1]] = (out.dmg[e[1]] || 0) + e[2]; else if (e[0] === 'd') out.dead[e[1]] = 1; }
+      return out;
+    }
+    const svgI = (k) => '<svg viewBox="0 0 12 12" width="12" height="12">' + (k === 'd' ? '<path d="M2 10L9 2.5l1.5-.5-.5 1.5L3 11z" fill="currentColor"/><path d="M1.5 8l2.5 2.5" stroke="currentColor" stroke-width="1.6"/>' : '<circle cx="6" cy="6" r="4.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 3.2V6l2 1.4" fill="none" stroke="currentColor" stroke-width="1.4"/>') + '</svg>';
+    const kwBox = (t) => kwsIn(t).map((k) => '<div><b class="ld-kw" style="color:' + KW[k].c + '">' + KW[k].n + '</b> — ' + esc(KW[k].d) + '</div>').join('');
+    function renderTop() {
+      const hr = st && st.hero;
+      if (!hr) { top.innerHTML = '<div class="ld-where" style="text-align:left">한 줄 결투</div>'; return; }
+      const L0 = LEN[st.len], hp = st.f ? max(0, st.f.u[0].hp) : hr.hp;
+      top.innerHTML = '<div class="ld-hp"><span class="ld-lab">체력</span><div class="ld-bar' + (hp * 3 <= hr.mhp ? ' low' : '') + '"><i style="width:' + Math.round(100 * hp / hr.mhp) + '%"></i></div><b class="mono">' + hp + '/' + hr.mhp + '</b></div>'
+        + '<div class="ld-coin">' + glyph('coin', 15) + '<b class="mono">' + hr.coin + '</b></div>'
+        + '<div class="ld-where">' + (st.act + 1) + '막 ' + ACT_NAME[st.act] + ' ' + min(st.step + 1, L0.S + 1) + '/' + (L0.S + 1) + '</div>';
+    }
+    function renderInfo() {
+      const f = st && st.f;
+      if (!f) { info.innerHTML = ''; return; }
+      if (sel != null && st.hero.tiles[sel]) {
+        const T = G.T[sel], cd = f.cd[sel], qd = f.q.includes(sel), full = f.q.length >= st.hero.qmax, d = tDesc(T);
+        const lab = qd ? '예약됨' : cd >= 90 ? '다 씀' : cd > 0 ? '대기 ' + cd : full ? '칸 없음' : '올리기';
+        info.innerHTML = '<div class="ld-it"><b>' + esc(tName(st.hero.tiles[sel])) + '</b><i style="color:' + GRP[T.g][1] + '">' + GRP[T.g][0] + '</i><br>' + kwH(d) + '<div class="ld-kx">' + kwBox(d) + '</div></div>'
+          + '<button class="btn primary ld-put"' + (!can() || qd ? ' disabled' : lab !== '올리기' ? ' style="opacity:.5"' : '') + '>' + lab + '</button>';
+        return;
+      }
+      const u = selU != null ? f.u.find((v) => v.i === selU) : null;
+      if (u && u.k !== 'H') {
+        const D0 = EN[u.k], tr = trTxt(D0.tr), sts = ST_ORDER.filter((k) => u.st[k] > 0).map((k) => kwLab(k, u.st[k])).join(' · ');
+        const t = [tr, sts].filter(Boolean).join(' · ');
+        info.innerHTML = '<div class="ld-it"><b>' + (u.el ? '노련한 ' : '') + D0.n + '</b><i class="ld-muted">체력 ' + u.hp + '/' + u.mh + '</i><br><span class="ld-warn">다음: ' + esc(itText(G, u)) + '</span>'
+          + (t ? '<br>' + kwH(t) : '') + '<div class="ld-kx">' + esc(D0.d) + kwBox(t) + '</div></div>';
+        return;
+      }
+      if (u) {
+        const sts = ST_ORDER.filter((k) => u.st[k] > 0).map((k) => kwLab(k, u.st[k])).join(' · '), C0 = CLS[st.hero.c];
+        info.innerHTML = '<div class="ld-it"><b>' + C0.n + '</b><i class="ld-muted">체력 ' + u.hp + '/' + u.mh + '</i><br>' + kwH(C0.p) + (sts ? '<br>' + kwH(sts) : '') + '<div class="ld-kx">' + kwBox(sts) + (st.hero.trk.length ? '장신구: ' + st.hero.trk.map((k) => TK[k].n).join(', ') : '') + '</div></div>';
+        return;
+      }
+      const hl = hintLines(st, 0) || [];
+      info.innerHTML = '<div class="ld-it"><span class="' + (th[f.u[0].x] ? 'ld-warn' : '') + '">' + esc(hl[0] || '') + '</span><div class="ld-kx">' + hl.slice(1, 3).map(esc).join('<br>') + '</div></div>';
+    }
+    function renderFight() {
+      const f = st && st.f;
+      if (!f) { qrow.innerHTML = hand.innerHTML = acts.innerHTML = ''; return; }
+      const hr = st.hero, ok = can(), h = f.u[0];
+      let o = '';
+      for (let i = 0; i < hr.qmax; i++) {
+        const ti = f.q[i];
+        if (ti != null) { const T = G.T[ti]; o += '<div class="ld-slot on" style="--gc:' + GRP[T.g][1] + '">' + esc(T.n) + '<small>' + (i + 1) + '번째</small></div>'; }
+        else if (i === f.q.length && sel != null && f.cd[sel] === 0 && !f.q.includes(sel)) o += '<div class="ld-slot" style="border-color:#e3ae45;color:#e3ae45">' + esc(G.T[sel].n) + '<small>올릴 자리</small></div>';
+        else o += '<div class="ld-slot">빈 칸</div>';
+      }
+      qrow.innerHTML = o + '<button class="btn primary ld-go' + (f.q.length ? '' : ' ld-no') + '" data-action="go"' + (ok ? '' : ' disabled') + '>실행</button>';
+      o = '';
+      hr.tiles.forEach((t, i) => {
+        const T = G.T[i], cd = f.cd[i], qi = f.q.indexOf(i);
+        o += '<button class="ld-tile' + (sel === i ? ' sel' : '') + (cd > 0 ? ' cool' : '') + (qi >= 0 ? ' qd' : '') + '" data-i="' + i + '" data-action="t' + (i + 1) + '" style="--gc:' + GRP[T.g][1] + '">'
+          + '<span class="ld-tn">' + esc(tName(t)) + '</span>'
+          + (qi >= 0 ? '<span class="ld-cool">예약 ' + (qi + 1) + '</span>' : cd > 0 ? '<span class="ld-cool">' + (cd >= 90 ? '다 씀' : '대기 ' + cd) + '</span>' : tileSvg(T, 66, 18))
+          + '<span class="ld-tb"><span class="d">' + (T.d > 0 ? svgI('d') + T.d + (T.hits > 1 ? '×' + T.hits : '') : '') + '</span><span class="c">' + (T.once ? '1회' : svgI('c') + T.cd) + '</span></span></button>';
+      });
+      hand.innerHTML = o;
+      const mv = (d) => (!ok ? ' disabled' : !h.st.root && inb(f, h.x + d) && !at(f, h.x + d) ? '' : ' style="opacity:.42"');
+      acts.innerHTML = '<button class="btn" data-a="l" data-action="left"' + mv(-1) + '>◀ 왼쪽</button>'
+        + '<button class="btn" data-a="t" data-action="turn"' + (ok ? '' : ' disabled') + '>돌아서기</button>'
+        + '<button class="btn" data-a="w" data-action="wait"' + (ok ? '' : ' disabled') + '>대기</button>'
+        + '<button class="btn" data-a="r" data-action="right"' + mv(1) + '>오른쪽 ▶</button>';
+    }
+    function optView(o, ch) {
+      const hr = st.hero;
+      switch (o.t) {
+        case 'cls': { const C0 = CLS[o.id]; return { ic: figImg(C0.g, 1, 52), n: C0.n, tag: '체력 ' + C0.hp, d: C0.d + ' 처음 타일: ' + C0.tiles.map((k) => TL[k].n).join(', ') + '.', x: C0.p }; }
+        case 'tile': { const T = TL[o.id]; return { ic: tileSvg(T, 56, 16) + '<span style="font-size:12px;color:' + GRP[T.g][1] + '">' + GRP[T.g][0] + '</span>', n: T.n, tag: '새 타일', d: tDesc(T), kw: 1 }; }
+        case 'up': { const t = hr.tiles[o.i], T = eff(t); return { ic: glyph('hammer', 30), n: tName(t) + ' — ' + UPS[o.u].n, tag: '강화', d: UPS[o.u].d + ' (지금: ' + tDesc(T) + ')', kw: 1 }; }
+        case 'trk': return { ic: glyph(TK[o.id].ic, 30), n: TK[o.id].n, tag: '장신구', d: TK[o.id].d, kw: 1 };
+        case 'heal': return { ic: glyph('herb', 30, '#9be07a'), n: '체력 +' + o.n, tag: '회복', d: '지금 체력 ' + hr.hp + ' / ' + hr.mhp };
+        case 'coin': return { ic: glyph('coin', 30), n: o.lab || '은화', tag: '', d: '은화 +' + o.n };
+        case 'node': { const N = NODE[o.nd]; return { ic: glyph(N.ic, 30, o.nd === 'boss' || o.nd === 'elite' ? '#ee6a55' : '#e3ae45'), n: o.nd === 'boss' ? '우두머리 — ' + EN[st.boss].n : N.n, tag: '', d: o.nd === 'boss' ? EN[st.boss].d : N.d }; }
+        case 'ev': { const q = EVENTS[ch.e].o[o.j]; return { ic: glyph('map', 30), n: q.lab, tag: '', d: q.d }; }
+        case 'drop': { const t = hr.tiles[o.i], T = eff(t); return { ic: tileSvg(T, 56, 16), n: tName(t), tag: '이 타일을 버림', d: tDesc(T), kw: 1 }; }
+        case 'back': return { ic: glyph('back', 30, '#cbbfd6'), n: '그만둔다', tag: '', d: '바꾸지 않고 돌아감' };
+        case 'leave': return { ic: glyph('back', 30, '#cbbfd6'), n: '떠난다', tag: '', d: '행상을 떠나 길을 이어 감' };
+      }
+      return { ic: '', n: '', d: '' };
+    }
+    function renderOv() {
+      const ch = st && st.ch;
+      if (!ch || play || st.res) { ov.hidden = true; ovKey = ''; return; }
+      const hr = st.hero, ok = can(), key = ch.k + '|' + ch.t + '|' + ch.o.length + '|' + st.lid + '|' + (hr ? hr.coin + ',' + hr.tiles.length + ',' + hr.trk.length : '');
+      if (key !== ovKey) { ovKey = key; osel = ch.o.length === 1 ? 0 : -1; own = null; }
+      const keep = ov.querySelector('.ld-ol'), sc = keep ? keep.scrollTop : 0;
+      let o = '<div class="ld-ovin"><div class="ld-oh"><div class="ld-ot">' + esc(ch.t) + '</div><div class="ld-os">' + esc(ch.s || '') + '</div>';
+      if (hr) {
+        const L0 = LEN[st.len]; let pips = '';
+        for (let i = 0; i <= L0.S; i++) pips += '<i class="' + (i === L0.S ? 'bs ' : '') + (i <= st.step ? 'dn' : i === st.step + 1 && ch.k === 'path' ? 'nx' : '') + '"></i>';
+        o += '<div class="ld-ost"><span>체력 <b class="mono">' + hr.hp + '/' + hr.mhp + '</b></span><span>은화 <b class="mono">' + hr.coin + '</b></span><span>' + (st.act + 1) + '막</span><span class="ld-pips">' + pips + '</span></div>';
+      }
+      o += '</div><div class="ld-ol">';
+      let selKw = '';
+      ch.o.forEach((q, i) => {
+        const v = optView(q, ch), p = ch.k === 'shop' && q.t !== 'leave' ? priceOf(st, q) : 0, off = q.x || (p && hr.coin < p);
+        if (i === osel) selKw = (v.x ? '<div>' + kwH(v.x) + '</div>' : '') + (v.kw || v.x ? kwBox(v.d + ' ' + (v.x || '')) : '');
+        o += '<button class="ld-opt' + (i === osel ? ' sel' : '') + (off ? ' off' : '') + '" data-o="' + i + '"><span class="ld-oi">' + v.ic + '</span><span class="ld-ob"><span class="ld-on">' + esc(v.n) + (v.tag ? '<i>' + esc(v.tag) + '</i>' : '') + (p ? '<em>은화 ' + p + '</em>' : '') + (q.x ? '<i>' + (ch.k === 'shop' ? '팔림' : '고름') + '</i>' : '') + '</span><br><span class="ld-od">' + kwH(v.d) + '</span></span></button>';
+      });
+      if (hr) {
+        o += '<div class="ld-own"><h4>가진 타일 ' + hr.tiles.length + ' / ' + CAP + ' — 눌러서 살펴보기</h4><div class="ld-chips">';
+        hr.tiles.forEach((t, i) => { o += '<button class="ld-chip' + (own === 't' + i ? ' sel' : '') + '" data-own="t' + i + '" style="--gc:' + GRP[TL[t.id].g][1] + '">' + esc(tName(t)) + '</button>'; });
+        o += '</div>';
+        if (own && own[0] === 't' && hr.tiles[+own.slice(1)]) { const t = hr.tiles[+own.slice(1)], d = tDesc(eff(t)); o += '<div class="ld-cd"><b>' + esc(tName(t)) + '</b> — ' + kwH(d) + (t.u.length ? '<br><span class="ld-muted">강화: ' + t.u.map((u) => UPS[u].n).join(', ') + '</span>' : '') + '<div class="ld-kx">' + kwBox(d) + '</div></div>'; }
+        o += '<h4>' + CLS[hr.c].n + ' — ' + kwH(CLS[hr.c].p) + '</h4>';
+        if (hr.trk.length) {
+          o += '<h4>장신구 ' + hr.trk.length + '</h4><div class="ld-chips">';
+          hr.trk.forEach((k) => { o += '<button class="ld-chip' + (own === 'k' + k ? ' sel' : '') + '" data-own="k' + k + '">' + esc(TK[k].n) + '</button>'; });
+          o += '</div>';
+          if (own && own[0] === 'k' && TK[own.slice(1)]) o += '<div class="ld-cd"><b>' + TK[own.slice(1)].n + '</b> — ' + kwH(TK[own.slice(1)].d) + '</div>';
+        }
+        o += '</div>';
+      }
+      const so = ch.o[osel], lab = ch.k === 'cls' ? '이 인물로' : ch.k === 'path' ? '이 길로' : ch.k === 'shop' ? (so && so.t === 'leave' ? '떠나기' : '사기') : ch.k === 'drop' ? (so && so.t === 'back' ? '돌아가기' : '바꾸기') : '고르기';
+      const bad = !so || so.x || (ch.k === 'shop' && so.t !== 'leave' && priceOf(st, so) > hr.coin);
+      o += '</div><div class="ld-of"><div class="ld-ox">' + (osel < 0 ? (ok ? '하나를 눌러 고른 뒤 오른쪽 단추로 정해요.' : '') : selKw) + '</div><button class="btn primary ld-ok" data-action="go"' + (bad || !ok ? ' disabled' : '') + '>' + lab + '</button></div></div>';
+      ov.innerHTML = o; ov.hidden = false;
+      const ol = ov.querySelector('.ld-ol'); if (ol && keep) ol.scrollTop = sc;
+    }
+    function refresh() {
+      if (!st) return;
+      const f = st.f;
+      G = f ? mkG(st, f, null) : null;
+      if (f && sel != null && !st.hero.tiles[sel]) sel = null;
+      th = f && !st.res ? threats(G) : {};
+      pv = f ? calcPv() : null;
+      renderTop(); renderInfo(); renderFight(); renderOv();
+    }
+    function confirmOpt() { const ch = st && st.ch; if (!ch || !can() || osel < 0) return; const o = ch.o[osel]; if (!o || o.x) return; if (ch.k === 'shop' && o.t !== 'leave' && priceOf(st, o) > st.hero.coin) { api.toast('은화가 모자라요'); return; } sfx('click'); const i = osel; osel = -1; api.act({ t: 'pick', i }); }
+    function putTile(i) { const f = st && st.f; if (!f || !can()) return; if (f.q.includes(i)) return; if (f.cd[i] > 0) { api.toast(f.cd[i] >= 90 ? '이 전투에서는 다 썼어요' : '쉬는 중이에요. ' + f.cd[i] + '박자 뒤에 쓸 수 있어요'); return; } if (f.q.length >= st.hero.qmax) { api.toast('예약 칸이 가득 찼어요. 「실행」으로 비워요'); return; } sel = null; api.act({ t: 'q', i }); }
+    function tapTile(i) { if (!st || !st.f || !st.hero.tiles[i]) return; if (sel === i && can()) { putTile(i); return; } sel = i; selU = null; sfx('click', { vol: 0.5 }); refresh(); }
+    function doAct(a) {
+      const f = st && st.f; if (!f || !can()) return; const h = f.u[0];
+      if (a === 'l' || a === 'r') { const d = a === 'l' ? -1 : 1; if (h.st.root > 0) { api.toast('속박되어 움직일 수 없어요'); return; } if (!inb(f, h.x + d)) { api.toast('줄의 끝이에요'); return; } if (at(f, h.x + d)) { api.toast('적이 서 있는 칸이에요. 밀치거나 넘어가야 해요'); return; } act({ t: 'mv', d }); }
+      else if (a === 't') act({ t: 'turn' }); else if (a === 'w') act({ t: 'wait' }); else if (a === 'go') { if (f.q.length) { sel = null; act({ t: 'go' }); } else api.toast('올려 둔 타일이 없어요. 타일을 먼저 올려요'); }
+    }
+    hand.addEventListener('click', (e) => { const b = e.target.closest('.ld-tile'); if (b) tapTile(+b.dataset.i); });
+    info.addEventListener('click', (e) => { if (e.target.closest('.ld-put') && sel != null) putTile(sel); });
+    qrow.addEventListener('click', (e) => { if (e.target.closest('.ld-go')) doAct('go'); });
+    acts.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) doAct(b.dataset.a); });
+    ov.addEventListener('click', (e) => {
+      const b = e.target.closest('.ld-opt'), k = e.target.closest('.ld-chip');
+      if (b) { const i = +b.dataset.o; if (osel === i && can()) { confirmOpt(); return; } osel = i; sfx('click', { vol: 0.5 }); renderOv(); }
+      else if (k) { own = own === k.dataset.own ? null : k.dataset.own; renderOv(); }
+      else if (e.target.closest('.ld-ok')) confirmOpt();
+    });
+    cv.addEventListener('pointerdown', (e) => {
+      if (!st || !st.f || play) return;
+      const r = cv.getBoundingClientRect(), g = geo(), i = Math.floor((e.clientX - r.left - g.x0) / g.cw), u = st.f.u.find((v) => v.x === i && v.hp > 0);
+      selU = u ? (selU === u.i ? null : u.i) : null; if (u) sel = null; refresh();
+    });
+    const onCancel = (e) => { if (sel != null || selU != null || (st && st.ch && osel >= 0)) { sel = null; selU = null; osel = -1; refresh(); e.preventDefault(); } };
+    G0.addEventListener('lounge-cancel', onCancel);
+    const offIn = api.input && api.input.on ? api.input.on((type, id) => {
+      if (type !== 'down' || !st || st.res) return;
+      const m = /^t(\d)$/.exec(id);
+      if (st.ch) { if (m && st.ch.o[+m[1] - 1]) { osel = +m[1] - 1; renderOv(); } else if (id === 'go') confirmOpt(); return; }
+      if (m) tapTile(+m[1] - 1); else if (id === 'left') doAct('l'); else if (id === 'right') doAct('r'); else if (id === 'turn') doAct('t'); else if (id === 'wait') doAct('w'); else if (id === 'go') doAct('go');
+    }) : null;
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => resize()) : null; if (ro) ro.observe(field);
+    G0.addEventListener('resize', resize);
+    resize(); raf = requestAnimationFrame(frame);
+
+    function onResult() {
+      if (resDone || !st.res) return; resDone = true;
+      if (api.players[0] && api.players[0].ai) return;
+      const got = [];
+      if (st.res.w && unlock('shadow')) got.push('shadow');
+      if (st.st.k >= 40 && unlock('kindler')) got.push('kindler');
+      if (st.res.w && st.len !== 's' && unlock('brewer')) got.push('brewer');
+      if (got.length) api.toast('새 인물이 열렸어요: ' + got.map((k) => CLS[k].n).join(', '));
+      try { api.best('kills', st.st.k, { label: '한 판에 쓰러뜨린 적' }); if (st.res.w) api.best('beats_' + st.len, st.st.b, { label: LEN[st.len].n + ' 완주 박자', lower: true, unit: '박자' }); } catch (e) {}
+    }
+    return {
+      update(state, prev) {
+        const was = st; st = state;
+        if (st.msg && st.msg.id !== seenMsg) { if (seenMsg || prev) api.toast(st.msg.t); seenMsg = st.msg.id; }
+        const last = st.last;
+        if (last && last.id !== seen && prev && prev !== state && D.fid && last.fid === D.fid && last.ev.length) { seen = last.id; if (play) { play.q = play.q.concat(last.ev); } else startPlay(last.ev); }
+        else { if (last) seen = last.id; if (!play) syncD(); }
+        if (st.f && st.f.kind === 'boss' && bossShown !== st.f.fid) { bossShown = st.f.fid; if (prev) try { api.banner('우두머리', { sub: EN[st.boss].n, small: true, ms: 1300 }); } catch (e) {} }
+        if (st.f && !st.res && st.f.fid === 1 && st.f.t === 0 && !st.f.q.length && api.canAct(0) && !(L.debug && L.debug.noTut)) {
+          try { if (!G0.localStorage.getItem('lounge.lineduel.tut')) { G0.localStorage.setItem('lounge.lineduel.tut', '1'); setTimeout(() => { if (!dead && api.tutorial) api.tutorial(TUT); }, 350); } } catch (e) {}
+        }
+        if (!play) refresh(); else { renderTop(); renderFight(); }
+        if (st.res) onResult();
+      },
+      destroy() {
+        dead = true; cancelAnimationFrame(raf); if (ro) ro.disconnect(); G0.removeEventListener('resize', resize); G0.removeEventListener('lounge-cancel', onCancel); if (offIn) offIn();
+        try { api.setBusy(false); } catch (e) {} el.remove();
+      },
+    };
+  }
+  /* ================= ⑦ 등록 ================= */
+  function codex() {
+    const open = unlocked();
+    const enRow = (k) => { const D0 = EN[k], tr = trTxt(D0.tr); return { icon: figImg(D0.g, 0, 40), name: D0.n, tag: (D0.boss ? '우두머리' : D0.t + '단계') + ' · 체력 ' + D0.hp, desc: D0.d + (tr ? ' ' + tr + '.' : '') + ' ' + (D0.at.length ? D0.at.map(aDesc).join(' / ') : '공격하지 않음') + '.' }; };
+    return [
+      { h: '타일', p: ['타일 ' + TILE_IDS.length + '가지. 갈래는 날붙이 · 사격 · 투척 · 이동 · 제어 · 자세 여섯. 판 안의 타일 그림에서는 밝은 칸이 주인공, 붉은 칸이 닿는 자리, 초록 화살표가 움직임이에요.', '한 번에 ' + CAP + '개까지 가질 수 있고, 타일 하나에 강화는 ' + UP_MAX + '번까지 붙어요.'],
+        rows: TILE_IDS.map((k) => ({ icon: glyph(GICON[TL[k].g], 24, GRP[TL[k].g][1]), name: TL[k].n, tag: GRP[TL[k].g][0], desc: tDesc(TL[k]) })) },
+      { h: '강화', p: ['쉼터 · 대장간 · 행상 · 전투 보상에서 타일에 붙여요. 같은 강화는 한 타일에 두 번까지.'],
+        rows: Object.keys(UPS).map((k) => ({ icon: glyph('hammer', 24), name: UPS[k].n, tag: '강화', desc: UPS[k].d + ' — 붙는 타일 ' + TILE_IDS.filter((t) => UPS[k].ok(TL[t])).length + '가지' })) },
+      { h: '장신구', p: ['장신구 ' + TRK_IDS.length + '가지. 가지고만 있어도 듣고, 한 판 동안 이어져요. 정예와 우두머리를 쓰러뜨리거나 행상 · 길 위의 일에서 얻어요.'],
+        rows: TRK_IDS.map((k) => ({ icon: glyph(TK[k].ic, 24), name: TK[k].n, tag: '장신구', desc: TK[k].d })) },
+      { h: '적', p: ['적 ' + EN_IDS.length + '종. 1단계는 바깥 성벽, 2단계는 물길 다리, 3단계는 봉화 능선에서 나와요. 뒤 단계에는 앞 단계의 적도 섞여요.', '「준비 N박자」인 공격은 그만큼 미리 드러나고, 「준비 없음」도 한 박자 전에는 예고돼요.'],
+        rows: EN_IDS.map(enRow) },
+      { h: '우두머리', p: ['막마다 마지막에 하나가 기다려요. 판마다 무작위로 정해져요.'], rows: Object.keys(EN).filter((k) => EN[k].boss).map(enRow) },
+      { h: '주인공', p: ['숨은 인물은 조건을 채우면 열려요. 능력치가 오르는 것은 아니고, 고를 수 있는 인물이 늘어요.'],
+        rows: CLS_IDS.map((k) => { const C0 = CLS[k]; return C0.hid && !open.includes(k) ? { icon: glyph('eye', 24, '#8d809c'), name: '숨은 인물', tag: '잠김', desc: '여는 법: ' + C0.u } : { icon: figImg(C0.g, 1, 40), name: C0.n, tag: '체력 ' + C0.hp + (C0.hid ? ' · 숨은 인물' : ''), desc: C0.d + ' 처음 타일: ' + C0.tiles.map((t) => TL[t].n).join(', ') + '. ' + C0.p }; }) },
+      { h: '키워드', p: ['되풀이되는 효과는 짧은 낱말과 수치로 적어요(「기절: 1」).'],
+        rows: Object.keys(KW).map((k) => ({ icon: '<svg viewBox="0 0 24 24" width="24" height="24"><rect x="4" y="4" width="16" height="16" rx="4" fill="' + KW[k].c + '"/></svg>', name: kwLab(k, KW[k].f ? 'N' : null), tag: '키워드', desc: KW[k].d })) },
+      { h: '길', p: ['갈림길에서 고르는 구간과, 길 위에서 만나는 일 ' + EVENTS.length + '가지.'],
+        rows: Object.keys(NODE).map((k) => ({ icon: glyph(NODE[k].ic, 24), name: NODE[k].n, tag: '구간', desc: NODE[k].d })).concat(EVENTS.map((e) => ({ icon: glyph('map', 24, '#cbbfd6'), name: e.n, tag: '길 위의 일', desc: e.tx + ' ' + e.o.map((o) => '「' + o.lab + '」 ' + o.d).join(' / ') }))) },
+    ];
+  }
+  function preview(cv) {
+    const c = cv.getContext('2d'), W = cv.width, H = cv.height, base = H - 86, n = 7, cw = 78, x0 = (W - cw * n) / 2;
+    backdrop(c, W, H, 0, base); c.fillStyle = '#15111c'; c.fillRect(0, base, W, H - base);
+    for (let i = 0; i < n; i++) { c.fillStyle = i === 4 || i === 5 ? '#b8483a' : '#2d2639'; c.fillRect(x0 + i * cw + 2, base, cw - 4, 24); c.fillStyle = '#5c4f70'; c.fillRect(x0 + i * cw + 5, base, cw - 10, 2); }
+    const put = (sp, x, f, hero, S) => { c.save(); c.translate(x0 + (x + 0.5) * cw, base); c.scale(f, 1); drawFig(c, sp, S || 104, 0, hero); c.restore(); };
+    put(EN.spearman.g, 6, -1, 0); put(EN.shieldman.g, 4, -1, 0); put(EN.dog.g, 1, 1, 0, 100); put(CLS.patrol.g, 3, 1, 1, 110);
+    c.fillStyle = '#f6d58a'; c.font = '40px "Black Han Sans", sans-serif'; c.textAlign = 'left'; c.textBaseline = 'top'; c.fillText('한 줄 결투', 24, 22);
+    c.fillStyle = '#e6dcee'; c.font = '600 15px sans-serif'; c.fillText('올려 두고, 한 박자에 터뜨린다', 26, 72);
+  }
+  const ICON = '<rect x="4" y="38" width="10" height="8" rx="2" fill="currentColor" opacity=".45"/><rect x="16" y="38" width="10" height="8" rx="2" fill="currentColor"/><rect x="28" y="38" width="10" height="8" rx="2" fill="currentColor" opacity=".8"/><rect x="40" y="38" width="10" height="8" rx="2" fill="currentColor" opacity=".45"/><circle cx="21" cy="16" r="5" fill="currentColor"/><path d="M15 36l2-13h8l2 13z" fill="currentColor"/><path d="M27 26L44 12l4-1-1 4L30 29z" fill="currentColor"/><path d="M30 34h14" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity=".8"/>';
+  const DEF = {
+    id: ID, name: '한 줄 결투', tag: '예약 전투 로그라이크', cat: '보드', icon: ICON, tint: '#3a2430', time: '15–25분', mood: 'drums', ambient: 'wind',
+    blurb: '한 줄로 난 성벽길 위에서, 공격 타일을 예약 칸에 올려 두었다가 한 박자에 터뜨리는 턴제 전투. 적은 다음 행동을 미리 드러내니 읽고 피하고 받아쳐요. 타일 ' + TILE_IDS.length + '가지 · 적 ' + EN_IDS.length + '종 · 우두머리 ' + BOSS_IDS.length + ' · 장신구 ' + TRK_IDS.length + '가지, 길과 적은 판마다 달라요. 혼자 하는 게임이에요.',
+    minPlayers: 1, maxPlayers: 1, defaultPlayers: 1, hidden: false, aiDelay: 430, undo: false, save: true, sidePanel: true,
+    saveLabel: (s) => (s.hero ? CLS[s.hero.c].n + ' · ' + (s.act + 1) + '막 ' + min(s.step + 1, LEN[s.len].S + 1) + '/' + (LEN[s.len].S + 1) + ' · 체력 ' + s.hero.hp : '인물 고르기'),
+    options: [
+      { id: 'len', label: '길이', tip: '막의 수. 막마다 전투 몇 번과 우두머리 하나가 있어요.', def: 'n',
+        choices: [{ v: 's', label: '짧게', tip: '2막 · 10분 안팎' }, { v: 'n', label: '보통', tip: '3막 · 15~25분' }, { v: 'l', label: '길게', tip: '4막 · 마지막 막의 적이 더 단단함' }] },
+      { id: 'hero', label: '주인공', tip: '「판에서 고르기」는 시작할 때 인물을 골라요. 숨은 인물은 조건을 채우면 열려요.', def: 'pick',
+        choices: [{ v: 'pick', label: '판에서 고르기' }, { v: 'rand', label: '무작위', tip: '열린 인물 가운데 하나' }] },
+    ],
+    controls: [
+      { id: 'left', label: '왼쪽으로', keys: ['ArrowLeft', 'KeyA'], pad: ['left'] },
+      { id: 'right', label: '오른쪽으로', keys: ['ArrowRight', 'KeyD'], pad: ['right'] },
+      { id: 'turn', label: '돌아서기', keys: ['KeyF', 'ArrowUp'], pad: ['y'] },
+      { id: 'wait', label: '대기', keys: ['KeyS', 'ArrowDown'], pad: ['b'] },
+      { id: 'go', label: '실행 · 고르기', keys: ['Space', 'KeyE'], pad: ['a'] },
+    ].concat([1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ id: 't' + n, label: '타일 ' + n + ' (두 번 누르면 올림)', keys: ['Digit' + n] }))),
+    quick: [
+      '성벽길 끝의 봉화대까지 가요. 전투를 이기며 막마다 기다리는 우두머리를 쓰러뜨려요.',
+      '박자마다 하나를 해요: 이동 · 돌아서기 · 타일 올리기 · 올려 둔 타일 실행 · 대기. 그러면 적도 한 번 움직여요.',
+      '적 머리 위 표시와 붉은 칸이 다음 박자의 공격이에요. 읽고 피하면서, 타일을 모아 한 번에 터뜨려요.',
+    ],
+    rules: [
+      { h: '목표', p: ['길이에 따라 2~4막을 지나요. 막마다 전투 · 쉼터 · 행상 같은 구간을 거쳐 마지막에 우두머리와 싸워요.', '마지막 막의 우두머리를 쓰러뜨리면 승리, 체력이 0이 되면 그 판은 끝이에요. 체력은 전투가 끝나도 저절로 차지 않아요.'] },
+      { h: '한 박자', p: ['싸움터는 한 줄의 칸이에요. 내가 행동 하나를 하면 적 모두가 한 번씩 움직여요. 이 한 번이 「박자」예요.',
+        '이동 — 옆 칸으로 한 칸. 가는 쪽을 보게 돼요. 누가 서 있는 칸으로는 못 가요.',
+        '돌아서기 — 제자리에서 반대쪽을 봐요. 공격은 대부분 보는 쪽으로 나가요.',
+        '타일 올리기 — 타일을 예약 칸에 올려요. 올리는 데 한 박자(「가벼움」 타일은 박자를 쓰지 않아요).',
+        '실행 — 예약 칸의 타일이 올린 순서대로, 한 박자에 모두 나가요. 쓴 타일은 「대기」 수만큼의 박자를 쉬어요.',
+        '대기 — 아무것도 하지 않고 한 박자를 보내요.'] },
+      { h: '적의 예고', p: ['적 머리 위의 표시가 다음 박자에 할 행동이에요. 화살표는 이동, 굽은 화살표는 돌아섬, 모래시계는 공격 준비(숫자 = 남은 박자), 붉은 표시는 공격(숫자 = 피해)이에요.',
+        '공격이 떨어질 칸은 붉게 물들고 피해가 적혀요. 그 칸에서 벗어나거나, 막거나, 적을 밀치고 기절시켜 공격을 흩어요.',
+        '적의 공격은 정한 쪽으로 그대로 나가요. 비켜서면 뒤에 있던 다른 적이 맞아요. 돌려세우면 제 편을 치기도 해요.',
+        '적을 누르면 다음 행동과 특성이 글로 나와요.'] },
+      { h: '타일 읽기', p: ['타일의 작은 그림에서 밝은 칸이 나, 붉은 칸이 닿는 자리예요. 왼쪽 아래 숫자가 피해, 오른쪽 아래 숫자가 대기예요.',
+        '타일을 한 번 누르면 설명이 나오고, 싸움터에 닿는 칸(금빛 테두리)과 예상 피해가 보여요. 한 번 더 누르거나 「올리기」를 누르면 예약 칸에 올라가요.',
+        '예약 칸은 3칸이에요. 여러 장을 올려 한 번에 실행하면 그 박자에 큰 피해를 몰아줄 수 있어요. 대신 올리는 동안 박자가 흘러요.',
+        '예시: 「밀치기」로 적을 뒤의 적에게 부딪치게 하고(충돌), 이어서 「찌르기」를 넣으려면 밀치기 → 찌르기 순서로 올리면 안 돼요. 밀려난 적은 한 칸 밖이라 찌르기가 닿지 않으니, 찌르기 → 밀치기 순서로 올려요.'] },
+      { h: '무리와 땅거미', p: ['전투마다 적이 두세 무리로 나뉘어 와요. 남은 적이 줄면 줄 끝에 「도착」 표시가 뜨고 다음 박자에 새 무리가 들어와요.',
+        '한 전투가 ' + DUSK + '박자를 넘기면 땅거미가 져서 5박자마다 체력을 1씩 잃어요. 피하기만 하며 끌 수는 없어요.'] },
+      { h: '전투가 끝나면', p: ['은화를 얻고, 새 타일이나 강화 가운데 하나를 골라요(넘기면 은화 조금). 타일은 ' + CAP + '개까지 — 가득 차면 하나와 바꿔요.',
+        '정예 전투와 우두머리는 장신구도 줘요. 우두머리를 쓰러뜨리면 체력을 5 회복해요.',
+        '갈림길에서 다음 구간을 골라요: 전투 · 정예 전투 · 쉼터(회복이나 강화) · 대장간(강화) · 행상(은화로 삼) · 길 위의 일.'] },
+      { h: '키워드', p: Object.keys(KW).map((k) => '「' + kwLab(k, KW[k].f ? 'N' : null) + '」 — ' + KW[k].d) },
+      { h: '조작', p: ['폰: 타일 · 단추를 눌러요. 적이나 나를 누르면 설명이 나와요.',
+        'PC: ←/→ 이동, F 돌아서기, S 대기, 숫자 1~8 타일(한 번 누르면 살펴보기, 한 번 더 누르면 올리기), Space 실행. 오른쪽 클릭은 고른 것 풀기. 키는 「조작 설정」에서 바꿀 수 있어요.',
+        '판은 자동으로 저장돼요. 나갔다가 설정 화면의 「이어하기」로 돌아올 수 있어요.',
+        'AI 자리로 두면 쉬움 · 보통 · 어려움에 따라 내다보는 깊이가 달라요.'] },
+    ],
+    hint: (s, seat) => hintLines(s, seat),
+    panelInfo(s) {
+      if (!s.hero) return null; const hr = s.hero;
+      return [{ label: '인물', value: CLS[hr.c].n }, { label: '체력', value: hr.hp + ' / ' + hr.mhp }, { label: '은화', value: String(hr.coin) }, { label: '길', value: (s.act + 1) + '막 ' + ACT_NAME[s.act] },
+        { label: '타일', value: hr.tiles.map(tName).join(', ') }].concat(hr.trk.length ? [{ label: '장신구', value: hr.trk.map((k) => TK[k].n).join(', ') }] : []);
+    },
+    init, actor: (s) => (s.res ? null : 0), apply, ai, result, mount, preview,
+    aiDelayFor: (s, seat, lv) => (s.ch ? 700 : 430),
+    _t: { TL, EN, TK, CLS, LEN, UPS, KW, EVENTS, mkG, legal, simStep, evalF, look, threats, tDesc, aDesc, unlocked },
+  };
+  Object.defineProperty(DEF, 'codex', { enumerable: true, get: () => codex() });   // 열 때마다 새로(숨은 인물 해금 반영)
+  L.register(DEF);
+})();

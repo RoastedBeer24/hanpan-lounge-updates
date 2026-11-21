@@ -1,0 +1,2099 @@
+/* 기울여 공 굴리기 미로 — realtime tilt-maze race (1–4) + solo stage mode with stars.
+   A wooden labyrinth seen from above: tilt the board (phone tilt, drag "joystick" anywhere, or keys/pad) to roll a steel
+   ball past holes into the goal cup. Race: everyone plays the same course (3 stages by default) at the same time on their
+   own board; the fastest total time wins. Rivals appear as see-through ghost balls when they are on the same stage.
+   Each device simulates its own ball (host/local also the AI balls). Guests publish [stage,x,y,phase,time,…] ~12×/s,
+   the host relays all rows and ends the match with setState (cooking.js / pinball.js pattern).
+   Board = 7×10 cells, authored as ASCII with thin walls on the cell grid (see parseMap).
+   Physics: fixed 240 Hz steps, |v| ≤ 6.5 cells/s → < 0.03 cell per step vs 0.2-thick walls (no tunnelling). */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+  const TAU = Math.PI * 2;
+
+  /* ======================= constants ======================= */
+  const W = 7, H = 10, HW = 0.1;
+  const R = 0.24, G = 8, VMAX = 6.5, HZ = 240, DT = 1 / HZ;
+  const HOLE_R = 0.31, FALL_R = 0.25, RIM_R = 0.38, RIM_A = 4.5, SINK = 0.04;
+  const GOAL_R = 0.34, GOAL_CAP = 0.22, GOAL_PULL = 4;
+  const SLOPE_A = 6.5, MAG_R = 1.45, MAG_A = 7, PORT_R = 0.24, PORT_OUT = 0.5, SW_R = 0.34, E_WALL = 0.3;
+  const FRIC = [[1.0, 0.35], [0.12, 0.04], [3.2, 1.6]];   // [linear damping /s, rolling resistance cells/s²]: wood · ice · sand
+  const SLOPE_DIR = [null, null, null, [1, 0], [-1, 0], [0, -1], [0, 1]];
+  const READY1 = 3.4, READYN = 1.7, GOAL_T = 1.1, FALL_T = 0.95;
+  const NS = 4, NW = W * NS, NH = H * NS, NN = NW * NH, HOLE_NAV = 0.48, WALL_NAV = R + 0.015;
+  const DI = [1, -1, 0, 0, 1, 1, -1, -1], DJ = [0, 0, 1, -1, 1, -1, 1, -1];
+  const GRACE = 20;   // seconds per stage the others still get after the first finisher
+  const PH = { ready: 0, run: 1, fall: 2, goal: 3, fin: 4 };
+  const PORT_COL = ['#b48cff', '#3fd6c6', '#ffa04a', '#8be36a'];
+  const SW_COL = ['#ee6a55', '#3fb0d6'];
+
+  function fmtT(sec) {
+    if (!(sec >= 0) || !isFinite(sec)) return '-:--.-';
+    const ds = Math.round(sec * 10), m = Math.floor(ds / 600), r = ds - m * 600, s = Math.floor(r / 10);
+    return m + ':' + (s < 10 ? '0' : '') + s + '.' + (r % 10);
+  }
+  function mkRng(seed) {
+    let a = (seed >>> 0) || 0x9e3779b9;
+    return function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  /* ======================= stages (hand-made) =======================
+     Rows alternate wall rows (even) and cell rows (odd); 15 chars × 21 rows.
+     Wall positions: '-' '|' wall, ' ' open, 'A'/'B' door (opened by switch 'a'/'b'), 'o' hole on that edge.
+     Joints (even,even): blank/'+' = automatic, '*' = pillar, 'o' = hole on the corner.
+     Cells: '.' floor, S start, G goal, O hole, C checkpoint, ~ ice, % sand, > < ^ v slope, M magnet, a/b switch,
+     1–4 teleport pair. Cells that can't be reached from S are drawn as solid raised wood.
+     mv: moving walls [x, y, w, h, dx, dy, period, phase] (position eases back and forth by (dx,dy)). */
+  const STAGES = [
+    { n: '첫 굴리기', tip: '살짝만 기울여도 굴러가요. 금빛 도착 구멍까지!', g: 1, m: [
+      '+-------------+',
+      '|S . . . . . .|',
+      '+     *       +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . . . . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+   *     *   +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . . . . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+       *     +',
+      '|. . . . . . G|',
+      '+-------------+'] },
+    { n: '구멍 조심', tip: '검은 구멍에 빠지면 출발점으로 돌아가요. 옆으로 비켜 가요.', g: 1, m: [
+      '+-------------+',
+      '|S . . O . . .|',
+      '+             +',
+      '|. . . . . O .|',
+      '+- - - - -    +',
+      '|. . O . . . .|',
+      '+             +',
+      '|. . . . O . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+     o       +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . O . . .|',
+      '+             +',
+      '|. O . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+         o   +',
+      '|. . . . . . G|',
+      '+-------------+'] },
+    { n: '지그재그', tip: '길 끝 막다른 칸에 구멍! 꺾기 전에 미리 속도를 줄여요.', g: 1, m: [
+      '+-------------+',
+      '|S . . O|. . .|',
+      '+- -   -      +',
+      '|. .|.|. . . .|',
+      '+      - - -  +',
+      '|. .|. . . O|.|',
+      '+      -   -  +',
+      '|. .|O|.|.|. .|',
+      '+    -     - -+',
+      '|. . . .|. . .|',
+      '+          -  +',
+      '|. . . .|O|.|.|',
+      '+        -    +',
+      '|. . . . . .|.|',
+      '+    - - - -  +',
+      '|. .|O . . . .|',
+      '+- - -   - -  +',
+      '|O . . .|. .|O|',
+      '+-   - -     -+',
+      '|G .|. . . . .|',
+      '+-------------+'] },
+    { n: '체크포인트', tip: '초록 깃발을 지나면, 구멍에 빠져도 깃발에서 다시 시작해요.', g: 1, m: [
+      '+-------------+',
+      '|S . . O . . .|',
+      '+   o     o   +',
+      '|. O . . . . .|',
+      '+             +',
+      '|. . . . O . .|',
+      '+- - - - -    +',
+      '|. . . . . C .|',
+      '+             +',
+      '|. . O . . . .|',
+      '+       o     +',
+      '|O . . . . O .|',
+      '+    - - - - -+',
+      '|. C . . . . .|',
+      '+   o   o     +',
+      '|. . . . . . O|',
+      '+             +',
+      '|. . . O . . .|',
+      '+         o   +',
+      '|. . . . . . G|',
+      '+-------------+'] },
+    { n: '미끄러운 얼음', tip: '파란 얼음 위에서는 잘 안 멈춰요. 브레이크는 일찍!', m: [
+      '+-------------+',
+      '|S ~ ~ ~ ~ . O|',
+      '+             +',
+      '|. ~ ~ ~ ~ . .|',
+      '+- - - - -    +',
+      '|O . ~ ~ ~ ~ .|',
+      '+             +',
+      '|. . ~ ~ ~ ~ .|',
+      '+    - - - - -+',
+      '|. . % % . . O|',
+      '+             +',
+      '|. . % % ~ ~ .|',
+      '+- - - - -    +',
+      '|O ~ ~ ~ ~ . C|',
+      '+             +',
+      '|. ~ ~ ~ ~ . .|',
+      '+    - - - - -+',
+      '|C . ~ ~ ~ ~ O|',
+      '+             +',
+      '|. . ~ ~ ~ ~ G|',
+      '+-------------+'] },
+    { n: '경사와 모래', tip: '화살표 경사는 공을 그쪽으로 밀어요. 반대로 기울여 버텨요. 모래는 느려요.', m: [
+      '+-------------+',
+      '|S . v v v . .|',
+      '+             +',
+      '|. . . O . . .|',
+      '+- - - - -    +',
+      '|O < < < < . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. . % % ^ ^ O|',
+      '+             +',
+      '|. . % % ^ ^ .|',
+      '+- - - - -    +',
+      '|. O . . O . C|',
+      '+             +',
+      '|. > > > > > .|',
+      '+    - - - - -+',
+      '|C . v v v v .|',
+      '+             +',
+      '|. . . O . O G|',
+      '+-------------+'] },
+    { n: '자석', tip: '빨간 자석은 공을 끌어당겨요. 붙으면 구멍 반대쪽으로 세게 기울여요.', m: [
+      '+-------------+',
+      '|S . . O . . .|',
+      '+             +',
+      '|. . . M . . .|',
+      '+- - - - -    +',
+      '|. . . . M . .|',
+      '+   o         +',
+      '|. O . . . . .|',
+      '+    - - - - -+',
+      '|. . M . . M .|',
+      '+       o     +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . O . . C|',
+      '+             +',
+      '|. M . . . M .|',
+      '+    - - - - -+',
+      '|C . . M . . .|',
+      '+             +',
+      '|. . O . O . G|',
+      '+-------------+'] },
+    { n: '스위치 문', tip: '같은 색 스위치를 밟으면 문이 열려요. 스위치부터 찾아가요.', m: [
+      '+-------------+',
+      '|S . . O . . a|',
+      '+             +',
+      '|. . O . . . .|',
+      '+A - - - - - -+',
+      '|. . . . . . .|',
+      '+     o   o   +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . b . . .|',
+      '+     o o     +',
+      '|. . . . . . .|',
+      '+B - - - - - -+',
+      '|C . . . . . .|',
+      '+             +',
+      '|. . O . . O .|',
+      '+- - - - -    +',
+      '|. . . . . . .|',
+      '+             +',
+      '|G . O . . . .|',
+      '+-------------+'] },
+    { n: '순간이동', tip: '같은 숫자 소용돌이끼리 이어져요. 엉뚱한 소용돌이는 먼 길!', m: [
+      '+-------------+',
+      '|S . . O . . .|',
+      '+   o         +',
+      '|. . . . . O 1|',
+      '+- - - - - - -+',
+      '|1 . . . . . .|',
+      '+             +',
+      '|. O . 3 . O .|',
+      '+             +',
+      '|. . . . . . 2|',
+      '+- - - - - - -+',
+      '|. . . . . . 2|',
+      '+             +',
+      '|. O . . O . .|',
+      '+     o       +',
+      '|3 . . . . O .|',
+      '+- - - - - -  +',
+      '|. . . . O . C|',
+      '+             +',
+      '|G . O . . . .|',
+      '+-------------+'] },
+    { n: '움직이는 문', tip: '나무 문이 위아래로 움직여요. 틈이 열릴 때 지나가요.', m: [
+      '+-------------+',
+      '|S . . . . . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . . . . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . O|',
+      '+             +',
+      '|. . . O . . .|',
+      '+- - - - -    +',
+      '|. . . . . . C|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+             +',
+      '|. O . . O . G|',
+      '+-------------+'],
+    mv: [[2.37, 0.1, 0.26, 0.72, 0, 1.08, 2.4, 0], [4.37, 0.1, 0.26, 0.72, 0, 1.08, 2.4, 0.5],
+      [1.87, 2.1, 0.26, 0.72, 0, 1.08, 2.0, 0.1], [3.87, 2.1, 0.26, 0.72, 0, 1.08, 2.0, 0.6],
+      [0.6, 4.87, 1.0, 0.26, 4.6, 0, 4.2, 0],
+      [1.37, 6.1, 0.26, 0.72, 0, 1.08, 1.8, 0.3], [3.87, 6.1, 0.26, 0.72, 0, 1.08, 1.8, 0.8],
+      [2.87, 8.1, 0.26, 0.72, 0, 1.08, 2.2, 0]] },
+    { n: '구멍 숲', tip: '구멍이 숲처럼 늘어서 있어요. 사이사이 대각선 길로 천천히.', m: [
+      '+-------------+',
+      '|S . . . . . .|',
+      '+   o   o   o +',
+      '|. . . . . . .|',
+      '+ o   o   o   +',
+      '|. . . . . . .|',
+      '+   o   o   o +',
+      '|. . . . . . C|',
+      '+- - - - - -  +',
+      '|. . . . . . .|',
+      '+ o   o   o   +',
+      '|. . . . . . .|',
+      '+   o   o   o +',
+      '|. . . . . . .|',
+      '+ o   o   o   +',
+      '|C . . . . . .|',
+      '+  - - - - - -+',
+      '|. . . . . . .|',
+      '+   o   o   o +',
+      '|. . . . . . G|',
+      '+-------------+'] },
+    { n: '얼음 구멍', tip: '얼음 위 구멍들! 살살 기울이는 게 비결이에요.', m: [
+      '+-------------+',
+      '|S ~ ~ ~ ~ ~ ~|',
+      '+             +',
+      '|~ ~ O ~ ~ ~ ~|',
+      '+- - - - -    +',
+      '|~ ~ ~ ~ ~ ~ O|',
+      '+             +',
+      '|O ~ ~ ~ ~ ~ ~|',
+      '+    - - - - -+',
+      '|~ ~ ~ O ~ ~ ~|',
+      '+         o   +',
+      '|~ ~ ~ ~ ~ ~ ~|',
+      '+- - - - -    +',
+      '|~ ~ ~ ~ ~ ~ C|',
+      '+   o         +',
+      '|O ~ ~ ~ ~ ~ ~|',
+      '+    - - - - -+',
+      '|C % % ~ ~ ~ ~|',
+      '+             +',
+      '|% % ~ ~ O ~ G|',
+      '+-------------+'] },
+    { n: '경사 미로', tip: '오르막은 아주 느려요. 경사가 구멍 쪽으로 밀면 반대로 기울여요.', m: [
+      '+-------------+',
+      '|S . > > > . .|',
+      '+             +',
+      '|. . O . O . .|',
+      '+- - - - -    +',
+      '|O O . O . . .|',
+      '+             +',
+      '|. . ^ ^ ^ ^ .|',
+      '+    - - - - -+',
+      '|. . . < < . O|',
+      '+             +',
+      '|. . . < < . .|',
+      '+- - - - -    +',
+      '|. . O . O . C|',
+      '+             +',
+      '|. . ^ ^ ^ ^ .|',
+      '+    - - - - -+',
+      '|C . ^ ^ ^ . .|',
+      '+             +',
+      '|. . O . O . G|',
+      '+-------------+'] },
+    { n: '자석 회랑', tip: '자석 바로 옆이 구멍! 붙으면 구멍 반대쪽으로 빠져나와요.', m: [
+      '+-------------+',
+      '|S . . O M . .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+- - - - -    +',
+      '|. . . O M O .|',
+      '+             +',
+      '|. . . . . . .|',
+      '+    - - - - -+',
+      '|. M . . . M .|',
+      '+   o     o   +',
+      '|. . . M . . .|',
+      '+- - - - -    +',
+      '|. . O . . . C|',
+      '+             +',
+      '|. M . O M . .|',
+      '+    - - - - -+',
+      '|C . . . . . .|',
+      '+             +',
+      '|. . O M O . G|',
+      '+-------------+'] },
+    { n: '두 스위치', tip: '스위치 2개를 모두 밟아야 끝까지 가요. 좁은 길은 천천히.', m: [
+      '+-------------+',
+      '|S . . . . O .|',
+      '+  - - -      +',
+      '|. . . a|. . O|',
+      '+- - - - -    +',
+      '|. . . . . . .|',
+      '+   o     - - +',
+      '|. . O . . . b|',
+      '+A - - - - - -+',
+      '|. . . . . . .|',
+      '+     o   o   +',
+      '|. O . . . . .|',
+      '+- - - - - - B+',
+      '|. . . . . . C|',
+      '+  - - - -    +',
+      '|. O . . . . .|',
+      '+    - - - - -+',
+      '|. . . . . . .|',
+      '+     o   o   +',
+      '|. . O . . . G|',
+      '+-------------+'] },
+    { n: '최종 시험', tip: '얼음·경사·자석·움직이는 문·스위치·순간이동 총출동!', m: [
+      '+-------------+',
+      '|S ~ ~ ~ ~ ~ .|',
+      '+           o +',
+      '|. ~ ~ O ~ ~ .|',
+      '+- - - - -    +',
+      '|. . v v v . M|',
+      '+             +',
+      '|O . . O . . .|',
+      '+    - - - - -+',
+      '|. . . . . . a|',
+      '+             +',
+      '|. . O . . . .|',
+      '+- - - - - A -+',
+      '|. . O . . C .|',
+      '+             +',
+      '|1 . . . O . .|',
+      '+- - - - - - -+',
+      '|1 . . . . . .|',
+      '+     o   o   +',
+      '|. . O % % . G|',
+      '+-------------+'],
+    mv: [[2.37, 4.1, 0.26, 0.72, 0, 1.08, 2.3, 0], [4.37, 4.1, 0.26, 0.72, 0, 1.08, 2.3, 0.45]] },
+  ];
+  const TIERS = [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12, 13, 14, 15]];
+  // star times [★★★, ★★] in seconds (measured with the AI: ≈ strong-AI time ×1.15 and ×1.8, rounded)
+  const PAR = [[16, 26], [18, 28], [12, 19], [10, 15], [19, 29], [21, 32], [18, 28], [22, 35], [10, 15], [23, 35], [14, 21], [21, 32], [16, 24], [18, 29], [25, 40], [18, 28]];
+
+  /* ======================= parsing ======================= */
+  function mkR(x0, y0, x1, y1) { return { x0, y0, x1, y1 }; }
+  function parseMap(m, mv, nm) {
+    const R2 = 2 * H, C2 = 2 * W;
+    if (!Array.isArray(m) || m.length !== R2 + 1) throw new Error('tiltmaze: bad row count in ' + nm);
+    for (let r = 0; r <= R2; r++) if (typeof m[r] !== 'string' || m[r].length !== C2 + 1) throw new Error('tiltmaze: row ' + r + ' of ' + nm + ' has length ' + (m[r] || '').length);
+    const ch = (r, c) => (r < 0 || c < 0 || r > R2 || c > C2 ? ' ' : m[r][c]);
+    const wall = (r, c) => {
+      if (r < 0 || c < 0 || r > R2 || c > C2) return false;
+      if ((r & 1) === (c & 1)) return false;
+      if (r === 0 || r === R2 || c === 0 || c === C2) return true;
+      const k = m[r][c]; return k === '-' || k === '|';
+    };
+    const rects = [], doors = [], holes = [], mags = [], sws = [], ports = [], pd = {};
+    for (let r = 0; r <= R2; r += 2) {   // horizontal wall runs (walls + the joints they touch)
+      let s = -1;
+      for (let c = 0; c <= C2 + 1; c++) {
+        let on = false;
+        if (c <= C2) {
+          if (c & 1) on = wall(r, c);
+          else { const k = ch(r, c); on = k !== 'o' && ((k === '*' && r > 0 && r < R2) || wall(r, c - 1) || wall(r, c + 1)); }
+        }
+        if (on && s < 0) s = c;
+        else if (!on && s >= 0) { rects.push(mkR(s / 2 - HW, r / 2 - HW, (c - 1) / 2 + HW, r / 2 + HW)); s = -1; }
+      }
+    }
+    for (let c = 0; c <= C2; c += 2) {   // vertical wall runs
+      let s = -1;
+      for (let r = 0; r <= R2 + 1; r++) {
+        let on = false;
+        if (r <= R2) {
+          if (r & 1) on = wall(r, c);
+          else on = ch(r, c) !== 'o' && (wall(r - 1, c) || wall(r + 1, c));
+        }
+        if (on && s < 0) s = r;
+        else if (!on && s >= 0) { rects.push(mkR(c / 2 - HW, s / 2 - HW, c / 2 + HW, (r - 1) / 2 + HW)); s = -1; }
+      }
+    }
+    let start = null, goal = null;
+    const surf = new Int8Array(W * H), cp = new Uint8Array(W * H), cellCh = [];
+    for (let r = 0; r <= R2; r++) for (let c = 0; c <= C2; c++) {
+      const k = ch(r, c);
+      if ((r & 1) && (c & 1)) {
+        const cx = (c - 1) / 2, cy = (r - 1) / 2, i = cy * W + cx, X = cx + 0.5, Y = cy + 0.5;
+        cellCh[i] = k;
+        switch (k) {
+          case 'S': start = [X, Y]; break;
+          case 'G': goal = [X, Y]; break;
+          case 'O': holes.push({ x: X, y: Y }); break;
+          case 'C': cp[i] = 1; break;
+          case '~': surf[i] = 1; break;
+          case '%': surf[i] = 2; break;
+          case '>': surf[i] = 3; break;
+          case '<': surf[i] = 4; break;
+          case '^': surf[i] = 5; break;
+          case 'v': surf[i] = 6; break;
+          case 'M': mags.push({ x: X, y: Y }); break;
+          case 'a': case 'b': sws.push({ x: X, y: Y, g: k === 'a' ? 0 : 1 }); break;
+          case '1': case '2': case '3': case '4': (pd[k] = pd[k] || []).push({ x: X, y: Y, c: i, d: +k - 1 }); break;
+          case '.': case ' ': break;
+          default: throw new Error('tiltmaze: bad cell "' + k + '" in ' + nm);
+        }
+      } else if (k === 'o') holes.push({ x: c / 2, y: r / 2 });
+      else if ((k === 'A' || k === 'B') && (r & 1) !== (c & 1) && r > 0 && r < R2 && c > 0 && c < C2) {
+        const g = k === 'A' ? 0 : 1;
+        if (!(r & 1)) doors.push({ g, x0: (c - 1) / 2 - HW, y0: r / 2 - HW, x1: (c + 1) / 2 + HW, y1: r / 2 + HW });
+        else doors.push({ g, x0: c / 2 - HW, y0: (r - 1) / 2 - HW, x1: c / 2 + HW, y1: (r + 1) / 2 + HW });
+      }
+    }
+    if (!start || !goal) throw new Error('tiltmaze: start/goal missing in ' + nm);
+    for (let i = 0; i < W * H; i++) {   // marked cells (hole, flag, goal…) inside an ice field are icy too
+      if (surf[i] || cellCh[i] === '.' || cellCh[i] === ' ') continue;
+      const x = i % W, y = (i / W) | 0;
+      let n = 0;
+      if (x > 0 && surf[i - 1] === 1) n++;
+      if (x < W - 1 && surf[i + 1] === 1) n++;
+      if (y > 0 && surf[i - W] === 1) n++;
+      if (y < H - 1 && surf[i + W] === 1) n++;
+      if (n >= 2) surf[i] = 1;
+    }
+    for (const k in pd) {
+      const a = pd[k]; if (a.length !== 2) throw new Error('tiltmaze: portal ' + k + ' needs 2 ends in ' + nm);
+      const i0 = ports.length; ports.push(a[0], a[1]); a[0].p = i0 + 1; a[1].p = i0;
+    }
+    // cells unreachable from the start → solid wood
+    const filled = new Uint8Array(W * H).fill(1), q = [Math.floor(start[1]) * W + Math.floor(start[0])];
+    filled[q[0]] = 0;
+    while (q.length) {
+      const i = q.pop(), cx = i % W, cy = (i / W) | 0, nb = [];
+      if (cx < W - 1 && !wall(2 * cy + 1, 2 * cx + 2)) nb.push(i + 1);
+      if (cx > 0 && !wall(2 * cy + 1, 2 * cx)) nb.push(i - 1);
+      if (cy < H - 1 && !wall(2 * cy + 2, 2 * cx + 1)) nb.push(i + W);
+      if (cy > 0 && !wall(2 * cy, 2 * cx + 1)) nb.push(i - W);
+      for (const p of ports) if (p.c === i) nb.push(ports[p.p].c);
+      for (const j of nb) if (filled[j]) { filled[j] = 0; q.push(j); }
+    }
+    const mvs = (mv || []).map((a) => ({ x: a[0], y: a[1], w: a[2], h: a[3], dx: a[4], dy: a[5], p: a[6], ph: a[7] || 0 }));
+    return { name: nm, rects, doors, holes, mags, sws, ports, surf, cp, start, goal, filled, mv: mvs, cellCh, nav: null };
+  }
+
+  /* ======================= generated mazes =======================
+     Stage id >= 1000 encodes a generated maze: id = 1000 + kind*1e6 + seed (seed < 1e6).
+       kind 0      -> quick random maze (difficulty 3)
+       kind 1..999 -> 「끝없는 미로」 stage k (difficulty grows every 3 stages, max 9)
+       id >= DAILY0 -> 「오늘의 미로」, id - DAILY0 = yyyymmdd
+     Solvable by construction (spanning tree S -> G, hazards only off the path or passable) and verified by the
+     nav field (AI path search with the ball radius); moving bars fully clear their gap once per cycle. */
+  const DAILY0 = 1000 + 1e9;
+  const genKind = (id) => (id >= DAILY0 ? -1 : Math.floor((id - 1000) / 1e6));
+  const lvlOfK = (k) => Math.min(9, Math.floor((k - 1) / 3));
+  function genLvl(id) { const k = genKind(id); return k < 0 ? 4 : k === 0 ? 3 : k >= 900 ? Math.min(9, k - 900) : lvlOfK(k); }
+  const genId = (k, seed) => 1000 + k * 1e6 + (((Math.floor(seed) % 1e6) + 1e6) % 1e6);
+  function dayKey(d) { d = d || new Date(); return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); }
+  function genMap(seed, att, lvl) {
+    lvl = lvl == null ? 3 : lvl;
+    const r = mkRng(((seed * 2654435761) >>> 0) ^ Math.imul(att + 1, 0x9e3779b9) ^ Math.imul(lvl + 7, 0x85ebca6b));
+    const N = W * H, rw = new Uint8Array(N).fill(1), dw = new Uint8Array(N).fill(1), seen = new Uint8Array(N);
+    const s0 = r() < 0.5 ? 0 : W - 1, stack = [s0];
+    seen[s0] = 1;
+    while (stack.length) {   // recursive backtracker
+      const c = stack[stack.length - 1], x = c % W, y = (c / W) | 0, o = [];
+      if (x > 0 && !seen[c - 1]) o.push(0);
+      if (x < W - 1 && !seen[c + 1]) o.push(1);
+      if (y > 0 && !seen[c - W]) o.push(2);
+      if (y < H - 1 && !seen[c + W]) o.push(3);
+      if (!o.length) { stack.pop(); continue; }
+      const d = o[Math.floor(r() * o.length)];
+      let nc;
+      if (d === 0) { nc = c - 1; rw[nc] = 0; } else if (d === 1) { nc = c + 1; rw[c] = 0; } else if (d === 2) { nc = c - W; dw[nc] = 0; } else { nc = c + W; dw[c] = 0; }
+      seen[nc] = 1; stack.push(nc);
+    }
+    const loops = Math.max(3, 12 - lvl);   // easy mazes have more loops (more ways round)
+    for (let k = 0; k < loops; k++) { const c = Math.floor(r() * N), x = c % W, y = (c / W) | 0; if (r() < 0.5) { if (x < W - 1) rw[c] = 0; } else if (y < H - 1) dw[c] = 0; }
+    const nbs = (c) => { const x = c % W, y = (c / W) | 0, o = []; if (x < W - 1 && !rw[c]) o.push(c + 1); if (x > 0 && !rw[c - 1]) o.push(c - 1); if (y < H - 1 && !dw[c]) o.push(c + W); if (y > 0 && !dw[c - W]) o.push(c - W); return o; };
+    const dist = new Int16Array(N).fill(-1), par = new Int16Array(N).fill(-1), q = [s0];
+    dist[s0] = 0;
+    for (let h = 0; h < q.length; h++) for (const n of nbs(q[h])) if (dist[n] < 0) { dist[n] = dist[q[h]] + 1; par[n] = q[h]; q.push(n); }
+    let goal = 1, gs = -1;
+    for (let c = 0; c < N; c++) { if (c === s0) continue; const s = dist[c] + (((c / W) | 0) >= H - 2 ? 5 : 0); if (s > gs) { gs = s; goal = c; } }
+    const path = []; for (let c = goal; c >= 0; c = par[c]) path.unshift(c);
+    const on = new Uint8Array(N); path.forEach((c) => { on[c] = 1; });
+    const cells = new Array(N).fill('.');
+    cells[s0] = 'S'; cells[goal] = 'G';
+    const pl = path.length, hz = att < 5;
+    // holes: dead ends off the path, then (harder) cells beside the path
+    if (hz) for (let c = 0; c < N; c++) if (!on[c] && cells[c] === '.' && nbs(c).length === 1 && r() < 0.35 + lvl * 0.07) cells[c] = 'O';
+    if (hz && lvl >= 5) for (let c = 0; c < N; c++) if (!on[c] && cells[c] === '.' && nbs(c).some((n) => on[n]) && r() < (lvl - 4) * 0.06) cells[c] = 'O';
+    const free = (k) => path[k] != null && cells[path[k]] === '.';
+    if (hz && lvl >= 2 && pl > 12) { const a = 2 + Math.floor(r() * (pl - 9)), n = 2 + Math.min(4, lvl >> 1); for (let k = 0; k < n; k++) if (free(a + k)) cells[path[a + k]] = '~'; }
+    if (hz && lvl >= 1 && pl > 8) { const a = 1 + Math.floor(r() * (pl - 4)); for (let k = 0; k < 2; k++) if (free(a + k)) cells[path[a + k]] = '%'; }
+    if (hz && lvl >= 6 && pl > 10) {   // slopes along the path (they push the way you are going)
+      for (let t = 0; t < 2; t++) {
+        const k = 2 + Math.floor(r() * (pl - 4)); if (!free(k)) continue;
+        const c = path[k], d = path[k + 1] - c;
+        cells[c] = d === 1 ? '>' : d === -1 ? '<' : d === W ? 'v' : '^';
+      }
+    }
+    const ncp = lvl >= 6 && pl > 14 ? 2 : pl > 6 ? 1 : 0;
+    for (let t = 1; t <= ncp; t++) { let k = Math.floor(pl * t / (ncp + 1)); while (k < pl - 1 && !free(k)) k++; if (free(k)) cells[path[k]] = 'C'; }
+    if (hz && lvl >= 4) {
+      let nm = 0;
+      for (let k = 0; k < 30 && nm < (lvl >= 8 ? 2 : 1); k++) {
+        const c = Math.floor(r() * N);
+        if (on[c] || cells[c] !== '.' || !nbs(c).some((n) => on[n])) continue;
+        cells[c] = 'M'; nm++;
+      }
+    }
+    const jh = {};
+    if (att < 3) for (let jy = 1; jy < H; jy++) for (let jx = 1; jx < W; jx++) {
+      const a = (jy - 1) * W + (jx - 1), b = a + 1, c = a + W;
+      if (!rw[a] && !rw[c] && !dw[a] && !dw[b] && r() < 0.2 + lvl * 0.06) jh[jx + ',' + jy] = 1;
+    }
+    // moving bars across gaps on the path (they open the gap completely once per cycle)
+    const mv = [], nmv = att < 4 ? Math.min(3, Math.max(0, Math.floor((lvl - 1) / 2.5))) : 0;
+    const used = {};
+    for (let t = 0, tries = 0; t < nmv && tries < 40 && pl > 4; tries++) {
+      const k = 1 + Math.floor(r() * (pl - 3)), a = path[k], b = path[k + 1];
+      if (b == null || used[k] || used[k - 1] || used[k + 1]) continue;
+      const lo = Math.min(a, b), x = lo % W, y = (lo / W) | 0, per = +(3.4 - lvl * 0.12 + r() * 0.6).toFixed(2), ph = +r().toFixed(2);
+      if (Math.abs(a - b) === W) { if (x < 1 || x > W - 2) continue; mv.push([x - 0.4, y + 1 - 0.1, 0.5, 0.2, 1.3, 0, per, ph]); }
+      else { if (y < 1 || y > H - 2) continue; mv.push([x + 1 - 0.1, y - 0.4, 0.2, 0.5, 0, 1.3, per, ph]); }
+      used[k] = 1; t++;
+    }
+    const rows = [];
+    for (let rr = 0; rr <= 2 * H; rr++) {
+      let s = '';
+      for (let cc = 0; cc <= 2 * W; cc++) {
+        if (rr === 0 || rr === 2 * H) { s += cc === 0 || cc === 2 * W ? '+' : '-'; continue; }
+        if (cc === 0 || cc === 2 * W) { s += rr & 1 ? '|' : '+'; continue; }
+        const ro = rr & 1, co = cc & 1;
+        if (ro && co) s += cells[((rr - 1) / 2) * W + (cc - 1) / 2];
+        else if (ro) s += rw[((rr - 1) / 2) * W + (cc / 2 - 1)] ? '|' : ' ';
+        else if (co) s += dw[(rr / 2 - 1) * W + (cc - 1) / 2] ? '-' : ' ';
+        else s += jh[(cc / 2) + ',' + (rr / 2)] ? 'o' : ' ';
+      }
+      rows.push(s);
+    }
+    rows.mv = mv;
+    return rows;
+  }
+  function genCheck(D) {   // AI path search (ball radius, holes) start -> goal; returns cost or -1
+    const F = field(D, 'g', 0), f0 = nodeNear(F, freeOf(D, 0), D.start[0], D.start[1]);
+    return f0 >= 0 && isFinite(F[f0]) ? F[f0] : -1;
+  }
+  function genStage(id) {
+    const kd = genKind(id), lvl = genLvl(id), seed = kd < 0 ? id - DAILY0 : (id - 1000) % 1e6 + kd * 7919;
+    for (let att = 0; att < 6; att++) {
+      const m = genMap(seed, att, lvl), D = parseMap(m, m.mv, '무작위 미로'), c = genCheck(D);
+      if (c >= 0) {
+        const wt = D.mv.length * 1.2;
+        D.par = [Math.round(c * 0.6 + 1 + wt), Math.round(c * 0.95 + 2 + wt * 1.5)];
+        D.lvl = lvl; D.att = att;
+        return D;
+      }
+    }
+    const D = parseMap(STAGES[0].m, STAGES[0].mv, '무작위 미로'); D.par = PAR[0]; D.lvl = lvl; D.att = -1; return D;
+  }
+  const CACHE = {};
+  function genName(id) {
+    const k = genKind(id);
+    if (k < 0) { const d = id - DAILY0; return '오늘의 미로 ' + Math.floor(d / 100 % 100) + '/' + (d % 100); }
+    return k === 0 ? '무작위 미로' : k >= 900 ? '새 미로 · 난이도 ' + (k - 899) : '끝없는 미로 ' + k + '단계';
+  }
+  function stageDef(id) {
+    if (CACHE[id]) return CACHE[id];
+    let D;
+    if (id >= 1000) { D = genStage(id); D.name = genName(id); D.tip = '처음 보는 미로! 길을 먼저 눈으로 따라가 봐요.' + (D.mv.length ? ' 움직이는 막대는 틈이 열릴 때 지나가요.' : ''); D.gen = true; }
+    else {
+      const S = STAGES[id] || STAGES[0];
+      D = parseMap(S.m, S.mv, S.n); D.tip = S.tip; D.guide = !!S.g; D.par = PAR[id] || [30, 45];
+    }
+    D.id = id;
+    return (CACHE[id] = D);
+  }
+  const stageName = (id) => (id >= 1000 ? genName(id) : (STAGES[id] || STAGES[0]).n);
+
+  /* ======================= navigation (AI + progress) ======================= */
+  const nodeX = (n) => ((n % NW) + 0.5) / NS, nodeY = (n) => (((n / NW) | 0) + 0.5) / NS;
+  function nodeOfXY(x, y) { const i = Math.floor(x * NS), j = Math.floor(y * NS); return i < 0 || j < 0 || i >= NW || j >= NH ? -1 : j * NW + i; }
+  function rectDist(x, y, r) { const dx = Math.max(r.x0 - x, 0, x - r.x1), dy = Math.max(r.y0 - y, 0, y - r.y1); return Math.hypot(dx, dy); }
+  function navBase(D) {
+    if (D.nav) return D.nav;
+    const wallD = new Float32Array(NN), holeD = new Float32Array(NN), haz = new Float32Array(NN), doorD = [new Float32Array(NN).fill(9), new Float32Array(NN).fill(9)];
+    const inPort = new Int8Array(NN).fill(-1), region = D.ports.map(() => []), ringOf = new Array(NN);
+    for (let n = 0; n < NN; n++) {
+      const x = nodeX(n), y = nodeY(n), ci = Math.floor(y) * W + Math.floor(x);
+      let wd = 9;
+      if (D.filled[ci]) wd = -1;
+      else for (const r of D.rects) { const d = rectDist(x, y, r); if (d < wd) wd = d; }
+      for (const d of D.doors) { const v = rectDist(x, y, d); if (v < doorD[d.g][n]) doorD[d.g][n] = v; }
+      let hd = 9, hz = 0;
+      for (const o of D.holes) { const d = Math.hypot(o.x - x, o.y - y); if (d < hd) hd = d; if (d < 0.8) hz += (0.8 - d) * 2.5; }
+      for (const g of D.mags) { const d = Math.hypot(g.x - x, g.y - y); if (d < MAG_R) hz += (MAG_R - d) * 0.5; }
+      if (wd >= 0 && wd < R + 0.12) hz += 0.25;
+      wallD[n] = wd; holeD[n] = hd; haz[n] = hz;
+      D.ports.forEach((p, k) => {
+        const d = Math.hypot(p.x - x, p.y - y);
+        if (d < PORT_R + 0.04) { inPort[n] = k; region[k].push(n); }
+        else if (d >= 0.3 && d <= 0.62 && wd >= WALL_NAV && hd >= HOLE_NAV) (ringOf[n] = ringOf[n] || []).push(k);
+      });
+    }
+    return (D.nav = { wallD, holeD, haz, doorD, inPort, region, ringOf, free: {}, f: {} });
+  }
+  function freeOf(D, mask) {
+    const N = navBase(D);
+    if (N.free[mask]) return N.free[mask];
+    const fr = new Uint8Array(NN);
+    for (let n = 0; n < NN; n++) {
+      let ok = N.wallD[n] >= WALL_NAV && N.holeD[n] >= HOLE_NAV;
+      for (let g = 0; g < 2 && ok; g++) if (!((mask >> g) & 1) && N.doorD[g][n] < WALL_NAV) ok = false;
+      fr[n] = ok ? 1 : 0;
+    }
+    return (N.free[mask] = fr);
+  }
+  function moveMul(D, u, di, dj) {
+    const sf = D.surf[Math.floor(nodeY(u)) * W + Math.floor(nodeX(u))];
+    if (sf >= 3) { const s = SLOPE_DIR[sf], dot = (di * s[0] + dj * s[1]) / Math.hypot(di, dj); return dot < -0.5 ? 6 : dot > 0.5 ? 0.6 : 1.5; }
+    return sf === 1 ? 1.2 : sf === 2 ? 1.8 : 1;
+  }
+  function Heap() { this.n = []; this.k = []; }
+  Heap.prototype.push = function (n, k) {
+    const a = this.n, b = this.k; let i = a.length; a.push(n); b.push(k);
+    while (i > 0) { const p = (i - 1) >> 1; if (b[p] <= k) break; a[i] = a[p]; b[i] = b[p]; i = p; }
+    a[i] = n; b[i] = k;
+  };
+  Heap.prototype.pop = function () {
+    const a = this.n, b = this.k, top = a[0], tk = b[0], ln = a.pop(), lk = b.pop();
+    if (a.length) {
+      let i = 0; const m = a.length;
+      for (;;) { let c = 2 * i + 1; if (c >= m) break; if (c + 1 < m && b[c + 1] < b[c]) c++; if (b[c] >= lk) break; a[i] = a[c]; b[i] = b[c]; i = c; }
+      a[i] = ln; b[i] = lk;
+    }
+    this.top = tk; return top;
+  };
+  // cost-to-go field (in cells) towards the goal ('g') or the switches of group 0/1, with doors in `mask` open
+  function field(D, tg, mask) {
+    const N = navBase(D), key = tg + ':' + mask;
+    if (N.f[key]) return N.f[key];
+    const fr = freeOf(D, mask), dist = new Float32Array(NN).fill(Infinity), hp = new Heap();
+    const seed = (x, y) => {
+      let any = false;
+      for (let n = 0; n < NN; n++) if (fr[n] && Math.hypot(nodeX(n) - x, nodeY(n) - y) < 0.3) { dist[n] = 0; hp.push(n, 0); any = true; }
+      if (!any) { const n = nodeOfXY(x, y); if (n >= 0) { dist[n] = 0; hp.push(n, 0); } }
+    };
+    if (tg === 'g') seed(D.goal[0], D.goal[1]);
+    else for (const s of D.sws) if (s.g === tg) seed(s.x, s.y);
+    while (hp.n.length) {
+      const v = hp.pop(), dv = hp.top;
+      if (dv > dist[v]) continue;
+      const i = v % NW, j = (v / NW) | 0;
+      for (let d = 0; d < 8; d++) {
+        const ui = i - DI[d], uj = j - DJ[d];
+        if (ui < 0 || uj < 0 || ui >= NW || uj >= NH) continue;
+        const u = uj * NW + ui;
+        if (!fr[u] || N.inPort[u] >= 0) continue;
+        if (d >= 4 && (!fr[uj * NW + i] || !fr[j * NW + ui])) continue;
+        const c = (d >= 4 ? 1.4142 : 1) * (moveMul(D, u, DI[d], DJ[d]) + N.haz[v]) / NS;
+        if (dv + c < dist[u]) { dist[u] = dv + c; hp.push(u, dist[u]); }
+      }
+      const rl = N.ringOf[v];
+      if (rl) for (const q of rl) { const p = D.ports[q].p; for (const u of N.region[p]) if (dv + 0.3 < dist[u]) { dist[u] = dv + 0.3; hp.push(u, dist[u]); } }
+    }
+    return (N.f[key] = dist);
+  }
+  function nodeNear(F, fr, x, y) {
+    const i0 = U.clamp(Math.floor(x * NS), 0, NW - 1), j0 = U.clamp(Math.floor(y * NS), 0, NH - 1);
+    let best = -1, bv = Infinity;
+    for (let r = 0; r <= 4; r++) {
+      for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) {
+        if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+        const i = i0 + di, j = j0 + dj;
+        if (i < 0 || j < 0 || i >= NW || j >= NH) continue;
+        const n = j * NW + i;
+        if (!fr[n] || !isFinite(F[n])) continue;
+        const v = F[n] + 2.5 * Math.hypot(nodeX(n) - x, nodeY(n) - y);
+        if (v < bv) { bv = v; best = n; }
+      }
+      if (best >= 0 && r >= 1) break;
+    }
+    return best;
+  }
+  function remOf(P) {   // remaining cost to the goal (for ranking unfinished players)
+    const D = P.D;
+    let F = field(D, 'g', P.open), n = nodeNear(F, freeOf(D, P.open), P.x, P.y);
+    if (n < 0) { F = field(D, 'g', 3); n = nodeNear(F, freeOf(D, 3), P.x, P.y); }
+    return n < 0 ? 99 : Math.min(99, F[n] + (P.open === 3 || !D.sws.length ? 0 : 6));
+  }
+  function guidePath(D) {   // node path from start to goal (all doors open) for the pencil guide line
+    const F = field(D, 'g', 3), fr = freeOf(D, 3), out = [];
+    let n = nodeNear(F, fr, D.start[0], D.start[1]);
+    for (let k = 0; k < 600 && n >= 0; k++) {
+      out.push(n);
+      if (F[n] <= 0) break;
+      const i = n % NW, j = (n / NW) | 0;
+      let bn = -1, bv = F[n];
+      for (let d = 0; d < 8; d++) {
+        const ni = i + DI[d], nj = j + DJ[d];
+        if (ni < 0 || nj < 0 || ni >= NW || nj >= NH) continue;
+        const nb = nj * NW + ni;
+        if (fr[nb] && F[nb] < bv) { bv = F[nb]; bn = nb; }
+      }
+      n = bn;
+    }
+    return out;
+  }
+
+  /* ======================= simulation ======================= */
+  function mvAt(o, t) {
+    const a = TAU * (t / o.p + o.ph), f = 0.5 - 0.5 * Math.cos(a), df = 0.5 * Math.sin(a) * TAU / o.p;
+    return [o.x + o.dx * f, o.y + o.dy * f, o.dx * df, o.dy * df];
+  }
+  function newRun(sl) {
+    const P = { sl: sl.slice(), si: 0, D: null, ph: 'ready', tm: READY1, t: 0, tot: 0, x: 0, y: 0, vx: 0, vy: 0, tx: 0, ty: 0, ex: 0, ey: 0,
+      cpx: 0, cpy: 0, open: 0, tc: -1, sink: 0, falls: 0, fx: 0, fy: 0, fin: -1, ev: [], ai: null, hitT: 0, acc: 0, remT: 0, rem: 0 };
+    loadStage(P, 0, READY1);
+    return P;
+  }
+  function loadStage(P, si, ready) {
+    P.si = si; P.D = stageDef(P.sl[si]);
+    P.x = P.cpx = P.D.start[0]; P.y = P.cpy = P.D.start[1];
+    P.vx = P.vy = 0; P.t = 0; P.open = 0; P.tc = -1; P.sink = 0; P.ph = 'ready'; P.tm = ready; P.remT = 0;
+    if (P.ai) { P.ai.F = null; P.ai.bt = 0; P.ai.tx = P.ai.ty = 0; }
+    P.ev.push({ k: 'stage', si });
+  }
+  function hitRect(P, x0, y0, x1, y1, wvx, wvy) {
+    const qx = P.x < x0 ? x0 : P.x > x1 ? x1 : P.x, qy = P.y < y0 ? y0 : P.y > y1 ? y1 : P.y;
+    const dx = P.x - qx, dy = P.y - qy, d2 = dx * dx + dy * dy;
+    if (d2 >= R * R) return 0;
+    let d = Math.sqrt(d2), nx, ny;
+    if (d < 1e-7) {
+      const l = P.x - x0, r = x1 - P.x, t = P.y - y0, b = y1 - P.y, m = Math.min(l, r, t, b);
+      if (m === l) { nx = -1; ny = 0; d = -l; } else if (m === r) { nx = 1; ny = 0; d = -r; } else if (m === t) { nx = 0; ny = -1; d = -t; } else { nx = 0; ny = 1; d = -b; }
+    } else { nx = dx / d; ny = dy / d; }
+    const pen = R - d;
+    P.x += nx * pen; P.y += ny * pen;
+    const rvx = P.vx - wvx, rvy = P.vy - wvy, vn = rvx * nx + rvy * ny;
+    if (vn < 0) {
+      P.vx -= (1 + E_WALL) * vn * nx; P.vy -= (1 + E_WALL) * vn * ny;
+      const vt = (P.vx - wvx) * -ny + (P.vy - wvy) * nx;
+      P.vx -= vt * 0.03 * -ny; P.vy -= vt * 0.03 * nx;
+      return -vn;
+    }
+    return 1e-4;
+  }
+  function collideStatic(P) {
+    const D = P.D;
+    let imp = 0;
+    for (const r of D.rects) {
+      if (P.x + R < r.x0 || P.x - R > r.x1 || P.y + R < r.y0 || P.y - R > r.y1) continue;
+      const v = hitRect(P, r.x0, r.y0, r.x1, r.y1, 0, 0); if (v > imp) imp = v;
+    }
+    for (const d of D.doors) {
+      if ((P.open >> d.g) & 1) continue;
+      if (P.x + R < d.x0 || P.x - R > d.x1 || P.y + R < d.y0 || P.y - R > d.y1) continue;
+      const v = hitRect(P, d.x0, d.y0, d.x1, d.y1, 0, 0); if (v > imp) imp = v;
+    }
+    return imp;
+  }
+  function physics(P, h) {
+    const D = P.D;
+    const cx = U.clamp(Math.floor(P.x), 0, W - 1), cy = U.clamp(Math.floor(P.y), 0, H - 1), sf = D.surf[cy * W + cx];
+    let ex = 0, ey = 0, kk = FRIC[sf === 1 ? 1 : sf === 2 ? 2 : 0][0];
+    const cc = FRIC[sf === 1 ? 1 : sf === 2 ? 2 : 0][1];
+    if (sf >= 3) { const s = SLOPE_DIR[sf]; ex += s[0] * SLOPE_A; ey += s[1] * SLOPE_A; }
+    P.sx = ex; P.sy = ey;
+    for (const g of D.mags) {
+      const dx = g.x - P.x, dy = g.y - P.y, d2 = dx * dx + dy * dy;
+      if (d2 >= MAG_R * MAG_R) continue;
+      const d = Math.sqrt(d2);
+      if (d > 1e-4) { const a = MAG_A * Math.min(1, d / 0.25) * (1 - d / MAG_R); ex += dx / d * a; ey += dy / d * a; }
+      if (d < 0.3) kk += 3;
+    }
+    P.ex = ex; P.ey = ey;
+    let ax = G * P.tx + ex, ay = G * P.ty + ey, over = null, rx = 0, ry = 0;
+    for (const o of D.holes) {
+      const dx = o.x - P.x, dy = o.y - P.y;
+      if (dx > RIM_R || dx < -RIM_R || dy > RIM_R || dy < -RIM_R) continue;
+      const d = Math.hypot(dx, dy);
+      if (d >= RIM_R || d < 1e-4) { if (d < 1e-4) over = o; continue; }
+      const a = RIM_A * Math.min(1, (RIM_R - d) / (RIM_R - FALL_R));
+      rx += dx / d * a; ry += dy / d * a;
+      if (d < FALL_R) over = o;
+    }
+    P.rx = rx; P.ry = ry; ax += rx; ay += ry;
+    { const dx = D.goal[0] - P.x, dy = D.goal[1] - P.y, d = Math.hypot(dx, dy); if (d < GOAL_R + 0.08 && d > 1e-4) { ax += dx / d * GOAL_PULL; ay += dy / d * GOAL_PULL; } }
+    P.vx += ax * h; P.vy += ay * h;
+    const f = Math.max(0, 1 - kk * h); P.vx *= f; P.vy *= f;
+    const sp = Math.hypot(P.vx, P.vy);
+    if (sp > 0) { let ns = sp - cc * h; if (ns < 0) ns = 0; if (ns > VMAX) ns = VMAX; P.vx *= ns / sp; P.vy *= ns / sp; }
+    P.x += P.vx * h; P.y += P.vy * h;
+    let imp = 0;
+    for (const o of D.mv) { const q = mvAt(o, P.t), v = hitRect(P, q[0], q[1], q[0] + o.w, q[1] + o.h, q[2], q[3]); if (v > imp) imp = v; }
+    const v0 = collideStatic(P); if (v0 > imp) imp = v0;
+    if (D.mv.length) for (const o of D.mv) {   // squeezed between a moving wall and a fixed one → pop out sideways
+      const q = mvAt(o, P.t), x0 = q[0], y0 = q[1], x1 = x0 + o.w, y1 = y0 + o.h;
+      const qx = U.clamp(P.x, x0, x1), qy = U.clamp(P.y, y0, y1);
+      if (Math.hypot(P.x - qx, P.y - qy) < R - 0.03) {
+        if (o.dy) P.x = P.x < (x0 + x1) / 2 ? x0 - R : x1 + R; else P.y = P.y < (y0 + y1) / 2 ? y0 - R : y1 + R;
+        collideStatic(P);
+      }
+    }
+    if (P.x < R) P.x = R; else if (P.x > W - R) P.x = W - R;
+    if (P.y < R) P.y = R; else if (P.y > H - R) P.y = H - R;
+    P.hitT -= h;
+    if (imp > 0.7 && P.hitT <= 0) { P.ev.push({ k: 'wall', v: imp }); P.hitT = 0.07; }
+    // goal
+    const gd = Math.hypot(D.goal[0] - P.x, D.goal[1] - P.y);
+    if (gd < GOAL_CAP) {
+      P.ph = 'goal'; P.tm = GOAL_T; P.tot += P.t; P.vx = P.vy = 0; P.x = D.goal[0]; P.y = D.goal[1];
+      P.ev.push({ k: 'goal', t: P.t }); return;
+    }
+    // holes
+    if (over) {
+      P.sink += h;
+      if (P.sink >= SINK) { P.ph = 'fall'; P.tm = FALL_T; P.fx = over.x; P.fy = over.y; P.falls++; P.vx = P.vy = 0; P.ev.push({ k: 'fall', x: over.x, y: over.y }); return; }
+    } else P.sink = 0;
+    // checkpoint
+    const ci = U.clamp(Math.floor(P.y), 0, H - 1) * W + U.clamp(Math.floor(P.x), 0, W - 1);
+    if (D.cp[ci]) { const X = (ci % W) + 0.5, Y = ((ci / W) | 0) + 0.5; if (X !== P.cpx || Y !== P.cpy) { P.cpx = X; P.cpy = Y; P.ev.push({ k: 'cp', x: X, y: Y }); } }
+    // switches
+    for (const s of D.sws) if (!((P.open >> s.g) & 1) && Math.abs(s.x - P.x) < SW_R && Math.abs(s.y - P.y) < SW_R) { P.open |= 1 << s.g; P.ev.push({ k: 'sw', g: s.g, x: s.x, y: s.y }); }
+    // teleports
+    if (P.tc >= 0) { const q = D.ports[P.tc]; if (Math.hypot(q.x - P.x, q.y - P.y) > PORT_OUT) P.tc = -1; }
+    else for (let i = 0; i < D.ports.length; i++) {
+      const q = D.ports[i];
+      if (Math.hypot(q.x - P.x, q.y - P.y) < PORT_R) { const to = D.ports[q.p]; P.ev.push({ k: 'tele', x: q.x, y: q.y, x2: to.x, y2: to.y }); P.x = to.x; P.y = to.y; P.tc = q.p; break; }
+    }
+  }
+  function simStep(P, h) {
+    switch (P.ph) {
+      case 'ready': P.tm -= h; if (P.tm <= 0) { P.ph = 'run'; P.ev.push({ k: 'go' }); } return;
+      case 'goal':
+        P.tm -= h;
+        if (P.tm <= 0) {
+          if (P.si + 1 >= P.sl.length) { P.ph = 'fin'; P.fin = P.tot; P.ev.push({ k: 'fin' }); }
+          else loadStage(P, P.si + 1, READYN);
+        }
+        return;
+      case 'fin': return;
+      case 'fall': {
+        P.t += h; P.tm -= h;
+        const k = Math.min(1, h * 14); P.x += (P.fx - P.x) * k; P.y += (P.fy - P.y) * k;
+        if (P.tm <= 0) { P.ph = 'run'; P.x = P.cpx; P.y = P.cpy; P.vx = P.vy = 0; P.sink = 0; P.tc = -1; P.ev.push({ k: 'back' }); }
+        return;
+      }
+    }
+    P.t += h;
+    if (P.ai) aiStep(P, h);
+    physics(P, h);
+  }
+  function runFor(P, dt, maxSteps) {
+    P.acc += dt;
+    let n = 0;
+    while (P.acc >= DT && n < maxSteps) { simStep(P, DT); P.acc -= DT; n++; }
+    if (n >= maxSteps) P.acc = 0;
+  }
+  const timeOf = (P) => (P.ph === 'fin' ? P.fin : P.tot + (P.ph === 'goal' || P.ph === 'ready' ? 0 : P.t));
+  const doneOf = (P) => (P.ph === 'fin' ? P.sl.length : P.si + (P.ph === 'goal' ? 1 : 0));
+
+  /* ======================= AI ======================= */
+  const AIP = {
+    1: { th: 0.13, vmax: 2.3, kp: 2.6, ff: 0.65, rim: 0.2, avoid: 1.5, wob: 0.24, la: 7, care: 0.4, slip: 0.01, sm: 7 },
+    2: { th: 0.07, vmax: 3.3, kp: 3.8, ff: 0.8, rim: 0.35, avoid: 1.9, wob: 0.13, la: 9, care: 0.26, slip: 0.005, sm: 14 },
+    3: { th: 0.035, vmax: 4.3, kp: 5.5, ff: 1, rim: 1, avoid: 3, wob: 0.02, la: 11, care: 0.2, slip: 0, sm: 28 },
+  };
+  function aiInit(P, lv, seed) { P.ai = { lv: U.clamp(lv | 0, 1, 3), r: mkRng(seed), tk: 0, tx: 0, ty: 0, wx: 0, wy: 0, wt: 0, bt: 0, F: null, best: 0, stk: 0, path: [], dyn: [] }; }
+  function aiStep(P, h) {
+    const A = P.ai, p = AIP[A.lv];
+    A.tk -= h;
+    if (A.tk <= 0) { A.tk = p.th; aiThink(P, A, p); }
+    const k = Math.min(1, h * p.sm);
+    P.tx += (A.tx - P.tx) * k; P.ty += (A.ty - P.ty) * k;
+  }
+  function losClear(fr, inPort, x0, y0, x1, y1, end) {
+    const d = Math.hypot(x1 - x0, y1 - y0), n = Math.ceil(d / 0.1);
+    for (let k = 1; k < n; k++) {
+      const t = k / n, m = nodeOfXY(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+      if (m < 0 || !fr[m] || (inPort[m] >= 0 && m !== end)) return false;
+    }
+    return true;
+  }
+  function path0(F, fr, N, n) {   // a few nodes down the field from n (direction to lean when stuck)
+    let cur = n;
+    for (let k = 0; k < 6; k++) {
+      const i = cur % NW, j = (cur / NW) | 0;
+      let bn = -1, bv = F[cur];
+      for (let d = 0; d < 8; d++) { const ni = i + DI[d], nj = j + DJ[d]; if (ni < 0 || nj < 0 || ni >= NW || nj >= NH) continue; const nb = nj * NW + ni; if (fr[nb] && F[nb] < bv) { bv = F[nb]; bn = nb; } }
+      if (bn < 0) break; cur = bn;
+    }
+    return cur === n ? -1 : cur;
+  }
+  function aiThink(P, A, p) {
+    if (A.bt > 0) { A.bt -= p.th; return; }
+    const D = P.D, N = navBase(D);
+    let fr = freeOf(D, P.open), F = field(D, 'g', P.open), n = nodeNear(F, fr, P.x, P.y), tg = D.goal;
+    if (n < 0) {
+      let bv = Infinity;
+      for (const s of D.sws) {
+        if ((P.open >> s.g) & 1) continue;
+        const f = field(D, s.g, P.open), m = nodeNear(f, fr, P.x, P.y);
+        if (m >= 0 && f[m] < bv) { bv = f[m]; F = f; n = m; tg = [s.x, s.y]; }
+      }
+    }
+    if (n < 0) { fr = freeOf(D, 3); F = field(D, 'g', 3); n = nodeNear(F, fr, P.x, P.y); tg = D.goal; }
+    if (n < 0) { A.tx = -P.vx * 0.3; A.ty = -P.vy * 0.3; return; }
+    const fv = F[n];
+    if (A.F !== F) { A.F = F; A.best = fv; A.stk = 0; }
+    if (fv < A.best - 0.25) { A.best = fv; A.stk = 0; }
+    else if ((A.stk += p.th) > 2.5) {   // stuck (magnet, uphill…): first lean hard towards the path, then try a random shove
+      A.stk = 0; A.best = fv; A.esc = (A.esc || 0) + 1;
+      let a = A.r() * TAU;
+      if (A.esc % 3 !== 0) { const q = path0(F, fr, N, n); if (q >= 0) a = Math.atan2(nodeY(q) - P.y, nodeX(q) - P.x); }
+      A.tx = Math.cos(a); A.ty = Math.sin(a); A.bt = 0.9; return;
+    }
+    // moving walls (where they are now and in a moment) block nodes for the local path
+    const dyn = A.dyn; dyn.length = 0;
+    for (const o of D.mv) for (const lt of [0, 0.25]) { const q = mvAt(o, P.t + lt), e = R + 0.05; dyn.push(q[0] - e, q[1] - e, q[0] + o.w + e, q[1] + o.h + e); }
+    const blocked = (m) => { if (!dyn.length) return false; const x = nodeX(m), y = nodeY(m); for (let k = 0; k < dyn.length; k += 4) if (x > dyn[k] && x < dyn[k + 2] && y > dyn[k + 1] && y < dyn[k + 3]) return true; return false; };
+    const path = A.path; path.length = 0;
+    let cur = n, cv = N.inPort[n] >= 0 ? Infinity : fv;
+    for (let k = 0; k < p.la; k++) {
+      const i = cur % NW, j = (cur / NW) | 0;
+      let bn = -1, bv = cv;
+      for (let d = 0; d < 8; d++) {
+        const ni = i + DI[d], nj = j + DJ[d];
+        if (ni < 0 || nj < 0 || ni >= NW || nj >= NH) continue;
+        const nb = nj * NW + ni;
+        if (!fr[nb] || blocked(nb)) continue;
+        if (d >= 4 && (!fr[j * NW + ni] || !fr[nj * NW + i])) continue;
+        if (F[nb] < bv - 1e-6) { bv = F[nb]; bn = nb; }
+      }
+      if (bn < 0) break;
+      path.push(bn); cur = bn; cv = bv;
+      if (N.inPort[bn] >= 0 || bv <= 0) break;
+    }
+    let tx, ty, fin = false;
+    if (!path.length && dyn.length && fv > 0.3) { tx = nodeX(n); ty = nodeY(n); fin = true; }   // a moving wall is in the way: wait
+    else if (!path.length) { tx = tg[0]; ty = tg[1]; fin = true; }
+    else {
+      let k = path.length - 1;
+      for (; k > 0; k--) if (losClear(fr, N.inPort, P.x, P.y, nodeX(path[k]), nodeY(path[k]), path[k]) && !blocked(path[k])) break;
+      const e = path[k];
+      tx = nodeX(e); ty = nodeY(e);
+      if (k === path.length - 1) {
+        if (F[e] <= 1e-6) { tx = tg[0]; ty = tg[1]; fin = true; }
+        else if (N.inPort[e] >= 0) { const q = D.ports[N.inPort[e]]; tx = q.x; ty = q.y; fin = true; }
+      }
+    }
+    const dx = tx - P.x, dy = ty - P.y, dist = Math.hypot(dx, dy) || 1e-6;
+    let sp = p.vmax;
+    if (path.length > 1) {
+      const last = path[path.length - 1], lx = nodeX(last) - tx, ly = nodeY(last) - ty, ll = Math.hypot(lx, ly);
+      if (ll > 0.2) { const c = (dx * lx + dy * ly) / (dist * ll); sp *= 0.3 + 0.7 * U.clamp((c + 0.1) / 1.1, 0, 1); }
+    }
+    let hz = N.haz[n]; for (const q of path) if (N.haz[q] > hz) hz = N.haz[q];
+    sp /= 1 + hz * p.care;
+    const sf = D.surf[U.clamp(Math.floor(P.y), 0, H - 1) * W + U.clamp(Math.floor(P.x), 0, W - 1)];
+    if (sf === 1) sp *= 0.7;
+    if (fin) sp = Math.min(sp, 1 + dist * 3);
+    sp = Math.max(0.45, sp);
+    let vx = dx / dist * sp, vy = dy / dist * sp;
+    for (const o of D.holes) {   // steer away from nearby holes
+      const hx = P.x - o.x, hy = P.y - o.y, hd = Math.hypot(hx, hy);
+      if (hd < 0.75 && hd > 1e-3) { const k = (0.75 - hd) / 0.75 * p.avoid; vx += hx / hd * k; vy += hy / hd * k; }
+    }
+    // feed-forward: slopes are plain to see (all levels lean against them), magnet / rim pull depends on skill
+    const sx = P.sx || 0, sy = P.sy || 0;
+    let ax = (vx - P.vx) * p.kp - sx - (P.ex - sx) * p.ff - (P.rx || 0) * p.rim, ay = (vy - P.vy) * p.kp - sy - (P.ey - sy) * p.ff - (P.ry || 0) * p.rim;
+    let ttx = ax / G, tty = ay / G;
+    if ((A.wt -= p.th) <= 0) { A.wt = 0.5 + A.r() * 0.6; A.wx = (A.r() * 2 - 1) * p.wob; A.wy = (A.r() * 2 - 1) * p.wob; }
+    ttx += A.wx; tty += A.wy;
+    if (p.slip && A.r() < p.slip) { const l = Math.hypot(ttx, tty) || 1; A.tx = ttx / l; A.ty = tty / l; A.bt = 0.3; return; }
+    const l = Math.hypot(ttx, tty); if (l > 1) { ttx /= l; tty /= l; }
+    A.tx = ttx; A.ty = tty;
+  }
+
+  /* ======================= pure game interface ======================= */
+  function pickCourse(cs, len, rnd, mz) {
+    const r = rnd || Math.random;
+    if (cs === 3) { const out = []; for (let i = 0; i < len; i++) out.push(genId(0, r() * 1e6)); return out; }
+    if (!mz) {   // generated course: difficulty 1 / 4 / 7 (easy/normal/hard), 골고루 climbs through them
+      const out = [];
+      for (let i = 0; i < len; i++) {
+        const lv = cs === 0 ? 1 : cs === 1 ? 4 : cs === 2 ? 7 : Math.round(1 + 7 * (len > 1 ? i / (len - 1) : 0.5));
+        out.push(genId(900 + lv, r() * 1e6));
+      }
+      return out;
+    }
+    const tiers = cs === 0 || cs === 1 || cs === 2 ? new Array(len).fill(cs) : len === 1 ? [1] : len === 3 ? [0, 1, 2] : [0, 1, 1, 2, 2];
+    const used = {}, out = [];
+    for (const t of tiers) {
+      const pool = TIERS[t].filter((i) => !used[i]);
+      const i = pool.length ? pool[Math.floor(r() * pool.length)] : TIERS[t][0];
+      used[i] = 1; out.push(i);
+    }
+    return out.sort((a, b) => a - b);
+  }
+  function init(players, opts) {
+    const o = opts || {};
+    const n = players.length, cs = [0, 1, 2, 3, 4].includes(o.course) ? o.course : 4, len = [1, 3, 5].includes(o.len) ? o.len : 3, mz = o.maze === 1 ? 1 : 0;
+    return { rid: 1 + U.rand(99999), n, nm: players.map((p) => String((p && p.name) || '').slice(0, 10)), cs, len, mz,
+      ph: n === 1 ? 'pick' : 'play', sl: n === 1 ? [] : pickCourse(cs, len, null, mz), res: null };
+  }
+  function finish(s, rows) {   // rows: [seat, time10 (-1 = not finished), stagesDone, rem10, falls]
+    const res = rows.slice().sort((a, b) => {
+      const fa = a[1] >= 0, fb = b[1] >= 0;
+      if (fa !== fb) return fa ? -1 : 1;
+      if (fa) return a[1] - b[1] || a[4] - b[4] || a[0] - b[0];
+      return b[2] - a[2] || a[3] - b[3] || a[0] - b[0];
+    });
+    return Object.assign({}, s, { ph: 'done', res });
+  }
+  function starsFor(id, t) { const p = stageDef(id).par; return t <= p[0] ? 3 : t <= p[1] ? 2 : 1; }
+  function result(s) {
+    const r = result0(s);
+    if (r) { // res rows [seat, time×10 or -1, stages done, -, holes]
+      const by = []; s.res.forEach((x) => { if (Array.isArray(x)) by[x[0]] = x; });
+      const col = (fm) => Array.from({ length: s.n }, (_, i) => (by[i] ? fm(by[i]) : '-'));
+      const L2 = (s.sl || []).length || 1;
+      r.stats = [{ label: '기록', values: col((x) => (x[1] >= 0 ? fmtT(x[1] / 10) : '미완주')) }];
+      if (L2 > 1) r.stats.push({ label: '깬 판', values: col((x) => (x[1] >= 0 ? L2 : x[2] | 0) + '/' + L2) });
+      r.stats.push({ label: '구멍에 빠짐', values: col((x) => (x[4] | 0) + '번') });
+    }
+    return r;
+  }
+  function shareText(id, t, n, falls) {
+    const d = id - DAILY0;
+    return '한판 라운지 · 오늘의 미로 ' + Math.floor(d / 10000) + '.' + Math.floor(d / 100 % 100) + '.' + (d % 100) + '\n' + '★'.repeat(n) + '☆'.repeat(3 - n) + ' ' + fmtT(t) + ' · 구멍 ' + (falls | 0) + '번';
+  }
+  function result0(s) {
+    if (!s || s.ph !== 'done' || !Array.isArray(s.res) || !s.res.length) return null;
+    const nm = (i) => (s.nm && s.nm[i]) || (i + 1) + '번';
+    const L2 = (s.sl || []).length || 1;
+    if (s.n === 1) {
+      const r = s.res[0], id = s.sl[0];
+      if (r[1] < 0) return { winners: [], title: '다음에 다시!', text: stageName(id) };
+      const t = r[1] / 10, n = starsFor(id, t), p = stageDef(id).par;
+      return { winners: [r[0]], title: '별 ' + n + '개!', text: (id >= 1000 ? stageName(id) : (id + 1) + '. ' + stageName(id)) + '\n' + '★'.repeat(n) + '☆'.repeat(3 - n) + '  ' + fmtT(t) + (r[4] ? ' · 구멍 ' + r[4] + '번' : ' · 한 번도 안 빠졌어요') + '\n별 기준: ★★★ ' + fmtT(p[0]) + ' · ★★ ' + fmtT(p[1]) + (id >= DAILY0 ? '\n\n' + shareText(id, t, n, r[4]) : genKind(id) > 0 && genKind(id) < 900 ? '\n다음 도전: 끝없는 미로 ' + (genKind(id) + 1) + '단계' : '') };
+    }
+    const top = s.res[0], winners = top[1] >= 0 ? s.res.filter((r) => r[1] === top[1] && r[4] === top[4]).map((r) => r[0]) : [];
+    const lines = s.res.map((r, k) => (k + 1) + '위  ' + nm(r[0]) + '  ' + (r[1] >= 0 ? fmtT(r[1] / 10) + (r[4] ? ' · 구멍 ' + r[4] : '') : r[2] + '/' + L2 + '판까지'));
+    const head = L2 + '판 코스 · ' + (s.sl || []).map(stageName).join(' → ');
+    return { winners, title: winners.length === 1 ? nm(winners[0]) + ' 우승!' : winners.length ? '공동 우승' : '아무도 완주 못 했어요', text: head + '\n' + lines.join('\n') };
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const CSS = `
+.tm-btn{position:absolute;height:44px;min-width:84px;padding:0 14px;border-radius:22px;z-index:3;background:rgba(23,19,31,.84);
+  color:var(--ink,#f2e9d8);border:1.5px solid rgba(227,174,69,.72);font:700 13px var(--f-body,sans-serif);box-shadow:0 2px 10px rgba(0,0,0,.45);
+  touch-action:manipulation;-webkit-user-select:none;user-select:none;cursor:pointer;white-space:nowrap}
+.tm-btn.on{background:rgba(227,174,69,.92);color:#17131f}
+.tm-btn:active{transform:translateY(1px)}
+.tm-btn[hidden]{display:none}
+.tm-pick{position:absolute;inset:0;z-index:4;overflow-y:auto;background:rgba(18,14,24,.96);padding:12px 12px 24px;-webkit-overflow-scrolling:touch;touch-action:pan-y}
+.tm-pick h3{margin:2px 0 2px;font:400 20px var(--f-display,sans-serif);color:var(--ink,#f2e9d8)}
+.tm-pick .sub{color:var(--muted,#ab9fb8);font:500 12px var(--f-body,sans-serif);margin:0 0 10px}
+.tm-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.tm-st{position:relative;display:flex;flex-direction:column;align-items:center;gap:2px;padding:7px 3px 6px;border-radius:12px;background:#2e2640;
+  border:1.5px solid rgba(255,255,255,.06);color:var(--ink,#f2e9d8);font:600 11px var(--f-body,sans-serif);cursor:pointer;min-height:44px}
+.tm-st:active{transform:translateY(1px)}
+.tm-st.next{border-color:#e3ae45;box-shadow:0 0 0 2px rgba(227,174,69,.25)}
+.tm-st canvas{border-radius:5px;display:block}
+.tm-st .nm{line-height:1.15;text-align:center;word-break:keep-all;min-height:2.3em;display:flex;align-items:center}
+.tm-st .stars{color:#ffd24a;letter-spacing:1px;font-size:11px;line-height:1}
+.tm-st .stars i{color:rgba(242,233,216,.22);font-style:normal}
+.tm-st .bt{font:500 10px var(--f-mono,monospace);color:var(--muted,#ab9fb8)}
+.tm-st .no{position:absolute;left:5px;top:3px;font:700 11px var(--f-mono,monospace);color:#e3ae45;text-shadow:0 1px 2px #000}
+.tm-rand{display:block;width:100%;margin-top:12px}
+`;
+  const KEYN = { ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓', ShiftLeft: 'Shift', ShiftRight: 'Shift', Space: '스페이스' };
+  function rr(g, x, y, w, h, r) { g.beginPath(); if (g.roundRect) g.roundRect(x, y, w, h, r); else g.rect(x, y, w, h); }
+  function mkC(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+  function circ(g, x, y, r) { g.beginPath(); g.arc(x, y, Math.max(0.001, r), 0, TAU); }
+
+  /* ----- board painting (shared by the play view and thumbnails); g is in cell units ----- */
+  function paintSurface(g, D, rnd) {
+    for (let i = 0; i < W * H; i++) {
+      const s = D.surf[i]; if (!s || D.filled[i]) continue;
+      const x = i % W, y = (i / W) | 0;
+      if (s === 1) {
+        const gr = g.createLinearGradient(x, y, x + 1, y + 1); gr.addColorStop(0, 'rgba(214,240,250,.92)'); gr.addColorStop(1, 'rgba(160,212,232,.92)');
+        g.fillStyle = gr; g.fillRect(x - 0.005, y - 0.005, 1.01, 1.01);
+        g.strokeStyle = 'rgba(255,255,255,.55)'; g.lineWidth = 0.03; g.beginPath();
+        const o = rnd() * 0.4; g.moveTo(x + 0.15 + o, y + 0.85); g.lineTo(x + 0.45 + o, y + 0.35); g.moveTo(x + 0.35 + o * 0.5, y + 0.9); g.lineTo(x + 0.5 + o * 0.5, y + 0.65); g.stroke();
+      } else if (s === 2) {
+        g.fillStyle = '#dcc08a'; g.fillRect(x - 0.005, y - 0.005, 1.01, 1.01);
+        for (let k = 0; k < 26; k++) { g.fillStyle = rnd() < 0.5 ? 'rgba(120,85,40,.35)' : 'rgba(255,245,215,.5)'; g.fillRect(x + rnd() * 0.95, y + rnd() * 0.95, 0.035, 0.035); }
+      } else {
+        const d = SLOPE_DIR[s], gr = g.createLinearGradient(x + 0.5 - d[0] * 0.5, y + 0.5 - d[1] * 0.5, x + 0.5 + d[0] * 0.5, y + 0.5 + d[1] * 0.5);
+        gr.addColorStop(0, 'rgba(120,70,30,.36)'); gr.addColorStop(1, 'rgba(255,225,170,.18)');
+        g.fillStyle = gr; g.fillRect(x, y, 1, 1);
+        g.strokeStyle = 'rgba(110,62,24,.55)'; g.lineWidth = 0.06; g.lineCap = 'round'; g.lineJoin = 'round';
+        const a = Math.atan2(d[1], d[0]), c = Math.cos(a), sn = Math.sin(a);
+        for (const off of [-0.22, 0.12]) {
+          g.beginPath();
+          const P = [[-0.12, -0.2], [0.08, 0], [-0.12, 0.2]];
+          P.forEach((p, k) => { const px = x + 0.5 + (p[0] + off) * c - p[1] * sn, py = y + 0.5 + (p[0] + off) * sn + p[1] * c; if (k) g.lineTo(px, py); else g.moveTo(px, py); });
+          g.stroke();
+        }
+      }
+    }
+  }
+  function paintHole(g, x, y, r, goal) {
+    g.fillStyle = 'rgba(80,45,15,.32)'; circ(g, x + 0.015, y + 0.025, r + 0.06); g.fill();
+    const gr = g.createRadialGradient(x - r * 0.25, y - r * 0.3, r * 0.05, x, y, r);
+    gr.addColorStop(0, '#000'); gr.addColorStop(0.6, '#080402'); gr.addColorStop(0.86, '#22130a'); gr.addColorStop(1, '#4a2c12');
+    g.fillStyle = gr; circ(g, x, y, r); g.fill();
+    g.strokeStyle = 'rgba(190,130,70,.45)'; g.lineWidth = r * 0.16; g.beginPath(); g.arc(x, y, r * 0.86, -0.15 * Math.PI, 0.65 * Math.PI); g.stroke();
+    g.strokeStyle = 'rgba(255,232,190,.4)'; g.lineWidth = 0.022; g.beginPath(); g.arc(x, y, r + 0.012, 0.95 * Math.PI, 1.65 * Math.PI); g.stroke();
+    if (goal) {
+      g.strokeStyle = '#c98f2a'; g.lineWidth = 0.08; circ(g, x, y, r + 0.03); g.stroke();
+      g.strokeStyle = '#ffe08a'; g.lineWidth = 0.025; g.beginPath(); g.arc(x, y, r + 0.05, 0.9 * Math.PI, 1.7 * Math.PI); g.stroke();
+    }
+  }
+  function unionPath(g, D, grow) {
+    g.beginPath();
+    const e = grow || 0;
+    for (const r of D.rects) g.rect(r.x0 - e, r.y0 - e, r.x1 - r.x0 + 2 * e, r.y1 - r.y0 + 2 * e);
+    for (let i = 0; i < W * H; i++) if (D.filled[i]) g.rect((i % W) - 0.02 - e, ((i / W) | 0) - 0.02 - e, 1.04 + 2 * e, 1.04 + 2 * e);
+  }
+  function paintBoard(g, D, opts) {   // g: transform maps cell units; opts {sc, dpr, thumb}
+    const rnd = mkRng(((D.id | 0) * 7919 + 17) >>> 0), thumb = opts && opts.thumb;
+    // floor
+    const fl = g.createLinearGradient(0, 0, W, H); fl.addColorStop(0, '#e6c18a'); fl.addColorStop(0.5, '#d9b077'); fl.addColorStop(1, '#c99d62');
+    g.fillStyle = fl; g.fillRect(0, 0, W, H);
+    if (!thumb) {
+      for (let k = 0; k < 46; k++) {   // vertical grain
+        const x0 = rnd() * W, amp = 0.04 + rnd() * 0.16, fq = 0.4 + rnd() * 1.1, ph = rnd() * TAU;
+        g.strokeStyle = 'rgba(' + (rnd() < 0.5 ? '120,72,30' : '150,95,45') + ',' + (0.05 + rnd() * 0.1).toFixed(3) + ')';
+        g.lineWidth = 0.01 + rnd() * 0.035; g.beginPath();
+        for (let y = 0; y <= H; y += 0.25) { const x = x0 + Math.sin(y * fq + ph) * amp; if (y) g.lineTo(x, y); else g.moveTo(x, y); }
+        g.stroke();
+      }
+      for (let k = 0; k < 2; k++) {   // knots
+        const kx = 0.6 + rnd() * (W - 1.2), ky = 0.6 + rnd() * (H - 1.2);
+        for (let q = 0; q < 4; q++) { g.strokeStyle = 'rgba(110,62,24,' + (0.12 - q * 0.02).toFixed(3) + ')'; g.lineWidth = 0.02; g.beginPath(); g.ellipse(kx, ky, 0.08 + q * 0.06, 0.18 + q * 0.1, 0, 0, TAU); g.stroke(); }
+      }
+      const sh = 0.35;   // inner edge shadow under the frame
+      [[0, 0, W, sh, 0, 0, 0, sh], [0, H - sh, W, sh, 0, H, 0, H - sh], [0, 0, sh, H, 0, 0, sh, 0], [W - sh, 0, sh, H, W, 0, W - sh, 0]].forEach((a) => {
+        const gr = g.createLinearGradient(a[4], a[5], a[6], a[7]); gr.addColorStop(0, 'rgba(60,30,8,.35)'); gr.addColorStop(1, 'rgba(60,30,8,0)');
+        g.fillStyle = gr; g.fillRect(a[0], a[1], a[2], a[3]);
+      });
+    }
+    paintSurface(g, D, rnd);
+    // guide line (easy stages)
+    if (D.guide && !thumb) {
+      const p = guidePath(D);
+      if (p.length > 2) {
+        g.strokeStyle = 'rgba(70,40,15,.32)'; g.lineWidth = 0.035; g.setLineDash([0.13, 0.1]); g.lineCap = 'round'; g.beginPath();
+        g.moveTo(D.start[0], D.start[1]);
+        for (let k = 2; k < p.length - 1; k += 2) g.lineTo(nodeX(p[k]), nodeY(p[k]));
+        g.lineTo(D.goal[0], D.goal[1]); g.stroke(); g.setLineDash([]);
+      }
+    }
+    // start ring
+    g.strokeStyle = 'rgba(255,248,230,.55)'; g.lineWidth = 0.04; circ(g, D.start[0], D.start[1], 0.32); g.stroke();
+    g.strokeStyle = 'rgba(90,50,20,.25)'; g.lineWidth = 0.02; circ(g, D.start[0] + 0.015, D.start[1] + 0.02, 0.36); g.stroke();
+    // checkpoint flags (base)
+    for (let i = 0; i < W * H; i++) if (D.cp[i]) {
+      const x = (i % W) + 0.5, y = ((i / W) | 0) + 0.5;
+      g.fillStyle = 'rgba(40,140,80,.2)'; circ(g, x, y, 0.36); g.fill();
+      g.strokeStyle = 'rgba(40,140,80,.55)'; g.lineWidth = 0.03; circ(g, x, y, 0.36); g.stroke();
+      g.strokeStyle = '#5a3a1c'; g.lineWidth = 0.035; g.beginPath(); g.moveTo(x - 0.1, y + 0.22); g.lineTo(x - 0.1, y - 0.24); g.stroke();
+      g.fillStyle = '#3fbf6a'; g.beginPath(); g.moveTo(x - 0.08, y - 0.24); g.lineTo(x + 0.2, y - 0.14); g.lineTo(x - 0.08, y - 0.04); g.closePath(); g.fill();
+    }
+    // magnets (base plate + horseshoe)
+    for (const m of D.mags) {
+      g.fillStyle = 'rgba(40,30,30,.3)'; circ(g, m.x + 0.02, m.y + 0.03, 0.3); g.fill();
+      g.fillStyle = '#4b4650'; circ(g, m.x, m.y, 0.28); g.fill();
+      g.strokeStyle = '#d8403a'; g.lineWidth = 0.1; g.lineCap = 'butt'; g.beginPath(); g.arc(m.x, m.y + 0.02, 0.13, Math.PI, TAU, true); g.stroke();
+      g.strokeStyle = '#d8403a'; g.beginPath(); g.moveTo(m.x - 0.13, m.y + 0.02); g.lineTo(m.x - 0.13, m.y - 0.1); g.moveTo(m.x + 0.13, m.y + 0.02); g.lineTo(m.x + 0.13, m.y - 0.1); g.stroke();
+      g.fillStyle = '#e6e8ee'; g.fillRect(m.x - 0.18, m.y - 0.16, 0.1, 0.07); g.fillRect(m.x + 0.08, m.y - 0.16, 0.1, 0.07);
+    }
+    // holes + goal
+    for (const o of D.holes) paintHole(g, o.x, o.y, HOLE_R, false);
+    paintHole(g, D.goal[0], D.goal[1], GOAL_R, true);
+    // raised walls: drop shadow, body, bevel
+    if (thumb) { g.fillStyle = '#7a4a22'; unionPath(g, D, 0); g.fill(); return; }
+    const sc = opts.sc * opts.dpr, cw = g.canvas.width, ch = g.canvas.height, T = g.getTransform();
+    g.save();
+    g.fillStyle = 'rgba(50,24,6,.4)'; g.translate(0.05, 0.075);
+    try { g.filter = 'blur(' + Math.max(1, sc * 0.03).toFixed(1) + 'px)'; } catch (e) {}
+    unionPath(g, D, 0); g.fill();
+    try { g.filter = 'none'; } catch (e) {}
+    g.restore();
+    const mkL = (col, dx, dy, cut) => {   // union in `col` (optionally minus the union shifted by cut)
+      const c = mkC(cw, ch), q = c.getContext('2d');
+      q.setTransform(T); q.translate(dx, dy); q.fillStyle = col; unionPath(q, D, 0); q.fill();
+      if (cut) { q.setTransform(T); q.translate(cut[0], cut[1]); q.globalCompositeOperation = 'destination-out'; q.fillStyle = '#000'; unionPath(q, D, 0); q.fill(); }
+      return c;
+    };
+    const d = 0.035;
+    const A = mkL('#5e3416', 0, 0), a = A.getContext('2d');
+    a.globalCompositeOperation = 'source-atop';
+    a.drawImage(mkL('#94602f', -d, -d), 0, 0);           // body everywhere except the lower-right edge (stays dark)
+    a.drawImage(mkL('#c99054', 0, 0, [d, d]), 0, 0);     // light upper-left edge
+    a.setTransform(T);
+    const wr = mkRng(((D.id | 0) * 131 + 7) >>> 0);
+    for (let k = 0; k < 70; k++) {   // grain on the walls
+      a.strokeStyle = 'rgba(' + (wr() < 0.5 ? '70,38,12' : '200,140,80') + ',' + (0.08 + wr() * 0.12).toFixed(3) + ')';
+      a.lineWidth = 0.008 + wr() * 0.02; a.beginPath();
+      if (wr() < 0.5) { const y = wr() * H; a.moveTo(0, y); a.bezierCurveTo(W * 0.3, y + wr() * 0.2 - 0.1, W * 0.7, y + wr() * 0.2 - 0.1, W, y); }
+      else { const x = wr() * W; a.moveTo(x, 0); a.bezierCurveTo(x + wr() * 0.2 - 0.1, H * 0.3, x + wr() * 0.2 - 0.1, H * 0.7, x, H); }
+      a.stroke();
+    }
+    g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(A, 0, 0); g.restore();
+  }
+  function paintFrame(g, FR) {
+    const o = -FR;
+    const gr = g.createLinearGradient(o, o, W + FR, H + FR); gr.addColorStop(0, '#7b4723'); gr.addColorStop(0.5, '#5b3218'); gr.addColorStop(1, '#40220e');
+    g.fillStyle = gr; rr(g, o, o, W + 2 * FR, H + 2 * FR, FR * 0.6); g.fill();
+    g.strokeStyle = 'rgba(255,205,150,.35)'; g.lineWidth = 0.035; rr(g, o + 0.03, o + 0.03, W + 2 * FR - 0.06, H + 2 * FR - 0.06, FR * 0.55); g.stroke();
+    g.strokeStyle = 'rgba(20,8,2,.55)'; g.lineWidth = 0.05; g.strokeRect(-0.02, -0.02, W + 0.04, H + 0.04);
+    const r = mkRng(4242);
+    g.save(); rr(g, o, o, W + 2 * FR, H + 2 * FR, FR * 0.6); g.clip();
+    for (let k = 0; k < 40; k++) { g.strokeStyle = 'rgba(25,10,2,' + (0.08 + r() * 0.1).toFixed(3) + ')'; g.lineWidth = 0.012 + r() * 0.02; g.beginPath(); const y = o + r() * (H + 2 * FR); g.moveTo(o, y); g.bezierCurveTo(W * 0.3, y + r() * 0.3 - 0.15, W * 0.7, y + r() * 0.3 - 0.15, W + FR, y); g.stroke(); }
+    g.restore();
+  }
+  function drawThumb(D, wpx, hpx) {
+    const c = L.h('canvas'), d = Math.min(2, window.devicePixelRatio || 1);
+    c.width = Math.round(wpx * d); c.height = Math.round(hpx * d); c.style.width = wpx + 'px'; c.style.height = hpx + 'px';
+    const g = c.getContext('2d'), s = Math.min(wpx / W, hpx / H) * d;
+    g.setTransform(s, 0, 0, s, 0, 0);
+    paintBoard(g, D, { thumb: true });
+    for (const dd of D.doors) { g.fillStyle = SW_COL[dd.g]; g.fillRect(dd.x0, dd.y0, dd.x1 - dd.x0, dd.y1 - dd.y0); }
+    for (const sw of D.sws) { g.fillStyle = SW_COL[sw.g]; circ(g, sw.x, sw.y, 0.22); g.fill(); }
+    for (const p of D.ports) { g.strokeStyle = PORT_COL[p.d % 4]; g.lineWidth = 0.1; circ(g, p.x, p.y, 0.24); g.stroke(); }
+    for (const m of D.mv) { g.fillStyle = '#5e3416'; g.fillRect(m.x, m.y, m.w, m.h); }
+    g.fillStyle = '#f4f6fa'; circ(g, D.start[0], D.start[1], R); g.fill();
+    return c;
+  }
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS });
+    root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    const DPR = () => Math.min(2.5, cv.dpr || 1);
+    const Pl = (s) => api.players[s] || { name: '?', color: '#888', ai: true };
+    let st = null;
+    const name = (s) => (st && st.nm && st.nm[s]) || Pl(s).name || (s + 1) + '번';
+    const simHere = (s) => { const p = api.players[s]; if (!p) return false; if (!api.online) return true; if (api.isHost) return !!p.ai || !!p.local; return !p.ai && !!p.local; };
+    const host = () => !api.online || api.isHost;
+    const mine = () => api.mySeats().slice(0, 1);
+    const isMine = (s) => mine().includes(s);
+    const auto = () => !!(L.debug && L.debug.autoplay);
+    const fine = (() => { try { return matchMedia('(pointer:fine)').matches || !!window.LOUNGE_DESKTOP; } catch (e) { return false; } })();
+
+    let key = null, RS = [], view = 0, lay = null, statC = null, statKey = '', ff = 1, endWait = 0, graceT = -1, pubT = 0, autoSwT = -1, finSeen = false;
+    let parts = [], floats = [], goFlash = 0, shakeT = 0, pick = null, pickRid = -1, hostT = 0, frameN = 0, lastSfx = {}, respawnT = 0, bestNew = false, shareT = null, shareEl = null;
+    const remote = {}, heard = {}, ghost = {};
+    const ballC = { c: null, k: '' };
+
+    /* ----- tilt input: sensor / drag joystick / keys ----- */
+    const needPerm = typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function';
+    const inp = { mode: 'drag', sensor: needPerm ? 'need' : 'none', g: 0, b: 0, g0: 0, b0: 0, got: 0, drag: null, kx: 0, ky: 0, tx: 0, ty: 0, src: '' };
+    let savedMode = null; try { savedMode = localStorage.getItem('lounge.tiltmaze.mode'); } catch (e) {}
+    function setMode(m, quiet) {
+      inp.mode = m;
+      try { localStorage.setItem('lounge.tiltmaze.mode', m); } catch (e) {}
+      if (m === 'tilt') { zero(); if (!quiet) api.toast('기울기 조작 · 지금 자세가 수평이에요'); }
+      else if (!quiet) api.toast('끌어서 조작 · 화면 아무 데나 누르고 끌어요');
+      syncBar();
+    }
+    function zero() { inp.g0 = inp.g; inp.b0 = inp.b; }
+    function onOri(e) {
+      if (e.beta == null || e.gamma == null) return;
+      const b = e.beta, g = e.gamma;
+      let ang = 0; try { ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0; } catch (er) { ang = 0; }
+      let sx, sy;
+      if (ang === 90) { sx = b; sy = -g; } else if (ang === -90 || ang === 270) { sx = -b; sy = g; } else if (ang === 180) { sx = -g; sy = -b; } else { sx = g; sy = b; }
+      if (!inp.got) { inp.g = sx; inp.b = sy; } else { inp.g += (sx - inp.g) * 0.4; inp.b += (sy - inp.b) * 0.4; }
+      inp.got++;
+      if (inp.sensor !== 'ok') {
+        inp.sensor = 'ok';
+        if (savedMode === 'tilt' || (!savedMode && !window.LOUNGE_DESKTOP && !fine)) setMode('tilt', true);
+        syncBar();
+      }
+    }
+    addEventListener('deviceorientation', onOri);
+    function askTilt() {
+      if (inp.sensor === 'ok') { setMode(inp.mode === 'tilt' ? 'drag' : 'tilt'); return; }
+      if (needPerm) {
+        try {
+          DeviceOrientationEvent.requestPermission().then((r) => {
+            if (r === 'granted') { savedMode = 'tilt'; api.toast('기울기를 켰어요'); setTimeout(() => { if (inp.sensor === 'ok') setMode('tilt', true); else api.toast('센서 신호가 없어요 · 끌어서 해요'); }, 700); }
+            else { inp.sensor = 'denied'; syncBar(); api.toast('기울기 권한이 없어요 · 화면을 끌어서 해요'); }
+          }).catch(() => { inp.sensor = 'denied'; syncBar(); api.toast('기울기를 켤 수 없어요 · 화면을 끌어서 해요'); });
+        } catch (e) { api.toast('기울기를 켤 수 없어요'); }
+        return;
+      }
+      api.toast('이 기기에서는 기울기 센서를 쓸 수 없어요 · 화면을 끌어서 굴려요');
+    }
+    const JR = () => U.clamp((lay ? lay.sc : 40) * 1.5, 46, 76);
+    function readInput(rdt) {
+      let tx = 0, ty = 0, src = '';
+      const I = api.input;
+      let ax = 0, ay = 0;
+      if (I && I.axis) { ax = I.axis('left', 'right'); ay = I.axis('up', 'down'); if (I.held && I.held('fine')) { ax *= 0.45; ay *= 0.45; } }
+      const digital = Math.abs(ax) === 1 || Math.abs(ay) === 1 || Math.abs(ax) === 0.45 || Math.abs(ay) === 0.45;
+      const k = digital ? Math.min(1, rdt * 6) : 1;   // keys ease in, sticks are direct
+      inp.kx += (ax - inp.kx) * k; inp.ky += (ay - inp.ky) * k;
+      if (Math.abs(inp.kx) < 0.004) inp.kx = 0;
+      if (Math.abs(inp.ky) < 0.004) inp.ky = 0;
+      if (inp.drag) {
+        const q = inp.drag, j = JR();
+        let dx = q.x - q.x0, dy = q.y - q.y0; const l = Math.hypot(dx, dy);
+        if (l > j) { q.x0 = q.x - dx / l * j; q.y0 = q.y - dy / l * j; dx = dx / l * j; dy = dy / l * j; }
+        tx = dx / j; ty = dy / j; src = 'drag';
+      } else if (inp.kx || inp.ky) { tx = inp.kx; ty = inp.ky; src = 'key'; }
+      else if (inp.mode === 'tilt' && inp.sensor === 'ok') {
+        const S = 17, dz = 0.06;
+        tx = (inp.g - inp.g0) / S; ty = (inp.b - inp.b0) / S;
+        const l = Math.hypot(tx, ty);
+        if (l < dz) { tx = ty = 0; } else { const m = (l - dz) / (1 - dz); tx = tx / l * m; ty = ty / l * m; }
+        src = 'tilt';
+      }
+      const l = Math.hypot(tx, ty); if (l > 1) { tx /= l; ty /= l; }
+      inp.tx = tx; inp.ty = ty; inp.src = src;
+    }
+
+    /* ----- match setup ----- */
+    const curKey = () => (st && st.ph !== 'pick' && st.sl && st.sl.length ? st.rid + '.' + st.sl.join(',') : null);
+    function ensureMatch() {
+      const k = curKey();
+      if (!k || k === key) return;
+      key = k;
+      RS = [];
+      for (let s = 0; s < st.n; s++) {
+        if (!simHere(s)) { RS[s] = null; continue; }
+        const P = newRun(st.sl);
+        const p = api.players[s];
+        if (p && p.ai) aiInit(P, p.lv || 2, ((st.rid * 7919) ^ (s * 104729 + 13)) >>> 0);
+        else if (auto() && isMine(s)) aiInit(P, 3, (st.rid ^ (99 + s * 31)) >>> 0);
+        RS[s] = P;
+      }
+      const m = mine(), f0 = RS.findIndex(Boolean);
+      view = m.length && RS[m[0]] ? m[0] : f0 >= 0 ? f0 : 0;
+      for (const x in remote) delete remote[x];
+      for (const x in ghost) delete ghost[x];
+      parts = []; floats = []; ff = 1; endWait = 0; graceT = -1; autoSwT = -1; finSeen = false; goFlash = 0; bestNew = false; shareT = null; if (shareEl) { shareEl.remove(); shareEl = null; }
+      statC = null; zeroAsked = false;
+      if (st.ph === 'done') RS.forEach((P) => { if (P && P.ph !== 'fin') P.ph = 'fin'; });
+      syncBar();
+    }
+    let zeroAsked = false;
+    function adoptSeats() {   // an online seat taken over by the AI (player left) → the host simulates it from where it was
+      if (!api.online || !api.isHost || !st || st.ph !== 'play' || !key) return;
+      for (let s = 0; s < st.n; s++) {
+        if (RS[s] || !simHere(s)) continue;
+        const P = newRun(st.sl), r = remote[s];
+        if (r) {
+          const si = U.clamp(r[0] | 0, 0, st.sl.length - 1);
+          if (si) loadStage(P, si, 0.6);
+          P.tot = Math.max(0, (r[4] - r[7]) / 10); P.falls = r[5] | 0;
+          if (r[3] === 4) { P.ph = 'fin'; P.fin = r[4] / 10; }
+        }
+        aiInit(P, (api.players[s] && api.players[s].lv) || 2, (st.rid * 31 + s) >>> 0);
+        RS[s] = P; delete remote[s]; delete ghost[s];
+      }
+    }
+
+    /* ----- layout ----- */
+    function layout() {
+      const w = cv.w, h = cv.h, hudH = 46, stripH = 24, barH = 58, FR = 0.34;
+      const availH = h - hudH - stripH - barH - 6, availW = w - 12;
+      const sc = Math.max(10, Math.min(availW / (W + 2 * FR), availH / (H + 2 * FR)));
+      const bw = (W + 2 * FR) * sc, bh = (H + 2 * FR) * sc;
+      const ox = (w - bw) / 2 + FR * sc, oy = hudH + stripH + 3 + Math.max(0, (availH - bh) * 0.3) + FR * sc;
+      lay = { w, h, hudH, stripH, barH, sc, ox, oy, FR, bw, bh, barY: h - barH };
+      statC = null; ballC.k = '';
+      placeBar();
+    }
+    cv.onresize = layout;
+
+    /* ----- bottom bar buttons ----- */
+    const modeBtn = L.h('button', { class: 'tm-btn', type: 'button', text: '기울기 켜기' });
+    const zeroBtn = L.h('button', { class: 'tm-btn', type: 'button', text: '영점 맞추기', hidden: true });
+    const ffBtn = L.h('button', { 'data-action': 'ff', class: 'tm-btn', type: 'button', text: '▶▶ 빨리 보기', hidden: true });
+    const stopEv = (e) => { e.stopPropagation(); };
+    [modeBtn, zeroBtn, ffBtn].forEach((b) => { b.addEventListener('pointerdown', stopEv); root.appendChild(b); });
+    modeBtn.onclick = () => { api.sfx('click'); askTilt(); };
+    zeroBtn.onclick = () => { api.sfx('click'); api.buzz(15); zero(); api.toast('지금 자세를 수평으로 맞췄어요'); };
+    ffBtn.onclick = () => { api.sfx('click'); ff = ff > 1 ? 1 : 6; syncBar(); };
+    const offFF = api.input ? api.input.on((t, id) => { if (t === 'down' && id === 'ff' && !ffBtn.hidden && ffBtn.getClientRects().length) ffBtn.click(); }) : null;
+    function placeBar() {
+      if (!lay) return;
+      const y = lay.barY + (lay.barH - 44) / 2;
+      modeBtn.style.top = zeroBtn.style.top = ffBtn.style.top = y + 'px';
+      modeBtn.style.left = '10px'; zeroBtn.style.right = '10px'; ffBtn.style.right = '10px';
+    }
+    let barSig = '';
+    function syncBar() {
+      const P = myP(), playing = !!(P && P.ph !== 'fin' && st && st.ph === 'play' && !auto());
+      const showMode = playing && !(fine && inp.sensor === 'none');
+      const showZero = playing && inp.mode === 'tilt' && inp.sensor === 'ok';
+      const anyAI = RS.some((X, s) => X && X.ph !== 'fin' && !isMine(s));
+      const showFF = !!(st && st.ph === 'play' && (!P || P.ph === 'fin') && anyAI);
+      const lbl = inp.mode === 'tilt' && inp.sensor === 'ok' ? '기울기 ON' : inp.sensor === 'ok' ? '기울기로 하기' : inp.sensor === 'denied' ? '끌어서 조작' : '기울기 켜기';
+      const sig = [showMode, showZero, showFF, lbl, ff].join('|');
+      if (sig === barSig) return;
+      barSig = sig;
+      modeBtn.hidden = !showMode; zeroBtn.hidden = !showZero || showFF; ffBtn.hidden = !showFF;
+      modeBtn.textContent = lbl; modeBtn.classList.toggle('on', inp.mode === 'tilt' && inp.sensor === 'ok');
+      ffBtn.textContent = ff > 1 ? '▶ 보통 속도' : '▶▶ 빨리 보기';
+    }
+
+    /* ----- pointer: drag joystick + HUD chips ----- */
+    function myP() { const m = mine()[0]; return m != null ? RS[m] : null; }
+    function canCtl() { const P = myP(); return !!P && view === mine()[0] && P.ph !== 'fin' && !auto() && !P.ai; }
+    function onDown(e) {
+      if (!lay || !st) return;
+      const p = cv.local(e);
+      if (p.y < lay.hudH) { tapChip(p.x); return; }
+      if (!canCtl()) { if (myP() && myP().ph === 'fin') tapChip(-1); return; }
+      e.preventDefault();
+      if (inp.drag) return;
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      inp.drag = { id: e.pointerId, x0: p.x, y0: p.y, x: p.x, y: p.y };
+      api.buzz(6);
+    }
+    function onMove(e) { const q = inp.drag; if (!q || q.id !== e.pointerId) return; const p = cv.local(e); q.x = p.x; q.y = p.y; }
+    function onUp(e) { if (inp.drag && inp.drag.id === e.pointerId) inp.drag = null; }
+    function tapChip(x) {
+      if (!st || !key || canCtl()) return;
+      const n = st.n, cw = (lay.w - 8 - (n - 1) * 4) / n;
+      let s = x < 0 ? -1 : Math.floor((x - 4) / (cw + 4));
+      if (s < 0 || s >= n) { const idx = []; for (let i = 0; i < n; i++) if (RS[i] || remote[i]) idx.push(i); if (idx.length < 2) return; s = idx[(idx.indexOf(view) + 1) % idx.length]; }
+      if (s === view || (!RS[s] && !remote[s])) return;
+      view = s; autoSwT = -2; api.sfx('click');
+    }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('contextmenu', noCtx);
+
+    /* ----- solo stage picker ----- */
+    function genBest(k) { const r = (U.store.get('best.tiltmaze', {}) || {})[k]; return r && r.v > 0 ? r.v : 0; }
+    function endlessNext() { return U.clamp((U.store.get('tiltmaze.endless', 0) | 0) + 1, 1, 999); }
+    function pruneDaily() {   // keep only the last 7 days of 「오늘의 미로」 records
+      const all = U.store.get('best.tiltmaze', {}) || {}, lim = Date.now() - 7 * 864e5; let ch = false;
+      for (const k in all) if (/^d\d{8}$/.test(k)) { const d = +k.slice(1), t = new Date(Math.floor(d / 10000), Math.floor(d / 100 % 100) - 1, d % 100).getTime(); if (!(t >= lim)) { delete all[k]; ch = true; } }
+      if (ch) U.store.set('best.tiltmaze', all);
+    }
+    function saveGen(id, t, falls) {
+      const k = genKind(id);
+      if (k < 0) { pruneDaily(); const d = id - DAILY0, nw = api.best('d' + d, Math.round(t * 10) / 10, { label: '오늘의 미로 ' + Math.floor(d / 100 % 100) + '/' + (d % 100), lower: true, fmt: 'time' }); shareT = shareText(id, t, starsFor(id, t), falls); return nw; }
+      if (k > 0 && k < 900) { if (k >= endlessNext()) U.store.set('tiltmaze.endless', k); return api.best('endless', k, { label: '끝없는 미로 최고 단계', unit: '단계' }); }
+      return false;
+    }
+    function bests() { try { return JSON.parse(localStorage.getItem('lounge.tiltmaze.best') || '{}') || {}; } catch (e) { return {}; } }
+    function saveBest(id, t) { if (id >= 1000) return false; const b = bests(), old = b[id]; if (old && old <= t) return false; b[id] = Math.round(t * 10) / 10; try { localStorage.setItem('lounge.tiltmaze.best', JSON.stringify(b)); } catch (e) {} return true; }
+    function buildPicker() {
+      if (pick) return;
+      const canPick = host() && mine().length > 0 && !auto();
+      const B = bests();
+      let next = STAGES.findIndex((_, i) => !(B[i] > 0));
+      if (next < 0) next = STAGES.findIndex((_, i) => starsFor(i, B[i]) < 3);
+      const grid = L.h('div', { class: 'tm-grid' }), wpx = Math.max(40, Math.min(64, Math.floor(((lay ? lay.w : 360) - 24 - 24) / 4) - 14));
+      const go = (id) => { if (!canPick || !st || st.ph !== 'pick') return; api.sfx('click'); api.buzz(15); api.setState(Object.assign({}, st, { ph: 'play', sl: [id] })); };
+      let nextEl = null;
+      STAGES.forEach((S, i) => {
+        const bt = B[i], n = bt > 0 ? starsFor(i, bt) : 0;
+        const stars = L.h('div', { class: 'stars' }); stars.innerHTML = '★'.repeat(n) + '<i>' + '★'.repeat(3 - n) + '</i>';
+        const b = L.h('button', { class: 'tm-st' + (i === next ? ' next' : ''), type: 'button', 'aria-label': (i + 1) + '번 ' + S.n, disabled: !canPick },
+          L.h('span', { class: 'no', text: String(i + 1) }), drawThumb(stageDef(i), wpx, Math.round(wpx * H / W)), L.h('span', { class: 'nm', text: S.n }), stars,
+          L.h('span', { class: 'bt', text: bt > 0 ? fmtT(bt) : '기록 없음' }));
+        b.onclick = () => go(i);
+        if (i === next) nextEl = b;
+        grid.append(b);
+      });
+      const rnd = L.h('button', { class: 'btn tm-rand', type: 'button', text: '무작위 미로 · 매번 새로 만들어요', disabled: !canPick });
+      rnd.onclick = () => go(genId(0, Math.random() * 1e6));
+      let el;
+      if (!st.mz) {   // generated mode: 오늘의 미로 + 끝없는 미로 first, hand-made stages below
+        const dk = dayKey(), bd = genBest('d' + dk), ek = endlessNext();
+        const day = L.h('button', { class: 'btn primary tm-rand', type: 'button', disabled: !canPick,
+          text: '📅 오늘의 미로 (' + Math.floor(dk / 100 % 100) + '/' + (dk % 100) + ')' + (bd ? ' · 내 기록 ' + fmtT(bd) : ' · 모두 같은 미로') });
+        day.onclick = () => go(DAILY0 + dk);
+        const end = L.h('button', { class: 'btn tm-rand', type: 'button', disabled: !canPick,
+          text: '♾ 끝없는 미로 · ' + ek + '단계' + (ek > 1 ? ' 이어서' : '부터') + ' (난이도 ' + (lvlOfK(ek) + 1) + '/10)' });
+        end.onclick = () => go(genId(ek, Math.random() * 1e6));
+        const kids = [L.h('h3', { text: '미로 고르기' }),
+          L.h('p', { class: 'sub', text: canPick ? '새로 만든 미로를 굴려요. 단계가 오를수록 구멍·움직이는 막대·얼음이 많아져요.' : '고르는 중…' }), day, end];
+        if (ek > 1) { const re = L.h('button', { class: 'btn tm-rand', type: 'button', disabled: !canPick, text: '끝없는 미로 1단계부터 다시' }); re.onclick = () => go(genId(1, Math.random() * 1e6)); kids.push(re); }
+        kids.push(rnd, L.h('p', { class: 'sub', style: 'margin-top:14px', text: '직접 만든 스테이지' }), grid);
+        el = L.h('div', { class: 'tm-pick' }, ...kids);
+      } else el = L.h('div', { class: 'tm-pick' }, L.h('h3', { text: '스테이지 고르기' }),
+        L.h('p', { class: 'sub', text: canPick ? '빨리 도착할수록 별이 많아요(★★★). 금테 칸이 다음 도전이에요.' : '고르는 중…' }), grid, rnd);
+      el.addEventListener('pointerdown', (e) => e.stopPropagation());
+      root.appendChild(el);
+      pick = { el };
+      if (nextEl) setTimeout(() => { try { nextEl.scrollIntoView({ block: 'nearest' }); } catch (e) {} }, 30);
+    }
+    function dropPicker() { if (pick) { pick.el.remove(); pick = null; } }
+    function hostPickFlow(rdt) {
+      if (!host() || !st || st.ph !== 'pick') return;
+      if (pickRid !== st.rid) { pickRid = st.rid; hostT = 0; }
+      if (!mine().length || auto()) { hostT += rdt * SPD(); if (hostT > 1.2) { hostT = -1e9; api.setState(Object.assign({}, st, { ph: 'play', sl: [st.mz ? (auto() ? 0 : U.rand(STAGES.length)) : genId(900 + (auto() ? 3 : U.rand(10)), Math.random() * 1e6)] })); } }
+    }
+
+    /* ----- effects ----- */
+    function sfx(n, gap) { const t = performance.now(); if (t - (lastSfx[n] || 0) < (gap || 50)) return; lastSfx[n] = t; api.sfx(n); }
+    function burst(x, y, cols, n, sp, life) {
+      for (let i = 0; i < n; i++) { const a = Math.random() * TAU, v = sp * (0.3 + Math.random()); parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: life, T: life, c: cols[i % cols.length] }); }
+      if (parts.length > 140) parts.splice(0, parts.length - 140);
+    }
+    function pop(x, y, text, col, big) { floats.push({ x, y, text, col: col || '#fff3c0', t: 1.3, T: 1.3, big: !!big }); if (floats.length > 8) floats.shift(); }
+    function onEvents(P, me, s) {
+      for (const e of P.ev) {
+        switch (e.k) {
+          case 'wall': sfx(e.v > 2.2 ? 'hit' : 'tick', 70); if (me) api.buzz(Math.round(U.clamp(e.v * 4, 6, 22))); break;
+          case 'fall': sfx('thud', 120); if (me) { api.buzz([40, 30, 25]); shakeT = 0.25; } pop(e.x, e.y - 0.5, '퐁당!', '#ffb0a0'); break;
+          case 'back': respawnT = 0.25; break;
+          case 'goal': sfx('win', 200); if (me) api.buzz([20, 30, 40]); burst(P.D.goal[0], P.D.goal[1], ['#ffe08a', '#ee6a55', '#7dd8ff', '#9dff8a'], 26, 3.2, 0.9); pop(P.D.goal[0], P.D.goal[1] - 0.7, '통과! ' + fmtT(e.t), '#ffe08a', true); break;
+          case 'cp': sfx('chip', 100); if (me) api.buzz(12); pop(e.x, e.y - 0.55, '체크!', '#9dffb0'); burst(e.x, e.y, ['#9dffb0', '#3fbf6a'], 10, 1.8, 0.5); break;
+          case 'sw': sfx('click', 80); setTimeout(() => sfx('whoosh', 10), 120); if (me) api.buzz([15, 20, 15]); pop(e.x, e.y - 0.55, '문 열림!', SW_COL[e.g]); burst(e.x, e.y, [SW_COL[e.g], '#fff'], 12, 2, 0.5); break;
+          case 'tele': sfx('whoosh', 80); if (me) api.buzz(18); burst(e.x, e.y, ['#d8c0ff', '#fff'], 8, 1.6, 0.4); burst(e.x2, e.y2, ['#d8c0ff', '#fff'], 10, 2, 0.5); break;
+          case 'go': sfx('pop', 80); goFlash = 0.7; if (me) api.buzz(20); break;
+          case 'stage': if (me && e.si > 0) sfx('roll', 80); break;
+          case 'fin': if (me) { sfx('win', 200); api.buzz([30, 40, 60]); } break;
+        }
+      }
+      P.ev.length = 0;
+      void s;
+    }
+
+    /* ----- online ----- */
+    function rowOf(s) {   // [stage, x100, y100, phase, time10, falls, rem10, stageTime10]
+      const P = RS[s];
+      if (P) {
+        if (P.remT <= 0) { P.rem = remOf(P); P.remT = 0.25; }
+        return [P.si, Math.round(P.x * 100), Math.round(P.y * 100), PH[P.ph], Math.round(timeOf(P) * 10), P.falls, Math.round(P.rem * 10), Math.round(P.t * 10)];
+      }
+      return remote[s] || null;
+    }
+    function pollNet(rdt) {
+      if (!api.online || !key) return;
+      const now = performance.now();
+      if (api.isHost) {
+        let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+        if (rem && typeof rem === 'object') for (const k in rem) {
+          const s = +k, o = rem[k];
+          if (!(s >= 0 && s < st.n) || RS[s] || !o || o.k !== key || !Array.isArray(o.a)) continue;
+          const a = o.a.map((v) => +v || 0);
+          const old = remote[s];
+          if (!old || old.join() !== a.join()) heard[s] = now;
+          remote[s] = a;
+        }
+      } else {
+        let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+        if (hs && typeof hs === 'object' && hs.k === key && Array.isArray(hs.s)) hs.s.forEach((a, s) => { if (RS[s] || !Array.isArray(a)) return; remote[s] = a.map((v) => +v || 0); heard[s] = now; });
+      }
+      // smooth ghost motion
+      for (const k in remote) {
+        const a = remote[k], gx = a[1] / 100, gy = a[2] / 100;
+        let q = ghost[k];
+        if (!q || q.si !== a[0] || Math.hypot(q.x - gx, q.y - gy) > 2.5) q = ghost[k] = { x: gx, y: gy, si: a[0] };
+        const f = Math.min(1, rdt * 12); q.x += (gx - q.x) * f; q.y += (gy - q.y) * f; q.si = a[0];
+      }
+    }
+    function publish(rdt) {
+      if (!api.online || !key || !st) return;
+      pubT -= rdt;
+      if (pubT > 0) return;
+      pubT = 1 / 12;
+      try {
+        if (api.isHost) { const s = []; for (let i = 0; i < st.n; i++) s.push(rowOf(i) || 0); api.net.hostSend({ k: key, s }); }
+        else { const m = mine()[0]; if (m != null && RS[m]) api.net.publish({ k: key, a: rowOf(m) }); }
+      } catch (e) {}
+    }
+    function hostEnd(rdt) {
+      if (!host() || !st || st.ph !== 'play' || !key) return;
+      const now = performance.now();
+      let all = true, any = false;
+      for (let s = 0; s < st.n; s++) {
+        const r = rowOf(s);
+        if (r && r[3] === 4) any = true;
+        else if (RS[s] || !(heard[s] && now - heard[s] > 40000)) all = false;
+      }
+      if (any && graceT < 0 && st.n > 1) graceT = GRACE * st.sl.length;
+      if (graceT > 0) graceT = Math.max(0, graceT - rdt * SPD() * ff);
+      const timeUp = graceT === 0;
+      if (!all && !timeUp) { endWait = 0; return; }
+      endWait += rdt;
+      if (endWait > (all ? 0.9 : 0.2)) {
+        endWait = -1e9;
+        const rows = [];
+        for (let s = 0; s < st.n; s++) {
+          const r = rowOf(s) || [0, 0, 0, 0, 0, 0, 990, 0], f = r[3] === 4;
+          const done = RS[s] ? doneOf(RS[s]) : f ? st.sl.length : r[0];
+          rows.push([s, f ? r[4] : -1, done, f ? 0 : r[6], r[5]]);
+        }
+        api.setState(finish(st, rows));
+      }
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      frameN++;
+      ensureMatch();
+      if ((frameN & 15) === 0) adoptSeats();
+      hostPickFlow(rdt);
+      if (!st || !key) { draw(now); return; }
+      readInput(rdt);
+      if (auto()) { const M0 = myP(); if (M0 && !M0.ai) aiInit(M0, 3, (st.rid ^ (99 + mine()[0] * 31)) >>> 0); }
+      const dt = rdt * SPD();
+      const playing = st.ph === 'play';
+      RS.forEach((P, s) => {
+        if (!P) return;
+        if (isMine(s) && !P.ai) { P.tx = inp.tx; P.ty = inp.ty; }
+        if (playing) { const k = !isMine(s) || auto() ? ff : 1; runFor(P, dt * k, 2400); P.remT -= dt * k; }
+        if (s !== view && !isMine(s)) P.ev.length = 0;
+      });
+      // zero the tilt sensor once per match, a moment into the first countdown (phone is held still then)
+      const M = myP();
+      if (M && !zeroAsked && M.si === 0 && M.ph === 'ready' && M.tm < READY1 - 1.0) { zeroAsked = true; if (inp.mode === 'tilt') zero(); }
+      pollNet(rdt);
+      if (M && isMine(view)) onEvents(M, true, view);
+      else { const V = RS[view]; if (V) onEvents(V, false, view); if (M) onEvents(M, true, mine()[0]); }
+      // my run is over → watch someone still rolling
+      if (M && M.ph === 'fin' && !finSeen) {
+        finSeen = true; autoSwT = 2.6; inp.drag = null;
+        if (st.n === 1 && !auto() && M.sl.length === 1) bestNew = (M.sl[0] >= 1000 ? saveGen(M.sl[0], M.fin, M.falls) : saveBest(M.sl[0], M.fin)) && true;
+      }
+      if (autoSwT > 0) {
+        autoSwT -= rdt;
+        if (autoSwT <= 0) { let s = -1; for (let i = 0; i < st.n; i++) { if (isMine(i)) continue; const r = rowOf(i); if (r && r[3] !== 4) { s = i; break; } } if (s >= 0) view = s; }
+      }
+      hostEnd(rdt);
+      publish(rdt);
+      for (let i = parts.length - 1; i >= 0; i--) { const q = parts[i]; q.t -= rdt; q.x += q.vx * rdt; q.y += q.vy * rdt; q.vx *= 0.96; q.vy *= 0.96; if (q.t <= 0) parts.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t -= rdt; if (floats[i].t <= 0) floats.splice(i, 1); }
+      goFlash = Math.max(0, goFlash - rdt); shakeT = Math.max(0, shakeT - rdt); respawnT = Math.max(0, respawnT - rdt);
+      syncBar();
+      draw(now);
+    }
+
+    /* ----- static board layer (cached per stage/scale) ----- */
+    function getStatic(D) {
+      const sk = D.id + '|' + lay.sc + '|' + DPR();
+      if (statC && statKey === sk) return statC;
+      const d = DPR(), FR = lay.FR, sc = lay.sc;
+      const c = mkC(lay.bw * d, lay.bh * d), g = c.getContext('2d');
+      g.setTransform(sc * d, 0, 0, sc * d, FR * sc * d, FR * sc * d);
+      paintFrame(g, FR);
+      g.save(); g.beginPath(); g.rect(0, 0, W, H); g.clip();
+      paintBoard(g, D, { sc, dpr: d });
+      g.restore();
+      // '출발' label in pixel space
+      g.setTransform(d, 0, 0, d, 0, 0);
+      const fs = Math.max(9, Math.round(sc * 0.2));
+      g.font = '700 ' + fs + 'px ' + FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillStyle = 'rgba(90,50,20,.55)';
+      g.fillText('출발', (FR + D.start[0]) * sc, (FR + D.start[1] + 0.36) * sc + fs * 0.5);
+      statC = c; statKey = sk;
+      return c;
+    }
+    function ballSprite() {
+      const px = Math.ceil(2 * R * lay.sc * DPR()) + 2, k = String(px);
+      if (ballC.k === k) return ballC.c;
+      const c = mkC(px, px), g = c.getContext('2d'), r = px / 2 - 1;
+      const gr = g.createRadialGradient(px / 2 - r * 0.38, px / 2 - r * 0.42, r * 0.04, px / 2, px / 2, r);
+      gr.addColorStop(0, '#ffffff'); gr.addColorStop(0.18, '#eef1f5'); gr.addColorStop(0.55, '#a6acb6'); gr.addColorStop(0.86, '#5d626b'); gr.addColorStop(1, '#3a3d44');
+      g.fillStyle = gr; circ(g, px / 2, px / 2, r); g.fill();
+      // warm reflection of the wooden board along the lower half
+      const rg = g.createLinearGradient(0, px * 0.55, 0, px); rg.addColorStop(0, 'rgba(190,130,70,0)'); rg.addColorStop(1, 'rgba(190,130,70,.42)');
+      g.save(); circ(g, px / 2, px / 2, r); g.clip(); g.fillStyle = rg; g.fillRect(0, px * 0.5, px, px * 0.5); g.restore();
+      g.fillStyle = 'rgba(255,255,255,.85)'; circ(g, px / 2 - r * 0.36, px / 2 - r * 0.4, r * 0.16); g.fill();
+      g.strokeStyle = 'rgba(20,20,26,.5)'; g.lineWidth = 1; circ(g, px / 2, px / 2, r - 0.5); g.stroke();
+      ballC.c = c; ballC.k = k;
+      return c;
+    }
+
+    /* ----- drawing ----- */
+    function txt(t, x, y, col, font, align, base) { ctx.font = font; ctx.fillStyle = col; ctx.textAlign = align || 'center'; ctx.textBaseline = base || 'middle'; ctx.fillText(t, x, y); }
+    function fitText(t, maxW, font) { ctx.font = font; if (ctx.measureText(t).width <= maxW) return t; let s = t; while (s.length > 1 && ctx.measureText(s + '…').width > maxW) s = s.slice(0, -1); return s + '…'; }
+    function rankList() {   // seats sorted like the result
+      const rows = [];
+      for (let s = 0; s < st.n; s++) { const r = rowOf(s) || [0, 0, 0, 0, 0, 0, 990, 0]; const f = r[3] === 4; rows.push([s, f ? r[4] : -1, RS[s] ? doneOf(RS[s]) : f ? st.sl.length : r[0], r[6], r[5]]); }
+      if (st.ph === 'done' && Array.isArray(st.res)) return st.res.map((r) => r[0]);
+      return finish(st, rows).res.map((r) => r[0]);
+    }
+    function drawHud() {
+      const n = st.n, cw = (lay.w - 8 - (n - 1) * 4) / n, ch = lay.hudH - 8, order = rankList(), Ls = st.sl.length;
+      for (let s = 0; s < n; s++) {
+        const x = 4 + s * (cw + 4), y = 3, r = rowOf(s), P = Pl(s), place = order.indexOf(s);
+        ctx.fillStyle = s === view ? 'rgba(227,174,69,.22)' : 'rgba(255,255,255,.06)'; rr(ctx, x, y, cw, ch, 8); ctx.fill();
+        if (s === view) { ctx.strokeStyle = 'rgba(227,174,69,.85)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+        ctx.fillStyle = P.color || '#888'; rr(ctx, x + 4, y + 5, 4, ch - 10, 2); ctx.fill();
+        const f1 = '600 11px ' + FONT;
+        const fin = r && r[3] === 4, done = RS[s] ? doneOf(RS[s]) : fin ? Ls : r ? r[0] : 0;
+        let dots = ''; for (let k = 0; k < Ls; k++) dots += k < done ? '●' : '○';
+        if (Ls > 3 && cw < 80) dots = done + '/' + Ls;
+        ctx.font = '600 9px ' + FONT; const dw = ctx.measureText(dots).width;
+        const crown = n > 1 && place === 0 && (fin || (r && r[0] > 0)) ? '♛ ' : '';
+        txt(fitText(crown + name(s), cw - 22 - dw, f1), x + 12, y + 10, '#f2e9d8', f1, 'left');
+        txt(dots, x + cw - 5, y + 10, fin ? '#9dffb0' : '#e3ae45', '600 9px ' + FONT, 'right');
+        const f2 = '700 ' + (cw < 96 ? 11 : 13) + 'px ' + MONO;
+        const t = r ? r[4] / 10 : 0;
+        const line = !r ? '…' : (n > 1 ? (place + 1) + '위 ' : '') + fmtT(t);
+        txt(fitText(line, cw - 16, f2), x + 12, y + ch - 9, fin ? '#9dffb0' : '#fff6e0', f2, 'left');
+      }
+    }
+    function drawStrip(P, sRow) {
+      const y = lay.hudH + lay.stripH / 2 + 1, Ls = st.sl.length;
+      const si = P ? P.si : sRow ? sRow[0] : 0, id = st.sl[si];
+      const left = (Ls > 1 ? (si + 1) + '/' + Ls + ' · ' : (id < 1000 ? (id + 1) + '. ' : '')) + stageName(id);
+      txt(fitText(left, lay.w * 0.42, '700 13px ' + FONT), 10, y, '#f2e9d8', '700 13px ' + FONT, 'left');
+      const t = P ? timeOf(P) : sRow ? sRow[4] / 10 : 0, falls = P ? P.falls : sRow ? sRow[5] : 0;
+      txt(fmtT(t), lay.w - 10, y, '#ffe9b0', '700 13px ' + MONO, 'right');
+      if (falls) { ctx.font = '700 13px ' + MONO; const tw = ctx.measureText(fmtT(t)).width; txt('구멍 ' + falls, lay.w - 18 - tw, y, '#ffb0a0', '600 12px ' + FONT, 'right'); }
+      if (graceT > 0 && graceT < 1e8) {
+        const g = Math.ceil(graceT / SPD());
+        txt('마감 ' + g + '초', lay.w / 2 + 14, y, graceT < 6 ? '#ff8a70' : '#ffcf7a', '700 12px ' + FONT);
+      } else if (st.n === 1 && P && id != null) {
+        const p = stageDef(id).par, n = P.ph === 'fin' ? starsFor(id, P.fin) : t <= p[0] ? 3 : t <= p[1] ? 2 : 1;
+        txt('★'.repeat(n) + '☆'.repeat(3 - n), lay.w / 2 + 20, y, '#ffd24a', '700 13px ' + FONT);
+      }
+    }
+    function drawGauge() {
+      if (!canCtl()) return;
+      const cx = lay.w / 2, cy = lay.barY + lay.barH / 2, r = 19;
+      ctx.fillStyle = 'rgba(23,19,31,.75)'; circ(ctx, cx, cy, r + 3); ctx.fill();
+      ctx.strokeStyle = 'rgba(227,174,69,.6)'; ctx.lineWidth = 1.5; circ(ctx, cx, cy, r); ctx.stroke();
+      ctx.strokeStyle = 'rgba(242,233,216,.18)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy); ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r); ctx.stroke();
+      circ(ctx, cx, cy, r * 0.5); ctx.stroke();
+      const m = Math.hypot(inp.tx, inp.ty), col = m > 0.85 ? '#ff8a6a' : m > 0.4 ? '#ffd24a' : '#9dffb0';
+      ctx.fillStyle = col; circ(ctx, cx + inp.tx * (r - 4), cy + inp.ty * (r - 4), 5); ctx.fill();
+    }
+    function drawBoard(D, t, main, ghosts, P, now) {
+      const sc = lay.sc, FR = lay.FR, tsec = now / 1000;
+      const sx = shakeT > 0 ? Math.sin(now * 0.08) * shakeT * 10 * (L.fx ? L.fx() : 1) : 0;
+      ctx.drawImage(getStatic(D), lay.ox - FR * sc + sx, lay.oy - FR * sc, lay.bw, lay.bh);
+      ctx.save();
+      ctx.translate(lay.ox + sx, lay.oy); ctx.scale(sc, sc);
+      const tx = main && main.me ? inp.tx : (P ? P.tx : 0), ty = main && main.me ? inp.ty : (P ? P.ty : 0);
+      // tilt light: the raised side catches more light
+      if (Math.abs(tx) + Math.abs(ty) > 0.03) {
+        const gr = ctx.createLinearGradient(W / 2 + tx * W / 2, H / 2 + ty * H / 2, W / 2 - tx * W / 2, H / 2 - ty * H / 2);
+        const a = Math.min(0.16, Math.hypot(tx, ty) * 0.16);
+        gr.addColorStop(0, 'rgba(30,12,0,' + a.toFixed(3) + ')'); gr.addColorStop(1, 'rgba(255,240,210,' + (a * 0.8).toFixed(3) + ')');
+        ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+      }
+      // checkpoint reached glow
+      if (P && (P.cpx !== D.start[0] || P.cpy !== D.start[1])) { ctx.strokeStyle = 'rgba(157,255,176,' + (0.5 + 0.3 * Math.sin(tsec * 4)).toFixed(2) + ')'; ctx.lineWidth = 0.05; circ(ctx, P.cpx, P.cpy, 0.4); ctx.stroke(); }
+      // goal glow
+      ctx.strokeStyle = 'rgba(255,224,138,' + (0.25 + 0.2 * Math.sin(tsec * 3)).toFixed(2) + ')'; ctx.lineWidth = 0.05; circ(ctx, D.goal[0], D.goal[1], GOAL_R + 0.12 + 0.03 * Math.sin(tsec * 3)); ctx.stroke();
+      // goal flag
+      { const gx = D.goal[0] + 0.2, gy = D.goal[1] - 0.05, wv = Math.sin(tsec * 5) * 0.03;
+        ctx.strokeStyle = '#3a2412'; ctx.lineWidth = 0.035; ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy - 0.55); ctx.stroke();
+        for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) { ctx.fillStyle = (i + j) & 1 ? '#17131f' : '#fff6e0'; ctx.fillRect(gx + 0.018 + j * 0.09, gy - 0.55 + i * 0.09 + wv * j, 0.09, 0.09); } }
+      // magnets: field rings
+      for (const m of D.mags) { const ph = (tsec * 0.8) % 1; ctx.strokeStyle = 'rgba(232,80,70,' + (0.35 * (1 - ph)).toFixed(3) + ')'; ctx.lineWidth = 0.03; ctx.setLineDash([0.08, 0.07]); circ(ctx, m.x, m.y, 0.3 + (MAG_R - 0.4) * (1 - ph)); ctx.stroke(); ctx.setLineDash([]); }
+      // teleports
+      for (const p of D.ports) {
+        const col = PORT_COL[p.d % 4];
+        ctx.fillStyle = 'rgba(20,10,30,.55)'; circ(ctx, p.x, p.y, 0.3); ctx.fill();
+        ctx.strokeStyle = col; ctx.lineWidth = 0.05;
+        for (let k = 0; k < 3; k++) { const a = tsec * 3 + k * TAU / 3; ctx.beginPath(); ctx.arc(p.x, p.y, 0.24 - k * 0.05, a, a + 2.2); ctx.stroke(); }
+        ctx.fillStyle = col; circ(ctx, p.x, p.y, 0.05); ctx.fill();
+      }
+      // switches
+      for (const s of D.sws) {
+        const on = P ? (P.open >> s.g) & 1 : 0;
+        ctx.fillStyle = 'rgba(40,25,10,.45)'; circ(ctx, s.x + 0.02, s.y + 0.03, 0.31); ctx.fill();
+        ctx.fillStyle = '#3d3440'; circ(ctx, s.x, s.y, 0.29); ctx.fill();
+        ctx.fillStyle = on ? 'rgba(255,255,255,.15)' : SW_COL[s.g]; circ(ctx, s.x, s.y, on ? 0.17 : 0.21); ctx.fill();
+        if (!on) { ctx.fillStyle = 'rgba(255,255,255,.45)'; circ(ctx, s.x - 0.06, s.y - 0.07, 0.06); ctx.fill(); ctx.strokeStyle = SW_COL[s.g]; ctx.globalAlpha = 0.4 + 0.3 * Math.sin(tsec * 5); ctx.lineWidth = 0.04; circ(ctx, s.x, s.y, 0.36); ctx.stroke(); ctx.globalAlpha = 1; }
+        else { ctx.strokeStyle = SW_COL[s.g]; ctx.lineWidth = 0.05; ctx.beginPath(); ctx.moveTo(s.x - 0.09, s.y); ctx.lineTo(s.x - 0.02, s.y + 0.07); ctx.lineTo(s.x + 0.1, s.y - 0.07); ctx.stroke(); }
+      }
+      // doors
+      for (const d of D.doors) {
+        const open = P ? (P.open >> d.g) & 1 : 0, w = d.x1 - d.x0, h = d.y1 - d.y0;
+        if (open) { ctx.strokeStyle = SW_COL[d.g]; ctx.globalAlpha = 0.45; ctx.lineWidth = 0.025; ctx.setLineDash([0.06, 0.05]); ctx.strokeRect(d.x0 + 0.02, d.y0 + 0.02, w - 0.04, h - 0.04); ctx.setLineDash([]); ctx.globalAlpha = 1; continue; }
+        ctx.fillStyle = 'rgba(30,15,5,.35)'; ctx.fillRect(d.x0 + 0.04, d.y0 + 0.06, w, h);
+        const gr = ctx.createLinearGradient(d.x0, d.y0, d.x0 + (h > w ? w : 0), d.y0 + (h > w ? 0 : h)); gr.addColorStop(0, '#fff'); gr.addColorStop(0.25, SW_COL[d.g]); gr.addColorStop(1, '#5a2a22');
+        ctx.fillStyle = gr; ctx.fillRect(d.x0, d.y0, w, h);
+        ctx.fillStyle = 'rgba(255,255,255,.7)';
+        const n = 3; for (let k = 0; k < n; k++) { const f = (k + 0.5) / n; circ(ctx, w > h ? d.x0 + w * f : d.x0 + w / 2, w > h ? d.y0 + h / 2 : d.y0 + h * f, 0.025); ctx.fill(); }
+      }
+      // moving walls
+      for (const o of D.mv) {
+        const q = mvAt(o, t);
+        ctx.fillStyle = 'rgba(40,20,5,.22)'; rr(ctx, o.x - 0.02, o.y - 0.02, o.w + Math.abs(o.dx) + 0.04, o.h + Math.abs(o.dy) + 0.04, 0.06); ctx.fill();
+        ctx.fillStyle = 'rgba(50,24,6,.4)'; ctx.fillRect(q[0] + 0.05, q[1] + 0.07, o.w, o.h);
+        const gr = ctx.createLinearGradient(q[0], q[1], q[0] + o.w, q[1] + o.h); gr.addColorStop(0, '#c08a50'); gr.addColorStop(0.3, '#8a5528'); gr.addColorStop(1, '#5e3416');
+        ctx.fillStyle = gr; rr(ctx, q[0], q[1], o.w, o.h, 0.04); ctx.fill();
+        ctx.fillStyle = 'rgba(255,220,160,.35)'; ctx.fillRect(q[0] + 0.02, q[1] + 0.02, o.w - 0.04, 0.03);
+      }
+      // ghosts
+      const B = ballSprite(), d2 = 2 * R;
+      for (const gq of ghosts) {
+        ctx.globalAlpha = 0.42;
+        ctx.drawImage(B, gq.x - R, gq.y - R, d2, d2);
+        ctx.globalAlpha = 0.85; ctx.strokeStyle = gq.col; ctx.lineWidth = 0.05; circ(ctx, gq.x, gq.y, R + 0.02); ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.save(); ctx.setTransform(DPR(), 0, 0, DPR(), 0, 0);
+        const px = lay.ox + sx + gq.x * sc, py = lay.oy + (gq.y - R - 0.16) * sc;
+        txt(gq.lbl, px, py, gq.col, '700 10px ' + FONT);
+        ctx.restore();
+      }
+      // main ball
+      if (main) {
+        let s = 1, alpha = 1;
+        if (main.ph === 2) { const k = P ? 1 - P.tm / FALL_T : 0.5; s = Math.max(0, 1 - k * 2.4); alpha = Math.max(0, 1 - k * 2); }
+        if (main.ph === 3 && P) { const k = 1 - P.tm / GOAL_T; s = Math.max(0.2, 1 - k * 2.5); alpha = Math.max(0, 1 - k * 1.6); }
+        if (respawnT > 0 && main.me) s = 1 + respawnT * 1.2;
+        if (s > 0.02 && alpha > 0.02) {
+          const lx = 0.06 - tx * 0.04, ly = 0.09 - ty * 0.04;
+          ctx.globalAlpha = alpha * 0.45; ctx.fillStyle = 'rgba(40,20,4,1)'; ctx.beginPath(); ctx.ellipse(main.x + lx * s, main.y + ly * s, R * 0.95 * s, R * 0.85 * s, 0, 0, TAU); ctx.fill();
+          ctx.globalAlpha = alpha;
+          const v2 = P ? P.vx * P.vx + P.vy * P.vy : 0;
+          if (v2 > 16 && P) { ctx.globalAlpha = alpha * 0.18; ctx.drawImage(B, main.x - P.vx * 0.02 - R, main.y - P.vy * 0.02 - R, d2, d2); ctx.globalAlpha = alpha; }
+          ctx.drawImage(B, main.x - R * s, main.y - R * s, d2 * s, d2 * s);
+          ctx.globalAlpha = 1;
+          if (main.col) { ctx.strokeStyle = main.col; ctx.globalAlpha = 0.7 * alpha; ctx.lineWidth = 0.035; circ(ctx, main.x, main.y, R * s + 0.025); ctx.stroke(); ctx.globalAlpha = 1; }
+        }
+      }
+      // particles
+      for (const q of parts) { ctx.globalAlpha = Math.max(0, q.t / q.T); ctx.fillStyle = q.c; ctx.fillRect(q.x - 0.04, q.y - 0.04, 0.08, 0.08); }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      for (const p of D.ports) txt(String(p.d + 1), lay.ox + sx + p.x * sc, lay.oy + (p.y - 0.42) * sc, PORT_COL[p.d % 4], '800 ' + Math.max(10, Math.round(sc * 0.26)) + 'px ' + MONO);
+      // floating texts (pixel space)
+      for (const f of floats) {
+        const k = 1 - f.t / f.T, px = lay.ox + f.x * sc, py = lay.oy + (f.y - k * 0.8) * sc;
+        ctx.globalAlpha = Math.min(1, f.t / f.T * 2.5);
+        const font = '800 ' + (f.big ? 20 : 14) + 'px ' + (f.big ? DISP : FONT);
+        ctx.font = font; ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(20,10,4,.75)'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        const cxp = U.clamp(px, 70, lay.w - 70);
+        ctx.strokeText(f.text, cxp, py); txt(f.text, cxp, py, f.col, font);
+      }
+      ctx.globalAlpha = 1;
+      // drag joystick ring
+      if (inp.drag && main && main.me) {
+        const q = inp.drag, j = JR();
+        ctx.strokeStyle = 'rgba(242,233,216,.4)'; ctx.lineWidth = 2; circ(ctx, q.x0, q.y0, j); ctx.stroke();
+        ctx.fillStyle = 'rgba(242,233,216,.08)'; ctx.fill();
+        ctx.fillStyle = 'rgba(227,174,69,.75)'; circ(ctx, q.x0 + inp.tx * j, q.y0 + inp.ty * j, 15); ctx.fill();
+        ctx.strokeStyle = 'rgba(23,19,31,.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+    }
+    function panel(x, y, w, h) { ctx.fillStyle = 'rgba(18,12,24,.86)'; rr(ctx, x, y, w, h, 14); ctx.fill(); ctx.strokeStyle = 'rgba(227,174,69,.65)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+    function wrap(t, maxW, font) {
+      ctx.font = font; const out = []; let line = '';
+      for (const wd of t.split(' ')) { const tryL = line ? line + ' ' + wd : wd; if (ctx.measureText(tryL).width > maxW && line) { out.push(line); line = wd; } else line = tryL; }
+      if (line) out.push(line); return out;
+    }
+    function controlTip() {
+      if (fine && inp.sensor !== 'ok') {
+        const b = (api.input && api.input.bindings) ? api.input.bindings() : [];
+        const kn = (id) => { const x = b.find((o) => o.id === id); return x && x.keys[0] ? (KEYN[x.keys[0]] || x.keys[0].replace(/^Key/, '')) : '?'; };
+        return '방향키(' + kn('up') + kn('left') + kn('down') + kn('right') + ')로 기울여요 · ' + kn('fine') + ' = 살살 · 마우스로 끌어도 돼요';
+      }
+      if (inp.mode === 'tilt' && inp.sensor === 'ok') return '폰을 기울이면 굴러가요. 지금 자세가 수평이에요(아래 「영점 맞추기」).';
+      if (inp.sensor === 'need') return '화면 아무 데나 누르고 끌면 그쪽으로 기울어요. 폰 기울기는 아래 「기울기 켜기」.';
+      return '화면 아무 데나 누르고 끌면 그쪽으로 기울어요. 많이 끌수록 많이 기울어요.';
+    }
+    function drawReady(P) {
+      const first = P.si === 0, sc = lay.sc;
+      const w = Math.min(lay.w - 28, 340), x = (lay.w - w) / 2, D = P.D;
+      const tipFont = '600 13px ' + FONT, ctlFont = '500 12px ' + FONT;
+      const tipL = wrap(D.tip || '', w - 32, tipFont), ctlL = first ? wrap(controlTip(), w - 32, ctlFont) : [];
+      const h = 92 + tipL.length * 18 + (ctlL.length ? 10 + ctlL.length * 16 : 0);
+      const y = lay.oy + Math.max(0.6 * sc, (H * sc - h) * 0.36);
+      panel(x, y, w, h);
+      const Ls = P.sl.length, id = P.sl[P.si];
+      txt(Ls > 1 ? '스테이지 ' + (P.si + 1) + ' / ' + Ls : (id < 1000 ? '스테이지 ' + (id + 1) : '무작위 미로'), lay.w / 2, y + 18, '#e3ae45', '700 12px ' + FONT);
+      txt(fitText(D.name, w - 80, '400 22px ' + DISP), lay.w / 2, y + 42, '#f2e9d8', '400 22px ' + DISP);
+      let yy = y + 66;
+      tipL.forEach((l) => { txt(l, lay.w / 2, yy, '#f2e9d8', tipFont); yy += 18; });
+      if (ctlL.length) { yy += 6; ctlL.forEach((l) => { txt(l, lay.w / 2, yy, '#c9bcd6', ctlFont); yy += 16; }); }
+      const cd = Math.ceil(P.tm / (first ? READY1 / 3 : READYN / 2));
+      txt(String(Math.max(1, cd)), x + w - 24, y + 22, '#ffd24a', '800 24px ' + MONO);
+    }
+    function drawFin(P) {
+      const w = Math.min(lay.w - 40, 300), h = 96, x = (lay.w - w) / 2, y = lay.oy + lay.sc * 3.2;
+      panel(x, y, w, h);
+      const order = rankList(), place = order.indexOf(mine()[0]) + 1;
+      txt(st.n > 1 ? place + '위로 완주!' : '도착!', lay.w / 2, y + 26, '#ffe08a', '400 24px ' + DISP);
+      txt(fmtT(P.fin) + (P.falls ? ' · 구멍 ' + P.falls + '번' : ' · 한 번도 안 빠짐'), lay.w / 2, y + 56, '#f2e9d8', '700 15px ' + FONT);
+      if (shareT && !shareEl && st.n === 1) {
+        shareEl = L.h('button', { class: 'btn sm', type: 'button', text: '📋 결과 공유' });
+        shareEl.style.cssText = 'position:absolute;left:50%;transform:translateX(-50%);z-index:5;min-height:44px;top:' + Math.round(y + h + 8) + 'px';
+        shareEl.onclick = (e) => { e.stopPropagation(); const t = shareT; try { if (navigator.share) { navigator.share({ text: t }).catch(() => {}); return; } } catch (er) {} try { navigator.clipboard.writeText(t).then(() => L.toast('결과를 복사했어요'), () => L.toast(t)); } catch (er) { L.toast(t); } };
+        shareEl.addEventListener('pointerdown', (e) => e.stopPropagation());
+        root.appendChild(shareEl);
+      }
+      const sub = st.n === 1 ? (bestNew ? '최고 기록!' : '') : st.ph === 'play' ? '다른 사람을 기다리는 중…' : '';
+      if (sub) txt(sub, lay.w / 2, y + 80, '#c9bcd6', '600 12px ' + FONT);
+    }
+    function draw(now) {
+      const w = cv.w, h = cv.h;
+      ctx.fillStyle = '#120e18'; ctx.fillRect(0, 0, w, h);
+      if (!st || !lay) return;
+      if (st.ph === 'pick') return;
+      if (!key) { txt('준비 중…', w / 2, h / 2, '#ab9fb8', '600 14px ' + FONT); return; }
+      drawHud();
+      const P = RS[view], r = rowOf(view);
+      const si = P ? P.si : r ? r[0] : 0, D = stageDef(st.sl[U.clamp(si, 0, st.sl.length - 1)]);
+      drawStrip(P, r);
+      const ghosts = [];
+      for (let s = 0; s < st.n; s++) {
+        if (s === view) continue;
+        let gx, gy, ok = false;
+        const Q = RS[s];
+        if (Q) { if (Q.si === si && (Q.ph === 'run' || Q.ph === 'fall')) { gx = Q.x; gy = Q.y; ok = Q.ph === 'run'; } }
+        else { const a = remote[s], q = ghost[s]; if (a && q && a[0] === si && a[3] === 1) { gx = q.x; gy = q.y; ok = true; } }
+        if (ok) ghosts.push({ x: gx, y: gy, col: Pl(s).color || '#ccc', lbl: name(s).slice(0, 4) });
+      }
+      let main = null, t = 0;
+      if (P) { main = { x: P.x, y: P.y, ph: PH[P.ph], me: isMine(view) }; t = P.t; if (P.ph === 'fin' || P.ph === 'goal' && P.tm <= 0) main = null; if (P.ph === 'ready' && P.si === 0 && P.tm > READY1 - 0.01) void 0; }
+      else if (r) { const q = ghost[view]; main = { x: q ? q.x : r[1] / 100, y: q ? q.y : r[2] / 100, ph: r[3], me: false, col: Pl(view).color }; t = r[7] / 10; if (r[3] === 4) main = null; }
+      if (main && !main.me && P) main.col = Pl(view).color;
+      drawBoard(D, t, main, ghosts, P || null, now);
+      if (P && P.ph === 'ready' && (isMine(view) || !mine().length)) drawReady(P);
+      if (goFlash > 0 && P && isMine(view)) { ctx.globalAlpha = Math.min(1, goFlash * 2); txt('출발!', lay.w / 2, lay.oy + H * lay.sc * 0.42, '#ffe08a', '400 40px ' + DISP); ctx.globalAlpha = 1; }
+      if (P && P.ph === 'fin' && isMine(view)) drawFin(P);
+      if (!isMine(view) && mine().length && myP() && myP().ph === 'fin') txt('관전 중: ' + name(view) + ' · 위 점수판을 눌러 바꾸기', w / 2, lay.barY - 6, 'rgba(242,233,216,.8)', '600 11px ' + FONT);
+      drawGauge();
+      if (canCtl() && fine && inp.sensor === 'none' && P) txt('방향키·WASD · Shift 살살 · 끌기', 12, lay.barY + lay.barH / 2, 'rgba(242,233,216,.55)', '600 11px ' + FONT, 'left');
+    }
+
+    const stop = U.loop(frame);
+    layout();
+    root._tm = { RS: () => RS, view: () => view, lay: () => lay, inp, st: () => st };   // test hook
+    return {
+      update(state) {
+        st = state;
+        if (!st) return;
+        if (st.ph === 'pick') buildPicker(); else dropPicker();
+        if (st.ph === 'done') RS.forEach((P) => { if (P && P.ph !== 'fin') { P.ph = 'fin'; if (P.fin < 0) P.fin = timeOf(P); } });
+        syncBar();
+      },
+      destroy() {
+        stop();
+        removeEventListener('deviceorientation', onOri);
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        if (offFF) offFF(); modeBtn.remove(); zeroBtn.remove(); ffBtn.remove(); dropPicker();
+        cv.destroy(); styleEl.remove();
+      },
+    };
+  }
+
+  L.register({
+    id: 'tiltmaze', name: '기울여 공 굴리기 미로', tag: '기울기 미로 레이스', cat: '아케이드',
+    blurb: '나무 미로판을 기울여 쇠구슬을 굴려요. 구멍을 피해 도착 구멍까지! 여럿이면 같은 코스를 동시에 달려 가장 빨리 도착한 사람이 승리, 혼자면 스테이지별 별 모으기.',
+    tint: '#6b3c16',
+    icon: '<rect x="6" y="6" width="44" height="44" rx="5" fill="none" stroke="currentColor" stroke-width="3"/><path d="M6 20h24M26 34h24M18 34v16" stroke="currentColor" stroke-width="3"/><circle cx="40" cy="14" r="4" fill="currentColor"/><circle cx="14" cy="42" r="3.5" fill="none" stroke="currentColor" stroke-width="2.5"/><circle cx="34" cy="26" r="3" fill="currentColor" opacity=".55"/>',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2, hidden: false, realtime: true, aiDelay: 0,
+    options: [
+      { id: 'course', label: '코스 (여럿이 할 때)', tip: '여럿이 할 때 난이도.', choices: [{ v: 4, label: '골고루', tip: '판마다 쉬움→보통→어려움으로 올라가요.' }, { v: 0, label: '쉬움' }, { v: 1, label: '보통' }, { v: 2, label: '어려움' }, { v: 3, label: '무작위 미로' }], def: 4 },
+      { id: 'maze', label: '미로', tip: '미로 모양.', choices: [{ v: 0, label: '무작위 생성', tip: '판마다 새로 만든 미로.' }, { v: 1, label: '기존 미로', tip: '미리 만든 미로.' }], def: 0 },
+      { id: 'len', label: '스테이지 수', choices: [{ v: 1, label: '1판' }, { v: 3, label: '3판' }, { v: 5, label: '5판' }], def: 3 },
+    ],
+    controls: [
+      { id: 'up', label: '위로 기울이기', keys: ['ArrowUp', 'KeyW'], pad: ['ly-', 'up'] },
+      { id: 'down', label: '아래로 기울이기', keys: ['ArrowDown', 'KeyS'], pad: ['ly+', 'down'] },
+      { id: 'left', label: '왼쪽으로 기울이기', keys: ['ArrowLeft', 'KeyA'], pad: ['lx-', 'left'] },
+      { id: 'right', label: '오른쪽으로 기울이기', keys: ['ArrowRight', 'KeyD'], pad: ['lx+', 'right'] },
+      { id: 'fine', label: '살살 (누르는 동안 조금만)', keys: ['ShiftLeft', 'ShiftRight'], pad: ['lb', 'rb'] },
+      { id: 'ff', label: '빨리 보기 켜고 끄기', keys: ['KeyF'] },
+    ],
+    quick: [
+      '나무 미로판을 기울여 쇠구슬을 금빛 도착 구멍에 넣으면 통과!',
+      '폰을 기울이거나(센서), 화면 아무 데나 누르고 끌어서 기울여요. 검은 구멍에 빠지면 출발점·깃발로 돌아가요.',
+      '여럿이면 같은 코스(기본 3판)를 동시에 달려 가장 빨리 끝낸 사람이 승리. 혼자면 스테이지별 별 3개 도전!',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '미로판을 기울이면 쇠구슬이 기울어진 쪽으로 굴러가요. 금테 두른 도착 구멍에 넣으면 그 스테이지 통과!',
+        '여럿이 할 때: 모두 똑같은 코스(기본 3판)를 동시에 각자의 판에서 달려요. 3판을 모두 가장 빨리 끝낸 사람이 1등(총 시간이 짧은 순).',
+        '맨 처음 완주한 사람이 나오면, 남은 사람은 스테이지당 20초(3판이면 60초) 안에 끝내야 해요. 못 끝내면 더 멀리 간 순서로 순위를 매겨요.',
+        '혼자 할 때: 스테이지 16개 중 하나를 골라요. 빨리 도착할수록 별이 많아요(★★★ 기준 시간은 게임 중 위쪽에 보여요).',
+      ] },
+      { h: '조작', p: [
+        '폰 기울기: 센서를 쓸 수 있으면 자동으로 켜져요(아이폰은 「기울기 켜기」를 한 번 눌러 허락). 시작할 때 들고 있는 자세가 「수평」이에요. 자세를 바꿨으면 「영점 맞추기」.',
+        '끌기(가상 조이스틱): 화면 아무 데나 누르고 끌면 그쪽으로 판이 기울어요. 많이 끌수록 많이 기울고, 손을 떼면 수평으로 돌아와요. 기울기 모드에서도 언제든 쓸 수 있어요.',
+        '아래 가운데 동그라미가 지금 기울기예요(초록 = 살짝, 노랑 = 중간, 빨강 = 최대).',
+        'PC: 방향키·WASD로 기울이고(누르고 있으면 점점 더 기울어요), Shift를 함께 누르면 살살. 마우스로 끌어도 돼요. 게임패드는 왼쪽 스틱. 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '판 위의 것들', p: [
+        '검은 구멍: 공 가운데가 구멍 위로 가면 빠져요. 빠지면 잠깐 뒤 출발점(또는 마지막으로 지난 초록 깃발)에서 다시 시작. 그동안에도 시간은 흘러요.',
+        '초록 깃발(체크포인트): 지나가면 다음부터 여기서 다시 시작해요.',
+        '파란 얼음: 잘 안 멈춰요. 모래: 느려져요. 화살표 경사: 화살표 쪽으로 계속 밀어요(오르막은 아주 느려요).',
+        '빨간 자석: 가까이 가면 끌려가 붙어요. 세게 기울이면 떨어져요.',
+        '스위치와 문: 같은 색 스위치를 밟으면 그 색 문이 열려요(한 번 열리면 계속 열림).',
+        '소용돌이(순간이동): 같은 숫자 소용돌이로 순식간에 이동해요.',
+        '움직이는 나무 문: 위아래·옆으로 계속 움직여요. 틈이 열릴 때 지나가요.',
+      ] },
+      { h: '예시', p: [
+        '「구멍 조심」: 오른쪽으로 기울여 출발 → 첫 구멍은 아래쪽 줄로 비켜 가고 → 끝에서 아래로 기울여 다음 줄로…',
+        '→ 구멍에 빠지면 1초쯤 뒤 출발점으로! → 금빛 구멍에 쏙 = 「통과! 0:12.3」.',
+        '여럿이면 다른 사람 공이 반투명한 「유령 공」으로 내 판에 보여요(같은 스테이지에 있을 때). 누가 앞서는지 한눈에!',
+      ] },
+      { h: '코스와 옵션', p: [
+        '코스: 골고루(쉬움→보통→어려움, 기본) · 쉬움 · 보통 · 어려움 · 무작위 미로(매번 새로 만든 미로). 스테이지 수: 1판 · 3판(기본) · 5판.',
+        '쉬운 스테이지(1~4)에는 연필 안내선이 그려져 있어요.',
+        '혼자 할 때는 코스 옵션 대신 고르기 화면이 나와요. 금테 칸이 다음 도전이에요.',
+        '미로: 무작위 생성(기본) — 판마다 새 미로를 만들어요(코스 쉬움·보통·어려움에 맞춰 구멍·움직이는 막대·얼음 수가 달라져요). 기존 미로 — 직접 만든 16개 스테이지에서 골라요.',
+        '오늘의 미로: 날짜마다 모두에게 똑같은 미로 하나. 내 최고 기록(최근 7일)이 남고, 끝나면 「결과 공유」로 기록을 친구에게 보낼 수 있어요.',
+        '끝없는 미로: 1단계부터 끝없이! 3단계마다 난이도가 올라가요(10단계까지). 깬 단계는 기억해 두고 다음에 이어서 해요.',
+        '만든 미로는 모두 도착할 수 있는지 미리 길을 찾아 확인해요. 움직이는 막대는 한 번씩 틈이 활짝 열려요.',
+      ] },
+      { h: '함께 하기', p: [
+        '한 폰에서는 한 명만 해요. 혼자 시작하면서 자리를 늘리면 나머지는 AI예요.',
+        '친구와는 온라인·LAN 방으로: 각자 폰에서 자기 판을 굴리고, 위 점수판과 유령 공으로 서로의 진행이 보여요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 천천히 가다 가끔 구멍에 빠지고, 어려움은 빠르고 거의 안 빠져요.',
+        '내 판을 끝내면 남은 사람의 판을 구경할 수 있어요(위 점수판을 눌러 바꾸기). AI만 남았으면 「빨리 보기」.',
+      ] },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { genKind, genLvl, genId, genCheck, dayKey, DAILY0, shareText, STAGES, PAR, TIERS, stageDef, parseMap, genMap, genStage, newRun, simStep, runFor, aiInit, field, freeOf, nodeNear, navBase, remOf, finish, pickCourse, starsFor, timeOf, doneOf, guidePath, W, H, R, DT, HZ },
+  });
+})();
