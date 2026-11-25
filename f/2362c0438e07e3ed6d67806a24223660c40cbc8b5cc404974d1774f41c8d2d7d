@@ -1071,8 +1071,35 @@
     }
     return n;
   }
+  /* 카드 묶음별 계산 기억(봇 계산 속도) — gunOf · cg는 카드 묶음(s.cards의 내용) · 총 id(· 다인대전 s.fr)만으로 정해지는 순수 계산이라 기억해 둠.
+     같은 카드 객체라도 내용이 바뀌면(층 카드 받기 · 다인대전 줍기는 제자리에서 고침) 키 · 값 대조로 알아채고 새로 셈. 기억한 gunOf 결과는 여럿이 나눠 쓰니 고치지 말 것 */
+  const CM_W = new WeakMap(), CM_E = { ks: [], vs: [], o: Object.create(null), c: Object.create(null) };
+  function cardMemo(cs) {
+    if (!cs || typeof cs !== 'object') return CM_E;   // 카드 없음 = 빈 묶음과 같은 값(cg가 모두 0)
+    let m = CM_W.get(cs);
+    if (m) {
+      const ks = m.ks, vs = m.vs; let i = 0;
+      for (const k in cs) { if (k !== ks[i] || cs[k] !== vs[i]) { m = null; break; } i++; }
+      if (m && i !== ks.length) m = null;
+    }
+    if (!m) {
+      const ks = [], vs = []; for (const k in cs) { ks.push(k); vs.push(cs[k]); }
+      m = ks.length ? { ks, vs, o: Object.create(null), c: Object.create(null) } : CM_E;
+      CM_W.set(cs, m);
+    }
+    return m;
+  }
+  /* 한 번의 계산(사격 한 번 등) 안에서 쓰는 cg 기억: 그동안 카드가 안 바뀔 때만 쓸 것 */
+  function cgFn(s, gid) {
+    const m = cardMemo(s.cards), t = m.c[gid] || (m.c[gid] = Object.create(null));
+    return (id) => { const v = t[id]; return v !== undefined ? v : (t[id] = cg(s, gid, id)); };
+  }
   function gunOf(s, seat) {
-    const id = gunId(s, seat), G = GUNS[id], c = (k) => cg(s, id, k), mp = (G.pel || 1) > 1;
+    const id = gunId(s, seat), m = cardMemo(s.cards), k = s.fr ? id + '|f' : id;
+    return m.o[k] || (m.o[k] = gunOf0(s, id));
+  }
+  function gunOf0(s, id) {
+    const G = GUNS[id], c = (k) => cg(s, id, k), mp = (G.pel || 1) > 1;
     const o = { id, G, k: G.k, n: G.n, bm: G.bm };
     o.pel = mp ? Math.max(G.pel >= 5 ? 3 : 2, G.pel + 2 * c('w_pel') + c('w_wide') + 3 * c('w_grain') + 2 * c('m_long') + (G.seq ? 0 : 2 * c('n_powder')) - c('b_damp')) : 1;
     o.spr = G.spr || 0;
@@ -1319,11 +1346,15 @@
     return h;
   }
   /* 판 칸: 0 빈칸, -1 기둥, -(10+자리) 왕, j+1 = s.E[j] */
+  /* 8×8 판은 보통 배열(0 64개 글자 그대로 — 복사가 빠름). Int16Array(64)는 128바이트라 V8이 힙 밖에 따로 잡아 한 번에 약 0.4µs(봇 계산에서 grid가 수십만 번).
+     값은 늘 작은 정수이고 판 밖 칸에는 쓰지 않으니(쓰는 곳은 모두 inB · 말 자리) 결과는 같음. 다인대전처럼 판이 크면 그대로 Int16Array */
+  const GRID8 = () => [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   function grid(s) {
-    const g = new Int16Array(BW * BW);
+    const g = BW === 8 ? GRID8() : new Int16Array(BW * BW);
     for (const p of s.pil) g[p[1] * BW + p[0]] = -1;
-    s.K.forEach((k, i) => { if (!k.dn) g[k.y * BW + k.x] = -(10 + i); });
-    s.E.forEach((e, j) => { if (e.hp > 0) g[e.y * BW + e.x] = j + 1; });
+    const K = s.K, E = s.E;
+    for (let i = 0; i < K.length; i++) { const k = K[i]; if (!k.dn) g[k.y * BW + k.x] = -(10 + i); }
+    for (let j = 0; j < E.length; j++) { const e = E[j]; if (e.hp > 0) g[e.y * BW + e.x] = j + 1; }
     if (s.dc) for (const d of s.dc) if (g[d[1] * BW + d[0]] === 0) g[d[1] * BW + d[0]] = -17;   // 왕의 허상(자리 7)
     return g;
   }
@@ -1380,18 +1411,25 @@
   }
   /* (x,y)에 선 왕을 흑군이 다음 차례에 잡을 수 있나 — 왕 자신의 칸은 g에서 비워 두고 부를 것 */
   function attackedSq(s, g, x, y) {
-    for (let j = 0; j < s.E.length; j++) if (canHit(s, s.E[j], g, x, y)) return true;
+    const E = s.E; let C = null;
+    for (let j = 0; j < E.length; j++) { const e = E[j]; if (!canAct(e)) continue; if (canHitC(e, g, x, y, C || (C = hitCtx(s)))) return true; }
     return false;
   }
+  /* canHit에 쓰는 카드 값을 한 번에 셈(봇 계산 속도 — 말 · 칸마다 cnt를 다시 부르지 않게). cnt는 부작용 없는 계산이라 미리 세도 같은 값 */
+  const hitCtx = (s) => ({ fury: cnt(s, 'b_fury'), pike: cnt(s, 'b_pike'), dread: cnt(s, 'w_dread'), lance: cnt(s, 'b_lance'), bstep: cnt(s, 'b_bstep'), hoof: s.bz === 'hoof' });
+  /* 칸과 상관없이 이번 차례에 아무도 못 치는 말(쓰러짐 · 정지 · 연막 · 갓 나옴) */
+  const canAct = (e) => !(e.hp <= 0 || e.st > 0 || e.bd > 0 || e.nt);
   /* 흑군 말 e가 다음 차례에 (x,y)의 왕을 잡을(체력제: 공격할) 수 있나 — pMoves와 같은 판정 */
-  function canHit(s, e, g, x, y) {
-    if (e.hp <= 0 || e.st > 0 || e.bd > 0 || e.nt || (e.x === x && e.y === y)) return false;
+  function canHit(s, e, g, x, y) { return canAct(e) && canHitC(e, g, x, y, hitCtx(s)); }
+  /* canHit의 본문(canAct를 이미 본 말) — C = hitCtx(s). 폰: 「공포」(w_dread)가 있으면 못 침(pawnFrozen은 w_dread가 0이면 늘 거짓이라 따로 안 봄) */
+  function canHitC(e, g, x, y, C) {
+    if (e.x === x && e.y === y) return false;
     const dx = x - e.x, dy = y - e.y, ax = Math.abs(dx), ay = Math.abs(dy), sl = e.sl > 0;
-    const t = moveType(s, e), kn = (ax === 1 && ay === 2) || (ax === 2 && ay === 1);
-    if (e.t === 'k' && s.bz === 'hoof' && !sl && kn) return true;
-    if (t === 'p') return (dy === 1 || (dy === 0 && cnt(s, 'b_pike') > 0)) && ax === 1 && !cnt(s, 'w_dread') && !pawnFrozen(s, e);
-    if (t === 'n') return (!sl && kn) || (cnt(s, 'b_lance') > 0 && ax <= 1 && ay <= 1);
-    if (t === 'b' && ax + ay === 1 && cnt(s, 'b_bstep')) return true;
+    const t = e.t === 'k' && C.fury && e.hp * 2 <= e.mh ? 'q' : e.t, kn = (ax === 1 && ay === 2) || (ax === 2 && ay === 1);   // = moveType
+    if (e.t === 'k' && C.hoof && !sl && kn) return true;
+    if (t === 'p') return (dy === 1 || (dy === 0 && C.pike > 0)) && ax === 1 && !C.dread;
+    if (t === 'n') return (!sl && kn) || (C.lance > 0 && ax <= 1 && ay <= 1);
+    if (t === 'b' && ax + ay === 1 && C.bstep) return true;
     if (t === 'k') return ax <= 1 && ay <= 1;
     if (t === 'm') return !sl && ((ax === 1 && ay === 3) || (ax === 3 && ay === 1));
     if ((t === 'a' || t === 'c') && !sl && kn) return true;
@@ -1426,8 +1464,8 @@
   const hpDmgX = () => (HPM.deep.length ? ' · 깊은 층에서 모든 피해 +1씩 늘어남(8층 판 기준 ' + hpDeepFl().join(' · ') + '층부터, 층 수가 다르면 같은 비율)' : '') + (HPM.co ? ' · 협동이면 모든 피해 ' + (HPM.co > 0 ? '+' + HPM.co : '−' + -HPM.co + '(최소 1)') : '') + ' · 무한 모드는 8층 뒤 4층마다 +1 더';
   /* 체력제: (x,y)에서 차례를 끝내면 받을 피해(공격할 수 있는 말 가운데 가장 큰 것 — 흑군은 가장 아픈 말로 공격). 왕 자신의 칸은 g에서 비워 두고 부를 것 */
   function attackDmg(s, g, x, y) {
-    let d = 0;
-    for (let j = 0; j < s.E.length; j++) { const e = s.E[j]; if (canHit(s, e, g, x, y)) d = Math.max(d, pDmg(s, e)); }
+    let d = 0, C = null;
+    for (let j = 0; j < s.E.length; j++) { const e = s.E[j]; if (canAct(e) && canHitC(e, g, x, y, C || (C = hitCtx(s)))) d = Math.max(d, pDmg(s, e)); }
     return d;
   }
   const hpOn = (s) => md(s, 'hp') && !s.ffa;
@@ -1564,12 +1602,17 @@
     }
   }
   /* 왕의 안전: 지금 칸이 위협받는지, 안전한 옆 칸 수 */
-  function kSafe(s, g, k) {
+  /* kSafe에 넘길 준비물: 칠 수 있는 말 목록 + 카드 값. 말의 자리만 바뀌고(armyChoose의 시험 이동) 상태 · 카드는 그대로인 동안 다시 씀 */
+  function kPrep(s) { const A = []; for (const e of s.E) if (canAct(e)) A.push(e); return { A, C: A.length ? hitCtx(s) : null }; }
+  function kSafe(s, g, k, P) {
     const K = s.K[k], idx = K.y * BW + K.x, keep = g[idx];
     g[idx] = 0;
-    const att = attackedSq(s, g, K.x, K.y), dm = att && hpOn(s) ? attackDmg(s, g, K.x, K.y) : 0;   // 체력제: 그 자리에서 받을 피해
+    // attackedSq를 칸마다 부르는 것과 같은 판정 — 칠 수 있는 말 목록 · 카드 값(hitCtx)을 한 번만 모아 9칸에 씀
+    const Q = P || kPrep(s), A = Q.A, C = Q.C;
+    const hitAt = (x, y) => { for (let j = 0; j < A.length; j++) if (canHitC(A[j], g, x, y, C)) return true; return false; };
+    const att = hitAt(K.x, K.y), dm = att && hpOn(s) ? attackDmg(s, g, K.x, K.y) : 0;   // 체력제: 그 자리에서 받을 피해
     let safe = 0;
-    for (const d of DIR8) { const x = K.x + d[0], y = K.y + d[1]; if (inB(x, y) && g[y * BW + x] === 0 && !attackedSq(s, g, x, y)) safe++; }
+    for (const d of DIR8) { const x = K.x + d[0], y = K.y + d[1]; if (inB(x, y) && g[y * BW + x] === 0 && !hitAt(x, y)) safe++; }
     g[idx] = keep;
     return { att, safe, dm };
   }
@@ -2059,15 +2102,16 @@
       if (visW(s, e.x, e.y)) E.push(e);
       else if (ghosts && e.sn) E.push(Object.assign({}, e, { x: e.sn[0], y: e.sn[1], hp: e.sn[2], gh: 1 }));
     }
-    return Object.assign({}, s, { E });
+    return { ...s, E };   // 펼침 복사 = Object.assign과 같은 결과(빠른 객체)
   }
   /* 흑군이 아는 판: 보이는 왕은 제자리, 안 보이는 왕은 마지막으로 본 칸(모르면 없는 것으로) */
   function fogArmy(s) {
     const ls = (s.fg && s.fg.ls) || [];
-    return Object.assign({}, s, {
+    return {
+      ...s,
       dc: (s.dc || []).filter((q) => seenAt(s, q[0], q[1])),
-      K: s.K.map((K, i) => (K.dn || seenAt(s, K.x, K.y) ? K : ls[i] ? Object.assign({}, K, { x: ls[i][0], y: ls[i][1] }) : Object.assign({}, K, { dn: 1 }))),
-    });
+      K: s.K.map((K, i) => (K.dn || seenAt(s, K.x, K.y) ? K : ls[i] ? { ...K, x: ls[i][0], y: ls[i][1] } : { ...K, dn: 1 })),
+    };
   }
   /* 왕이 선 칸에서 안개 속으로 뚫린 줄 수(8방향) — 안 보이는 룩 · 비숍 · 퀸에게 열려 있는 정도 */
   function fogRays(s, g, x, y) {
@@ -2166,7 +2210,8 @@
     const ks = []; sv.K.forEach((K, i) => { if (!K.dn) ks.push(i); });
     const lost = sv !== s && !ks.length;   // 왕이 어디 있는지 전혀 모름 → 흩어져 내려오며 수색
     const fogA = sv !== s;
-    const base = ks.map((k) => kSafe(sv, g, k));
+    const kp = kPrep(sv);   // 아래 시험 이동은 말의 자리만 바꿈 → 칠 수 있는 말 · 카드 값은 그대로(kSafe 준비물을 한 번만)
+    const base = ks.map((k) => kSafe(sv, g, k, kp));
     const promoRow = cnt(s, 'b_promo') ? 6 : 7;
     let best = null, bs = -1e9;
     for (const m of mv) {
@@ -2177,7 +2222,7 @@
       const r0 = risk(sv, gun, fx, fy, e), d0 = nearK(sv, fx, fy);
       g[fy * 8 + fx] = 0; g[ty * 8 + tx] = j + 1; e.x = tx; e.y = ty;
       for (let q = 0; q < ks.length; q++) {
-        const r = kSafe(sv, g, ks[q]), b = base[q];
+        const r = kSafe(sv, g, ks[q], kp), b = base[q];
         if (r.att && !b.att) sc += 7 * H.p;
         sc += (b.safe - r.safe) * 1.6 * H.p;
         if (r.att && r.safe === 0) sc += 25 * H.p;
@@ -2420,7 +2465,7 @@
     return out;
   }
   function shoot(s, seat, a, ev, pred) {
-    const K = s.K[seat], T = s.sts[seat], gun = gunOf(s, seat), G = gun.G, c = (id) => cg(s, gun.id, id);
+    const K = s.K[seat], T = s.sts[seat], gun = gunOf(s, seat), G = gun.G, c = cgFn(s, gun.id);   // 사격 한 번 동안 카드는 안 바뀜 → cg 기억
     let ang = +a.a, tx = -1, ty = -1;
     if (G.k === 'lob') {
       tx = a.x | 0; ty = a.y | 0;
@@ -3285,7 +3330,7 @@
   function kkView(s, seat, fog) {
     const me = kkBody(s, seat), op = kkBody(s, 1 - seat), K = s.K[seat];
     const see = op && (!fog || cheb(K.x, K.y, op.x, op.y) <= FOG_R);
-    return Object.assign({}, s, { K: s.K.map((k, i) => (i === seat ? k : Object.assign({}, k, { dn: 1 }))), E: see ? [op] : [], nomv: me && me.st > 0 ? 1 : 0, kh: me ? me.hp : 0 });
+    return { ...s, K: s.K.map((k, i) => (i === seat ? k : { ...k, dn: 1 })), E: see ? [op] : [], nomv: me && me.st > 0 ? 1 : 0, kh: me ? me.hp : 0 };
   }
   /* 블라인드전: 몸의 sn = 상대가 그 왕을 마지막으로 본(총소리를 들은) [x, y, 체력] */
   function kkFog(s) {
@@ -3477,7 +3522,7 @@
   }
   /* 흑군끼리의 AI: 한 수 뒤의 형세(말의 값어치 × 남은 체력 · 왕의 체력 · 전진 · 접근) + 상대의 가장 아픈 응수(보통은 공격만, 어려움은 모든 응수)
      + 판 · 자리마다 정해지는 버릇(공격성 · 폰 전진 · 조심성) + 난이도별 흔들림. 블라인드전에서는 보이는 말만으로 셈 */
-  function aaCopy(s) { return Object.assign({}, s, { E: s.E.map((e) => Object.assign({}, e)), vs: Object.assign({}, s.vs, { rv: (s.vs.rv || [0, 0]).slice(), bt: (s.vs.bt || [6, 6]).slice() }) }); }
+  function aaCopy(s) { return { ...s, E: s.E.map((e) => ({ ...e })), vs: { ...s.vs, rv: (s.vs.rv || [0, 0]).slice(), bt: (s.vs.bt || [6, 6]).slice() } }; }
   /* 진영 sd가 다음 차례에 칠 수 있는 칸(왕 몰이 · 왕의 안전 계산용) */
   function aaAtt(s, g, sd) {
     const A = new Uint8Array(64), put = (x, y) => { if (inB(x, y)) A[y * 8 + x] = 1; };
@@ -4546,7 +4591,9 @@
   }
 
   /* ---------------- 우리 왕 AI ---------------- */
-  function lite(s) { return Object.assign({}, s, { K: s.K.map((k) => Object.assign({}, k)), E: s.E.map((e) => Object.assign({}, e)), sts: s.sts.map((t) => Object.assign({}, t)), mn: (s.mn || []).slice(), gf: (s.gf || []).map((q) => q.slice()), pil: s.pil.map((q) => q.slice()), dc: (s.dc || []).map((q) => q.slice()), gw: (s.gw || []).map((q) => q.slice()), ac: (s.ac || []).map((q) => q.slice()), fl2: (s.fl2 || []).map((q) => q.slice()), ic: (s.ic || []).map((q) => q.slice()), last: null }); }
+  /* 판 복사(조준 · 봇 시험용) — 펼침({...}) 복사는 Object.assign과 같은 키 · 같은 순서 · 같은 값이지만 V8의 빠른 복사 길을 타고(약 9배), 결과도 빠른 객체로 남음 */
+  const liteK = (o) => ({ ...o }), liteE = (o) => ({ ...o }), liteT = (o) => ({ ...o }), liteA = (q) => q.slice(), LITE0 = [];   // 왕 · 말 · 전적은 꼴이 달라 복사 함수를 따로(V8 캐시)
+  function lite(s) { return { ...s, K: s.K.map(liteK), E: s.E.map(liteE), sts: s.sts.map(liteT), mn: (s.mn || LITE0).slice(), gf: (s.gf || LITE0).map(liteA), pil: s.pil.map(liteA), dc: (s.dc || LITE0).map(liteA), gw: (s.gw || LITE0).map(liteA), ac: (s.ac || LITE0).map(liteA), fl2: (s.fl2 || LITE0).map(liteA), ic: (s.ic || LITE0).map(liteA), bgv: s.bgv && s.bgv.slice(), last: null }; }   // bgv: 시험 사격의 처치가 진짜 판의 「무덤을 여는 왕」 기록에 들어가지 않게(onKill이 밀어 넣음)
   function aiPick(s, seat, lv) {
     const st = (L.aiStyle && L.aiStyle(seat)) || 'bal';
     let best = 0, bs = -1e9;
@@ -4655,8 +4702,9 @@
     if (dm >= hp) return HP_AI.dead * w;
     return dm * (HP_AI.per + HP_AI.low * (1 - (hp - dm) / mh)) * w;
   }
-  /* 한 수 뒤 평가: 즉시 위험 · 처치/피해 · 남은 탄 · 피할 곳 · (어려움) 흑군 응수 뒤 갇히는지. base = 이 차례를 시작할 때의 상태(연속 사격) */
-  function evalAct(s, seat, a, lv, hab, base, dep) {
+  /* 한 수 뒤 평가: 즉시 위험 · 처치/피해 · 남은 탄 · 피할 곳 · (어려움) 흑군 응수 뒤 갇히는지. base = 이 차례를 시작할 때의 상태(연속 사격)
+     keep(맨 위 호출만): 흑군 응수 읽기(evalDeep) 앞까지의 판 · 점수를 남겨 둠 → 앞선 수를 다시 볼 때 시험 사격부터 다시 하지 않음(ai) */
+  function evalAct(s, seat, a, lv, hab, base, dep, keep) {
     const c = lite(s), ev = null, B = base || s;
     let r;
     try { r = act1(c, seat, a, ev, true); } catch (e) { return -1e9; }
@@ -4758,6 +4806,12 @@
     if (nd <= 1) sc -= gun.G.reach > 2 ? 4 : 2; else if (nd === 2) sc += gun.G.reach > 2 ? 0 : 1.5;
     if (lv >= 2 && a.t !== 'fire') sc += Math.min(14, potential(c, seat)) * 0.45 * (1 + B.ft / 120);
     if (a.t === 'mv' && B.last && B.last.ev) { const pm = B.last.ev.find((q) => q.k === 'mv' && q.s === seat); if (pm && pm.f[0] === a.x && pm.f[1] === a.y) sc -= 3; }
+    if (keep) { keep.c = c; keep.r = r; keep.sc = sc; }   // 아래 evalDeep은 lv 2에서 c를 안 고침(kkEval은 읽기만)
+    return evalDeep(c, r, seat, lv, hab, sc);
+  }
+  /* evalAct의 끝: (어려움) 흑군 응수 뒤 갇히는지 + 맞대결 총왕끼리의 사정권. lv 3이면 c를 고침(응수한 말을 옮김) */
+  function evalDeep(c, r, seat, lv, hab, sc) {
+    const K = c.K[seat], gun = gunOf(c, seat);
     if (lv >= 3) {
       // 흑군의 응수(결정적으로) 뒤 내가 갇히는지
       const m = r.skip ? null : armyChoose(c, true, false, null, c.n > 1 ? seat : null);
@@ -4806,13 +4860,14 @@
     const noise = lv === 1 ? 9 : lv === 2 ? 2 : 0.6;
     const blunder = lv === 1 && Math.random() < 0.3;
     let scored = cands.map((a) => {
-      let v = evalAct(s, seat, a, lv >= 3 ? 2 : lv, hab);
+      const k = lv >= 2 ? {} : null;
+      let v = evalAct(s, seat, a, lv >= 3 ? 2 : lv, hab, null, 0, k);
       if (blunder && v < -1000 && v > -1e8 && !(a.t === 'fire' && (gun.G.swp || gun.G.grap || gun.G.rec))) v += 4800;   // 쉬움: 가끔 위험을 못 봄(쏘면 왕이 움직이는 총의 사격은 제외)
-      return { a, v: v + (Math.random() - 0.5) * noise };
+      return { a, v: v + (Math.random() - 0.5) * noise, k };
     });
-    if (lv >= 2) {   // 흑군의 응수까지 읽기: 보통은 앞선 4수, 어려움은 12수
+    if (lv >= 2) {   // 흑군의 응수까지 읽기: 보통은 앞선 4수, 어려움은 12수(첫 평가에서 남긴 판이 있으면 응수 읽기만 더함 — 연속 사격 수는 처음부터)
       scored.sort((x, y) => y.v - x.v);
-      scored = scored.slice(0, lv >= 3 ? 12 : 4).map((o) => ({ a: o.a, v: evalAct(s, seat, o.a, 3, hab) + (Math.random() - 0.5) * noise }));
+      scored = scored.slice(0, lv >= 3 ? 12 : 4).map((o) => ({ a: o.a, v: (o.k && o.k.c ? evalDeep(o.k.c, o.k.r, seat, 3, hab, o.k.sc) : evalAct(s, seat, o.a, 3, hab)) + (Math.random() - 0.5) * noise }));
     }
     let best = scored[0];
     for (const o of scored) if (o.v > best.v) best = o;
@@ -5222,7 +5277,7 @@
     }
     return '<svg viewBox="0 0 48 24" width="' + W + '" height="' + Math.round(W / 2) + '" fill="currentColor" aria-hidden="true"' + (col ? ' style="color:' + col + '"' : '') + '>' + (GICON[k] || GICON.rand) + '</svg>';
   }
-  const fakeGun = (id) => gunOf({ cards: {}, K: [{ g: id }] }, 0);
+  const fakeGun = (id) => ({ ...gunOf({ cards: {}, K: [{ g: id }] }, 0) });   // 복사본(gunOf 결과는 기억해 나눠 쓰니 — 다인대전 화면이 사거리를 고쳐 씀)
   /* 숙련 표식 테두리(1 황금 · 2 프리즘 — 프리즘의 빛 흐름은 「동작 줄이기」 · 전환 효과 끔이면 멈춤) */
   const mframe = (lv, inner) => (lv ? '<span class="sk-mf m' + lv + '" title="' + MAST_N[lv] + '"><span class="in">' + inner + '</span></span>' : inner);
   /* 변형끼리 견주는 세 칸: 피해 · 탄 · 거리 */
@@ -8318,7 +8373,7 @@
   L.register(DEF);
 })();
 (function () {  // 배포용 줄 → 조각:줄 (tools/parts_join.js가 만든 표)
-  const P = window.SHOTKING_PARTS || (window.SHOTKING_PARTS = {}), M = [[1,"shotking",0],[3,"cards",2],[327,"cards3",2],[588,"guns",2],[1040,"board",2],[1577,"floor",2],[1842,"modes",2],[2129,"army",2],[2402,"shoot",2],[3096,"vs",2],[3628,"ffa",2],[4395,"game",2],[4548,"ai",2],[4868,"art",2],[5312,"style",2],[5639,"shotking",0],[5640,"view",2],[6268,"view_ui",2],[6801,"view_draw",2],[7506,"shotking",0],[7507,"ffa_view",2],[8030,"def",2],[8319,"shotking",0]], N = 8320;
+  const P = window.SHOTKING_PARTS || (window.SHOTKING_PARTS = {}), M = [[1,"shotking",0],[3,"cards",2],[327,"cards3",2],[588,"guns",2],[1040,"board",2],[1620,"floor",2],[1885,"modes",2],[2173,"army",2],[2447,"shoot",2],[3141,"vs",2],[3673,"ffa",2],[4440,"game",2],[4593,"ai",2],[4923,"art",2],[5367,"style",2],[5694,"shotking",0],[5695,"view",2],[6323,"view_ui",2],[6856,"view_draw",2],[7561,"shotking",0],[7562,"ffa_view",2],[8085,"def",2],[8374,"shotking",0]], N = 8375;
   P.where = function (x) {
     const one = (ln) => { ln = +ln; let m = null; for (const e of M) if (e[0] <= ln) m = e; return m && m[1] !== 'shotking' && ln < N ? m[1] + '.js:' + (ln - m[0] + m[2]) : 'shotking.js'; };
     return typeof x === 'number' ? one(x) : String(x).replace(/shotking-joined\.js:(\d+)/g, (_, ln) => 'shotking/' + one(ln));
