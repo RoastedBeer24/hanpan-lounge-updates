@@ -1,0 +1,697 @@
+/* 잿빛 가도 (beltbrawl) — 옆에서 본 길을 오른쪽으로 나아가며 몰려오는 적을 치우는 1~4인 협동 난투. 구간을 치울 때마다 능력 셋 중 하나.
+   구조만 참고(횡스크롤 난투 + 판마다 능력 고르기). 이름 · 세계 · 직업 · 기술 · 그림 · 글은 모두 독자.
+
+   파일 구성
+   - 이 파일: 자료(직업 · 기술 · 능력 · 적 · 우두머리 · 구역) · 판 상태(pick → play → done) · 결과 · 규칙 · 도감 · 표지 · L.register · 불러오기.
+   - assets/beltbrawl/sim.js: 세계(순수 로직 — 고정 걸음 1/60초, 시드 난수, 전투 · 적 · 봇 · 네트워크 묶기). node에서도 돎.
+   - assets/beltbrawl/view.js: 화면(캔버스 2D, 걸음 사이 보간) · 조작 · HUD · 직업/능력 고르기 · 소리 · 온라인.
+   온라인: 세계는 호스트가 돌려 hostSend(약 12Hz). 손님은 입력과 자기 자리 이동을 보내고(이동만 예측), 판정은 호스트. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'beltbrawl';
+  const TITLE = '잿빛 가도';          // 게임 이름은 여기 한 곳
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  /* 글 문체: 화면 글은 짧은 명사형(느낌표 · 이모지 없음), 규칙은 합니다체. 반복 효과는 「키워드: 수치」. */
+
+  const ZD = 120;      // 길의 깊이(위아래)
+  /* 적 자료 표에 곱하는 전체 배율: 졸개 체력 · 우두머리 체력 · 우두머리 공격력 · 인원별 공격력(1인 atk1, 한 명 늘 때마다 +atkN) */
+  const SCALE = { mobHp: 1.45, bossHp: 1.5, bossAtk: 0.7, atk1: 0.9, atkN: 0.14 };
+  const AW = 900;      // 한 구간 싸움터 너비
+  const SEG = 800;     // 구간 사이 거리
+
+  /* ======================= 행동(동작) 자료 =======================
+     동작: { an 자세 · dur 길이 · can 이어 치기/취소 시각 · arm [a,b] 버티기 · inv [a,b] 무적 · acts[] }
+     acts: hit(범위 x0~x1 · 깊이 zr · 피해 배수 d · kb 밀기 · lift 띄움 · down 넘어뜨림 · stun 경직 · poise 기절 수치)
+           proj · zone · dash · leap · grab · blink · summon · die. req가 있으면 그 능력을 가진 때만. */
+  const MV = [];
+  const mvReg = (m) => { m.i = MV.length; MV.push(m); m.acts.sort((a, b) => a.at - b.at); return m; };
+  const H = (at, x0, x1, zr, d, o) => Object.assign({ k: 'hit', at, x0, x1, zr, d }, o || {});
+  const A = (k, at, o) => Object.assign({ k, at }, o || {});
+  const M = (an, dur, acts, o) => mvReg(Object.assign({ an, dur, can: dur, acts }, o || {}));
+
+  /* 탄 · 던지는 것 */
+  const PJ = {
+    bullet: { spd: 900, life: 0.38, zr: 15, kb: 50, stun: 0.16, col: '#ffe9a8', sh: 'tr' },
+    bulletP: { spd: 900, life: 0.4, zr: 16, kb: 40, stun: 0.2, pierce: 1, col: '#ffd070', sh: 'tr' },
+    orb: { spd: 400, life: 0.8, zr: 17, kb: 70, stun: 0.2, aoe: 30, col: '#b58cff', sh: 'orb' },
+    orbL: { spd: 380, life: 0.8, zr: 20, kb: 110, stun: 0.25, aoe: 46, col: '#d0a8ff', sh: 'orb', big: 1 },
+    nade: { lob: 0.5, aoe: 74, lift: 340, kb: 120, col: '#ff9a4a', sh: 'nade', shake: 2 },
+    jav: { spd: 740, life: 0.6, zr: 19, kb: 220, stun: 0.5, pierce: 99, col: '#d8e2ea', sh: 'jav' },
+    /* 적 */
+    bolt: { spd: 340, life: 1.3, zr: 13, kb: 60, stun: 0.2, col: '#e0c090', sh: 'bolt' },
+    hook: { spd: 430, life: 0.62, zr: 15, pull: 1, stun: 0.5, col: '#b9b9c4', sh: 'hook' },
+    spit: { lob: 0.8, aoe: 40, zone: 'pool', col: '#9fd05a', sh: 'nade' },
+    arrow: { spd: 330, life: 1.3, zr: 12, kb: 50, stun: 0.2, col: '#b9a4e8', sh: 'bolt' },
+    spike: { spd: 310, life: 1.3, zr: 12, kb: 40, stun: 0.18, col: '#c8d880', sh: 'bolt' },
+    bubble: { spd: 170, life: 2.6, zr: 18, kb: 90, stun: 0.3, col: '#8fd8e8', sh: 'orb' },
+    wave: { spd: 280, life: 1.5, zr: 24, kb: 160, down: 1, col: '#e8e0d0', sh: 'wave' },
+    shell: { lob: 1.0, aoe: 60, down: 1, kb: 140, col: '#40363a', sh: 'nade', shake: 2 },
+    seed: { lob: 1.0, aoe: 50, zone: 'ember', kb: 80, col: '#ffb060', sh: 'nade' },
+    anchor: { spd: 460, life: 0.8, zr: 20, pull: 1, stun: 0.7, col: '#8f98a8', sh: 'hook', big: 1 },
+    soul: { spd: 220, life: 2.2, zr: 15, kb: 60, stun: 0.25, col: '#9ad8ff', sh: 'orb' },
+  };
+  /* 바닥 지대: warn 예고(초) 뒤 발동. dur 0이면 한 번 터짐 */
+  const ZN = {
+    bind: { rx: 84, rz: 44, warn: 0.25, dur: 5, tick: 0.5, d: 0.45, chill: 1, col: '#8f6cff' },
+    curse: { rx: 70, rz: 40, warn: 0.4, dur: 0, d: 3.4, lift: 380, col: '#c070ff', shake: 2 },
+    curseS: { rx: 56, rz: 34, warn: 0.75, dur: 0, d: 1.8, lift: 260, col: '#c070ff' },
+    pure: { rx: 92, rz: 50, warn: 0.2, dur: 5, tick: 0.5, d: 0.4, heal: 0.022, col: '#7fe0c0' },
+    crater: { rx: 80, rz: 42, warn: 0, dur: 3, tick: 0.5, d: 0.5, burn: 1, col: '#ff8040' },
+    fire: { rx: 70, rz: 40, warn: 0, dur: 4, tick: 0.5, d: 0.45, burn: 1, col: '#ff7030' },
+    blinkb: { rx: 56, rz: 34, warn: 0.1, dur: 0, d: 1.8, kb: 160, col: '#b58cff' },
+    boomP: { rx: 76, rz: 44, warn: 0.3, dur: 0, d: 2.6, lift: 260, col: '#ffb060', shake: 1 },
+    /* 적 */
+    boom: { rx: 80, rz: 46, warn: 0.95, dur: 0, d: 2.3, down: 1, col: '#ff5040', shake: 2 },
+    pool: { rx: 50, rz: 30, warn: 0.15, dur: 4, tick: 0.5, d: 0.5, col: '#8fc840' },
+    acid: { rx: 64, rz: 36, warn: 0.6, dur: 5, tick: 0.5, d: 0.6, col: '#a0d040' },
+    shellz: { rx: 60, rz: 36, warn: 1.1, dur: 0, d: 2.0, down: 1, col: '#ff5040', shake: 2 },
+    hexz: { rx: 52, rz: 32, warn: 1.0, dur: 0, d: 1.7, col: '#b070ff' },
+    root: { rx: 44, rz: 28, warn: 0.7, dur: 0, d: 1.8, lift: 300, col: '#b08040' },
+    ember: { rx: 52, rz: 32, warn: 0.1, dur: 4, tick: 0.5, d: 0.5, burn: 1, col: '#ff7030' },
+    slamz: { rx: 96, rz: 54, warn: 0.9, dur: 0, d: 2.4, down: 1, col: '#ff5040', shake: 3 },
+    thorn: { rx: 40, rz: 26, warn: 0.9, dur: 0, d: 1.5, col: '#b08040' },
+  };
+
+  /* ======================= 직업 ======================= */
+  const CLS = [
+    { id: 'blade', nm: '거검사', sub: '느리고 넓은 대검 · 막기', hp: 130, atk: 10, spd: 138, reach: 96, rng: 0, col: '#d2553f', wpn: 'gsword',
+      d: '한 번 휘두를 때마다 여럿을 벰. 기술 중에는 맞아도 밀리지 않음. 구르는 대신 막기 — 맞는 순간에 막으면 피해 없음.',
+      basic: [
+        M('sw1', 0.5, [H(0.2, -6, 94, 30, 1.3, { kb: 140, fx: 'arc' })], { nm: '가로베기', can: 0.3, mvv: [0.04, 0.2, 110] }),
+        M('sw2', 0.52, [H(0.22, -6, 98, 32, 1.5, { kb: 160, fx: 'arc2' })], { nm: '올려치기', can: 0.32, mvv: [0.04, 0.2, 100] }),
+        M('ovh', 0.74, [H(0.34, 0, 106, 34, 2.4, { kb: 260, down: 1, hs: 5, poise: 2, fx: 'ovh', shake: 1, last: 1 })], { nm: '내려치기', can: 0.52, mvv: [0.1, 0.32, 90] }),
+      ],
+      sk: [
+        M('up', 0.6, [H(0.2, -6, 98, 34, 2.2, { lift: 430, kb: 40, hs: 4, fx: 'up', poise: 1.5 })], { nm: '올려베기', cd: 5, can: 0.38, arm: [0, 0.3], ic: 'up', d: '앞의 적을 높이 띄움.', bot: { r: [0, 95], zr: 30, gr: 1, pr: 1.2 } }),
+        M('spin', 0.8, [H(0.18, -104, 104, 40, 1.8, { kb: 200, fx: 'spin' }), H(0.42, -104, 104, 40, 2.0, { kb: 300, down: 1, fx: 'spin', hs: 4 }), H(0.68, -110, 110, 42, 2.0, { kb: 300, down: 1, fx: 'spin', req: 'spin2' })], { nm: '회전베기', cd: 8, arm: [0, 0.72], ic: 'spin', ext: { spin2: 0.25 }, d: '둘레를 두 번 휩쓸어 넘어뜨림.', bot: { r: [-100, 100], zr: 38, n: 2, pr: 1 } }),
+        M('leap', 0.95, [A('leap', 0.05, { vy: 330, v: 230 }), H(0.6, -70, 112, 46, 4.2, { kb: 240, down: 1, lift: 200, hs: 6, poise: 4, fx: 'slam', shake: 2, otg: 1 }), A('zone', 0.6, { z: 'crater', dx: 20, req: 'crater' })], { nm: '내려찍기', cd: 11, arm: [0, 0.85], ic: 'slam', d: '뛰어올라 내려찍음. 쓰러진 적도 맞음. 기절 수치 큼.', bot: { r: [90, 260], zr: 40, pr: 1.6 } }),
+      ],
+      ev: M('guard', 0.55, [], { nm: '막기', cd: 1.0, guard: 0.22, ic: 'guard', d: '0.55초 동안 앞에서 오는 피해 85% 감소. 처음 0.22초에 맞으면 「완벽 막기」: 피해 없음 · 공격자 기절 수치 3.' }) },
+    { id: 'fist', nm: '권갑사', sub: '빠른 연타 · 잡기', hp: 110, atk: 10, spd: 158, reach: 60, rng: 0, col: '#e0963a', wpn: 'fist',
+      d: '바짝 붙어 쉴 새 없이 침. 띄운 적을 따라 올라가고, 붙잡아 메쳐 둘레까지 넘어뜨림.',
+      basic: [
+        M('jab1', 0.26, [H(0.1, 0, 58, 24, 0.7, { kb: 50, hs: 2, fx: 'pun' })], { nm: '잽', can: 0.16, mvv: [0.02, 0.1, 120] }),
+        M('jab2', 0.26, [H(0.1, 0, 60, 24, 0.75, { kb: 50, hs: 2, fx: 'pun' })], { nm: '스트레이트', can: 0.16, mvv: [0.02, 0.1, 120] }),
+        M('hook', 0.32, [H(0.13, 0, 62, 26, 1.0, { kb: 90, hs: 3, fx: 'arc' })], { nm: '훅', can: 0.2, mvv: [0.02, 0.12, 120] }),
+        M('kick', 0.34, [H(0.14, 0, 68, 26, 1.1, { kb: 130, hs: 3, fx: 'arc2' })], { nm: '돌려차기', can: 0.22, mvv: [0.02, 0.12, 110] }),
+        M('fin', 0.52, [H(0.22, 0, 70, 28, 1.9, { kb: 280, down: 1, hs: 5, poise: 1.6, fx: 'pun', shake: 1, last: 1 })], { nm: '정권', can: 0.38, mvv: [0.08, 0.22, 160] }),
+      ],
+      sk: [
+        M('upper', 0.6, [H(0.14, 0, 62, 28, 1.8, { lift: 470, kb: 20, hs: 4, fx: 'up' }), A('leap', 0.14, { vy: 300, v: 30 }), H(0.38, 0, 66, 30, 1.6, { lift: 260, kb: 60, hs: 3, fx: 'arc', req: 'upfu' })], { nm: '승천 어퍼', cd: 5, can: 0.42, arm: [0, 0.2], ic: 'up', d: '올려쳐 띄우고 함께 솟구침.', bot: { r: [0, 60], zr: 26, gr: 1, pr: 1.3 } }),
+        M('grab', 0.72, [A('grab', 0.12, { x1: 72, zr: 30, d: 3.0, hold: 0.36 }), H(0.5, -74, 92, 44, 2.2, { kb: 200, down: 1, lift: 220, hs: 5, fx: 'slam', shake: 2, otg: 1, slam: 1 })], { nm: '붙잡아 메치기', cd: 9, arm: [0, 0.6], ic: 'grab', d: '앞의 적을 붙잡아 내리꽂고 둘레를 넘어뜨림. 방패를 무시. 무거운 적 · 우두머리에게는 강타.', bot: { r: [0, 68], zr: 28, pr: 1.5 } }),
+        M('dashp', 0.4, [A('dash', 0.04, { v: 560, t: 0.26 }), H(0.08, -20, 70, 30, 0.9, { kb: 60, hs: 1, fx: 'pun' }), H(0.16, -20, 70, 30, 0.9, { kb: 60, hs: 1, fx: 'pun' }), H(0.26, -20, 76, 32, 1.4, { kb: 220, down: 1, hs: 3, fx: 'arc' })], { nm: '연환 돌진', cd: 8, inv: [0, 0.2], ic: 'dash', d: '적을 뚫고 지나가며 세 번 침.', bot: { r: [60, 200], zr: 26, pr: 1 } }),
+      ],
+      ev: M('step', 0.22, [A('dash', 0, { v: 520, t: 0.18, dir: 1 })], { nm: '스텝', cd: 0.7, inv: [0, 0.2], ic: 'dodge', d: '짧고 빠르게 비켜섬(무적 0.2초).' }) },
+    { id: 'guns', nm: '쌍총수', sub: '거리 유지 · 연사', hp: 86, atk: 10, spd: 150, reach: 300, rng: 1, col: '#4f9ed8', wpn: 'guns',
+      d: '멀리서 쉬지 않고 쏨. 체력이 낮아 붙으면 위험. 뒤로 물러나며 쏘고, 폭발탄으로 무리를 띄움.',
+      basic: [
+        M('shA', 0.24, [A('proj', 0.06, { p: 'bullet', d: 0.75 })], { nm: '속사', can: 0.15 }),
+        M('shB', 0.24, [A('proj', 0.06, { p: 'bullet', d: 0.75 })], { nm: '속사', can: 0.15 }),
+        M('shA', 0.24, [A('proj', 0.06, { p: 'bullet', d: 0.8 })], { nm: '속사', can: 0.15 }),
+        M('shD', 0.4, [A('proj', 0.1, { p: 'bullet', d: 1.1, n: 2, last: 1 })], { nm: '쌍발', can: 0.26 }),
+      ],
+      sk: [
+        M('burst', 1.0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((i) => A('proj', 0.1 + i * 0.07, i < 8 ? { p: 'bulletP', d: 0.6, sway: 1 } : { p: 'bulletP', d: 0.6, sway: 1, req: 'sk0n' })), { nm: '제압 사격', cd: 7, ic: 'burst', ext: { sk0n: 0.28 }, d: '한 줄로 여덟 발을 퍼부음. 한 발이 둘까지 꿰뚫음.', bot: { r: [40, 300], zr: 16, pr: 1.1 } }),
+        M('backshot', 0.46, [A('dash', 0, { v: -430, t: 0.24 }), A('proj', 0.08, { p: 'bullet', d: 1.0, n: 3, fan: 26, kb: 220, sk: 1 })], { nm: '후퇴 사격', cd: 6, inv: [0, 0.24], ic: 'back', d: '뒤로 물러나며 세 갈래로 쏴 밀쳐 냄(무적 0.24초).', bot: { r: [0, 110], zr: 40, pr: 1.4, esc: 1 } }),
+        M('lob', 0.5, [A('proj', 0.22, { p: 'nade', d: 3.5, tgt: 1, rmax: 240, zf: 'fire' })], { nm: '폭발탄', cd: 10, ic: 'bomb', d: '적이 모인 곳에 던져 터뜨리고 띄움.', bot: { r: [70, 260], zr: 60, n: 2, pr: 1.3 } }),
+      ],
+      ev: M('roll', 0.36, [A('dash', 0, { v: 400, t: 0.3, dir: 1 })], { nm: '구르기', cd: 0.9, inv: [0, 0.3], ic: 'dodge', d: '누른 쪽으로 굴러 피함(무적 0.3초).' }) },
+    { id: 'hex', nm: '주술사', sub: '범위 · 설치 · 회복', hp: 80, atk: 10, spd: 142, reach: 290, rng: 1, col: '#9b6ce0', wpn: 'staff',
+      d: '바닥에 문양을 깔아 느리게 하고, 저주를 터뜨려 띄움. 정화의 원으로 동료를 회복시킴. 점멸로 빠져나옴.',
+      basic: [
+        M('cast', 0.42, [A('proj', 0.16, { p: 'orb', d: 1.25 })], { nm: '혼불', can: 0.3 }),
+        M('cast', 0.42, [A('proj', 0.16, { p: 'orb', d: 1.25 })], { nm: '혼불', can: 0.3 }),
+        M('cast2', 0.56, [A('proj', 0.24, { p: 'orbL', d: 2.0, last: 1 })], { nm: '큰 혼불', can: 0.4 }),
+      ],
+      sk: [
+        M('castD', 0.5, [A('zone', 0.2, { z: 'bind', tgt: 1, rmax: 260, dx: 120 })], { nm: '속박 문양', cd: 9, ic: 'rune', d: '문양 위의 적은 느려지고 계속 피해를 받음(5초).', bot: { r: [0, 260], zr: 60, n: 2, pr: 1.1 } }),
+        M('castU', 0.55, [A('zone', 0.12, { z: 'curse', tgt: 1, rmax: 260, dx: 110 }), A('zone', 0.3, { z: 'curseS', tgt: 1, rmax: 260, dx: 110, req: 'curse2' })], { nm: '저주 폭발', cd: 6, ic: 'curse', d: '적 발밑에서 저주가 터져 높이 띄움.', bot: { r: [0, 260], zr: 60, gr: 1, pr: 1.3 } }),
+        M('castU', 0.6, [A('zone', 0.2, { z: 'pure', self: 1 })], { nm: '정화의 원', cd: 16, ic: 'heal', d: '원 안의 동료는 5초 동안 체력을 회복하고, 적은 피해를 받음.', bot: { heal: 1, pr: 1 } }),
+      ],
+      ev: M('blink', 0.3, [A('blink', 0.06, { dist: 135 }), A('zone', 0.06, { z: 'blinkb', self: 1, back: 1, req: 'blinkBoom' })], { nm: '점멸', cd: 1.6, inv: [0, 0.3], ic: 'blink', d: '누른 쪽으로 순간 이동(무적 0.3초).' }) },
+    { id: 'spear', nm: '창술사', sub: '긴 사거리 · 꿰뚫기 · 출혈', hp: 100, atk: 10, spd: 146, reach: 132, rng: 0, col: '#4fb08a', wpn: 'spear',
+      d: '한 줄로 선 적을 멀리서 꿰뚫음. 깊이는 좁지만 길이 김. 찌른 적은 출혈을 입음.',
+      basic: [
+        M('th1', 0.36, [H(0.14, 10, 132, 20, 1.1, { kb: 110, fx: 'thr' })], { nm: '찌르기', can: 0.22, mvv: [0.03, 0.14, 100] }),
+        M('th2', 0.38, [H(0.15, 10, 136, 20, 1.2, { kb: 120, fx: 'thr' })], { nm: '깊이 찌르기', can: 0.24, mvv: [0.03, 0.15, 100] }),
+        M('th3', 0.62, [H(0.14, 10, 134, 22, 0.7, { kb: 30, hs: 2, fx: 'thr' }), H(0.24, 10, 134, 22, 0.7, { kb: 30, hs: 2, fx: 'thr' }), H(0.36, 10, 140, 22, 1.0, { kb: 240, hs: 4, fx: 'thr', last: 1 }), H(0.3, 10, 134, 22, 0.7, { kb: 30, hs: 2, fx: 'thr', req: 'th3x' })], { nm: '삼연 찌르기', can: 0.48 }),
+      ],
+      sk: [
+        M('lunge', 0.5, [A('dash', 0.06, { v: 620, t: 0.2 }), H(0.12, 0, 150, 24, 1.3, { kb: 40, bleed: 1, fx: 'thr', hs: 2 }), H(0.26, 0, 156, 26, 1.5, { kb: 220, bleed: 1, fx: 'thr', hs: 4, poise: 1.5 })], { nm: '꿰뚫기', cd: 6, arm: [0, 0.3], ic: 'pierce', d: '멀리 뛰어들며 두 번 꿰뚫음. 출혈: 2중첩.', bot: { r: [80, 260], zr: 18, pr: 1.2 } }),
+        M('sweep', 0.62, [H(0.24, -40, 150, 46, 2.2, { kb: 120, down: 1, hs: 4, fx: 'arc', shake: 1 }), H(0.5, -40, 150, 46, 1.6, { lift: 320, kb: 40, hs: 3, fx: 'arc2', req: 'sweep2', otg: 1 })], { nm: '휩쓸기', cd: 7, arm: [0, 0.3], ic: 'spin', ext: { sweep2: 0.2 }, d: '넓게 쓸어 발을 걸어 넘어뜨림.', bot: { r: [-30, 140], zr: 40, n: 2, pr: 1.1 } }),
+        M('hurl', 0.56, [A('proj', 0.26, { p: 'jav', d: 3.0 })], { nm: '투창', cd: 9, ic: 'jav', d: '창을 던져 한 줄을 모두 꿰뚫고 경직시킴.', bot: { r: [100, 420], zr: 16, pr: 1.2 } }),
+      ],
+      ev: M('hop', 0.32, [A('dash', 0, { v: 430, t: 0.26, dir: 1, back: 1 })], { nm: '물러서기', cd: 0.9, inv: [0, 0.26], ic: 'dodge', d: '누른 쪽(없으면 뒤)으로 뛰어 피함(무적 0.26초).' }) },
+  ];
+  CLS.forEach((c, i) => { c.i = i; c.basic.forEach((m, k) => { m.kind = 'b'; m.ci = k; }); c.sk.forEach((m, k) => { m.kind = 's'; m.si = k; }); c.ev.kind = 'e'; });
+
+  /* ======================= 능력(증강) =======================
+     fx 키마다 이름 · 표시 방식 → 설명은 자료에서 자동으로 만듦. max = 겹칠 수 있는 횟수. tier 1 일반 · 2 희귀 · 3 전설. */
+  const pc = (v) => (v > 0 ? '+' : '−') + Math.round(Math.abs(v) * 100) + '%';
+  const FXK = {
+    dmg: ['피해', pc], basic: ['기본 공격 피해', pc], skill: ['기술 피해', pc], aspd: ['공격 속도', pc], hp: ['최대 체력', pc], move: ['이동 속도', pc],
+    cdr: ['기술 재사용', (v) => pc(-v)], ecd: ['회피 재사용', (v) => pc(-v)], crit: ['치명 확률', pc], critd: ['치명 피해', pc], def: ['받는 피해', (v) => pc(-v)],
+    launch: ['띄움 높이', pc], airDmg: ['공중의 적 피해', pc], downDmg: ['쓰러진 적 피해', pc], landBoom: ['낙하 충격(띄운 적이 떨어질 때 둘레 피해)', (v) => Math.round(v * 100) + '%'], juggle: ['띄움 유지(공중 연타가 덜 가라앉음)', pc],
+    bleed: ['출혈 부여(기본 공격 확률)', (v) => Math.round(v * 100) + '%'], bleedDmg: ['출혈 피해', pc], critBleed: ['출혈 대상 치명 확률', pc], vsBleed: ['출혈 대상 피해', pc], rupture: ['출혈 파열(5중첩 대상을 치면 출혈을 터뜨림)', (v) => Math.round(v * 100) + '%'],
+    burn: ['화상 부여(기술 적중 확률)', (v) => Math.round(v * 100) + '%'], burnDmg: ['화상 피해', pc], vsBurn: ['화상 대상 피해', pc], burnSpread: ['화상 전파(화상 입은 적을 처치하면 둘레로 번짐)', () => ''],
+    shock: ['감전 부여(공격 확률)', (v) => Math.round(v * 100) + '%'], chain: ['연쇄 번개 피해', pc], chainN: ['연쇄 번개 대상', (v) => '+' + v], vsShock: ['감전 대상 기절 수치', pc],
+    chill: ['둔화 부여(공격 확률)', (v) => Math.round(v * 100) + '%'], vsChill: ['둔화 대상 피해', pc], freeze: ['빙결(둔화 대상에게 치명타 시 묶음)', (v) => v + '초'],
+    leech: ['흡혈(준 피해만큼 회복)', (v) => (v * 100).toFixed(1).replace('.0', '') + '%'], killHeal: ['처치 회복', (v) => '체력 ' + v], shield: ['구간 시작 보호막', (v) => '최대 체력의 ' + Math.round(v * 100) + '%'],
+    thorn: ['가시(맞으면 공격자에게 피해)', (v) => Math.round(v * 100) + '%'], selfRev: ['재기(구역마다 한 번 스스로 일어남)', () => ''], revive: ['일으키는 속도', pc], reviveHeal: ['일으킨 뒤 둘 다 회복', (v) => '최대 체력의 ' + Math.round(v * 100) + '%'],
+    low: ['궁지(체력 40% 아래에서 피해)', pc], full: ['여유(체력 80% 위에서 피해)', pc], combo: ['연타(콤보 10마다 피해, 다섯 번까지)', pc], exec: ['처형(체력 25% 아래 적 피해)', pc], elite: ['정예 · 우두머리 피해', pc],
+    poise: ['기절 수치', pc], vsStag: ['기절한 적 피해', pc], perfect: ['잔상(공격을 피하거나 막으면 4초 동안 피해)', pc], dodgeCrit: ['회피 뒤 첫 공격 치명 확정', () => ''],
+    killBoom: ['처치 폭발(둘레 피해)', (v) => '공격력의 ' + Math.round(v * 100) + '%'], loot: ['회복 구슬 회복량', pc], freeCast: ['기술을 쓸 때 재사용 없음(확률)', (v) => Math.round(v * 100) + '%'], killHaste: ['처치 뒤 3초 공격 속도', pc],
+    reach: ['기본 공격 범위', pc], aoe: ['기술 범위', pc],
+    sk0d: ['', pc], sk1d: ['', pc], sk2d: ['', pc], sk0c: ['', (v) => pc(-v)], sk1c: ['', (v) => pc(-v)], sk2c: ['', (v) => pc(-v)],
+    lastD: ['기본 공격 마지막 타 피해', pc], baspd: ['기본 공격 속도', pc],
+    spin2: ['회전베기 한 바퀴 추가', () => ''], crater: ['내려찍은 자리에 화상 지대(3초)', () => ''], upfu: ['승천 어퍼 뒤 공중 추가타', () => ''], sweep2: ['휩쓸기 뒤 올려치기(띄움)', () => ''],
+    blinkBoom: ['점멸한 자리에 폭발', () => ''], curse2: ['저주 폭발 한 번 더(작게)', () => ''], incend: ['폭발탄 자리에 화상 지대(4초)', () => ''], th3x: ['삼연 찌르기 한 번 더', () => ''], sk0n: ['제압 사격 4발 추가', () => ''],
+    guardSh: ['막기 성공 시 보호막', (v) => '최대 체력의 ' + Math.round(v * 100) + '%'], guardCtr: ['완벽 막기 뒤 다음 공격 피해', pc], armDef: ['기술 쓰는 중 받는 피해', (v) => pc(-v)],
+    grabBuff: ['메치기 뒤 4초 피해', pc], stepBuff: ['스텝 뒤 1.2초 기본 공격 피해', pc], dashRefund: ['연환 돌진 적중마다 재사용 감소', (v) => v + '초'], lastCrit: ['기본 공격 마지막 타 치명 확정', () => ''], rage: ['무쌍(콤보 20 넘으면 피해 · 공격 속도)', pc],
+    pierce: ['기본 탄 관통', (v) => '+' + v], far: ['먼 적(180 넘게) 피해', pc], near: ['가까운 적(90 안) 피해', pc], rollCd: ['구르기 뒤 기술 재사용 감소', (v) => v + '초'], rico: ['도탄(맞은 탄이 곁의 적에게 튐)', (v) => Math.round(v * 100) + '%'], slowShot: ['후퇴 사격 둔화', () => ''],
+    markOn: ['기본 공격이 표식을 새김(표식: 받는 피해 +15%, 5초)', () => ''], vsStatus: ['상태 이상(출혈 · 화상 · 감전 · 둔화) 대상 피해', pc], zoneDur: ['문양 · 원 지속', (v) => '+' + v + '초'], zoneHeal: ['정화의 원 회복량', pc], zoneKill: ['문양 위에서 처치 시 회복', (v) => '체력 ' + v], homing: ['혼불이 적을 따라감', () => ''], zoneBig: ['문양 · 원 범위', pc], zoneAlly: ['문양 · 원 위의 동료 피해', pc],
+    bleedAdd: ['꿰뚫기 출혈 중첩', (v) => '+' + v], pin: ['투창 경직', (v) => '+' + v + '초'], hopBuff: ['물러서기 뒤 다음 꿰뚫기 피해', pc], multi: ['한 번에 둘 이상 맞히면 피해', pc],
+  };
+  const AUG = [];
+  /* a(id, 이름, 직업(-1 공통), tier, max, 꼬리표, fx) */
+  const a = (id, nm, cls, tier, max, tags, fx) => { AUG.push({ id, nm, cls, tier, max, tags: tags.split(' ').filter(Boolean), fx, i: AUG.length }); };
+  // 공통 — 기초
+  a('edge', '날 선 손', -1, 1, 3, '피해', { dmg: 0.1 });
+  a('quick', '빠른 손놀림', -1, 1, 3, '속도', { aspd: 0.1 });
+  a('tough', '단련된 몸', -1, 1, 3, '생존', { hp: 0.2 });
+  a('light', '가벼운 발', -1, 1, 2, '속도 회피', { move: 0.1, ecd: 0.15 });
+  a('focus', '집중', -1, 1, 3, '기술', { cdr: 0.1 });
+  a('vital', '급소 노리기', -1, 1, 3, '치명', { crit: 0.08 });
+  a('deep', '깊은 타격', -1, 1, 2, '치명', { critd: 0.35 });
+  a('hide', '두꺼운 가죽', -1, 1, 3, '생존', { def: 0.08 });
+  a('drill', '기본기', -1, 1, 3, '피해', { basic: 0.16 });
+  a('craft', '숙련', -1, 1, 3, '기술', { skill: 0.16 });
+  // 띄움
+  a('loft', '높이 띄우기', -1, 1, 2, '띄움', { launch: 0.25, airDmg: 0.1 });
+  a('chase', '공중 추격', -1, 2, 2, '띄움', { airDmg: 0.28 });
+  a('crash', '떨어지는 충격', -1, 2, 2, '띄움', { landBoom: 0.9 });
+  a('float', '붙들린 허공', -1, 2, 1, '띄움', { juggle: 0.5, airDmg: 0.1 });
+  a('stomp', '짓밟기', -1, 1, 2, '넘어뜨림', { downDmg: 0.5 });
+  // 출혈
+  a('saw', '톱날', -1, 1, 2, '출혈', { bleed: 0.3 });
+  a('gash', '벌어진 상처', -1, 1, 2, '출혈', { bleedDmg: 0.45 });
+  a('scent', '피 냄새', -1, 2, 2, '출혈 치명', { critBleed: 0.2, vsBleed: 0.08 });
+  a('burst', '출혈 파열', -1, 3, 1, '출혈', { rupture: 4.0 });
+  // 화상
+  a('ember', '불씨', -1, 1, 2, '화상', { burn: 0.5 });
+  a('oil', '기름칠', -1, 1, 2, '화상', { burnDmg: 0.5 });
+  a('brand', '달군 날', -1, 2, 2, '화상', { vsBurn: 0.18 });
+  a('wild', '번지는 불', -1, 2, 1, '화상', { burnSpread: 1, burnDmg: 0.15 });
+  // 감전
+  a('static', '정전기', -1, 1, 2, '감전', { shock: 0.15 });
+  a('surge', '과충전', -1, 2, 2, '감전', { chain: 0.6, chainN: 1 });
+  a('cond', '전도체', -1, 2, 1, '감전 기절', { vsShock: 0.6, shock: 0.08 });
+  // 둔화
+  a('frost', '서리', -1, 1, 2, '둔화', { chill: 0.22 });
+  a('rime', '살얼음', -1, 2, 2, '둔화', { vsChill: 0.16 });
+  a('ice', '빙결', -1, 3, 1, '둔화 치명', { freeze: 1.2, crit: 0.05 });
+  // 생존
+  a('leech', '흡혈', -1, 2, 2, '생존', { leech: 0.025 });
+  a('reap', '처치 회복', -1, 1, 2, '생존', { killHeal: 2 });
+  a('ward', '보호막', -1, 1, 2, '생존', { shield: 0.2 });
+  a('thorn', '가시 갑옷', -1, 1, 2, '생존', { thorn: 1.2, def: 0.04 });
+  a('rise', '재기', -1, 3, 1, '생존', { selfRev: 1 });
+  a('medic', '응급 처치', -1, 1, 1, '협동', { revive: 1.0, reviveHeal: 0.15 });
+  a('loot', '전리품', -1, 1, 2, '생존', { loot: 0.6 });
+  // 조건
+  a('corner', '궁지', -1, 2, 2, '피해', { low: 0.3 });
+  a('ease', '여유', -1, 1, 2, '피해', { full: 0.15 });
+  a('flow', '연타 가속', -1, 2, 2, '피해 연타', { combo: 0.04 });
+  a('exec', '약자 처형', -1, 2, 2, '피해', { exec: 0.35 });
+  a('hunt', '거물 사냥', -1, 1, 2, '피해', { elite: 0.2 });
+  a('break', '무력화', -1, 2, 2, '기절', { poise: 0.3, vsStag: 0.2 });
+  a('after', '잔상', -1, 2, 2, '회피', { perfect: 0.25 });
+  a('riposte', '회피 반격', -1, 2, 1, '회피 치명', { dodgeCrit: 1 });
+  a('blast', '폭발 처치', -1, 2, 2, '범위', { killBoom: 1.2 });
+  a('spree', '연쇄 살육', -1, 1, 2, '속도', { killHaste: 0.2 });
+  a('wide', '넓은 손', -1, 1, 2, '범위', { reach: 0.12, aoe: 0.12 });
+  a('zerk', '광전사', -1, 3, 1, '피해', { dmg: 0.35, def: -0.2 });
+  a('warp', '시간 왜곡', -1, 3, 1, '기술', { freeCast: 0.2 });
+  // 거검사
+  a('g1', '솟구치는 칼', 0, 1, 2, '띄움', { sk0d: 0.4, launch: 0.15 });
+  a('g2', '회오리', 0, 2, 1, '범위', { spin2: 1, sk1d: 0.15 });
+  a('g3', '지각 파쇄', 0, 2, 1, '화상 범위', { crater: 1, sk2d: 0.2 });
+  a('g4', '철벽', 0, 1, 2, '생존', { guardSh: 0.08 });
+  a('g5', '반격의 칼', 0, 2, 2, '회피', { guardCtr: 0.8 });
+  a('g6', '무거운 일격', 0, 1, 2, '피해', { lastD: 0.45 });
+  a('g7', '불굴', 0, 1, 2, '생존', { armDef: 0.25 });
+  a('g8', '대검 돌풍', 0, 1, 2, '범위', { reach: 0.18 });
+  a('g9', '처단', 0, 2, 2, '띄움 넘어뜨림', { sk2d: 0.3, downDmg: 0.3, airDmg: 0.15 });
+  a('g10', '거신의 힘', 0, 3, 1, '기절', { poise: 0.8, vsStag: 0.3 });
+  // 권갑사
+  a('f1', '연타 달인', 1, 1, 2, '속도', { baspd: 0.18 });
+  a('f2', '승천 추격', 1, 2, 1, '띄움', { upfu: 1, sk0d: 0.2 });
+  a('f3', '대지 메치기', 1, 1, 2, '범위', { sk1d: 0.35, aoe: 0.15 });
+  a('f4', '잡기 연계', 1, 2, 2, '피해', { grabBuff: 0.22 });
+  a('f5', '끊기지 않는 돌진', 1, 2, 1, '기술', { dashRefund: 0.8, sk2d: 0.15 });
+  a('f6', '받아치기', 1, 1, 2, '회피', { stepBuff: 0.5 });
+  a('f7', '급소 정권', 1, 2, 1, '치명', { lastCrit: 1, lastD: 0.2 });
+  a('f8', '강철 주먹', 1, 1, 2, '기절', { poise: 0.4 });
+  a('f9', '공중 난무', 1, 2, 2, '띄움', { airDmg: 0.25, juggle: 0.3 });
+  a('f10', '무쌍', 1, 3, 1, '연타', { rage: 0.25 });
+  // 쌍총수
+  a('t1', '관통탄', 2, 1, 2, '범위', { pierce: 1 });
+  a('t2', '속사 숙련', 2, 1, 2, '속도', { baspd: 0.18 });
+  a('t3', '탄띠', 2, 2, 1, '기술', { sk0n: 1, sk0d: 0.1 });
+  a('t4', '소이탄', 2, 2, 1, '화상', { incend: 1, sk2d: 0.15 });
+  a('t5', '견제 사격', 2, 1, 2, '둔화', { sk1d: 0.5, slowShot: 1 });
+  a('t6', '거리 유지', 2, 1, 2, '피해', { far: 0.22 });
+  a('t7', '근접 사격', 2, 1, 2, '피해', { near: 0.3 });
+  a('t8', '대공 사격', 2, 2, 2, '띄움', { airDmg: 0.3, juggle: 0.3 });
+  a('t9', '구르며 장전', 2, 1, 2, '회피 기술', { rollCd: 0.8 });
+  a('t10', '도탄', 2, 3, 1, '범위', { rico: 0.5 });
+  // 주술사
+  a('h1', '깊은 속박', 3, 1, 2, '둔화', { zoneDur: 2, sk0d: 0.25 });
+  a('h2', '저주 표식', 3, 2, 1, '표식', { markOn: 1 });
+  a('h3', '터지는 저주', 3, 1, 2, '띄움', { sk1d: 0.35, launch: 0.1 });
+  a('h4', '맑은 원', 3, 1, 2, '협동 생존', { zoneHeal: 0.5, sk2c: 0.15 });
+  a('h5', '따르는 혼불', 3, 2, 1, '피해', { homing: 1, basic: 0.15 });
+  a('h6', '점멸 잔흔', 3, 1, 1, '회피 범위', { blinkBoom: 1, ecd: 0.15 });
+  a('h7', '거두기', 3, 1, 2, '생존', { zoneKill: 4 });
+  a('h8', '이중 시전', 3, 2, 1, '기술', { curse2: 1 });
+  a('h9', '원소 숙련', 3, 2, 2, '출혈 화상 감전 둔화', { vsStatus: 0.2 });
+  a('h10', '대문양', 3, 3, 1, '범위 협동', { zoneBig: 0.6, zoneAlly: 0.2 });
+  // 창술사
+  a('s1', '깊이 꿰기', 4, 1, 2, '출혈', { bleedAdd: 1, sk0d: 0.25 });
+  a('s2', '긴 창대', 4, 1, 2, '범위', { reach: 0.18 });
+  a('s3', '되감아 치기', 4, 2, 1, '띄움', { sweep2: 1 });
+  a('s4', '빠른 회수', 4, 1, 2, '기술', { sk2c: 0.3, sk2d: 0.15 });
+  a('s5', '못 박기', 4, 2, 1, '기절', { pin: 1.0, poise: 0.3 });
+  a('s6', '찌르기 연타', 4, 2, 1, '연타', { th3x: 1, lastD: 0.2 });
+  a('s7', '꿰인 적', 4, 1, 2, '출혈', { vsBleed: 0.2 });
+  a('s8', '장대 넘기', 4, 2, 2, '회피', { hopBuff: 0.7 });
+  a('s9', '대공 창', 4, 2, 2, '띄움', { airDmg: 0.3, juggle: 0.3 });
+  a('s10', '꼬치', 4, 3, 1, '피해 범위', { multi: 0.3 });
+  const AI = {}; AUG.forEach((x) => { AI[x.id] = x.i; });
+  const SKNM = (cls, k) => (cls >= 0 ? CLS[cls].sk[+k[2]].nm : '기술 ' + (+k[2] + 1));
+  function fxLine(k, v, cls) {
+    const f = FXK[k]; if (!f) return k;
+    let nm = f[0];
+    if (/^sk\dd$/.test(k)) nm = SKNM(cls, k) + ' 피해'; else if (/^sk\dc$/.test(k)) nm = SKNM(cls, k) + ' 재사용';
+    const s = f[1](v);
+    return s ? nm + ': ' + s : nm;
+  }
+  const augDesc = (x, n) => Object.keys(x.fx).map((k) => fxLine(k, x.fx[k] * (n || 1), x.cls)).join(' · ');
+  const TIERNM = ['', '일반', '희귀', '전설'], TIERC = ['', '#b9b2a2', '#62b8e8', '#e8b040'];
+
+  /* ======================= 적 =======================
+     mv: 동작 목록(rng [가까이, 멀리] 안이고 깊이가 zr 안이면 시작) · cd 재사용 · tele 바닥 예고 · w 고를 무게
+     guard 앞을 막음 · fly 떠 있음 · stat 붙박이 · aura 독려 · split 죽으면 갈라짐 · boomOnDeath · pmax 버티기(기절 수치) · heavy 못 띄움 */
+  const EN = [];
+  const em = (an, dur, rng, zr, cd, acts, o) => M(an, dur, acts, Object.assign({ rng, zr, cd, tele: 1 }, o || {}));
+  const e = (id, nm, zone, o) => { EN.push(Object.assign({ id, nm, zone, i: EN.length, w: 15, h: 60, sh: 'hum', cost: 2, pmax: 0, keep: 0 }, o)); };
+  // 0 녹슨 항만 — 약탈단
+  e('cut', '칼잡이', 0, { hp: 46, spd: 84, atk: 8, col: '#8a5a4a', wpn: 'blade', head: 'band', d: '다가와 벰. 가장 흔한 적.',
+    mv: [em('e_sw', 0.95, [0, 62], 22, 1.6, [H(0.5, 0, 66, 24, 1, { kb: 120 })])] });
+  e('hooker', '갈고리꾼', 0, { hp: 40, spd: 76, atk: 7, col: '#5a6a7a', wpn: 'hook', head: 'hood', cost: 3, keep: 210, d: '멀리서 갈고리를 던져 끌어당김. 줄이 보이면 깊이를 비켜섬.',
+    mv: [em('e_th', 1.25, [120, 260], 14, 4.5, [A('proj', 0.7, { p: 'hook', d: 0.6 })], { line: 260 }), em('e_sw', 0.8, [0, 54], 20, 1.8, [H(0.42, 0, 58, 22, 0.8, { kb: 100 })])] });
+  e('shield', '방패병', 0, { hp: 70, spd: 60, atk: 9, col: '#6a6258', wpn: 'club', off: 'shield', head: 'helm', cost: 3, guard: 4, d: '앞에서 치는 공격을 막음. 뒤로 돌거나, 띄우거나, 잡거나, 센 공격으로 방패를 깨뜨림.',
+    mv: [em('e_bash', 1.05, [0, 58], 24, 2.4, [H(0.6, 0, 70, 26, 1.2, { kb: 260, down: 1 })])] });
+  e('xbow', '석궁수', 0, { hp: 34, spd: 70, atk: 8, col: '#7a6a4a', wpn: 'bow', head: 'hat', cost: 3, keep: 250, d: '멀리서 쏨. 먼저 처리하거나 깊이를 비켜섬.',
+    mv: [em('e_sh', 1.3, [140, 330], 12, 2.8, [A('proj', 0.8, { p: 'bolt', d: 1 })], { line: 330 })] });
+  e('keg', '화약통꾼', 0, { hp: 30, spd: 118, atk: 9, col: '#a0503a', wpn: 'bomb', head: 'band', cost: 2, boomOnDeath: 1, d: '달려와 터짐. 먼저 쓰러뜨리면 그 자리에서 터져 둘레의 적이 다침.',
+    mv: [em('e_fuse', 1.05, [0, 56], 40, 9, [A('zone', 0.02, { z: 'boom', self: 1 }), A('die', 0.98, {})], { tele: 0 })] });
+  e('whip', '채찍 감독', 0, { hp: 60, spd: 66, atk: 8, col: '#5a3a5a', wpn: 'whip', head: 'hat', cost: 4, keep: 120, aura: 1, d: '둘레의 적을 독려함(독려: 이동 · 공격 속도 +25%). 채찍이 김.',
+    mv: [em('e_whip', 1.05, [50, 128], 18, 2.6, [H(0.58, 20, 134, 20, 1.1, { kb: 80 })])] });
+  // 1 지하 수로 — 변이체
+  e('rat', '수로 쥐', 1, { hp: 18, spd: 150, atk: 5, col: '#6a5a50', sh: 'rat', w: 12, h: 22, cost: 1, d: '작고 빠름. 떼로 몰려와 묾.',
+    mv: [em('lunge', 0.6, [0, 44], 18, 1.2, [H(0.3, 0, 46, 18, 1, { kb: 40 })], { tele: 0, mvv: [0.22, 0.34, 160] })] });
+  e('slime', '점액덩이', 1, { hp: 52, spd: 58, atk: 8, col: '#5aa870', sh: 'slime', w: 20, h: 34, cost: 3, split: ['slimelet', 2], d: '뛰어올라 덮침. 죽으면 둘로 갈라짐.',
+    mv: [em('hop', 1.2, [40, 150], 30, 2.6, [A('leap', 0.5, { tgt: 1, vy: 360 }), A('zone', 0.5, { z: 'thorn', tgt: 1, warn: 0.62, rx: 44, rz: 28, d: 1.3, down: 1 })], { tele: 0 })] });
+  e('slimelet', '작은 점액', 1, { hp: 16, spd: 96, atk: 5, col: '#7ac088', sh: 'slime', w: 12, h: 20, cost: 1, minion: 1, d: '갈라져 나온 조각.',
+    mv: [em('lunge', 0.6, [0, 40], 18, 1.4, [H(0.32, 0, 44, 18, 1, { kb: 40 })], { tele: 0, mvv: [0.22, 0.34, 140] })] });
+  e('wasp', '독침 벌레', 1, { hp: 30, spd: 90, atk: 7, col: '#b0a040', sh: 'bug', w: 13, h: 26, cost: 3, keep: 190, fly: 46, d: '떠다니며 독을 뱉음. 독 웅덩이는 4초 남음. 떠 있어 「공중의 적」으로 침.',
+    mv: [em('spit', 1.2, [110, 260], 60, 3.4, [A('proj', 0.7, { p: 'spit', d: 0.5, tgt: 1 })], { tele: 0 })] });
+  e('bloat', '팽창체', 1, { hp: 36, spd: 96, atk: 9, col: '#a07898', sh: 'bloat', w: 18, h: 40, cost: 2, boomOnDeath: 1, d: '부풀어 터짐. 먼저 쓰러뜨리면 그 자리에서 터져 둘레의 적이 다침.',
+    mv: [em('swell', 1.05, [0, 56], 40, 9, [A('zone', 0.02, { z: 'boom', self: 1 }), A('die', 0.98, {})], { tele: 0 })] });
+  e('crab', '껍질 게', 1, { hp: 80, spd: 64, atk: 9, col: '#b06048', sh: 'crab', w: 22, h: 32, cost: 4, guard: 5, heavy: 1, d: '앞 껍질이 공격을 막음. 옆걸음 돌진은 줄을 비켜 피함.',
+    mv: [em('charge', 1.4, [90, 300], 16, 4, [A('dash', 0.7, { v: 470, t: 0.5 }), H(0.7, -10, 40, 24, 1.6, { kb: 260, down: 1, to: 1.2 })], { line: 280, arm: [0.6, 1.3] }), em('claw', 0.9, [0, 56], 22, 2, [H(0.5, 0, 62, 24, 1.1, { kb: 140 })])] });
+  e('vine', '포식 덩굴', 1, { hp: 60, spd: 0, atk: 8, col: '#4a8a4a', sh: 'vine', w: 16, h: 56, cost: 3, stat: 1, heavy: 1, pmax: 4, d: '자리를 지키며 긴 줄기로 후려침. 맞으면 잠깐 묶임. 멀리 돌아가거나 줄을 비켜섬.',
+    mv: [em('lash', 1.2, [0, 176], 18, 2.4, [H(0.7, 10, 182, 20, 1.2, { stun: 0.8, kb: 0 })])] });
+  // 2 폐허 성채 — 망령 병단
+  e('pike', '해골 창병', 2, { hp: 50, spd: 78, atk: 9, col: '#c8c0a8', wpn: 'pike', head: 'skull', cost: 2, d: '창이 길어 먼저 찌름. 깊이를 비켜 다가감.',
+    mv: [em('e_th', 1.0, [40, 118], 14, 1.9, [H(0.55, 14, 126, 16, 1.1, { kb: 130 })])] });
+  e('tower', '대방패 근위', 2, { hp: 110, spd: 52, atk: 10, col: '#8088a0', wpn: 'club', off: 'shield', head: 'helm', cost: 4, guard: 7, heavy: 1, sc: 1.15, d: '큰 방패. 뒤를 잡거나 센 공격으로 깨뜨림. 내려치기는 넘어뜨림.',
+    mv: [em('e_slam', 1.3, [0, 74], 28, 2.8, [H(0.78, 0, 86, 32, 1.6, { kb: 220, down: 1, shake: 1 })])] });
+  e('hexbow', '저주 궁수', 2, { hp: 38, spd: 72, atk: 8, col: '#7060a0', wpn: 'bow', head: 'skull', cost: 3, keep: 250, d: '세 갈래로 쏨. 가운데 줄만 피해서는 맞음.',
+    mv: [em('e_sh', 1.35, [130, 320], 30, 3.2, [A('proj', 0.85, { p: 'arrow', d: 0.9, n: 3, fan: 30 })], { line: 320 })] });
+  e('lancer', '돌격 기사', 2, { hp: 84, spd: 70, atk: 10, col: '#a09080', wpn: 'pike', head: 'helm', cost: 4, pmax: 4, d: '줄을 맞춘 뒤 길게 돌진. 예고 줄에서 벗어남.',
+    mv: [em('e_charge', 1.5, [110, 330], 16, 4.2, [A('dash', 0.75, { v: 500, t: 0.55 }), H(0.75, 0, 54, 24, 1.8, { kb: 280, down: 1, to: 1.3 })], { line: 300, arm: [0.5, 1.4] }), em('e_th', 0.95, [30, 100], 16, 2.2, [H(0.52, 10, 110, 18, 1.0, { kb: 120 })])] });
+  e('necro', '망령 술사', 2, { hp: 44, spd: 60, atk: 7, col: '#504070', wpn: 'staff', head: 'hood', cost: 4, keep: 270, d: '해골 잔병을 계속 불러냄. 먼저 쓰러뜨림.',
+    mv: [em('e_cast', 1.4, [0, 500], 200, 6.5, [A('summon', 0.9, { e: 'bones', n: 2, cap: 4 })], { tele: 0, w: 2 }), em('e_cast', 1.1, [100, 320], 14, 3, [A('proj', 0.65, { p: 'soul', d: 0.9 })], { line: 300 })] });
+  e('bones', '해골 잔병', 2, { hp: 22, spd: 88, atk: 6, col: '#b8b0a0', wpn: 'blade', head: 'skull', cost: 1, minion: 1, sc: 0.9, d: '불려 나온 잔병. 약함.',
+    mv: [em('e_sw', 0.85, [0, 56], 20, 1.5, [H(0.45, 0, 60, 22, 1, { kb: 90 })])] });
+  e('heads', '철갑 집행자', 2, { hp: 170, spd: 50, atk: 11, col: '#4a4a58', wpn: 'axe', head: 'helm', cost: 6, pmax: 8, heavy: 1, sc: 1.3, d: '맞아도 밀리지 않음. 기절 수치를 다 깎으면 무릎을 꿇음. 큰 도끼는 예고가 김.',
+    mv: [em('e_slam', 1.5, [0, 96], 34, 3, [H(0.95, -10, 116, 40, 2.3, { kb: 260, down: 1, shake: 2 })]), em('e_sw', 1.2, [0, 90], 30, 2.6, [H(0.7, -30, 104, 34, 1.5, { kb: 200 })])] });
+  // 3 재의 숲 — 야수 · 정령
+  e('wolf', '잿빛 늑대', 3, { hp: 42, spd: 128, atk: 8, col: '#7a7a84', sh: 'wolf', w: 18, h: 30, cost: 2, d: '멀리서 뛰어 덮침. 바닥 예고를 보고 비켜섬.',
+    mv: [em('pounce', 1.0, [70, 190], 40, 2.6, [A('leap', 0.45, { tgt: 1, vy: 300 }), A('zone', 0.45, { z: 'thorn', tgt: 1, warn: 0.5, rx: 40, rz: 26, d: 1.2 })], { tele: 0 }), em('lunge', 0.6, [0, 46], 18, 1.4, [H(0.32, 0, 50, 20, 0.9, { kb: 70 })], { tele: 0, mvv: [0.22, 0.34, 150] })] });
+  e('boar', '뿔멧돼지', 3, { hp: 90, spd: 74, atk: 10, col: '#6a4a3a', sh: 'boar', w: 22, h: 34, cost: 4, pmax: 4, heavy: 1, d: '줄을 맞추고 들이받음. 예고 줄을 비켜섬.',
+    mv: [em('charge', 1.45, [100, 330], 16, 3.6, [A('dash', 0.72, { v: 520, t: 0.55 }), H(0.72, -10, 46, 24, 1.8, { kb: 300, down: 1, to: 1.27 })], { line: 310, arm: [0.5, 1.4] })] });
+  e('thorner', '가시 사수', 3, { hp: 36, spd: 64, atk: 8, col: '#5a8a4a', sh: 'plant', w: 15, h: 44, cost: 3, keep: 240, d: '가시를 두 번 이어 쏨.',
+    mv: [em('spit', 1.5, [130, 320], 12, 3, [A('proj', 0.7, { p: 'spike', d: 0.9 }), A('proj', 1.0, { p: 'spike', d: 0.9 })], { line: 320 })] });
+  e('wisp', '불씨 정령', 3, { hp: 26, spd: 104, atk: 9, col: '#ff9a50', sh: 'wisp', w: 13, h: 26, cost: 2, fly: 34, boomOnDeath: 1, d: '떠서 다가와 터지고 불을 남김. 먼저 쓰러뜨리면 둘레의 적이 다침.',
+    mv: [em('swell', 1.05, [0, 56], 40, 9, [A('zone', 0.02, { z: 'boom', self: 1 }), A('zone', 0.97, { z: 'ember', self: 1 }), A('die', 0.98, {})], { tele: 0 })] });
+  e('moss', '이끼 거인', 3, { hp: 160, spd: 46, atk: 11, col: '#5a6a4a', sh: 'golem', w: 24, h: 76, cost: 6, pmax: 8, heavy: 1, d: '내려치면 땅 물결이 한 줄로 나아감. 물결은 깊이를 비켜 피함.',
+    mv: [em('e_slam', 1.5, [0, 220], 26, 3.2, [H(0.95, -10, 100, 36, 2.0, { kb: 240, down: 1, shake: 2 }), A('proj', 0.95, { p: 'wave', d: 1.2 })], { line: 300 })] });
+  e('crow', '무당 까마귀', 3, { hp: 34, spd: 86, atk: 8, col: '#3a3a4a', sh: 'crow', w: 14, h: 26, cost: 4, keep: 230, fly: 58, d: '떠다니며 발밑에 저주를 내림. 원이 차기 전에 벗어남.',
+    mv: [em('caw', 1.3, [0, 420], 200, 3.6, [A('zone', 0.5, { z: 'hexz', tgt: 1 })], { tele: 0 })] });
+
+  /* 우두머리(구역마다 둘 중 하나). p2: 체력 절반 아래에서만 */
+  const b = (id, nm, zone, o) => e(id, nm, zone, Object.assign({ boss: 1, heavy: 1, cost: 99, pmax: 30, sc: 1.7, w: 28, h: 92 }, o));
+  b('anchor', '쇠닻 두목', 0, { hp: 950, spd: 70, atk: 12, col: '#5a4a48', wpn: 'anchor', head: 'hat', d: '닻을 크게 휘두르고, 던져서 끌어당김. 포격 신호가 오면 붉은 원에서 벗어남.',
+    mv: [em('e_slam', 1.5, [0, 140], 40, 2.2, [H(0.98, -40, 158, 42, 2.2, { kb: 260, down: 1, shake: 2 })]),
+      em('e_th', 1.3, [140, 380], 18, 6, [A('proj', 0.75, { p: 'anchor', d: 1.0 })], { line: 370 }),
+      em('e_cast', 1.5, [0, 600], 200, 9, [A('zone', 0.5, { z: 'shellz', all: 1 }), A('zone', 0.8, { z: 'shellz', all: 1, jit: 80 }), A('zone', 1.1, { z: 'shellz', all: 1, jit: 60 })], { tele: 0, nm: '포격 신호' }),
+      em('e_cast', 1.2, [0, 600], 200, 14, [A('summon', 0.7, { e: 'cut', n: 2, cap: 4 }), A('summon', 0.7, { e: 'keg', n: 1, cap: 5 })], { tele: 0, p2: 1, nm: '부하 호출' })] });
+  b('cart', '화포 전차', 0, { hp: 1000, spd: 56, atk: 12, col: '#6a5a4a', sh: 'cart', w: 44, h: 70, sc: 1, d: '줄을 맞춰 들이받고, 포탄을 쏘아 올리고, 앞으로 불을 뿜음. 뒤가 비어 있음.',
+    mv: [em('charge', 1.6, [120, 500], 22, 5, [A('dash', 0.85, { v: 540, t: 0.6 }), H(0.85, -30, 70, 32, 2.2, { kb: 320, down: 1, to: 1.45, shake: 2 })], { line: 380 }),
+      em('fire', 1.9, [0, 210], 34, 6, [0, 1, 2, 3, 4].map((i) => H(0.75 + i * 0.2, 30, 220, 38, 0.7, { kb: 30, burn: 1, hs: 0 })), { nm: '화염 분사' }),
+      em('mortar', 1.6, [0, 600], 200, 7, [0, 1, 2, 3, 4].map((i) => A('proj', 0.4 + i * 0.22, { p: 'shell', d: 1.8, tgt: 1, any: 1, jit: 50 })), { tele: 0, nm: '박격 포화' }),
+      em('charge', 1.3, [100, 500], 24, 8, [A('dash', 0.6, { v: 580, t: 0.55 }), H(0.6, -30, 70, 32, 2.0, { kb: 320, down: 1, to: 1.15 })], { line: 380, p2: 1 })] });
+  b('maw', '수로의 포식체', 1, { hp: 1050, spd: 60, atk: 12, col: '#4a9868', sh: 'slime', w: 46, h: 78, sc: 1, d: '뛰어올라 덮치고 산을 뱉음. 절반 아래에서는 덮칠 때마다 조각이 떨어져 나옴.',
+    mv: [em('hop', 1.6, [0, 420], 200, 3.4, [A('leap', 0.6, { tgt: 1, vy: 620 }), A('zone', 0.6, { z: 'slamz', tgt: 1, warn: 0.9, rx: 80, rz: 46 }), A('summon', 1.45, { e: 'slimelet', n: 2, cap: 5, p2: 1 })], { tele: 0, nm: '덮치기' }),
+      em('spit', 1.5, [0, 500], 200, 6, [A('proj', 0.6, { p: 'spit', d: 0.6, tgt: 1, any: 1, zone: 'acid' }), A('proj', 0.8, { p: 'spit', d: 0.6, tgt: 1, any: 1, zone: 'acid' }), A('proj', 1.0, { p: 'spit', d: 0.6, tgt: 1, any: 1, zone: 'acid' })], { tele: 0, nm: '산 뱉기' }),
+      em('charge', 1.6, [100, 500], 30, 6, [A('dash', 0.8, { v: 460, t: 0.65 }), H(0.8, -40, 60, 40, 2.0, { kb: 300, down: 1, to: 1.45 })], { line: 340, nm: '구르기' })] });
+  b('queen', '쌍집게 여왕게', 1, { hp: 980, spd: 68, atk: 12, col: '#c05840', sh: 'crab', w: 46, h: 62, sc: 1, guard: 0, d: '집게를 두 번 휘두르고, 옆걸음으로 들이받고, 거품을 흩뿌림. 거품은 느리지만 오래 감.',
+    mv: [em('claw', 1.5, [0, 120], 36, 2.4, [H(0.7, -10, 130, 40, 1.6, { kb: 120 }), H(1.1, -10, 140, 42, 2.0, { kb: 260, down: 1, shake: 1 })]),
+      em('charge', 1.5, [120, 500], 22, 5, [A('dash', 0.75, { v: 520, t: 0.6 }), H(0.75, -30, 60, 34, 2.0, { kb: 300, down: 1, to: 1.35 })], { line: 360 }),
+      em('spit', 1.4, [0, 500], 200, 6, [A('proj', 0.7, { p: 'bubble', d: 1.0, n: 5, fan: 70 })], { tele: 0, nm: '거품' }),
+      em('hop', 1.8, [0, 500], 200, 9, [A('leap', 0.5, { tgt: 1, vy: 640 }), A('zone', 0.5, { z: 'slamz', tgt: 1, warn: 1.0, rx: 80, rz: 46 })], { tele: 0, p2: 1, nm: '내려앉기' })] });
+  b('knight', '몰락한 기사장', 2, { hp: 1000, spd: 76, atk: 12, col: '#70687a', wpn: 'gsword', off: 'shield', head: 'helm', d: '세 번 이어 베며 다가오고, 방패로 들이받고, 검기를 세 갈래로 날림.',
+    mv: [em('e_combo', 1.9, [0, 120], 36, 2.6, [H(0.6, -10, 120, 38, 1.3, { kb: 100 }), H(1.0, -10, 126, 38, 1.3, { kb: 100 }), H(1.5, -10, 136, 42, 2.2, { kb: 280, down: 1, shake: 2 })], { mvv: [0.6, 1.5, 70] }),
+      em('e_charge', 1.4, [120, 460], 22, 5, [A('dash', 0.7, { v: 540, t: 0.5 }), H(0.7, 0, 60, 30, 2.0, { kb: 320, down: 1, to: 1.2 })], { line: 330 }),
+      em('e_sw', 1.3, [100, 500], 60, 5.5, [A('proj', 0.75, { p: 'wave', d: 1.4, n: 3, fan: 44 })], { line: 380, nm: '검기' }),
+      em('e_cast', 1.2, [0, 600], 200, 13, [A('summon', 0.7, { e: 'bones', n: 3, cap: 5 })], { tele: 0, p2: 1, nm: '잔병 소집' })] });
+  b('priest', '망령 사제', 2, { hp: 900, spd: 64, atk: 12, col: '#3a3058', wpn: 'staff', head: 'hood', keep: 240, d: '발밑에 저주를 두 번 내리고, 한 줄로 빛을 쏨. 자주 자리를 옮김.',
+    mv: [em('e_cast', 1.7, [0, 600], 200, 4, [A('zone', 0.4, { z: 'hexz', all: 1 }), A('zone', 0.9, { z: 'hexz', all: 1 }), A('zone', 1.2, { z: 'hexz', all: 1, jit: 70 })], { tele: 0, nm: '저주' }),
+      em('e_cast', 1.7, [60, 520], 16, 6, [H(1.05, 20, 540, 22, 2.2, { kb: 160, down: 1, shake: 1 })], { line: 540, nm: '망령의 빛' }),
+      em('e_cast', 0.8, [0, 150], 200, 5, [A('blink', 0.4, { away: 1, dist: 300 })], { tele: 0, nm: '자리 옮김' }),
+      em('e_cast', 1.3, [0, 600], 200, 12, [A('summon', 0.7, { e: 'bones', n: 2, cap: 4 })], { tele: 0, nm: '잔병 소집' }),
+      em('e_cast', 1.5, [0, 600], 200, 8, [A('proj', 0.8, { p: 'soul', d: 1.0, n: 7, fan: 130 }), A('proj', 1.1, { p: 'soul', d: 1.0, n: 6, fan: 110 })], { tele: 0, p2: 1, nm: '혼령 흩뿌리기' })] });
+  b('fang', '잿빛 송곳니', 3, { hp: 950, spd: 110, atk: 12, col: '#8a8a98', sh: 'wolf', w: 40, h: 60, sc: 1, d: '멀리서 덮치고, 세 번 이어 들이받고, 울부짖어 늑대를 부름.',
+    mv: [em('pounce', 1.3, [60, 420], 200, 3, [A('leap', 0.55, { tgt: 1, vy: 470 }), A('zone', 0.55, { z: 'slamz', tgt: 1, warn: 0.62, rx: 60, rz: 36 })], { tele: 0, nm: '덮치기' }),
+      em('charge', 2.6, [80, 500], 26, 7, [A('dash', 0.6, { v: 600, t: 0.4 }), H(0.6, -30, 60, 32, 1.6, { kb: 260, down: 1, to: 1.0 }), A('turn', 1.15, {}), A('dash', 1.4, { v: 600, t: 0.4 }), H(1.4, -30, 60, 32, 1.6, { kb: 260, down: 1, to: 1.8 }), A('turn', 1.9, {}), A('dash', 2.1, { v: 600, t: 0.4 }), H(2.1, -30, 60, 32, 1.8, { kb: 260, down: 1, to: 2.5 })], { line: 300, nm: '세 번 들이받기' }),
+      em('claw', 1.1, [0, 100], 36, 2.2, [H(0.6, -20, 116, 40, 1.7, { kb: 200, bleedP: 1 })]),
+      em('howl', 1.4, [0, 600], 200, 14, [A('summon', 0.8, { e: 'wolf', n: 2, cap: 4 })], { tele: 0, nm: '울부짖기' })] });
+  b('elder', '고목 거신', 3, { hp: 1100, spd: 44, atk: 12, col: '#5a4a34', sh: 'tree', w: 44, h: 110, sc: 1, d: '뿌리가 한 줄로 차례차례 솟고, 씨앗 불씨를 던짐. 느리지만 한 방이 큼.',
+    mv: [em('e_slam', 1.7, [0, 150], 44, 3, [H(1.12, -30, 170, 46, 2.4, { kb: 280, down: 1, shake: 3 })]),
+      em('root', 1.8, [0, 600], 200, 4.5, [0, 1, 2, 3, 4, 5].map((i) => A('zone', 0.4 + i * 0.16, { z: 'root', toward: 1, dx: 90 + i * 76 })), { tele: 0, nm: '뿌리 솟구침' }),
+      em('mortar', 1.6, [0, 600], 200, 7, [0, 1, 2, 3].map((i) => A('proj', 0.5 + i * 0.25, { p: 'seed', d: 1.4, tgt: 1, any: 1, jit: 40 })), { tele: 0, nm: '불씨 씨앗' }),
+      em('root', 2.0, [0, 600], 200, 10, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => A('zone', 0.4 + i * 0.13, { z: 'thorn', all: 1, jit: 110, one: 1 })), { tele: 0, p2: 1, nm: '가시 비' })] });
+  const EI = {}; EN.forEach((x) => { EI[x.id] = x.i; });
+
+  /* ======================= 구역 ======================= */
+  const ZONES = [
+    { id: 'harbor', nm: '녹슨 항만', sub: '약탈단이 차지한 부두', pool: ['cut', 'cut', 'hooker', 'shield', 'xbow', 'keg', 'whip'], boss: ['anchor', 'cart'], sky: ['#2a3550', '#8a6a5a'], floor: ['#5a4e48', '#3e3632'], far: '#3a3f55', acc: '#d08a4a' },
+    { id: 'sewer', nm: '지하 수로', sub: '변이체가 들끓는 물길', pool: ['rat', 'rat', 'slime', 'wasp', 'bloat', 'crab', 'vine'], boss: ['maw', 'queen'], sky: ['#16241f', '#2f4a3c'], floor: ['#3f4a44', '#27302c'], far: '#1f342c', acc: '#7fd0a0' },
+    { id: 'keep', nm: '폐허 성채', sub: '망령 병단이 지키는 성벽 길', pool: ['pike', 'pike', 'tower', 'hexbow', 'lancer', 'necro', 'heads'], boss: ['knight', 'priest'], sky: ['#251f38', '#5a4a6a'], floor: ['#55505e', '#37333f'], far: '#352f4a', acc: '#b090e0' },
+    { id: 'ashwood', nm: '재의 숲', sub: '타다 남은 숲의 야수와 정령', pool: ['wolf', 'wolf', 'boar', 'thorner', 'wisp', 'moss', 'crow'], boss: ['fang', 'elder'], sky: ['#3a2a24', '#a06a40'], floor: ['#5a4a3c', '#3a2f26'], far: '#4a342a', acc: '#ff9a50' },
+  ];
+  const LENS = { s: { nm: '짧게(2구역)', zones: 2, segs: 3, t: '6–8분' }, m: { nm: '보통(3구역)', zones: 3, segs: 3, t: '10–14분' }, l: { nm: '길게(3구역 · 구간 4)', zones: 3, segs: 4, t: '13–18분' } };
+
+  /* 그림 자리: 파일이 생기면 여기에 적음(없는 자리는 코드 그림). 목록 · 크기는 assets/beltbrawl/PROMPTS.md
+     예: { cls0: 'img/cls0.webp', bg0: 'img/bg0.webp', boss_anchor: 'img/boss_anchor.webp' } */
+  const ART = {
+    cls0: 'img/cls0.webp', cls1: 'img/cls1.webp', cls2: 'img/cls2.webp', cls3: 'img/cls3.webp', cls4: 'img/cls4.webp',
+    bg0: 'img/bg0.webp', bg1: 'img/bg1.webp', bg2: 'img/bg2.webp', bg3: 'img/bg3.webp',
+    boss_anchor: 'img/boss_anchor.webp', boss_cart: 'img/boss_cart.webp', boss_maw: 'img/boss_maw.webp', boss_queen: 'img/boss_queen.webp',
+    boss_knight: 'img/boss_knight.webp', boss_priest: 'img/boss_priest.webp', boss_fang: 'img/boss_fang.webp', boss_elder: 'img/boss_elder.webp',
+    /* 전투 그림(직업 p<번호>_<자세>: 서기 · 기본 공격 · 기술 / 적 · 우두머리 e_<id>: 한 장). 움직임은 view.js가 코드로 */
+    p0_atk: 'img/p0_atk.webp', p0_idle: 'img/p0_idle.webp', p0_skill: 'img/p0_skill.webp', p1_atk: 'img/p1_atk.webp',
+    p1_idle: 'img/p1_idle.webp', p1_skill: 'img/p1_skill.webp', p2_atk: 'img/p2_atk.webp', p2_idle: 'img/p2_idle.webp',
+    p2_skill: 'img/p2_skill.webp', p3_atk: 'img/p3_atk.webp', p3_idle: 'img/p3_idle.webp', p3_skill: 'img/p3_skill.webp',
+    p4_atk: 'img/p4_atk.webp', p4_idle: 'img/p4_idle.webp', p4_skill: 'img/p4_skill.webp', e_anchor: 'img/e_anchor.webp',
+    e_bloat: 'img/e_bloat.webp', e_boar: 'img/e_boar.webp', e_bones: 'img/e_bones.webp', e_cart: 'img/boss_cart.webp',
+    e_crab: 'img/e_crab.webp', e_crow: 'img/e_crow.webp', e_cut: 'img/e_cut.webp', e_elder: 'img/boss_elder.webp',
+    e_fang: 'img/boss_fang.webp', e_heads: 'img/e_heads.webp', e_hexbow: 'img/e_hexbow.webp', e_hooker: 'img/e_hooker.webp',
+    e_keg: 'img/e_keg.webp', e_knight: 'img/e_knight.webp', e_lancer: 'img/e_lancer.webp', e_maw: 'img/boss_maw.webp',
+    e_moss: 'img/e_moss.webp', e_necro: 'img/e_necro.webp', e_pike: 'img/e_pike.webp', e_priest: 'img/e_priest.webp',
+    e_queen: 'img/boss_queen.webp', e_rat: 'img/e_rat.webp', e_shield: 'img/e_shield.webp', e_slime: 'img/e_slime.webp',
+    e_slimelet: 'img/e_slime.webp', e_thorner: 'img/e_thorner.webp', e_tower: 'img/e_tower.webp', e_vine: 'img/e_vine.webp',
+    e_wasp: 'img/e_wasp.webp', e_whip: 'img/e_whip.webp', e_wisp: 'img/e_wisp.webp', e_wolf: 'img/e_wolf.webp',
+    e_xbow: 'img/e_xbow.webp',
+  };
+  /* 전투 그림의 발 자리 [x, y](그림 픽셀) · 그림 1px의 길이(게임 단위) · (1이면 왼쪽을 보는 그림 — 뒤집어 씀). 그림을 바꾸면 같이 고침(assets/beltbrawl/PROMPTS.md) */
+  const SPR = {
+    p0_atk: [690,911,0.07184], p0_idle: [437,1049,0.07184], p0_skill: [366,1455,0.07184], p1_atk: [618,927,0.06352],
+    p1_idle: [276,1182,0.06352], p1_skill: [436,1265,0.06352], p2_atk: [377,907,0.07319], p2_idle: [270,1027,0.07319],
+    p2_skill: [312,1383,0.07319], p3_atk: [236,1056,0.07048], p3_idle: [380,1396,0.06572], p3_skill: [340,1456,0.07048],
+    p4_atk: [524,1171,0.06271], p4_idle: [210,1499,0.05723], p4_skill: [215,1440,0.06271], e_anchor: [474,1251,0.05687],
+    e_bloat: [497,1234,0.03523,1], e_boar: [652,1203,0.0312,1], e_bones: [598,1256,0.04878], e_cart: [549,1465,0.05394,1],
+    e_crab: [550,1052,0.0338,1], e_crow: [623,1221,0.02751], e_cut: [587,1237,0.04792], e_elder: [648,1499,0.07851],
+    e_fang: [580,1052,0.06101,1], e_heads: [563,1309,0.05585], e_hexbow: [540,1078,0.05683], e_hooker: [691,1276,0.05418],
+    e_keg: [500,1276,0.05267], e_knight: [608,1231,0.05939], e_lancer: [753,1094,0.05962,1], e_maw: [467,1004,0.08008],
+    e_moss: [687,1311,0.06029,1], e_necro: [663,1241,0.05732], e_pike: [624,1311,0.05275], e_priest: [671,1304,0.06061],
+    e_queen: [624,1465,0.05609], e_rat: [615,1066,0.03336,1], e_shield: [627,1124,0.05097], e_slime: [718,1029,0.03458],
+    e_slimelet: [718,1029,0.02034], e_thorner: [527,1199,0.03954,1], e_tower: [722,1188,0.06156], e_vine: [568,1208,0.04742,1],
+    e_wasp: [607,1207,0.02782], e_whip: [637,1149,0.05331,1], e_wisp: [610,1209,0.02778,1], e_wolf: [591,1157,0.03074,1],
+    e_xbow: [444,1228,0.04827],
+  };
+
+  /* ======================= 아이콘 (56×56 안쪽, 이모지 없음) ======================= */
+  const svgW = (inner) => '<svg viewBox="0 0 56 56" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">' + inner + '</svg>';
+  const IC = {
+    up: (c) => '<path d="M12 46c14-4 24-16 28-34" stroke="' + c + '" stroke-width="6" fill="none" stroke-linecap="round"/><path d="M40 6l8 12-14-2z" fill="' + c + '"/>',
+    spin: (c) => '<path d="M28 8a20 20 0 1 1-19 14" stroke="' + c + '" stroke-width="6" fill="none" stroke-linecap="round"/><path d="M4 14l8 10 6-12z" fill="' + c + '"/>',
+    slam: (c) => '<path d="M28 6v24" stroke="' + c + '" stroke-width="7" stroke-linecap="round"/><path d="M16 24l12 12 12-12z" fill="' + c + '"/><path d="M6 46h44M12 40l-6 6M44 40l6 6" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/>',
+    guard: (c) => '<path d="M28 6l18 6v14c0 12-8 20-18 24C18 46 10 38 10 26V12z" fill="' + c + '"/><path d="M28 12v32" stroke="#0005" stroke-width="3"/>',
+    grab: (c) => '<path d="M14 30v-12a4 4 0 0 1 8 0v-4a4 4 0 0 1 8 0v2a4 4 0 0 1 8 0v4a4 4 0 0 1 8 0v14c0 10-7 16-17 16-9 0-13-5-19-16-2-4 3-7 6-4z" fill="' + c + '"/>',
+    dash: (c) => '<path d="M6 18h22M4 28h18M8 38h20" stroke="' + c + '" stroke-width="5" stroke-linecap="round" opacity=".6"/><path d="M30 12l20 16-20 16z" fill="' + c + '"/>',
+    dodge: (c) => '<path d="M10 40c4-18 18-28 36-28" stroke="' + c + '" stroke-width="5" fill="none" stroke-linecap="round" stroke-dasharray="2 9"/><circle cx="14" cy="42" r="7" fill="' + c + '" opacity=".45"/><circle cx="42" cy="16" r="8" fill="' + c + '"/>',
+    burst: (c) => '<rect x="6" y="12" width="20" height="6" rx="3" fill="' + c + '"/><rect x="14" y="25" width="24" height="6" rx="3" fill="' + c + '"/><rect x="6" y="38" width="20" height="6" rx="3" fill="' + c + '"/><path d="M34 15h14M44 28h8M34 41h14" stroke="' + c + '" stroke-width="4" stroke-linecap="round" opacity=".6"/>',
+    back: (c) => '<path d="M46 40c-8-2-16-2-26 4" stroke="' + c + '" stroke-width="5" fill="none" stroke-linecap="round" stroke-dasharray="2 8"/><path d="M6 44l14-10 2 14z" fill="' + c + '"/><path d="M28 14h20M26 22l18-8M26 22l20 6" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/>',
+    bomb: (c) => '<circle cx="26" cy="34" r="16" fill="' + c + '"/><path d="M34 20l6-8" stroke="' + c + '" stroke-width="5" stroke-linecap="round"/><path d="M42 8l3-4M46 12l5-1M40 4l-1-3" stroke="#ffd070" stroke-width="3" stroke-linecap="round"/>',
+    rune: (c) => '<ellipse cx="28" cy="36" rx="22" ry="11" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M28 26l8 10-8 8-8-8z" fill="' + c + '"/><path d="M28 6v12" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/>',
+    curse: (c) => '<path d="M28 4l5 14 14-5-9 12 12 9-15 1 2 15-9-12-9 12 2-15-15-1 12-9-9-12 14 5z" fill="' + c + '"/>',
+    heal: (c) => '<circle cx="28" cy="28" r="21" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M24 14h8v10h10v8H32v10h-8V32H14v-8h10z" fill="' + c + '"/>',
+    blink: (c) => '<circle cx="14" cy="38" r="8" fill="none" stroke="' + c + '" stroke-width="3" stroke-dasharray="3 4"/><path d="M22 30l10-10" stroke="' + c + '" stroke-width="3" stroke-dasharray="2 5"/><path d="M40 6l4 8 8 4-8 4-4 8-4-8-8-4 8-4z" fill="' + c + '"/>',
+    pierce: (c) => '<path d="M4 44L40 12" stroke="' + c + '" stroke-width="5" stroke-linecap="round"/><path d="M52 4L34 10l10 10z" fill="' + c + '"/><path d="M14 22l8 8M24 14l8 8" stroke="' + c + '" stroke-width="3" opacity=".5"/>',
+    jav: (c) => '<path d="M6 46L44 14" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/><path d="M52 6L36 12l8 8z" fill="' + c + '"/><path d="M8 30l-4 2M14 22l-6 2M22 16l-6 1" stroke="' + c + '" stroke-width="3" stroke-linecap="round" opacity=".6"/>',
+    sword: (c) => '<path d="M40 6h10v10L26 40l-10-10z" fill="' + c + '"/><path d="M12 30l14 14-4 4-6-6-6 8-4-4 8-6-6-6z" fill="' + c + '" opacity=".7"/>',
+    drop: (c) => '<path d="M28 6c10 14 16 22 16 30a16 16 0 0 1-32 0c0-8 6-16 16-30z" fill="' + c + '"/>',
+    flame: (c) => '<path d="M28 4c10 12 16 20 16 28a16 16 0 0 1-32 0c0-6 4-10 6-16 2 4 4 5 5 6 0-6 2-12 5-18z" fill="' + c + '"/>',
+    bolt: (c) => '<path d="M32 4L12 32h12l-4 20 22-30H30z" fill="' + c + '"/>',
+    snow: (c) => '<path d="M28 4v48M7 16l42 24M7 40l42-24" stroke="' + c + '" stroke-width="5" stroke-linecap="round"/>',
+    heart: (c) => '<path d="M28 48C10 36 4 26 8 16c4-8 14-8 20 0 6-8 16-8 20 0 4 10-2 20-20 32z" fill="' + c + '"/>',
+    wing: (c) => '<path d="M6 36c10-4 14-12 16-24 6 6 10 6 16 4-2 8 2 10 10 12-8 2-10 6-10 12-10-6-20-6-32-4z" fill="' + c + '"/>',
+    star: (c) => '<path d="M28 4l7 16 17 2-13 11 4 17-15-9-15 9 4-17L4 22l17-2z" fill="' + c + '"/>',
+    daze: (c) => '<circle cx="28" cy="30" r="14" fill="none" stroke="' + c + '" stroke-width="5"/><path d="M10 10l6 6M46 10l-6 6M28 4v8" stroke="' + c + '" stroke-width="4" stroke-linecap="round"/>',
+    ring: (c) => '<circle cx="28" cy="28" r="18" fill="none" stroke="' + c + '" stroke-width="5"/><circle cx="28" cy="28" r="6" fill="' + c + '"/>',
+    link: (c) => '<circle cx="18" cy="28" r="10" fill="none" stroke="' + c + '" stroke-width="5"/><circle cx="38" cy="28" r="10" fill="none" stroke="' + c + '" stroke-width="5"/>',
+    mark: (c) => '<circle cx="28" cy="28" r="18" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M28 4v14M28 38v14M4 28h14M38 28h14" stroke="' + c + '" stroke-width="4"/>',
+    clock: (c) => '<circle cx="28" cy="28" r="20" fill="none" stroke="' + c + '" stroke-width="5"/><path d="M28 14v14l10 6" stroke="' + c + '" stroke-width="5" fill="none" stroke-linecap="round"/>',
+    foe: (c) => '<path d="M10 22a18 18 0 0 1 36 0v10l-6 6v8H16v-8l-6-6z" fill="' + c + '"/><circle cx="21" cy="26" r="4" fill="#0008"/><circle cx="35" cy="26" r="4" fill="#0008"/>',
+    crown: (c) => '<path d="M6 42l-2-26 14 12 10-18 10 18 14-12-2 26z" fill="' + c + '"/><rect x="6" y="44" width="44" height="6" rx="2" fill="' + c + '"/>',
+    road: (c) => '<path d="M18 50L24 6h8l6 44z" fill="' + c + '" opacity=".6"/><path d="M28 10v6M28 22v8M28 36v10" stroke="#f2e9d8" stroke-width="3"/>',
+  };
+  const TAGIC = { 피해: 'sword', 속도: 'wing', 생존: 'heart', 회피: 'dodge', 기술: 'clock', 치명: 'star', 띄움: 'up', 넘어뜨림: 'slam', 출혈: 'drop', 화상: 'flame', 감전: 'bolt', 둔화: 'snow', 협동: 'link', 연타: 'burst', 기절: 'daze', 범위: 'ring', 표식: 'mark' };
+  const TAGCOL = { 피해: '#e8a060', 속도: '#8fd0a0', 생존: '#e07080', 회피: '#a0c8e8', 기술: '#c0a8f0', 치명: '#f0d060', 띄움: '#9fd8ff', 넘어뜨림: '#d8b890', 출혈: '#d84848', 화상: '#ff8a40', 감전: '#f0e060', 둔화: '#8fd8f0', 협동: '#7fe0c0', 연타: '#f0b070', 기절: '#e0d0a0', 범위: '#d0a0e0', 표식: '#c070ff' };
+  const augIcon = (x) => IC[TAGIC[x.tags[0]] || 'star'](TAGCOL[x.tags[0]] || '#e3ae45');
+
+  /* ======================= 글(설명 자동 생성) ======================= */
+  function mvDesc(m, atkNm) {
+    const o = []; let dsum = 0, n = 0; const kw = {};
+    for (const x of m.acts) {
+      if (x.req) continue;
+      if (x.k === 'hit') { dsum += x.d; n++; if (x.lift >= 250) kw['띄움'] = 1; if (x.down) kw['넘어뜨림'] = 1; if (x.bleed) kw['출혈'] = 1; if (x.poise >= 3) kw['기절 수치 큼'] = 1; }
+      else if (x.k === 'proj') { const c = x.n || 1; dsum += x.d * c; n += c; const p = PJ[x.p]; if (p.lift) kw['띄움'] = 1; if (p.pierce) kw['관통'] = 1; }
+      else if (x.k === 'zone') { const z = ZN[x.z]; if (z.dur) { o.push('지대 ' + z.dur + '초(0.5초마다 ' + Math.round(z.d * 100) + '%)'); if (z.chill) kw['둔화'] = 1; if (z.heal) o.push('동료 회복: 0.5초마다 최대 체력의 ' + (z.heal * 100).toFixed(1) + '%'); } else { dsum += z.d; n++; if (z.lift) kw['띄움'] = 1; } }
+      else if (x.k === 'grab') { dsum += x.d; n++; }
+    }
+    if (n) o.unshift((atkNm || '피해') + ': ' + Math.round(dsum * 100) + '%' + (n > 1 ? '(' + n + '타)' : ''));
+    for (const k in kw) o.push(k);
+    if (m.arm) o.push('버티기');
+    if (m.cd) o.push('재사용: ' + m.cd + '초');
+    return o.join(' · ');
+  }
+
+  /* ======================= 판 상태 ======================= */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = Math.random;
+    return {
+      v: 1, rid: 1 + Math.floor(R() * 1e6), seed: 1 + Math.floor(R() * 2e9), n, len: LENS[opts.len] ? opts.len : 'm',
+      nm: players.map((p) => String(p.name || '').slice(0, 12)), ai: players.map((p) => !!p.ai), lv: players.map((p) => (p.ai ? p.lv || 2 : 0)),
+      ph: 'pick', cls: players.map(() => -1), seq: 1, res: null,
+    };
+  }
+  /* AI 자리 직업: 사람이 고른 뒤, 아직 없는 직업부터(근접 · 원거리가 섞이게) */
+  function fillClasses(st, rnd) {
+    const cls = st.cls.slice(); const used = {}; cls.forEach((c) => { if (c >= 0) used[c] = (used[c] || 0) + 1; });
+    for (let i = 0; i < cls.length; i++) {
+      if (cls[i] >= 0) continue;
+      let best = 0, bs = -1;
+      for (let c = 0; c < CLS.length; c++) { const s = rnd() - (used[c] || 0) * 2; if (s > bs) { bs = s; best = c; } }
+      cls[i] = best; used[best] = (used[best] || 0) + 1;
+    }
+    return cls;
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.res) return null;
+    const r = s.res, st = r.st || [];
+    const winners = []; if (r.win) for (let i = 0; i < s.n; i++) winners.push(i);
+    const col = (k) => st.map((x) => String(x ? x[k] || 0 : 0));
+    const hl = [];
+    hl.push((r.zones || []).map((z) => ZONES[z].nm).join(' → ') + ' · ' + Math.floor((r.time || 0) / 60) + '분 ' + Math.round((r.time || 0) % 60) + '초');
+    st.forEach((x, i) => { if (x && hl.length < 4) { const top = (x.a || []).slice(0, 4).map((q) => AUG[q[0]].nm + (q[1] > 1 ? ' ' + q[1] : '')).join(' · '); hl.push((s.nm[i] || '') + '(' + CLS[x.c].nm + '): ' + (top || '능력 없음') + ((x.a || []).length > 4 ? ' 외 ' + ((x.a || []).length - 4) : '')); } });
+    return {
+      winners, title: r.win ? '가도 돌파' : '원정 실패', text: r.win ? '모든 구역을 지났습니다' : ZONES[r.zone].nm + ' ' + (r.boss ? '우두머리' : (r.si + 1) + '구간') + '에서 전원이 쓰러졌습니다',
+      highlights: hl.slice(0, 4),
+      stats: [
+        { label: '직업', values: st.map((x) => (x ? CLS[x.c].nm : '')), best: false },
+        { label: '준 피해', values: col('d') },
+        { label: '처치', values: col('k') },
+        { label: '쓰러짐', values: col('o'), low: true },
+        { label: '일으킴', values: col('r') },
+        { label: '최고 콤보', values: col('m') },
+        { label: '능력 수', values: st.map((x) => String(x ? (x.a || []).reduce((q, y) => q + y[1], 0) : 0)), best: false },
+      ],
+    };
+  }
+  function hint(st, seat) {
+    if (!st) return null;
+    if (st.ph === 'pick') return ['직업 고르기', '직업을 누르면 기술 설명이 보이고, 위쪽의 「정하기」 단추를 누르면 정해집니다.', '모두 고르면 시작합니다. 빈자리는 AI 동료가 남은 직업을 고릅니다.'];
+    const o = [TITLE + ' — 오른쪽으로 나아가며 적을 치웁니다'];
+    if (seat >= 0 && st.cls && st.cls[seat] >= 0) { const c = CLS[st.cls[seat]]; o.push('내 직업: ' + c.nm + ' — ' + c.sub + '. 기술: ' + c.sk.map((m) => m.nm).join(' · ') + ' · ' + c.ev.nm); }
+    o.push('공격을 누르고 있으면 연타가 이어집니다. 가까운 적 쪽으로 몸이 저절로 돕니다.');
+    o.push('붉은 바닥 예고가 차기 전에 벗어나거나 회피로 지나갑니다.');
+    o.push('쓰러진 동료 곁에 서 있으면 일으켜 세웁니다. 전원이 쓰러지면 실패.');
+    o.push('구간을 치우면 능력 셋 중 하나를 고릅니다. 같은 꼬리표끼리 엮입니다.');
+    return o.slice(0, 6);
+  }
+
+  /* ======================= 규칙 · 도감 ======================= */
+  const RULES = [
+    { h: '목표', p: ['길을 오른쪽으로 나아가며 구간마다 몰려오는 적을 모두 쓰러뜨립니다. 구간 몇 개를 지나면 구역의 우두머리가 나오고, 마지막 구역의 우두머리를 쓰러뜨리면 성공입니다.', '1~4명이 함께 싸우는 협동 게임입니다. 한 기기에 한 명이고, 빈자리는 AI 동료로 채울 수 있습니다(혼자서도 됩니다). 친구와는 온라인 방이나 LAN으로 합니다.', '전원이 쓰러지면 실패입니다.'] },
+    { h: '직업', p: CLS.map((c) => c.nm + ' — ' + c.sub + '. ' + c.d).concat(['판을 시작하면 먼저 직업을 고릅니다. 모두 고르면 시작하고, AI 동료는 남은 직업 가운데서 고릅니다. 같은 직업을 여럿이 골라도 됩니다.']) },
+    { h: '싸우기', p: ['공격 단추를 누르고 있으면 기본 연타가 끝까지 이어집니다. 가까운 적 쪽으로 몸이 저절로 돌고, 깊이(위아래)도 조금 맞춰 줍니다.', '기술 셋은 저마다 재사용 시간이 있습니다. 단추의 그늘이 걷히면 다시 쓸 수 있습니다.', '회피(거검사는 막기)는 잠깐 무적입니다. 연타나 기술 도중에도 바로 나갑니다.', '띄움: 높이 떠오른 적은 떨어질 때까지 아무것도 못 합니다. 공중에서 계속 치면 조금씩 덜 뜹니다.', '넘어뜨림: 쓰러진 적은 잠깐 누워 있습니다. 누운 적은 피해를 40% 덜 받습니다(쓰러진 적도 맞히는 기술은 예외).', '기절 수치: 무거운 적과 우두머리는 맞아도 밀리지 않습니다. 대신 기절 수치를 다 깎으면 잠깐 무릎을 꿇고, 그동안 피해를 25% 더 받습니다. 센 공격일수록 많이 깎습니다.'] },
+    { h: '예고', p: ['적이 공격하려 하면 몸이 밝게 빛납니다. 큰 공격은 바닥에 붉은 띠 · 원이 먼저 나타나고, 다 차면 맞습니다.', '붉은 줄(돌진 · 화살 · 갈고리)은 깊이(위아래)로 비켜서면 피합니다. 붉은 원은 밖으로 나가거나 회피로 지나갑니다.', '방패를 든 적은 앞에서 치면 막습니다. 뒤로 돌거나, 띄우거나, 잡거나, 센 공격으로 방패를 깨뜨립니다.', '터지는 적(화약통꾼 · 팽창체 · 불씨 정령)을 먼저 쓰러뜨리면 그 자리에서 터져 둘레의 적이 다칩니다.'] },
+    { h: '능력 고르기', p: ['구간을 치울 때마다 능력 셋이 나오고 하나를 고릅니다. 각자 따로 고릅니다. 마음에 드는 것이 없으면 「넘기기」로 체력을 30% 회복합니다.', '능력에는 꼬리표(띄움 · 출혈 · 화상 · 감전 · 둔화 · 치명 등)가 붙어 있습니다. 같은 꼬리표끼리 엮이도록 고르면 강해집니다. 예: 「높이 띄우기」 + 「공중 추격」, 「톱날」 + 「피 냄새」 + 「출혈 파열」.', '같은 능력이 다시 나오면 겹쳐서 수치가 오릅니다(능력마다 겹칠 수 있는 횟수가 다릅니다).', '능력은 이번 판에만 남습니다. 판 밖에서 캐릭터가 강해지는 것은 없습니다.'] },
+    { h: '상태 이상', p: ['출혈: 0.5초마다 피해. 5번까지 겹칩니다(4초, 다시 걸면 시간이 되돌아감).', '화상: 0.5초마다 피해(3초).', '감전: 감전된 적이 다음에 맞을 때 곁의 적 둘에게 번개가 번집니다.', '둔화: 이동 · 공격이 40% 느려집니다(3초).', '표식: 받는 피해 +15%(5초).'] },
+    { h: '쓰러졌을 때', p: ['체력이 0이 되면 쓰러집니다. 동료가 곁에 서 있으면 2.4초 만에 일으켜 세웁니다(체력 40%).', '구간을 치우면 쓰러진 동료가 모두 일어납니다(체력 30%).', '혼자(1인) 할 때는 구역마다 한 번, 3초 뒤 스스로 일어납니다(체력 50%).', '적이 가끔 떨어뜨리는 회복 구슬을 밟으면 체력을 12% 회복합니다. 정예(크고 빛나는 적)는 반드시 떨어뜨립니다.'] },
+    { h: '조작', p: ['터치(가로 화면): 왼쪽을 끌면 이동, 오른쪽의 큰 단추가 공격(누르고 있기), 둘레의 작은 단추 셋이 기술, 아래쪽이 회피.', 'PC: WASD/방향키 이동 · J 공격 · K L I 기술 · Space 회피. 「⌨ 조작 설정」에서 바꿀 수 있습니다.', '게임패드: 왼쪽 스틱 이동 · X 공격 · Y B RB 기술 · A 회피.', '설정의 「화면 흔들림 · 번쩍임」을 끄면 타격 흔들림이 사라집니다.'] },
+    { h: '구역과 길이', p: ZONES.map((z) => z.nm + ' — ' + z.sub + '. 우두머리: ' + z.boss.map((id) => EN[EI[id]].nm).join(' 또는 ')).concat(['판마다 구역 순서 · 나오는 적 · 우두머리 · 능력 후보가 달라집니다.', '길이: ' + Object.keys(LENS).map((k) => LENS[k].nm).join(' · ') + '. 인원이 많을수록 적이 많고 단단해집니다.']) },
+    { h: 'AI 동료', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움. 쉬움은 반응이 느리고 예고를 잘 못 피하며 기술을 아낍니다. 어려움은 예고를 보고 피하고, 띄운 적을 이어 치고, 쓰러진 동료를 일으키러 옵니다.', 'AI마다 버릇(공세 · 신중함 · 동료 챙기기)이 판마다 달라 같은 난이도라도 움직임이 다릅니다.'] },
+    { h: '만든 사람', p: ['직업 그림 · 구역 배경 · 우두머리 그림 · 전투 중 캐릭터 그림은 로컬에서 생성한 그림, 길 바닥 · 효과는 코드로 그린 그림입니다. 효과음은 앱 합성음. 출처: app/assets/beltbrawl/CREDITS.txt', '구조 참고: 횡스크롤 난투 + 판마다 능력 고르기. 이름 · 세계 · 직업 · 기술 · 그림 · 글은 이 게임만의 것입니다.'] },
+  ];
+  const MVNM = { e_slam: '내려치기', e_th: '닻 던지기', charge: '들이받기', e_charge: '방패 돌진', e_combo: '삼연 베기', claw: '후려치기' };
+  function codexData() {
+    const r = (icon, name, tag, desc) => ({ icon: svgW(icon), name, tag, desc });
+    const tabs = [];
+    tabs.push({ h: '직업', p: ['공격력은 모두 10. 피해 %는 공격력에 대한 비율입니다.'], rows: CLS.map((c) => r(IC.sword(c.col), c.nm, c.sub, '체력 ' + c.hp + ' · 이동 ' + c.spd + ' · 기본 사거리 ' + c.reach + '. ' + c.d)) });
+    const sk = [];
+    CLS.forEach((c) => {
+      sk.push(r(IC.sword(c.col), c.nm + ' 기본 연타', c.basic.length + '타', c.basic.map((m) => m.nm + ' ' + Math.round(m.acts.reduce((q, x) => q + (x.req ? 0 : (x.d || 0) * (x.n || 1)), 0) * 100) + '%').join(' → ')));
+      c.sk.forEach((m, i) => sk.push(r(IC[m.ic](c.col), m.nm, c.nm + ' 기술 ' + (i + 1), m.d + ' ' + mvDesc(m))));
+      sk.push(r(IC[c.ev.ic](c.col), c.ev.nm, c.nm + ' 회피', c.ev.d + ' 재사용: ' + c.ev.cd + '초'));
+    });
+    tabs.push({ h: '기술', p: ['버티기: 그 기술을 쓰는 동안 맞아도 밀리지 않음.'], rows: sk });
+    const ar = (x) => r(augIcon(x), x.nm, TIERNM[x.tier] + ' · ' + (x.cls >= 0 ? CLS[x.cls].nm : '공통') + ' · ' + x.tags.join(' ') + (x.max > 1 ? ' · ' + x.max + '번까지' : ''), augDesc(x));
+    tabs.push({ h: '공통 능력', p: ['모든 직업에게 나옵니다. 꼬리표가 같은 능력을 이미 갖고 있으면 조금 더 자주 나옵니다.'], rows: AUG.filter((x) => x.cls < 0).map(ar) });
+    tabs.push({ h: '직업 능력', p: ['그 직업에게만 나옵니다.'], rows: AUG.filter((x) => x.cls >= 0).map(ar) });
+    const er = (x) => { const z = ZONES[x.zone]; return r(IC[x.boss ? 'crown' : 'foe'](x.col), x.nm, z.nm + (x.boss ? ' 우두머리' : x.minion ? ' · 딸린 적' : ''), '체력 ' + Math.round(x.hp * (x.boss ? SCALE.bossHp : SCALE.mobHp)) + ' · 공격력 ' + (Math.round(x.atk * (x.boss ? SCALE.bossAtk : 1) * SCALE.atk1 * 10) / 10) + (x.pmax ? ' · 기절 수치 ' + x.pmax : '') + (x.guard ? ' · 방패 ' + x.guard : '') + (x.fly ? ' · 떠 있음' : '') + '. ' + x.d + (x.boss ? ' 패턴: ' + x.mv.map((m) => (m.nm || MVNM[m.an] || '후려치기') + (m.p2 ? '(절반 아래)' : '')).join(' · ') : '')); };
+    tabs.push({ h: '적', p: ['수치는 첫 구역 · 1인 기준(적의 피해 = 공격력 × 동작 배수). 구역이 넘어갈수록, 인원이 많을수록 체력과 공격력이 오릅니다. 정예는 체력 2.6배 · 피해 1.3배에 맞아도 잘 밀리지 않습니다.'], rows: EN.filter((x) => !x.boss).map(er) });
+    tabs.push({ h: '우두머리', p: ['구역마다 둘 중 하나가 나옵니다. 체력이 절반 아래로 내려가면 빨라지고 새 패턴을 씁니다.'], rows: EN.filter((x) => x.boss).map(er) });
+    tabs.push({ h: '구역', p: ['한 판에 2~3구역. 순서는 판마다 무작위.'], rows: ZONES.map((z) => r(IC.road(z.acc), z.nm, '구역', z.sub + '. 적: ' + z.pool.filter((id, i, arr) => arr.indexOf(id) === i).map((id) => EN[EI[id]].nm).join(' · '))) });
+    return tabs;
+  }
+
+  /* ======================= 표지 (640×360) ======================= */
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#251f38'); sky.addColorStop(0.6, '#8a5a4a'); sky.addColorStop(1, '#3a2f2a');
+    g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#2f2838'; for (let i = 0; i < 9; i++) { const x = i * 80 - 20, hh = 60 + ((i * 53) % 70); g.fillRect(x, 200 - hh, 56, hh); g.fillRect(x + 10, 190 - hh, 8, 10); g.fillRect(x + 36, 190 - hh, 8, 10); }
+    const fl = g.createLinearGradient(0, 200, 0, h); fl.addColorStop(0, '#5a4e48'); fl.addColorStop(1, '#2e2826'); g.fillStyle = fl; g.fillRect(0, 200, w, h - 200);
+    g.strokeStyle = 'rgba(0,0,0,.25)'; g.lineWidth = 2; for (let i = 0; i < 5; i++) { g.beginPath(); g.moveTo(0, 214 + i * 26); g.lineTo(w, 214 + i * 26); g.stroke(); }
+    const fig = (x, y, c, s, flip) => { g.save(); g.translate(x, y); g.scale(flip ? -s : s, s); g.fillStyle = 'rgba(0,0,0,.35)'; g.beginPath(); g.ellipse(0, 0, 18, 5, 0, 0, 7); g.fill(); g.strokeStyle = '#16131c'; g.lineCap = 'round'; g.lineWidth = 9; g.beginPath(); g.moveTo(-5, 0); g.lineTo(-2, -26); g.moveTo(7, 0); g.lineTo(2, -26); g.moveTo(0, -26); g.lineTo(2, -48); g.stroke(); g.strokeStyle = c; g.lineWidth = 6; g.beginPath(); g.moveTo(0, -26); g.lineTo(2, -48); g.stroke(); g.fillStyle = '#e8c8a8'; g.beginPath(); g.arc(3, -56, 8, 0, 7); g.fill(); g.strokeStyle = '#d8dce4'; g.lineWidth = 5; g.beginPath(); g.moveTo(8, -40); g.lineTo(40, -66); g.stroke(); g.restore(); };
+    fig(180, 290, CLS[0].col, 1.5); fig(120, 262, CLS[3].col, 1.2); fig(250, 258, CLS[2].col, 1.2);
+    fig(430, 286, '#8a5a4a', 1.4, 1); fig(500, 262, '#6a6258', 1.25, 1); fig(560, 296, '#5a6a7a', 1.4, 1);
+    g.strokeStyle = 'rgba(255,240,210,.8)'; g.lineWidth = 5; g.beginPath(); g.arc(250, 250, 70, -0.9, 0.5); g.stroke();
+    g.fillStyle = 'rgba(12,10,16,.62)'; g.fillRect(0, h - 58, w, 58);
+    g.fillStyle = '#f2e9d8'; g.font = '30px "Black Han Sans","IBM Plex Sans KR",sans-serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 24, h - 29);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(242,233,216,.75)'; g.fillText('구간마다 능력을 골라 나아가는 협동 횡스크롤 난투', 170, h - 28);
+  }
+
+  /* ======================= 불러오기 ======================= */
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  const loadCore = () => (API.sim ? Promise.resolve() : loadScript('assets/beltbrawl/sim.js')).then(() => (G.BELTBRAWL_VIEW ? null : loadScript('assets/beltbrawl/view.js')));
+  const CONTROLS = [
+    { id: 'up', label: '위(안쪽)', keys: ['KeyW', 'ArrowUp'], pad: ['ly-', 'up'] },
+    { id: 'down', label: '아래(바깥쪽)', keys: ['KeyS', 'ArrowDown'], pad: ['ly+', 'down'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA', 'ArrowLeft'], pad: ['lx-', 'left'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD', 'ArrowRight'], pad: ['lx+', 'right'] },
+    { id: 'atk', label: '공격(누르고 있기)', keys: ['KeyJ', 'KeyZ'], pad: ['x'] },
+    { id: 's0', label: '기술 1', keys: ['KeyK', 'KeyX'], pad: ['y'] },
+    { id: 's1', label: '기술 2', keys: ['KeyL', 'KeyC'], pad: ['b'] },
+    { id: 's2', label: '기술 3', keys: ['KeyI', 'KeyV'], pad: ['rb'] },
+    { id: 'ev', label: '회피 · 막기', keys: ['Space', 'ShiftLeft'], pad: ['a'] },
+    { id: 'info', label: '내 능력 보기(누르고 있기)', keys: ['Tab'], pad: ['back'] },
+  ];
+
+  const API = { ID, TITLE, ART, SPR, SCALE, ZD, AW, SEG, MV, PJ, ZN, CLS, AUG, AI, FXK, EN, EI, ZONES, LENS, IC, svgW, TAGIC, TAGCOL, TIERNM, TIERC, augIcon, augDesc, fxLine, mvDesc, clamp, init, result, hint, fillClasses };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 40%,#4a3a44,#141018)', color: '#f2e9d8', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t2 = h('div', { style: { fontSize: '14px', opacity: '.75' }, text: '길을 여는 중' });
+    box.append(h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '30px', letterSpacing: '2px' }, text: TITLE }), t2);
+    root.append(box);
+    loadCore().then(() => {
+      if (dead) return;
+      view = G.BELTBRAWL_VIEW.mount(root, api, API);
+      box.remove();
+      if (last) view.update(last, lastPrev);
+    }).catch((err) => { t2.textContent = '파일을 불러오지 못했습니다. (' + (err && err.message || err) + ')'; });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<path d="M4 46h48" stroke="currentColor" stroke-width="3" opacity=".5"/><circle cx="18" cy="14" r="5" fill="currentColor"/><path d="M18 20v14M18 34l-6 12M18 34l6 12M18 24l12-4" stroke="currentColor" stroke-width="4" stroke-linecap="round" fill="none"/><path d="M28 22L46 6" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M36 30a16 16 0 0 0 12-18" stroke="currentColor" stroke-width="3" fill="none" opacity=".7"/><circle cx="44" cy="30" r="4" fill="currentColor" opacity=".7"/><path d="M44 34v8M44 42l-4 4M44 42l4 4" stroke="currentColor" stroke-width="3" stroke-linecap="round" opacity=".7"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '협동 횡스크롤 난투', cat: '아케이드', icon: ICON, tint: '#3d2a33', coop: true,
+    blurb: '길을 오른쪽으로 나아가며 몰려오는 적을 치우는 1~4인 협동 난투. 직업 다섯 가운데 하나를 고르고, 구간을 치울 때마다 능력 셋 중 하나를 골라 엮어 갑니다. 구역마다 우두머리.',
+    time: '6–18분', landscape: true, realtime: true, aiDelay: 0, mood: 'drums', sidePanel: false, menuCorner: 'tr',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2,
+    options: [
+      { id: 'len', label: '길이', tip: '구역 수와 구역마다의 구간 수. 구역 순서 · 적 · 우두머리는 판마다 무작위.', choices: Object.keys(LENS).map((k) => ({ v: k, label: LENS[k].nm, tip: '예상 ' + LENS[k].t })), def: 'm' },
+    ],
+    controls: CONTROLS,
+    quick: ['오른쪽으로 나아가며 구간마다 적을 모두 쓰러뜨림', '공격은 누르고 있기 · 기술 셋 · 회피. 붉은 바닥 예고는 피함', '구간을 치울 때마다 능력 셋 중 하나 — 같은 꼬리표끼리 엮음', '마지막 구역의 우두머리를 쓰러뜨리면 성공, 전원이 쓰러지면 실패'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.BELTBRAWL = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

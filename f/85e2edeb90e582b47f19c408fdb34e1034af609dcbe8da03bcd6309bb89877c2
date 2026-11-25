@@ -1,0 +1,1351 @@
+/* 바둑 — 9/13/19줄, 한국 규칙(집+사석 계가, 덤), 패·자충 금지, 사석 표시 후 계가, MCTS(9줄)/휴리스틱(13·19줄) AI. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const COLS = 'ABCDEFGHJKLMNOPQRST';
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  /* =====================================================================
+   * Board engine: padded (n+2)² array, chains as circular lists with
+   * pseudo-liberty count / sum / sum of squares (atari test without walking).
+   * colours: 0 empty, 1 흑, 2 백, 3 edge.
+   * ===================================================================== */
+  function Board(n) {
+    const W = n + 2, S = W * W;
+    this.n = n; this.W = W; this.S = S;
+    this.col = new Int8Array(S); this.gh = new Int16Array(S); this.nx = new Int16Array(S);
+    this.pl = new Int32Array(S); this.ls = new Float64Array(S); this.ls2 = new Float64Array(S); this.sz = new Int16Array(S);
+    this.emp = new Int16Array(S); this.ei = new Int16Array(S); this.ne = 0; this.ko = 0;
+    this.cap = [0, 0, 0];
+    this.nb = [-W, -1, 1, W]; this.dg = [-W - 1, -W + 1, W - 1, W + 1];
+    this.col.fill(3);
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { const p = (y + 1) * W + x + 1; this.col[p] = 0; this.ei[p] = this.ne; this.emp[this.ne++] = p; }
+  }
+  const BP = Board.prototype;
+  BP.copyFrom = function (o) {
+    this.col.set(o.col); this.gh.set(o.gh); this.nx.set(o.nx); this.pl.set(o.pl); this.ls.set(o.ls); this.ls2.set(o.ls2); this.sz.set(o.sz);
+    this.emp.set(o.emp); this.ei.set(o.ei); this.ne = o.ne; this.ko = o.ko; this.cap[1] = o.cap[1]; this.cap[2] = o.cap[2];
+  };
+  BP.atari = function (h) { const pl = this.pl[h]; return pl > 0 && pl * this.ls2[h] === this.ls[h] * this.ls[h]; };
+  BP.lib1 = function (h) { return this.ls[h] / this.pl[h]; };
+  BP.addLib = function (h, q) { this.pl[h]++; this.ls[h] += q; this.ls2[h] += q * q; };
+  BP.subLib = function (h, q) { this.pl[h]--; this.ls[h] -= q; this.ls2[h] -= q * q; };
+  BP.delEmpty = function (p) { const i = this.ei[p], last = this.emp[--this.ne]; this.emp[i] = last; this.ei[last] = i; };
+  BP.addEmpty = function (p) { this.ei[p] = this.ne; this.emp[this.ne++] = p; };
+  BP.legal = function (p, c) {
+    const col = this.col;
+    if (col[p] !== 0 || p === this.ko) return false;
+    const o = 3 - c, nb = this.nb;
+    for (let i = 0; i < 4; i++) {
+      const q = p + nb[i], v = col[q];
+      if (v === 0) return true;
+      if (v === c) { if (!this.atari(this.gh[q])) return true; }
+      else if (v === o) { if (this.atari(this.gh[q])) return true; }
+    }
+    return false;
+  };
+  /* reason for an illegal point: 'occ' | 'ko' | 'suicide' | '' */
+  BP.why = function (p, c) { if (this.col[p] !== 0) return 'occ'; if (p === this.ko) return 'ko'; return this.legal(p, c) ? '' : 'suicide'; };
+  BP.merge = function (a, b) {
+    if (this.sz[a] < this.sz[b]) { const t = a; a = b; b = t; }
+    let s = b;
+    do { this.gh[s] = a; s = this.nx[s]; } while (s !== b);
+    const t = this.nx[a]; this.nx[a] = this.nx[b]; this.nx[b] = t;
+    this.pl[a] += this.pl[b]; this.ls[a] += this.ls[b]; this.ls2[a] += this.ls2[b]; this.sz[a] += this.sz[b];
+    return a;
+  };
+  BP.removeChain = function (h) {
+    const col = this.col, nb = this.nb, list = [];
+    let s = h;
+    do { list.push(s); s = this.nx[s]; } while (s !== h);
+    for (const p of list) { col[p] = 0; this.addEmpty(p); }
+    for (const p of list) for (let i = 0; i < 4; i++) { const q = p + nb[i]; if (col[q] === 1 || col[q] === 2) this.addLib(this.gh[q], p); }
+    return list.length;
+  };
+  /* assumes legal; returns number of captured stones */
+  BP.play = function (p, c) {
+    const col = this.col, nb = this.nb, o = 3 - c;
+    this.delEmpty(p);
+    col[p] = c; this.gh[p] = p; this.nx[p] = p; this.pl[p] = 0; this.ls[p] = 0; this.ls2[p] = 0; this.sz[p] = 1;
+    for (let i = 0; i < 4; i++) { const q = p + nb[i]; if (col[q] === 0) this.addLib(p, q); }
+    for (let i = 0; i < 4; i++) { const q = p + nb[i], v = col[q]; if (v === 1 || v === 2) this.subLib(this.gh[q], p); }
+    let h = p;
+    for (let i = 0; i < 4; i++) { const q = p + nb[i]; if (col[q] === c && this.gh[q] !== h) h = this.merge(h, this.gh[q]); }
+    let caps = 0, capPt = 0;
+    for (let i = 0; i < 4; i++) { const q = p + nb[i]; if (col[q] === o && this.pl[this.gh[q]] === 0) { caps += this.removeChain(this.gh[q]); capPt = q; } }
+    h = this.gh[p];
+    this.ko = caps === 1 && this.sz[h] === 1 && this.atari(h) ? capPt : 0;
+    this.cap[c] += caps;
+    return caps;
+  };
+  BP.pass = function () { this.ko = 0; };
+  BP.isEye = function (p, c) {
+    const col = this.col, nb = this.nb, dg = this.dg;
+    for (let i = 0; i < 4; i++) { const v = col[p + nb[i]]; if (v !== c && v !== 3) return false; }
+    let opp = 0, edge = 0;
+    for (let i = 0; i < 4; i++) { const v = col[p + dg[i]]; if (v === 3) edge++; else if (v === 3 - c) opp++; }
+    return edge ? opp === 0 : opp <= 1;
+  };
+  /* liberties of the chain that would result from c at p, capped at 2 (fast, approximate captures) */
+  BP.libsAfter2 = function (p, c) {
+    const col = this.col, nb = this.nb, o = 3 - c;
+    let l1 = -1, cnt = 0;
+    const add = (q) => { if (q === l1) return; if (!cnt) { l1 = q; cnt = 1; } else cnt = 2; };
+    for (let i = 0; i < 4; i++) { const q = p + nb[i], v = col[q]; if (v === 0) add(q); else if (v === o && this.atari(this.gh[q])) add(q); if (cnt > 1) return 2; }
+    for (let i = 0; i < 4; i++) {
+      const q = p + nb[i];
+      if (col[q] !== c) continue;
+      const h = this.gh[q];
+      if (this.atari(h)) continue;
+      let s = h;
+      do { for (let j = 0; j < 4; j++) { const r = s + nb[j]; if (col[r] === 0 && r !== p) { add(r); if (cnt > 1) return 2; } } s = this.nx[s]; } while (s !== h);
+    }
+    return cnt;
+  };
+  BP.sizeAfter = function (p, c) {
+    let n = 1; const seen = [];
+    for (let i = 0; i < 4; i++) { const q = p + this.nb[i]; if (this.col[q] === c) { const h = this.gh[q]; if (!seen.includes(h)) { seen.push(h); n += this.sz[h]; } } }
+    return n;
+  };
+  /* exact liberty count of chain h (stamp array scratch) */
+  let STAMP = new Int32Array(1), stampId = 1;
+  BP.libs = function (h) {
+    if (STAMP.length < this.S) STAMP = new Int32Array(this.S);
+    const id = ++stampId, col = this.col, nb = this.nb;
+    let s = h, n = 0;
+    do { for (let j = 0; j < 4; j++) { const r = s + nb[j]; if (col[r] === 0 && STAMP[r] !== id) { STAMP[r] = id; n++; } } s = this.nx[s]; } while (s !== h);
+    return n;
+  };
+  BP.chain = function (h) { const out = []; let s = h; do { out.push(s); s = this.nx[s]; } while (s !== h); return out; };
+  BP.areaScore = function () { // black − white (stones + single-colour eyes)
+    const col = this.col, nb = this.nb, W = this.W, n = this.n;
+    let sc = 0;
+    for (let y = 1; y <= n; y++) for (let x = 1; x <= n; x++) {
+      const p = y * W + x, v = col[p];
+      if (v === 1) sc++; else if (v === 2) sc--;
+      else { let b = 0, w = 0; for (let i = 0; i < 4; i++) { const u = col[p + nb[i]]; if (u === 1) b++; else if (u === 2) w++; } if (b && !w) sc++; else if (w && !b) sc--; }
+    }
+    return sc;
+  };
+
+  /* ---- playout policy ---- */
+  function policy(B, c, lm) {
+    const col = B.col, nb = B.nb, o = 3 - c;
+    if (lm > 0 && col[lm] === o) {
+      const h = B.gh[lm];
+      if (B.atari(h)) { const p = B.lib1(h); if (B.legal(p, c)) return p; }
+      for (let i = 0; i < 4; i++) {
+        const q = lm + nb[i];
+        if (col[q] !== c) continue;
+        const g = B.gh[q];
+        if (!B.atari(g)) continue;
+        const p = B.lib1(g);
+        if (B.legal(p, c) && B.libsAfter2(p, c) > 1) return p;
+      }
+    }
+    if (PAT && lm > 0 && Math.random() < 0.8) { // local shape near the last move: contact/hane/cut points
+      let cnt = 0, pick = 0;
+      for (let i = 0; i < 8; i++) {
+        const q = lm + (i < 4 ? nb[i] : B.dg[i - 4]);
+        if (col[q] !== 0) continue;
+        let a = 0, b = 0;
+        for (let j = 0; j < 4; j++) { const v = col[q + nb[j]]; if (v === c) a++; else if (v === o) b++; }
+        if (!b || (!a && b < 2)) continue;
+        if (!B.legal(q, c) || B.isEye(q, c) || B.libsAfter2(q, c) < 2) continue;
+        cnt++; if (Math.random() * cnt < 1) pick = q;
+      }
+      if (pick) return pick;
+    }
+    const ne = B.ne;
+    if (!ne) return 0;
+    const start = (Math.random() * ne) | 0;
+    for (let i = 0; i < ne; i++) {
+      const p = B.emp[(start + i) % ne];
+      if (!B.legal(p, c) || B.isEye(p, c)) continue;
+      if (B.libsAfter2(p, c) < 2 && B.sizeAfter(p, c) > 1) { // self-atari of a real group: avoid unless it captures
+        let capt = false;
+        for (let j = 0; j < 4; j++) { const q = p + nb[j]; if (col[q] === o && B.atari(B.gh[q])) capt = true; }
+        if (!capt) continue;
+      }
+      return p;
+    }
+    return 0;
+  }
+  /* plays to the end; returns area score (black − white) and the last colour */
+  function playout(B, c, lm, maxLen, rec) {
+    let passes = 0, len = 0;
+    while (passes < 2 && len < maxLen) {
+      const p = policy(B, c, lm);
+      if (p) { B.play(p, c); passes = 0; if (rec) rec(p, c); } else { B.pass(); passes++; }
+      lm = p; c = 3 - c; len++;
+    }
+    return B.areaScore();
+  }
+  /* average final ownership (+1 흑 … −1 백) from k playouts */
+  function ownership(B, c, k, ms) {
+    PAT = false;
+    const own = new Float64Array(B.S), T = new Board(B.n), t0 = now();
+    let done = 0;
+    for (let i = 0; i < k; i++) {
+      T.copyFrom(B);
+      playout(T, i % 2 ? 3 - c : c, 0, B.n * B.n * 3);
+      addOwn(T, own);
+      done++;
+      if (ms && now() - t0 > ms) break;
+    }
+    for (let i = 0; i < own.length; i++) own[i] /= done || 1;
+    return own;
+  }
+  function addOwn(T, own) {
+    const col = T.col, nb = T.nb, W = T.W, n = T.n;
+    for (let y = 1; y <= n; y++) for (let x = 1; x <= n; x++) {
+      const p = y * W + x, v = col[p];
+      if (v === 1) own[p]++; else if (v === 2) own[p]--;
+      else { let b = 0, w = 0; for (let i = 0; i < 4; i++) { const u = col[p + nb[i]]; if (u === 1) b++; else if (u === 2) w++; } if (b && !w) own[p]++; else if (w && !b) own[p]--; }
+    }
+  }
+  /* dead chains (padded heads) by ownership, but a chain with two real eyes is always alive */
+  /* Benson's algorithm: chain heads of colour c that are unconditionally alive (cannot be captured even if c always passes) */
+  function bensonAlive(B, c) {
+    const col = B.col, nb = B.nb, S = B.S;
+    const reg = new Int32Array(S).fill(-1), regs = [];
+    for (let p = 0; p < S; p++) { // regions = connected non-c areas
+      if (col[p] === 3 || col[p] === c || reg[p] >= 0) continue;
+      const id = regs.length, pts = [], st = [p]; reg[p] = id;
+      while (st.length) { const q = st.pop(); pts.push(q); for (let i = 0; i < 4; i++) { const r = q + nb[i]; if (col[r] !== 3 && col[r] !== c && reg[r] < 0) { reg[r] = id; st.push(r); } } }
+      const border = new Set();
+      for (const q of pts) for (let i = 0; i < 4; i++) { const r = q + nb[i]; if (col[r] === c) border.add(B.gh[r]); }
+      regs.push({ pts, border, ok: true });
+    }
+    const alive = new Set();
+    for (let p = 0; p < S; p++) if (col[p] === c) alive.add(B.gh[p]);
+    // vital[region] = set of chains for which every empty point of the region is a liberty
+    const vital = regs.map((R) => {
+      const v = new Set();
+      for (const h of R.border) {
+        let ok = true;
+        for (const q of R.pts) {
+          if (col[q] !== 0) continue;
+          let adj = false;
+          for (let i = 0; i < 4; i++) { const r = q + nb[i]; if (col[r] === c && B.gh[r] === h) { adj = true; break; } }
+          if (!adj) { ok = false; break; }
+        }
+        if (ok) v.add(h);
+      }
+      return v;
+    });
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const h of [...alive]) {
+        let n = 0;
+        for (let r = 0; r < regs.length && n < 2; r++) if (regs[r].ok && vital[r].has(h)) n++;
+        if (n < 2) { alive.delete(h); changed = true; }
+      }
+      for (const R of regs) if (R.ok) for (const h of R.border) if (!alive.has(h)) { R.ok = false; changed = true; break; }
+    }
+    return alive;
+  }
+  function deadChains(B, own) {
+    const seen = new Uint8Array(B.S), out = [];
+    const safe = new Set([...bensonAlive(B, 1), ...bensonAlive(B, 2)]);
+    for (let p = 0; p < B.S; p++) {
+      const v = B.col[p];
+      if ((v !== 1 && v !== 2) || seen[p]) continue;
+      if (safe.has(B.gh[p])) { for (const s of B.chain(B.gh[p])) seen[s] = 1; continue; }
+      const ch = B.chain(B.gh[p]);
+      let sum = 0; for (const s of ch) { seen[s] = 1; sum += own[s]; }
+      const avg = sum / ch.length * (v === 1 ? 1 : -1);
+      if (avg >= -0.3) continue;
+      // two eyes → alive
+      const eyes = new Set();
+      for (const s of ch) for (let i = 0; i < 4; i++) { const q = s + B.nb[i]; if (B.col[q] === 0 && B.isEye(q, v)) eyes.add(q); }
+      if (eyes.size >= 2) continue;
+      out.push(B.gh[p]);
+    }
+    return out;
+  }
+
+  /* ---- MCTS with RAVE (all sizes). Sliceable: mctsNew → mctsRun(ms) … → mctsPick ---- */
+  let HARD = false, PAT = false;
+  function mctsNew(B, c, opt) {
+    opt = opt || {};
+    const n = B.n, maxLen = n * n * 3, S = B.S;
+    HARD = !!opt.hard; PAT = !!opt.pat;
+    const R = new Board(n); R.copyFrom(B);
+    const root = { m: opt.lm || 0, c: 3 - c, n: 0, w: 0, rn: 0, rw: 0, k: null };
+    expand(root, R, c, opt.prior, opt.limit);
+    return {
+      B: R, c, root, hard: !!opt.hard, pat: !!opt.pat, komi: opt.komi != null ? opt.komi : KOMI, expN: opt.expN || 1,
+      T: new Board(n), own: new Float64Array(S), mvs: new Int16Array(maxLen + 400), mcl: new Int8Array(maxLen + 400),
+      fc: new Int8Array(S), fs: new Int32Array(S), iter: 0, maxLen, spent: 0, budget: opt.budget || 1000,
+    };
+  }
+  function mctsRun(X, ms) {
+    const root = X.root;
+    if (!root.k.length || ms <= 0) return;
+    HARD = X.hard; PAT = X.pat; KOMI = X.komi;
+    const { B, T, own, mvs, mcl, fc, fs, maxLen } = X;
+    let len = 0;
+    const rec = (p, cc) => { mvs[len] = p; mcl[len] = cc; len++; };
+    const t0 = now();
+    while (true) {
+      if ((X.iter & 7) === 0 && now() - t0 > ms) break;
+      const iter = ++X.iter;
+      T.copyFrom(B);
+      const path = [root];
+      let node = root, color = X.c;
+      len = 0;
+      while (node.k && node.k.length) {
+        const ch = select(node);
+        T.play(ch.m, color); rec(ch.m, color);
+        path.push(ch); node = ch; color = 3 - color;
+        if (!node.k && node.n >= X.expN) { expand(node, T, color); break; }
+        if (!node.k) break;
+      }
+      const treeLen = len;
+      const sc = playout(T, color, len ? mvs[len - 1] : 0, maxLen, rec) - KOMI;
+      const win = sc > 0 ? 1 : 2;
+      addOwn(T, own);
+      for (const nd of path) { nd.n++; if (nd.c === win) nd.w++; }
+      for (let i = len - 1; i >= treeLen; i--) { fc[mvs[i]] = mcl[i]; fs[mvs[i]] = iter; }
+      for (let d = treeLen - 1; d >= 0; d--) {
+        fc[mvs[d]] = mcl[d]; fs[mvs[d]] = iter;
+        const nd = path[d], mc = mcl[d];
+        if (nd.k) for (const k of nd.k) if (fs[k.m] === iter && fc[k.m] === mc) { k.rn++; if (mc === win) k.rw++; }
+      }
+    }
+    X.spent += now() - t0;
+  }
+  function mctsPick(X) {
+    const root = X.root;
+    if (!root.k.length) return { m: 0, wr: 0.5, own: null, iter: 0 };
+    let best = root.k[0];
+    for (const k of root.k) if (k.n > best.n) best = k;
+    const own = new Float64Array(X.own.length), it = X.iter || 1;
+    for (let i = 0; i < own.length; i++) own[i] = X.own[i] / it;
+    return { m: best.m, wr: best.n ? best.w / best.n : 0.5, own, iter: X.iter, kids: root.k };
+  }
+  function mcts(B, c, budget, hard, lm0) { const X = mctsNew(B, c, { hard, lm: lm0, budget, pat: hard }); mctsRun(X, budget); return mctsPick(X); }
+  let KOMI = 6.5;
+  const BH = { pri: 1, pat: 1, nm: 0, ms: 1500, nms: 150, ce: 0.15, req: 2000, scale: 1 };
+  function expand(node, B, c, prior, limit) {
+    let kids = [];
+    const col = B.col, o = 3 - c, empty = B.ne > B.n * B.n * 0.75;
+    const lm = node.m, W = B.W;
+    for (let i = 0; i < B.ne; i++) {
+      const p = B.emp[i];
+      if (!B.legal(p, c) || B.isEye(p, c)) continue;
+      const k = { m: p, c, n: 0, w: 0, rn: 0, rw: 0, k: null };
+      let capt = false;
+      for (let j = 0; j < 4; j++) { const q = p + B.nb[j]; if (col[q] === o && B.atari(B.gh[q])) capt = true; }
+      const line = edgeLine(B, p);
+      let save = false, atk = false;
+      if (HARD && BH.pri) for (let j = 0; j < 4; j++) {
+        const q = p + B.nb[j];
+        if (col[q] === c && B.atari(B.gh[q])) save = true;
+        else if (col[q] === o && !B.atari(B.gh[q]) && B.pl[B.gh[q]] <= 3 && B.libs(B.gh[q]) === 2) atk = true;
+      }
+      const l2 = B.libsAfter2(p, c);
+      if (capt) { k.rn = 20; k.rw = 16; }
+      else if (l2 < 2) { k.rn = 20; k.rw = 2; }
+      else if (save) { k.rn = 20; k.rw = 15; }
+      else if (atk) { k.rn = 14; k.rw = 9; }
+      else if (empty && line === 0) { k.rn = 20; k.rw = 4; }
+      else if (empty && line === 1) { k.rn = 20; k.rw = 7; }
+      else if (HARD && BH.pri && lm > 0 && Math.abs((lm % W) - (p % W)) <= 1 && Math.abs(((lm / W) | 0) - ((p / W) | 0)) <= 1) { k.rn = 10; k.rw = 6; }
+      kids.push(k);
+    }
+    if (prior) { // root on 13/19: keep the best-looking candidates (heuristic), boost the top few
+      kids.sort((a, b) => prior[b.m] - prior[a.m]);
+      if (limit && kids.length > limit) kids = kids.slice(0, limit);
+      for (let r = 0; r < Math.min(8, kids.length); r++) { kids[r].rn += 24; kids[r].rw += 17 - r; }
+    }
+    node.k = kids;
+  }
+  function edgeLine(B, p) { const x = p % B.W - 1, y = ((p / B.W) | 0) - 1, n = B.n; return Math.min(x, y, n - 1 - x, n - 1 - y); }
+  function select(node) {
+    let best = null, bv = -1;
+    const lg = Math.log(node.n + 1);
+    for (const k of node.k) {
+      let v;
+      if (k.n + k.rn === 0) v = 1.1 + Math.random() * 0.01;
+      else {
+        const beta = k.rn / (k.rn + k.n + k.rn * k.n / (HARD ? BH.req : 2000));
+        const q = k.n ? k.w / k.n : 0.5, r = k.rn ? k.rw / k.rn : 0.5;
+        v = (1 - beta) * q + beta * r + (HARD ? BH.ce : 0.15) * Math.sqrt(lg / (k.n + 1));
+      }
+      if (v > bv) { bv = v; best = k; }
+    }
+    return best;
+  }
+  /* ---- heuristic player (13·19줄) ---- */
+  function heuristic(B, c, mcount, opt) {
+    const noise = opt && opt.noise || 3, extra = opt && opt.extra;
+    const n = B.n, W = B.W, col = B.col, o = 3 - c, T = new Board(n);
+    const stones = n * n - B.ne;
+    // influence: own positive
+    const inf = new Float64Array(B.S);
+    for (let y = 1; y <= n; y++) for (let x = 1; x <= n; x++) {
+      const p = y * W + x, v = col[p];
+      if (v !== 1 && v !== 2) continue;
+      const sg = v === c ? 1 : -1;
+      for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+        const d = Math.abs(dx) + Math.abs(dy); if (d > 4) continue;
+        const yy = y + dy, xx = x + dx; if (yy < 1 || xx < 1 || yy > n || xx > n) continue;
+        inf[yy * W + xx] += sg * (5 - d);
+      }
+    }
+    const stars = starPoints(n).map(([x, y]) => (y + 1) * W + x + 1);
+    let best = 0, bs = -1e9;
+    for (let i = 0; i < B.ne; i++) {
+      const p = B.emp[i];
+      if (!B.legal(p, c) || B.isEye(p, c)) continue;
+      const line = edgeLine(B, p);
+      let sc = Math.random() * noise + (extra ? extra(p) : 0);
+      // tactical: simulate
+      T.copyFrom(B);
+      const before = T.cap[c];
+      T.play(p, c);
+      const caps = T.cap[c] - before;
+      const h = T.gh[p], libs = T.libs(h), size = T.sz[h];
+      if (caps) sc += 40 + 25 * caps;
+      for (let j = 0; j < 4; j++) { // saving own chains in atari
+        const q = p + B.nb[j];
+        if (col[q] === c && B.atari(B.gh[q])) sc += libs >= 2 ? 45 + 20 * B.sz[B.gh[q]] : -10;
+      }
+      if (libs === 1 && !caps) sc -= size > 1 ? 70 + 20 * size : 25;
+      else if (libs === 2 && size > 3) sc -= 8;
+      for (let j = 0; j < 4; j++) { // atari / pressure on opponent
+        const q = p + B.nb[j];
+        if (T.col[q] !== o) continue;
+        const l = T.libs(T.gh[q]);
+        if (l === 1 && libs >= 2) sc += 14 + 7 * T.sz[T.gh[q]];
+        else if (l === 2 && libs >= 3) sc += 3;
+      }
+      const f = inf[p];
+      sc += 14 - 2.2 * Math.abs(f);
+      if (f > 9) sc -= 10;
+      if (f < -10 && libs < 3) sc -= 6;
+      if (line === 0) sc -= caps ? 0 : 16;
+      if (stones < n * n / 6) {
+        if (line === 1) sc -= 6;
+        if (line === 2 || line === 3) sc += 6;
+        if (stars.includes(p)) sc += 8;
+        if (line >= 5) sc -= 3;
+      }
+      if (opt && opt.out) opt.out[p] = sc;
+      if (sc > bs) { bs = sc; best = p; }
+    }
+    return best;
+  }
+  function starPoints(n) {
+    const a = n === 9 ? [2, 6] : n === 13 ? [3, 9] : [3, 15], m = (n - 1) / 2;
+    const pts = [[a[1], a[0]], [a[0], a[1]], [a[1], a[1]], [a[0], a[0]]]; // 우상, 좌하, 우하, 좌상 (x, y)
+    if (n === 19) pts.push([3, 9], [15, 9], [9, 3], [9, 15]);
+    pts.push([m, m]);
+    return pts;
+  }
+
+  /* =====================================================================
+   * Game state. Moves are stored compactly (2 chars each, "zz" = 패스);
+   * the board is rebuilt by replay, which also gives 패, 사석, 수 번호.
+   * ===================================================================== */
+  const enc = (x, y) => String.fromCharCode(97 + x, 97 + y);
+  function moveCap(n) { return Math.min(n * n * 2, 600); }
+  function replay(s, upto) {
+    const n = s.n, B = new Board(n), W = B.W, num = new Int16Array(B.S);
+    const hs = handiPts(n, s.hc);
+    for (const [x, y] of hs) { const p = (y + 1) * W + x + 1; B.play(p, 1); }
+    B.ko = 0;
+    const mv = s.m, cnt = upto == null ? mv.length / 2 : upto;
+    let c = s.hc ? 2 : 1;
+    for (let i = 0; i < cnt; i++) {
+      const a = mv.charCodeAt(i * 2) - 97, b = mv.charCodeAt(i * 2 + 1) - 97;
+      if (a === 25) B.pass();
+      else { const p = (b + 1) * W + a + 1; if (!B.legal(p, c)) throw new Error('bad history'); B.play(p, c); num[p] = i + 1; }
+      c = 3 - c;
+    }
+    B.turn = c; B.num = num;
+    return B;
+  }
+  function handiPts(n, hc) { if (!hc) return []; return starPoints(n).slice(0, hc); }
+  function moveCount(s) { return s.m.length / 2; }
+  function toMove(s) { return (moveCount(s) + (s.hc ? 1 : 0)) % 2; } // seat
+  function isPass(s, i) { return s.m.charCodeAt(i * 2) === 122; }
+  function init(players, opts) {
+    const n = opts && [9, 13, 19].includes(+opts.size) ? +opts.size : 9;
+    const km = opts && [6.5, 0.5, 0].includes(+opts.komi) ? +opts.komi : 6.5;
+    let hc = opts && [0, 2, 3, 4].includes(+opts.hc) ? +opts.hc : 0;
+    const hum = players.map((p, i) => (p.ai ? -1 : i)).filter((i) => i >= 0);
+    const solo = hum.length === 1 && players.length === 2 && players.some((p) => p.ai) ? hum[0] : -1;
+    const fe = opts && +opts.eval === 1 ? 1 : 0;
+    return { n, km, hc, fe, m: '', rs: 0, ph: 'p', d: [], d0: [], ag: [0, 0], seq: 0, ev: null, st: null, solo, uk: -1 };
+  }
+  function actor(s) {
+    if (s.st) return null;
+    if (s.ph === 'm') return [0, 1].filter((i) => !s.ag[i]);
+    return toMove(s);
+  }
+  const spOf = (B, p) => (((p / B.W) | 0) - 1) * B.n + (p % B.W) - 1;
+  const pOf = (B, sp) => (((sp / B.n) | 0) + 1) * B.W + (sp % B.n) + 1;
+  function enterMarking(s, B) {
+    s.ph = 'm'; s.ag = [0, 0];
+    const k = s.n === 9 ? 600 : s.n === 13 ? 320 : 180;
+    const own = ownership(B, B.turn, k, 320);
+    s.d0 = deadChains(B, own).map((h) => spOf(B, h)).sort((a, b) => a - b);
+    s.d = s.d0.slice();
+    if (JSON.stringify(s).length > 2450) s.d0 = [];
+  }
+  /* is padded point p part of a chain listed in d (state points)? → set of dead padded points */
+  function deadSet(B, d) {
+    const set = new Set();
+    for (const sp of d) { const p = pOf(B, sp); if (B.col[p] === 1 || B.col[p] === 2) for (const q of B.chain(B.gh[p])) set.add(q); }
+    return set;
+  }
+  /* Korean territory counting: 집 + 사석 (잡은 돌 + 죽은 돌), 백 + 덤 */
+  function scoreOf(s, B) {
+    const dead = deadSet(B, s.d), n = B.n, W = B.W, col = B.col.slice();
+    const pris = [0, B.cap[1], B.cap[2]], deadN = [0, 0, 0];
+    for (const p of dead) { const v = col[p]; pris[3 - v]++; deadN[v]++; col[p] = 0; }
+    const ter = [0, 0, 0], owner = new Int8Array(B.S), seen = new Uint8Array(B.S);
+    for (let y = 1; y <= n; y++) for (let x = 1; x <= n; x++) {
+      const p0 = y * W + x;
+      if (col[p0] !== 0 || seen[p0]) continue;
+      const stack = [p0], reg = []; let bb = 0, ww = 0; seen[p0] = 1;
+      while (stack.length) {
+        const p = stack.pop(); reg.push(p);
+        for (const d of B.nb) { const q = p + d, v = col[q]; if (v === 0 && !seen[q]) { seen[q] = 1; stack.push(q); } else if (v === 1) bb = 1; else if (v === 2) ww = 1; }
+      }
+      const ow = bb && !ww ? 1 : ww && !bb ? 2 : 0;
+      if (ow) { ter[ow] += reg.length; for (const p of reg) owner[p] = ow; }
+    }
+    const b = ter[1] + pris[1], w = ter[2] + pris[2] + s.km;
+    return { b, w, ter, pris, deadN, owner, dead };
+  }
+  function apply(s, seat, a) {
+    if (s.st) throw new Error('game over');
+    if (!a) throw new Error('bad action');
+    const acts = actor(s);
+    if (Array.isArray(acts) ? !acts.includes(seat) : acts !== seat) throw new Error('not your turn');
+    if (s.ph === 'm') {
+      const B = replay(s);
+      if (a.type === 'mark') {
+        const sp = a.p | 0;
+        if (sp < 0 || sp >= s.n * s.n) throw new Error('off board');
+        const p = pOf(B, sp);
+        if (B.col[p] !== 1 && B.col[p] !== 2) throw new Error('no stone');
+        const chain = new Set(B.chain(B.gh[p]).map((q) => spOf(B, q)));
+        const had = s.d.some((x) => chain.has(x));
+        s.d = had ? s.d.filter((x) => !chain.has(x)) : s.d.concat([spOf(B, B.gh[p])]).sort((x, y) => x - y);
+        s.ag = [0, 0]; s.seq++; s.ev = { id: s.seq, k: 'mk', by: seat, p: sp, on: had ? 0 : 1 };
+        return s;
+      }
+      if (a.type === 'agree') {
+        s.ag[seat] = 1; s.seq++; s.ev = { id: s.seq, k: 'ag', by: seat };
+        if (s.ag[0] && s.ag[1]) {
+          const r = scoreOf(s, B);
+          s.ph = 'e';
+          s.st = { r: 'score', w: r.b > r.w ? 0 : r.w > r.b ? 1 : -1, b: r.b, wt: r.w, t: [r.ter[1], r.ter[2]], p: [r.pris[1], r.pris[2]], c: [B.cap[1], B.cap[2]], dd: [r.deadN[2], r.deadN[1]] };
+        }
+        return s;
+      }
+      if (a.type === 'resume') {
+        s.ph = 'p'; s.d = []; s.d0 = []; s.ag = [0, 0]; s.rs = moveCount(s);
+        s.seq++; s.ev = { id: s.seq, k: 'rs', by: seat }; s.uk = moveCount(s);
+        return s;
+      }
+      throw new Error('bad action');
+    }
+    if (a.type === 'resign') { s.seq++; s.st = { r: 'resign', w: 1 - seat }; return s; }
+    if (a.type === 'undo') {
+      const n = moveCount(s);
+      if (s.solo !== seat || n - 2 < s.rs || s.uk === n) throw new Error('cannot undo');
+      s.m = s.m.slice(0, -4); s.uk = n - 2; s.seq++; s.ev = { id: s.seq, k: 'u' };
+      return s;
+    }
+    const B = replay(s);
+    if (a.type === 'pass') {
+      const n = moveCount(s);
+      s.m += 'zz'; s.seq++; s.ev = { id: s.seq, k: 'ps', by: seat };
+      B.pass(); B.turn = 3 - B.turn;
+      if (n >= s.rs + 1 && isPass(s, n - 1)) enterMarking(s, B);
+      else if (moveCount(s) >= moveCap(s.n)) enterMarking(s, B);
+      return s;
+    }
+    if (a.type !== 'place') throw new Error('bad action');
+    const sp = a.p | 0;
+    if (sp < 0 || sp >= s.n * s.n) throw new Error('off board');
+    const p = pOf(B, sp), c = seat + 1;
+    const why = B.why(p, c);
+    if (why) throw new Error(why);
+    const caps = B.play(p, c); B.turn = 3 - B.turn;
+    s.m += enc(sp % s.n, (sp / s.n) | 0);
+    s.seq++; s.ev = caps ? { id: s.seq, k: 'cap', by: seat, n: caps } : null;
+    if (moveCount(s) >= moveCap(s.n)) { enterMarking(s, B); s.ev = { id: s.seq, k: 'cap0' }; }
+    return s;
+  }
+  const fmt = (v) => (Math.round(v * 10) / 10).toString();
+  function result(s) {
+    if (!s.st) return null;
+    const n = moveCount(s);
+    if (s.st.r === 'resign') return { winners: [s.st.w], title: (s.st.w ? '백' : '흑') + ' 불계승', text: (s.st.w ? '흑' : '백') + ' 기권 · ' + n + '수' };
+    const st = s.st;
+    const text = '흑 집 ' + st.t[0] + ' + 사석 ' + st.p[0] + ' = ' + fmt(st.b) + '\n백 집 ' + st.t[1] + ' + 사석 ' + st.p[1] + ' + 덤 ' + s.km + ' = ' + fmt(st.wt);
+    const cp = st.c || [st.p[0], st.p[1]], dd = st.dd || [0, 0];
+    const stats = [
+      { label: '집', values: [String(st.t[0]), String(st.t[1])] },
+      { label: '따낸 돌', values: [String(cp[0]), String(cp[1])] },
+      { label: '죽은 돌(사석)', values: [String(dd[0]), String(dd[1])] },
+      { label: '덤', values: ['0', String(s.km)] },
+      { label: '총점', values: [fmt(st.b), fmt(st.wt)] },
+    ];
+    if (st.w < 0) return { winners: [], title: '빅 (동점)', text, stats };
+    return { winners: [st.w], title: (st.w ? '백' : '흑') + ' ' + fmt(Math.abs(st.b - st.wt)) + '집 승', text, stats };
+  }
+
+  /* ---- AI ---- (lv 1 쉬움: noisy heuristic, no MCTS · 2 보통 · 3 어려움: longer MCTS / ownership-guided heuristic) */
+  /* MCTS 쓰는 자리: 어려움만(보통은 수읽기 휴리스틱 — 단계 간격을 고르게). 시간(ms): 9줄 1.5초, 13줄 2.5초, 19줄 3.5초 */
+  function useMcts(n, lv) { return lv === 3 || (n === 9 && lv === 2 && !!BH.nm); }
+  function budgetFor(n, lv) { return Math.round((lv === 3 ? (n === 9 ? BH.ms : n === 13 ? 2500 : 3500) : BH.nms) * BH.scale); }
+  function searchKey(s, seat, lv) { return s.n + '|' + s.km + '|' + s.hc + '|' + s.rs + '|' + s.m + '|' + seat + '|' + lv; }
+  function prepSearch(s, seat, lv, B) {
+    B = B || replay(s);
+    const n = s.n, c = seat + 1, mc = moveCount(s);
+    let lm = 0;
+    if (mc > 0 && !isPass(s, mc - 1)) lm = pOf(B, (s.m.charCodeAt(mc * 2 - 1) - 97) * n + (s.m.charCodeAt(mc * 2 - 2) - 97));
+    const opt = { hard: lv === 3, pat: lv === 3 && !!BH.pat, lm, komi: s.km, budget: budgetFor(n, lv), expN: n === 9 ? 1 : n === 13 ? 4 : 8 };
+    if (n > 9) { // root candidates from the tactical/shape heuristic
+      const out = new Float64Array(B.S).fill(-1e9);
+      heuristic(B, c, mc, { noise: 0.5, out });
+      opt.prior = out; opt.limit = n === 13 ? 48 : 56;
+    }
+    return mctsNew(B, c, opt);
+  }
+  /* background search, sliced into short chunks so the page never freezes (started by aiDelayFor, finished by ai) */
+  let BGS = null;
+  function bgStop() { if (BGS && BGS.timer) clearTimeout(BGS.timer); BGS = null; }
+  function bgStart(s, seat, lv) {
+    const key = searchKey(s, seat, lv);
+    if (BGS && BGS.key === key) return;
+    bgStop();
+    if (typeof setTimeout === 'undefined') return;
+    const X = prepSearch(s, seat, lv);
+    const me = BGS = { key, X, timer: 0 };
+    const slice = () => {
+      if (BGS !== me) return;
+      me.timer = 0;
+      if (X.spent >= X.budget) return;
+      mctsRun(X, Math.min(12, X.budget - X.spent));
+      me.timer = setTimeout(slice, 0);
+    };
+    me.timer = setTimeout(slice, 0);
+  }
+  function aiDelayFor(s, seat, lv) {
+    if (s.ph === 'm') return 500;
+    lv = lv === 1 || lv === 3 ? lv : 2;
+    if (!s.st && s.ph === 'p' && useMcts(s.n, lv) && toMove(s) === seat) {
+      try { bgStart(s, seat, lv); } catch (e) { bgStop(); }
+      return Math.round(budgetFor(s.n, lv) * 1.25) + 60; // wall time for the slices (the gaps between them cost a little)
+    }
+    return lv === 1 ? 600 : 300;
+  }
+  /* ownership-aware bonus for 13/19 (어려움): play where the outcome is still open, help weak own groups, attack weak ones */
+  function ownExtra(B, c, own) {
+    const sg = c === 1 ? 1 : -1, nb = B.nb, col = B.col;
+    return (p) => {
+      const o = own[p] * sg; // +1 = surely mine, −1 = surely theirs
+      let v = 14 * (1 - Math.abs(o)) - (o > 0.75 ? 10 : 0);
+      for (let j = 0; j < 4; j++) {
+        const q = p + nb[j], u = col[q];
+        if (u !== 1 && u !== 2) continue;
+        const oq = own[q] * sg;
+        if (u === c && oq < 0.3 && oq > -0.6) v += 6; // shore up a weak group
+        if (u !== c && oq > -0.3 && oq < 0.6) v += 5; // press a weak enemy group
+      }
+      return v;
+    };
+  }
+  function scoreFor(s, B, d, seat) { const t = Object.assign({}, s, { d }); const r = scoreOf(t, B); return seat ? r.w - r.b : r.b - r.w; }
+  function ai(s, seat, lv) {
+    lv = lv === 1 || lv === 3 ? lv : 2;
+    if (s.ph === 'm') {
+      const B = replay(s);
+      const d0 = s.d0 || [];
+      if (scoreFor(s, B, s.d, seat) >= scoreFor(s, B, d0, seat) - 0.01) return { type: 'agree' };
+      // restore one chain whose marking differs from my estimate and hurts me
+      const set0 = deadSet(B, d0), cur = deadSet(B, s.d);
+      for (const p of cur) if (!set0.has(p) && B.col[p] === seat + 1) return { type: 'mark', p: spOf(B, p) };
+      for (const p of set0) if (!cur.has(p) && B.col[p] === 2 - seat) return { type: 'mark', p: spOf(B, p) };
+      return { type: 'agree' };
+    }
+    const B = replay(s), c = seat + 1, n = s.n, mc = moveCount(s);
+    KOMI = s.km;
+    const oppPassed = mc > s.rs && isPass(s, mc - 1);
+    if (mc >= moveCap(n) - 2) return { type: 'pass' };
+    const late = mc > n * n * 0.45 || oppPassed;
+    let own = null;
+    if (lv === 1) {
+      if (late) {
+        own = ownership(B, c, 24, 90);
+        if (wantPass(s, B, own, seat, oppPassed)) return { type: 'pass' };
+      }
+      let m = 0;
+      if (Math.random() < 0.18) { // a careless move somewhere near the action
+        const cand = [];
+        for (let i = 0; i < B.ne; i++) { const p = B.emp[i]; if (B.legal(p, c) && !B.isEye(p, c) && B.libsAfter2(p, c) > 1 && edgeLine(B, p) > 0) cand.push(p); }
+        if (cand.length) m = cand[(Math.random() * cand.length) | 0];
+      }
+      if (!m) m = heuristic(B, c, mc, { noise: 26 });
+      if (m && own && Math.abs(own[m]) >= 0.9) m = heuristic2(B, c, own) || m;
+      if (!m) return { type: 'pass' };
+      return { type: 'place', p: spOf(B, m) };
+    }
+    if (useMcts(n, lv)) {
+      const key = searchKey(s, seat, lv);
+      let X;
+      if (BGS && BGS.key === key) { X = BGS.X; bgStop(); mctsRun(X, Math.min(60, X.budget - X.spent)); }
+      else { X = prepSearch(s, seat, lv, B); mctsRun(X, X.budget); }
+      const r = mctsPick(X);
+      own = r.own;
+      if (!r.m) return { type: 'pass' };
+      if (late && own && wantPass(s, B, own, seat, oppPassed)) return { type: 'pass' };
+      let m = r.m;
+      if (late && own && r.kids) { // don't play inside settled territory when there are open points
+        const open = r.kids.filter((k) => Math.abs(own[k.m]) < 0.7 && k.n > 0);
+        if (Math.abs(own[m]) >= 0.85 && open.length) m = open.reduce((a, b) => (b.n > a.n ? b : a)).m;
+      }
+      return { type: 'place', p: spOf(B, m) };
+    }
+    // 보통 13·19줄: 형세(집 추정)를 보는 빠른 판단
+    own = ownership(B, c, n === 13 ? 300 : 160, n === 13 ? 220 : 260);
+    if (late && wantPass(s, B, own, seat, oppPassed)) return { type: 'pass' };
+    let m = heuristic(B, c, mc, { noise: 1.5, extra: ownExtra(B, c, own) });
+    if (m && own && Math.abs(own[m]) >= 0.85) {
+      // settled point: look for an unsettled alternative
+      let alt = 0;
+      for (let i = 0; i < B.ne; i++) { const p = B.emp[i]; if (Math.abs(own[p]) < 0.7 && B.legal(p, c) && !B.isEye(p, c) && B.libsAfter2(p, c) > 1) { alt = p; break; } }
+      if (!alt) return { type: 'pass' };
+      m = heuristic2(B, c, own) || alt;
+    }
+    if (!m) return { type: 'pass' };
+    return { type: 'place', p: spOf(B, m) };
+  }
+  /* heuristic restricted to unsettled points */
+  function heuristic2(B, c, own) {
+    const T = new Board(B.n);
+    let best = 0, bs = -1e9;
+    for (let i = 0; i < B.ne; i++) {
+      const p = B.emp[i];
+      if (Math.abs(own[p]) >= 0.7 || !B.legal(p, c) || B.isEye(p, c)) continue;
+      T.copyFrom(B); const b0 = T.cap[c]; T.play(p, c);
+      const libs = T.libs(T.gh[p]);
+      if (libs < 2 && T.cap[c] === b0) continue;
+      const sc = (T.cap[c] - b0) * 30 + libs - Math.abs(own[p]) * 10 + Math.random();
+      if (sc > bs) { bs = sc; best = p; }
+    }
+    return best;
+  }
+  function wantPass(s, B, own, seat, oppPassed) {
+    const c = seat + 1, n = B.n, W = B.W;
+    let open = 0;
+    for (let y = 1; y <= n; y++) for (let x = 1; x <= n; x++) {
+      const p = y * W + x;
+      if (B.col[p] === 0 && Math.abs(own[p]) < 0.7 && B.legal(p, c) && !B.isEye(p, c)) open++;
+    }
+    if (!open) return true;
+    if (!oppPassed) return false;
+    // opponent passed: pass if we win with the estimated dead stones
+    const d = deadChains(B, own).map((h) => spOf(B, h));
+    return scoreFor(s, B, d, seat) > 0;
+  }
+
+  /* =====================================================================
+   * View
+   * ===================================================================== */
+  const FONT = '"IBM Plex Sans KR", system-ui, sans-serif', MONO = '"IBM Plex Mono", ui-monospace, monospace';
+  const SNAME = ['흑', '백'];
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    let st = null, G = null, B = null, ghost = -1, down = null, busy = false, stopLoop = null, shownSeq = -1, waitSeq = -1, waitUntil = 0;
+    let drop = null, fades = [], score = null, nsz = 0, shk = null;
+    const FX = () => (typeof L.fx === 'function' ? L.fx() : 1);
+    let showNum = U.store.get('baduk.nums', false);
+    const BS = { minHeight: '44px', flex: '1 1 0', minWidth: 0, padding: '6px 4px', fontSize: '13px', whiteSpace: 'nowrap' };
+    const hud = L.h('div', { class: 'hud bottom bd-hud', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px' } });
+    const numBtn = L.h('button', { 'data-action': 'nums', class: 'btn sm ghost', style: BS, onclick() { showNum = !showNum; U.store.set('baduk.nums', showNum); api.sfx('click'); api.buzz(8); numLabel(); draw(); } });
+    const undoBtn = L.h('button', { 'data-action': 'undo', class: 'btn sm ghost', style: BS, text: '↶ 무르기', 'aria-label': '한 수 무르기', onclick: onUndo });
+    const passBtn = L.h('button', { 'data-action': 'pass', class: 'btn sm ghost bd-pass', style: BS, text: '패스', 'aria-label': '패스', onclick: onPass });
+    const resignBtn = L.h('button', { class: 'btn sm ghost', style: BS, text: '기권', 'aria-label': '기권(불계)', onclick: onResign });
+    const placeBtn = L.h('button', { 'data-action': 'place', class: 'btn primary bd-place', style: Object.assign({}, BS, { flex: '1.5 1 0', fontSize: '15px' }), text: '놓기', onclick: () => commit() });
+    const resumeBtn = L.h('button', { 'data-action': 'resume', class: 'btn sm', style: BS, text: '계속 두기', 'aria-label': '계가를 멈추고 계속 두기', onclick: onResume });
+    const agreeBtn = L.h('button', { 'data-action': 'agree', class: 'btn primary', style: Object.assign({}, BS, { flex: '1.5 1 0', fontSize: '15px' }), text: '계가 동의', onclick: onAgree });
+    hud.append(numBtn, undoBtn, passBtn, resignBtn, placeBtn, resumeBtn, agreeBtn);
+    const hint = L.h('div', { class: 'bd-hint', style: { position: 'absolute', left: '12px', right: '12px', textAlign: 'center', fontSize: '12.5px', color: 'var(--muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', pointerEvents: 'none' } });
+    root.append(hud, hint);
+    /* 형세 판단 막대: 로컬은 개인 설정(이 기기), 온라인은 방장 옵션(st.fe)일 때 둘 다 */
+    let evalPref = U.store.get('baduk.eval', false), ev = null, evJob = 0, evKey = '';
+    const evFill = L.h('div', { style: { position: 'absolute', left: '0', top: '0', bottom: '0', width: '50%', background: 'linear-gradient(#2a2622,#0f0d0c)', transition: 'width .5s ease' } });
+    const evText = L.h('div', { class: 'bd-evtext', style: { position: 'relative', margin: 'auto', fontSize: '12px', fontWeight: 700, padding: '0 8px', borderRadius: '8px', background: 'rgba(30,24,36,.72)', color: '#f2e9d8', whiteSpace: 'nowrap' } });
+    const evBar = L.h('div', { class: 'bd-eval', role: 'status', 'aria-live': 'polite', style: { position: 'absolute', height: '20px', display: 'none', alignItems: 'center', overflow: 'hidden', borderRadius: '10px', background: 'linear-gradient(#fbf6ea,#d9d2c4)', border: '1px solid rgba(227,174,69,.6)', pointerEvents: 'none' } }, evFill, evText);
+    const evBtn = L.h('button', { class: 'btn sm ghost bd-evbtn', style: { position: 'absolute', width: '44px', height: '44px', minHeight: '44px', padding: '0', fontSize: '17px' }, onclick() { evalPref = !evalPref; U.store.set('baduk.eval', evalPref); api.sfx('click'); api.buzz(8); evLabel(); layout(); evalKick(); draw(); } });
+    root.append(evBar, evBtn);
+    /* 영역 미리보기: 돌에서 퍼지는 세력(거리에 따라 반씩 약해짐)을 합쳐 빈 점을 옅게 칠함. 수가 바뀔 때만 다시 계산 */
+    let terrPref = U.store.get('baduk.terr', false), terr = null, terrKey = '';
+    const terrBtn = L.h('button', { class: 'btn sm ghost bd-terrbtn', style: { position: 'absolute', width: '44px', height: '44px', minHeight: '44px', padding: '0', fontSize: '17px' }, onclick() { terrPref = !terrPref; U.store.set('baduk.terr', terrPref); api.sfx('click'); api.buzz(8); terrLabel(); draw(); } });
+    root.append(terrBtn);
+    function terrLabel() { terrBtn.textContent = '🗺'; terrBtn.setAttribute('aria-pressed', String(!!terrPref)); terrBtn.setAttribute('aria-label', '영역 미리보기 ' + (terrPref ? '켜짐' : '꺼짐')); terrBtn.style.opacity = terrPref ? '1' : '.55'; }
+    terrLabel();
+    function terrShown() { return !!terrPref && !!st && !st.st && st.ph === 'p' && (!api.online || st.fe === 1); }
+    function terrMap() {
+      const N = G.N, key = N + ':' + st.m + ':' + st.rs;
+      if (terr && terrKey === key) return terr;
+      terrKey = key;
+      const inf = new Float32Array(N * N), RAD = 4, WT = [0, 1, 0.5, 0.25, 0.125];
+      for (let sp = 0; sp < N * N; sp++) {
+        const v = B.col[pOf(B, sp)];
+        if (v !== 1 && v !== 2) continue;
+        const sg = v === 1 ? 1 : -1, x = sp % N, y = (sp / N) | 0;
+        for (let dy = -RAD; dy <= RAD; dy++) {
+          const yy = y + dy; if (yy < 0 || yy >= N) continue;
+          const rem = RAD - Math.abs(dy);
+          for (let dx = -rem; dx <= rem; dx++) {
+            const xx = x + dx; if (xx < 0 || xx >= N) continue;
+            const d = Math.abs(dx) + Math.abs(dy); if (d) inf[yy * N + xx] += sg * WT[d];
+          }
+        }
+      }
+      return (terr = inf);
+    }
+    function evLabel() { evBtn.textContent = '📊'; evBtn.setAttribute('aria-pressed', String(!!evalPref)); evBtn.setAttribute('aria-label', '형세 판단 ' + (evalPref ? '켜짐' : '꺼짐')); evBtn.style.opacity = evalPref ? '1' : '.55'; }
+    evLabel();
+    function evalShown() { return !!st && !st.st && st.ph === 'p' && (api.online ? st.fe === 1 : !!evalPref); }
+    function evalShow() {
+      if (!ev) { evText.textContent = '형세 계산 중…'; evFill.style.width = '50%'; return; }
+      const d = ev.d, n = st.n, sc = n === 9 ? 10 : n === 13 ? 18 : 30;
+      evFill.style.width = (50 + 50 * Math.tanh(d / sc)) + '%';
+      const a = Math.round(Math.abs(d) * 2) / 2;
+      evText.textContent = (a < 0.5 ? '형세 비슷' : (d > 0 ? '흑 ' : '백 ') + fmt(a) + '집 우세') + (ev.done ? '' : ' …');
+    }
+    /* 수가 바뀔 때마다 백그라운드로 나눠서 무작위 끝내기를 돌려 집 차이를 어림 */
+    function evalKick() {
+      const on = evalShown();
+      if (!on) { evJob++; evKey = ''; return; }
+      const key = st.n + ':' + st.m + ':' + st.rs;
+      if (key === evKey) { evalShow(); return; }
+      evKey = key; const job = ++evJob;
+      if (!B) return;
+      const S = new Board(B.n); S.copyFrom(B);
+      const T = new Board(B.n), acc = new Float64Array(S.S), total = B.n === 9 ? 240 : B.n === 13 ? 120 : 64, km = st.km;
+      let done = 0;
+      if (ev) ev.done = false;
+      evalShow();
+      const step = () => {
+        if (job !== evJob) return;
+        const oH = HARD, oP = PAT; HARD = false; PAT = false;
+        const t0 = now();
+        while (done < total && now() - t0 < 10) { T.copyFrom(S); playout(T, done % 2 ? 3 - S.turn : S.turn, 0, S.n * S.n * 3); addOwn(T, acc); done++; }
+        HARD = oH; PAT = oP;
+        let sum = 0; for (let i = 0; i < acc.length; i++) sum += acc[i];
+        if (done >= 12 || done >= total) { ev = { d: sum / done - km, done: done >= total }; evalShow(); }
+        if (done < total) setTimeout(step, 30);
+      };
+      setTimeout(step, 60);
+    }
+    // invisible boxes over canvas areas, so the first-play tutorial can spotlight them
+    const spot = (cls) => { const d = L.h('div', { class: cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none' } }); root.append(d); return d; };
+    const place = (d, x, y, w, h) => Object.assign(d.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' });
+    const spBoard = spot('bd-board'), spCorner = spot('bd-corner'), spMe = spot('bd-me'), spOpp = spot('bd-opp');
+    function numLabel() { numBtn.textContent = (showNum ? '● ' : '○ ') + '번호'; numBtn.setAttribute('aria-pressed', String(showNum)); numBtn.setAttribute('aria-label', '수 번호 ' + (showNum ? '켜짐' : '꺼짐')); }
+    numLabel();
+    const vis = (el, on) => { el.style.display = on ? '' : 'none'; };
+    const setBusy = (v) => { if (busy !== v) { busy = v; api.setBusy(v); } };
+
+    const confirms = new Map();
+    function armed(btn, label, ask) {
+      if (confirms.has(btn)) { disarm(btn); return true; }
+      for (const b of [...confirms.keys()]) disarm(b);
+      btn.classList.add('danger'); btn.classList.remove('ghost'); btn.textContent = ask;
+      confirms.set(btn, { label, timer: setTimeout(() => disarm(btn), 3000) });
+      api.sfx('click'); api.buzz(10);
+      return false;
+    }
+    function disarm(btn) { const c = confirms.get(btn); if (!c) return; clearTimeout(c.timer); confirms.delete(btn); btn.classList.remove('danger'); btn.classList.add('ghost'); btn.textContent = c.label; }
+    function disarmAll() { for (const b of [...confirms.keys()]) disarm(b); }
+
+    const acts = () => { const a = st && actor(st); return a == null ? [] : Array.isArray(a) ? a : [a]; };
+    function myTurn() { return acts().some((i) => api.canAct(i)); }
+    function mySeat() { return acts().find((i) => api.canAct(i)); }
+    function locked() { return st && st.seq === waitSeq && performance.now() < waitUntil; }
+    function send(a) {
+      waitSeq = st.seq; waitUntil = performance.now() + 3000;
+      const seat = mySeat();
+      if (st.ph === 'm' && seat != null && api.actAs) api.actAs(seat, a); else api.act(a);
+    }
+    function playing() { return !!st && !st.st && st.ph === 'p'; }
+    function canUndo() {
+      if (!playing() || api.online || st.solo < 0 || !myTurn() || toMove(st) !== st.solo || locked()) return false;
+      const n = moveCount(st);
+      return n - 2 >= st.rs && st.uk !== n;
+    }
+    function onUndo() { if (!canUndo()) return; ghost = -1; api.sfx('click'); api.buzz(15); send({ type: 'undo' }); }
+    function onPass() { if (!playing() || !myTurn() || locked() || busy) return; if (!armed(passBtn, '패스', '패스 확인')) return; ghost = -1; send({ type: 'pass' }); }
+    function onResign() { if (!playing() || !myTurn() || locked()) return; if (!armed(resignBtn, '기권', '기권 확인')) return; send({ type: 'resign' }); }
+    function onAgree() { if (!st || st.ph !== 'm' || !myTurn() || locked()) return; api.sfx('click'); api.buzz(12); send({ type: 'agree' }); }
+    function onResume() { if (!st || st.ph !== 'm' || !myTurn() || locked()) return; if (!armed(resumeBtn, '계속 두기', '계속 확인')) return; send({ type: 'resume' }); }
+    function commit() {
+      if (!playing() || ghost < 0 || !myTurn() || locked() || busy) return;
+      const p = pOf(B, ghost), w = B.why(p, toMove(st) + 1);
+      if (w) { api.buzz(30); api.toast(w === 'ko' ? '패: 바로 되따낼 수 없어요' : w === 'suicide' ? '자충수: 둘 수 없어요' : '이미 돌이 있어요'); return; }
+      const sp = ghost; ghost = -1;
+      api.buzz(12); send({ type: 'place', p: sp });
+      updateHud(); draw();
+    }
+
+    function layout() {
+      if (!st) return;
+      const W = cv.w, H = cv.h, N = st.n;
+      const stripH = 38, hudH = 62, hintH = 22, gap = 6, evH = evalShown() ? 24 : 0;
+      let size = Math.min(W - 10, H - hudH - hintH - stripH * 2 - gap * 3 - 6 - evH, 640);
+      size = Math.max(200, size);
+      const cell = size / (N - 1 + 2.2), pad = cell * 1.1;
+      const x0 = Math.round((W - size) / 2);
+      const block = stripH * 2 + gap * 2 + size + evH;
+      const y0 = Math.round(Math.max(4, (H - hudH - hintH - block) / 2));
+      const sw = Math.min(W - 12, Math.max(size, 300)), sx = Math.round((W - sw) / 2);
+      const st0 = stripH + gap + evH; // strip → board offset (incl. eval bar)
+      G = { N, x0, y0, size, pad, cell, stripH, gap, sx, sw, bx: x0 + pad, by: y0 + st0 + pad, topY: y0, botY: y0 + st0 + gap + size, bTop: y0 + st0 };
+      hint.style.top = (G.botY + stripH + 2) + 'px';
+      Object.assign(evBar.style, { top: (y0 + stripH + gap) + 'px', left: sx + 'px', width: sw + 'px', display: evH ? 'flex' : 'none' });
+      Object.assign(evBtn.style, { top: (G.botY + stripH + 1) + 'px', left: (sx + sw - 44) + 'px' });
+      hint.style.right = (W - (sx + sw) + 50) + 'px'; hint.style.left = (sx + 50) + 'px';
+      vis(evBtn, !api.online);
+      Object.assign(terrBtn.style, { top: (G.botY + stripH + 1) + 'px', left: sx + 'px' });
+      vis(terrBtn, !api.online || st.fe === 1);
+      place(spBoard, x0, G.bTop, size, size);
+      const cn = N >= 13 ? 4.5 : 3.5;
+      place(spCorner, Math.round(G.bx - cell * 0.6), Math.round(G.by - cell * 0.6), Math.round(cell * (cn + 0.6)), Math.round(cell * (cn + 0.6)));
+      place(spMe, sx, G.botY, sw, stripH); place(spOpp, sx, y0, sw, stripH);
+      nsz = N;
+      buildBg();
+    }
+    let bgc = null;
+    function rr(x, a, b, w, h, r) { x.beginPath(); if (x.roundRect) x.roundRect(a, b, w, h, r); else x.rect(a, b, w, h); }
+    function buildBg() {
+      const dpr = cv.dpr, s = G.size, N = G.N;
+      const c = document.createElement('canvas'); c.width = Math.ceil(s * dpr); c.height = Math.ceil(s * dpr);
+      const x = c.getContext('2d'); x.scale(dpr, dpr);
+      const g = x.createLinearGradient(0, 0, s, s);
+      g.addColorStop(0, '#e8bf74'); g.addColorStop(0.5, '#ddb066'); g.addColorStop(1, '#c99a52');
+      x.fillStyle = g; rr(x, 0, 0, s, s, 8); x.fill();
+      x.save(); rr(x, 0, 0, s, s, 8); x.clip();
+      let seed = 5; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+      for (let i = 0; i < 46; i++) {
+        const yy = rnd() * s, amp = 2 + rnd() * 6, ph = rnd() * 6;
+        x.strokeStyle = 'rgba(120,70,20,' + (0.04 + rnd() * 0.07).toFixed(3) + ')'; x.lineWidth = 0.6 + rnd() * 1.6;
+        x.beginPath();
+        for (let xx = 0; xx <= s; xx += 6) { const v = yy + Math.sin(xx / (40 + amp * 8) + ph) * amp; xx ? x.lineTo(xx, v) : x.moveTo(xx, v); }
+        x.stroke();
+      }
+      const sh = x.createRadialGradient(s * 0.3, s * 0.25, 10, s * 0.5, s * 0.5, s * 0.8);
+      sh.addColorStop(0, 'rgba(255,240,200,.22)'); sh.addColorStop(1, 'rgba(60,30,0,.12)');
+      x.fillStyle = sh; x.fillRect(0, 0, s, s);
+      x.restore();
+      /* 설정 「보드 판 재질」(라운드 34): 나무는 원래 결 그대로, 나머지는 core 재질 + 선 색 */
+      const BD = (L.ui && L.ui.board) ? L.ui.board() : { id: 'wood' };
+      const hexA = (hx, a) => 'rgba(' + parseInt(hx.slice(1, 3), 16) + ',' + parseInt(hx.slice(3, 5), 16) + ',' + parseInt(hx.slice(5, 7), 16) + ',' + a + ')';
+      if (BD.id !== 'wood') { x.save(); rr(x, 0, 0, s, s, 8); x.clip(); L.ui.drawBoard(x, 0, 0, s, s); x.restore(); }
+      const LN = BD.id === 'wood' ? null : BD.line;
+      const pd = G.pad, cl = G.cell;
+      x.strokeStyle = (LN ? hexA(LN, BD.dark ? 0.75 : 0.85) : 'rgba(40,24,8,.82)'); x.lineWidth = 1;
+      x.beginPath();
+      for (let i = 0; i < N; i++) {
+        const v = Math.round(pd + i * cl) + 0.5;
+        x.moveTo(pd, v); x.lineTo(pd + cl * (N - 1), v);
+        x.moveTo(v, pd); x.lineTo(v, pd + cl * (N - 1));
+      }
+      x.stroke();
+      x.lineWidth = 1.8; x.strokeRect(pd, pd, cl * (N - 1), cl * (N - 1));
+      x.fillStyle = (LN ? hexA(LN, 0.95) : 'rgba(40,24,8,.9)');
+      for (const [sx, sy] of starPoints(N)) { x.beginPath(); x.arc(pd + sx * cl + 0.5, pd + sy * cl + 0.5, Math.max(2, cl * 0.11), 0, 7); x.fill(); }
+      const fs = Math.max(7.5, Math.min(11, pd * 0.42));
+      x.font = '600 ' + fs + 'px ' + MONO; x.fillStyle = (LN ? hexA(LN, 0.75) : 'rgba(60,34,10,.72)'); x.textAlign = 'center'; x.textBaseline = 'middle';
+      for (let i = 0; i < N; i++) {
+        x.fillText(COLS[i], pd + i * cl, s - pd * 0.32);
+        x.fillText(String(N - i), pd * 0.32, pd + i * cl);
+      }
+      bgc = c;
+    }
+    cv.onresize = () => { if (st) { layout(); draw(); } };
+    const P = (sp) => ({ x: G.bx + (sp % G.N) * G.cell, y: G.by + ((sp / G.N) | 0) * G.cell });
+    const ptName = (sp) => COLS[sp % st.n] + (st.n - ((sp / st.n) | 0));
+    function hit(px, py) {
+      const cx = Math.round((px - G.bx) / G.cell), cy = Math.round((py - G.by) / G.cell);
+      if (cx < 0 || cy < 0 || cx >= G.N || cy >= G.N) return -1;
+      if (Math.abs(px - (G.bx + cx * G.cell)) > G.cell * 0.75 || Math.abs(py - (G.by + cy * G.cell)) > G.cell * 0.75) return -1;
+      return cy * G.N + cx;
+    }
+    function stone(x, y, r, c, alpha) {
+      ctx.save();
+      if (alpha != null) ctx.globalAlpha = alpha;
+      ctx.fillStyle = 'rgba(30,15,0,.38)'; ctx.beginPath(); ctx.arc(x + r * 0.12, y + r * 0.2, r, 0, 7); ctx.fill();
+      const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.08, x, y, r);
+      if (c === 1) { g.addColorStop(0, '#6b6670'); g.addColorStop(0.35, '#2a272e'); g.addColorStop(1, '#0b0a0d'); }
+      else { g.addColorStop(0, '#ffffff'); g.addColorStop(0.55, '#ece8e0'); g.addColorStop(1, '#b9b2a6'); }
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+      if (c === 2) { ctx.strokeStyle = 'rgba(90,80,60,.35)'; ctx.lineWidth = 0.8; ctx.stroke(); }
+      ctx.restore();
+    }
+    function bottomSeat() { const mine = [0, 1].filter((i) => api.canAct(i)); return mine.length === 1 ? mine[0] : 0; }
+    function drawStrip(seat, y) {
+      const p = api.players[seat] || { name: SNAME[seat], color: '#888' };
+      const x = G.sx, w = G.sw, hh = G.stripH;
+      const a = acts();
+      const active = st && !st.st && a.includes(seat);
+      const won = st && st.st && st.st.w === seat;
+      rr(ctx, x, y, w, hh, 12);
+      ctx.fillStyle = active ? 'rgba(46,38,64,.95)' : 'rgba(34,28,46,.75)'; ctx.fill();
+      ctx.lineWidth = active || won ? 1.5 : 1; ctx.strokeStyle = active || won ? '#e3ae45' : 'rgba(242,233,216,.13)'; ctx.stroke();
+      const cy = y + hh / 2;
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(x + 14, cy, 5, 0, 7); ctx.fill();
+      stone(x + 34, cy, 10, seat + 1);
+      ctx.font = '700 14px ' + FONT; ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      let name = p.name; const maxW = w * 0.34;
+      while (ctx.measureText(name).width > maxW && name.length > 1) name = name.slice(0, -1);
+      if (name !== p.name) name += '…';
+      ctx.fillText(name, x + 52, cy);
+      const nx2 = x + 52 + ctx.measureText(name).width + 7;
+      ctx.font = '600 12px ' + FONT; ctx.fillStyle = won ? '#e3ae45' : '#ab9fb8';
+      let tag = won ? '승리' : SNAME[seat] + (seat ? ' · 덤 ' + st.km : '');
+      if (st.ph === 'm') tag = st.ag[seat] ? '동의함 ✓' : '확인 중';
+      ctx.fillText(tag, nx2, cy + 0.5);
+      if (!B) return;
+      ctx.textAlign = 'right';
+      if (score) {
+        ctx.font = '700 13px ' + MONO; ctx.fillStyle = '#e3ae45';
+        ctx.fillText(fmt(seat ? score.w : score.b) + '집', x + w - 10, cy + 0.5);
+      } else {
+        ctx.font = '600 12px ' + MONO; ctx.fillStyle = '#ab9fb8';
+        ctx.fillText('사석 ' + B.cap[seat + 1], x + w - 10, cy + 0.5);
+      }
+    }
+
+    function draw() {
+      cv.clear();
+      if (!G || !st || !B) return;
+      let shook = false;
+      if (shk) { // small board shake on a big capture (× 효과 세기)
+        const k = (performance.now() - shk.t0) / shk.dur;
+        if (k >= 1) shk = null;
+        else { const a = shk.amp * (1 - k); ctx.save(); ctx.translate(Math.sin(k * 40) * a, Math.cos(k * 33) * a * 0.6); shook = true; }
+      }
+      drawBoard();
+      if (shook) ctx.restore();
+    }
+    function drawBoard() {
+      const { x0, size, cell } = G, N = G.N, W = B.W;
+      const yb = G.bTop;
+      const bot = bottomSeat();
+      drawStrip(1 - bot, G.topY); drawStrip(bot, G.botY);
+      ctx.fillStyle = 'rgba(0,0,0,.5)'; rr(ctx, x0 + 3, yb + 8, size, size, 10); ctx.fill();
+      if (bgc) ctx.drawImage(bgc, x0, yb, size, size);
+      const r = cell * 0.47, t = performance.now();
+      let lastSp = -1;
+      const mc = moveCount(st);
+      if (mc && !isPass(st, mc - 1)) lastSp = (st.m.charCodeAt(mc * 2 - 1) - 97) * N + st.m.charCodeAt(mc * 2 - 2) - 97;
+      // 영역 미리보기 (empty points only)
+      if (!score && terrShown()) {
+        const inf = terrMap(), k = cell * 0.9;
+        for (let sp = 0; sp < N * N; sp++) {
+          const v = inf[sp]; if (Math.abs(v) < 0.45 || B.col[pOf(B, sp)] === 1 || B.col[pOf(B, sp)] === 2) continue;
+          const a = Math.min(0.42, 0.12 + (Math.abs(v) - 0.45) * 0.14), q = P(sp);
+          ctx.fillStyle = v > 0 ? 'rgba(20,16,30,' + a.toFixed(3) + ')' : 'rgba(255,252,240,' + (a * 1.35).toFixed(3) + ')';
+          ctx.fillRect(q.x - k / 2, q.y - k / 2, k, k);
+        }
+      }
+      // territory
+      if (score) {
+        for (let sp = 0; sp < N * N; sp++) {
+          const p = pOf(B, sp), ow = score.owner[p];
+          if (!ow) continue;
+          const q = P(sp), k = cell * 0.26;
+          ctx.fillStyle = ow === 1 ? 'rgba(20,16,24,.82)' : 'rgba(250,246,236,.92)';
+          ctx.fillRect(q.x - k / 2, q.y - k / 2, k, k);
+        }
+      }
+      for (let sp = 0; sp < N * N; sp++) {
+        const p = pOf(B, sp), v = B.col[p];
+        if (v !== 1 && v !== 2) continue;
+        const q = P(sp);
+        let rr2 = r, al = 1;
+        if (drop && drop.sp === sp) { const k = U.clamp((t - drop.t0) / drop.dur, 0, 1); rr2 = r * (1.25 - 0.25 * (1 - Math.pow(1 - k, 3))); al = 0.5 + 0.5 * k; }
+        const dead = score && score.dead.has(p);
+        stone(q.x, q.y, rr2, v, dead ? 0.42 : al);
+        if (dead) { ctx.strokeStyle = v === 1 ? '#f2e9d8' : '#2a2620'; ctx.lineWidth = Math.max(1.5, cell * 0.08); const k = r * 0.45; ctx.beginPath(); ctx.moveTo(q.x - k, q.y - k); ctx.lineTo(q.x + k, q.y + k); ctx.moveTo(q.x + k, q.y - k); ctx.lineTo(q.x - k, q.y + k); ctx.stroke(); }
+        else if (showNum && B.num[p]) {
+          const nn = B.num[p];
+          ctx.fillStyle = v === 2 ? '#2a2620' : '#f2e9d8';
+          ctx.font = '600 ' + Math.max(6.5, Math.round(cell * (nn >= 100 ? 0.36 : 0.46))) + 'px ' + MONO; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(String(nn), q.x, q.y + 0.5);
+          if (sp === lastSp) { ctx.strokeStyle = '#ee6a55'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, r + 1.5, 0, 7); ctx.stroke(); }
+        } else if (sp === lastSp && !score) {
+          ctx.strokeStyle = v === 1 ? '#f2e9d8' : '#2a2620'; ctx.lineWidth = Math.max(1.5, cell * 0.08);
+          ctx.beginPath(); ctx.arc(q.x, q.y, r * 0.45, 0, 7); ctx.stroke();
+        }
+      }
+      // captured stones fading out
+      fades = fades.filter((f) => t - f.t0 < f.dur);
+      for (const f of fades) { const q = P(f.sp), k = (t - f.t0) / f.dur; stone(q.x, q.y + k * cell * 0.2, r * (1 - 0.2 * k), f.c, 0.8 * (1 - k)); }
+      // ko point
+      if (playing() && B.ko) {
+        const q = P(spOf(B, B.ko)), k = cell * 0.3;
+        ctx.strokeStyle = 'rgba(200,40,30,.85)'; ctx.lineWidth = 1.6; ctx.strokeRect(q.x - k / 2, q.y - k / 2, k, k);
+      }
+      // ghost
+      if (ghost >= 0 && playing() && myTurn()) {
+        const q = P(ghost), c = toMove(st) + 1, bad = !!B.why(pOf(B, ghost), c);
+        ctx.save();
+        ctx.strokeStyle = bad ? 'rgba(238,106,85,.85)' : 'rgba(227,174,69,.9)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(G.bx, q.y); ctx.lineTo(G.bx + cell * (N - 1), q.y); ctx.moveTo(q.x, G.by); ctx.lineTo(q.x, G.by + cell * (N - 1)); ctx.stroke();
+        ctx.restore();
+        stone(q.x, q.y, r, c, 0.55);
+        ctx.strokeStyle = bad ? '#ee6a55' : '#e3ae45'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, r + 3, 0, 7); ctx.stroke();
+        const w = B.why(pOf(B, ghost), c);
+        const tx0 = ptName(ghost) + (w === 'ko' ? ' 패' : w === 'suicide' ? ' 자충' : '');
+        ctx.font = '700 12px ' + MONO;
+        const tw = ctx.measureText(tx0).width + 12;
+        let tx = q.x - tw / 2, ty = q.y - r - 26;
+        if (ty < yb + 2) ty = q.y + r + 6;
+        tx = U.clamp(tx, x0 + 2, x0 + size - tw - 2);
+        ctx.fillStyle = 'rgba(16,12,22,.88)'; rr(ctx, tx, ty, tw, 20, 10); ctx.fill();
+        ctx.fillStyle = bad ? '#ee6a55' : '#f2e9d8'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(tx0, tx + tw / 2, ty + 10.5);
+      }
+      void W;
+    }
+
+    function updateHud() {
+      const pl = playing(), mine = pl && myTurn(), mark = !!st && st.ph === 'm' && !st.st;
+      vis(numBtn, !!st && !mark);
+      vis(undoBtn, pl && !api.online && st.solo >= 0);
+      undoBtn.disabled = !canUndo();
+      vis(passBtn, mine); vis(resignBtn, mine); vis(placeBtn, mine);
+      const gw = ghost >= 0 && B ? B.why(pOf(B, ghost), toMove(st) + 1) : 'x';
+      placeBtn.disabled = !mine || ghost < 0 || !!gw || !!locked() || busy;
+      placeBtn.textContent = ghost >= 0 && mine && !gw ? '놓기 ' + ptName(ghost) : '놓기';
+      const meM = mark && myTurn();
+      vis(resumeBtn, mark && [0, 1].some((i) => api.canAct(i))); resumeBtn.disabled = !meM;
+      vis(agreeBtn, mark && [0, 1].some((i) => api.canAct(i))); agreeBtn.disabled = !meM;
+      if (!mine && !meM) disarmAll();
+      let h = '';
+      if (st && pl) {
+        const a = toMove(st), p = api.players[a];
+        const mc = moveCount(st), oppPassed = mc > st.rs && isPass(st, mc - 1);
+        if (mine) h = oppPassed ? '상대가 패스했어요 · 나도 패스하면 계가' : ghost < 0 ? '놓을 자리를 탭하세요' : '같은 자리 한 번 더 탭 또는 「놓기」';
+        else h = (p ? p.name : SNAME[a]) + (p && p.ai ? ' 생각 중…' : ' 차례');
+        h = (mc + 1) + '수째 · ' + h;
+      } else if (mark) {
+        h = (myTurn() ? '죽은 돌을 탭해 표시/해제 · ' : '상대 확인 기다리는 중 · ') + '흑 ' + fmt(score.b) + ' : 백 ' + fmt(score.w);
+      } else if (st && st.st) { const r = result(st); h = r ? r.title : ''; }
+      hint.textContent = h;
+    }
+
+    function onDown(e) {
+      if (!st || !G || !e.isPrimary) return;
+      const q = cv.local(e), sp = hit(q.x, q.y);
+      if (st.ph === 'm' && !st.st) {
+        if (!myTurn() || locked() || sp < 0) return;
+        const p = pOf(B, sp);
+        if (B.col[p] !== 1 && B.col[p] !== 2) return;
+        api.sfx('tick'); api.buzz(10);
+        send({ type: 'mark', p: sp });
+        return;
+      }
+      if (!playing() || !myTurn() || locked()) return;
+      down = { sp, onGhost: sp >= 0 && sp === ghost, moved: false, id: e.pointerId };
+      if (sp >= 0 && !B.col[pOf(B, sp)] && sp !== ghost) { ghost = sp; api.sfx('tick'); api.buzz(6); updateHud(); draw(); }
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    function onMove(e) {
+      if (!down || e.pointerId !== down.id) return;
+      const q = cv.local(e), sp = hit(q.x, q.y);
+      if (sp >= 0 && sp !== ghost && !B.col[pOf(B, sp)]) { ghost = sp; down.moved = true; api.sfx('tick'); updateHud(); draw(); }
+    }
+    function onUp(e) {
+      if (!down || e.pointerId !== down.id) return;
+      const d = down; down = null;
+      const q = cv.local(e), sp = hit(q.x, q.y);
+      if (d.onGhost && !d.moved && sp === ghost) commit();
+    }
+    function onCancel() { down = null; }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onCancel);
+    /* 라운드 34: 판 재질 바뀌면 바탕 다시, 오른쪽 클릭 = 고른 자리(놓기 전) 해제 */
+    const onBoardMat = () => { if (G) { buildBg(); draw(); } };
+    const onRC = (e) => { if (ghost >= 0) { ghost = -1; down = null; updateHud(); draw(); e.preventDefault(); } };
+    window.addEventListener('lounge-board', onBoardMat); window.addEventListener('lounge-cancel', onRC);
+
+    let safety = 0;
+    function animate(dur) {
+      if (stopLoop) stopLoop();
+      setBusy(true);
+      clearTimeout(safety);
+      const end = performance.now() + dur;
+      safety = setTimeout(() => { drop = null; fades = []; setBusy(false); if (stopLoop) { stopLoop(); stopLoop = null; } draw(); }, dur + 400);
+      stopLoop = U.loop((dt, t) => {
+        draw();
+        if (t >= end) { drop = null; clearTimeout(safety); setBusy(false); draw(); if (stopLoop) { stopLoop(); stopLoop = null; } }
+      });
+    }
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prev) {
+        const fresh = prev && prev !== next && next.seq !== shownSeq;
+        const oldB = B;
+        st = next;
+        if (!G || nsz !== st.n) layout();
+        try { B = replay(st); } catch (e) { console.error(e); }
+        score = st.ph === 'm' || st.ph === 'e' ? scoreOf(st, B) : null;
+        if (ghost >= 0 && (st.st || st.ph !== 'p' || B.col[pOf(B, ghost)])) ghost = -1;
+        if (fresh) {
+          const e = next.ev, sp = 1 / (L.debug.speed || 1);
+          if (e && e.id === next.seq && e.k === 'u') { api.sfx('whoosh'); api.toast('한 수 물렀어요'); ghost = -1; }
+          else if (next.m.length > (prev.m || '').length) {
+            const mc = moveCount(next);
+            if (isPass(next, mc - 1)) {
+              const by = (mc - 1 + (next.hc ? 1 : 0)) % 2;
+              api.sfx('click'); api.toast(SNAME[by] + ' 패스');
+            } else {
+              const spt = (next.m.charCodeAt(mc * 2 - 1) - 97) * next.n + next.m.charCodeAt(mc * 2 - 2) - 97;
+              drop = { sp: spt, t0: performance.now(), dur: 160 * sp };
+              if (oldB && oldB.n === B.n) {
+                for (let p = 0; p < B.S; p++) if ((oldB.col[p] === 1 || oldB.col[p] === 2) && B.col[p] === 0) fades.push({ sp: spOf(B, p), c: oldB.col[p], t0: performance.now(), dur: 320 * sp });
+              }
+              if (fades.length) { api.sfx('hit'); api.buzz(18); if (fades.length >= 3) { api.toast(fades.length + '점 따냄'); const a = Math.min(5, 1.5 + fades.length * 0.4) * FX(); if (a > 0.2) shk = { t0: performance.now(), dur: 280 * sp, amp: a }; } } else { api.sfx('thud'); api.buzz(10); }
+              animate(fades.length ? 330 * sp : 170 * sp);
+            }
+          }
+          if (e && e.id === next.seq) {
+            const who = api.players[e.by] ? api.players[e.by].name : SNAME[e.by];
+            if (next.ph === 'm' && prev.ph === 'p') { api.sfx('chip'); api.buzz(25); api.toast(e.k === 'cap0' || moveCount(next) >= moveCap(next.n) ? '수 제한 · 계가로 넘어가요' : '두 번 연속 패스 · 계가'); }
+            else if (e.k === 'rs') { api.sfx('whoosh'); api.toast(who + ': 계속 두기'); }
+            else if (e.k === 'mk' && !api.canAct(e.by)) { api.sfx('tick'); api.toast(who + (e.on ? ': 죽은 돌 표시' : ': 표시 해제')); }
+            else if (e.k === 'ag' && !api.canAct(e.by) && !next.st) api.toast(who + ' 계가 동의');
+          }
+        }
+        if (!prev) { ghost = -1; fades = []; drop = null; }
+        if (prev && prev.seq !== next.seq) disarmAll();
+        shownSeq = next.seq;
+        if (evBar.style.display !== (evalShown() ? 'flex' : 'none')) layout();
+        evalKick();
+        updateHud();
+        draw();
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true);
+        if (stopLoop) stopLoop();
+        clearTimeout(safety); disarmAll();
+        setBusy(false);
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onCancel);
+        window.removeEventListener('lounge-board', onBoardMat); window.removeEventListener('lounge-cancel', onRC);
+        evJob++;
+        cv.destroy(); hud.remove(); hint.remove(); evBar.remove(); evBtn.remove(); terrBtn.remove();
+      },
+    };
+  }
+
+  L.register({
+    id: 'baduk', name: '바둑', tag: '전략', cat: '보드',
+    tint: '#4a3a1e',
+    icon: '<rect x="7" y="7" width="42" height="42" rx="4" fill="none" stroke="currentColor" stroke-width="2.4"/><path d="M7 21h42M7 35h42M21 7v42M35 7v42" stroke="currentColor" stroke-width="1.6" opacity=".55"/><circle cx="21" cy="21" r="6.5" fill="currentColor"/><circle cx="35" cy="35" r="6.5" fill="currentColor"/><circle cx="35" cy="21" r="6" fill="none" stroke="currentColor" stroke-width="2.4"/><circle cx="21" cy="35" r="6" fill="none" stroke="currentColor" stroke-width="2.4"/>',
+    blurb: '흑과 백이 번갈아 돌을 놓아 집을 더 많이 짓는 쪽이 이겨요. 한국 규칙(집 + 사석, 덤)으로 계가하고, 9·13·19줄 판을 고를 수 있어요.',
+    controls: [
+      { id: 'place', label: '놓기', keys: ['Enter', 'Space'], pad: ['a'] },
+      { id: 'pass', label: '패스', keys: ['KeyP'], pad: ['y'] },
+      { id: 'undo', label: '무르기', keys: ['KeyZ', 'Backspace'], pad: ['b'] },
+      { id: 'nums', label: '수 번호 보기', keys: ['KeyN'] },
+      { id: 'agree', label: '계가 동의', keys: ['Enter'], pad: ['a'] },
+      { id: 'resume', label: '계속 두기', keys: ['KeyR'], pad: ['x'] },
+    ],
+    minPlayers: 2, maxPlayers: 2, defaultPlayers: 2, hidden: false, aiDelay: 300,
+    options: [
+      { id: 'size', label: '판 크기', choices: [{ v: 9, label: '9줄' }, { v: 13, label: '13줄' }, { v: 19, label: '19줄' }], def: 9 },
+      { id: 'komi', label: '덤', tip: '먼저 두는 흑이 유리해서 백에게 주는 보너스 집.', choices: [{ v: 6.5, label: '6.5집' }, { v: 0.5, label: '0.5집' }, { v: 0, label: '없음' }], def: 6.5 },
+      { id: 'eval', label: '형세 판단(온라인)', tip: '온라인 방에서 지금 누가 몇 집 앞서는지 막대로 보여 줘요.', choices: [{ v: 0, label: '끔' }, { v: 1, label: '둘 다 보기' }], def: 0 },
+      { id: 'hc', label: '치석(접바둑)', tip: '실력 차가 날 때 흑이 미리 돌을 놓고 시작해요.', choices: [{ v: 0, label: '호선', tip: '맞바둑(호선).' }, { v: 2, label: '2점' }, { v: 3, label: '3점' }, { v: 4, label: '4점' }], def: 0 },
+    ],
+    quick: [
+      '돌로 빈 자리를 둘러싸 「집」을 만들어요. 끝났을 때 집 + 따낸 돌이 더 많으면 이겨요(백은 덤을 더 받아요).',
+      '내 차례: 선이 만나는 점을 탭 → 한 번 더 탭(또는 「놓기」)해 돌 1개를 놓아요. 흑이 먼저.',
+      '둘 곳이 없으면 「패스」. 둘 다 연달아 패스하면 계가(집 세기)로 승부를 내요.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '1번 자리가 흑, 2번 자리가 백이에요. 흑이 먼저, 한 수씩 번갈아 둬요(접바둑이면 흑이 돌을 깔고 백이 먼저).',
+        '「집」 = 내 돌로 빙 둘러싼 빈 자리. 한 칸이 1집이에요.',
+        '「사석」 = 내가 따낸 상대 돌. 한 개가 1집이에요.',
+        '끝났을 때 집 + 사석이 많은 쪽이 이겨요. 백은 나중에 두니까 「덤」(기본 6.5집)을 더 받아요.'] },
+      { h: '차례에 할 일', p: [
+        '빈 점(선이 만나는 곳) 하나에 돌 1개를 놓아요. 놓은 돌은 움직이지 않아요.',
+        '또는 「패스」: 놓을 만한 곳이 없으면 차례를 넘겨요(3초 안에 「패스 확인」).'] },
+      { h: '따내기 (돌 잡기)', fig: { svg: '<svg viewBox="0 0 340 120" xmlns="http://www.w3.org/2000/svg"><rect x="8" y="2" width="120" height="112" rx="4" fill="#dcb46e"/><line x1="20" y1="10" x2="116" y2="10" stroke="#2a1a0c"/><line x1="20" y1="10" x2="20" y2="106" stroke="#2a1a0c"/><line x1="20" y1="34" x2="116" y2="34" stroke="#2a1a0c"/><line x1="44" y1="10" x2="44" y2="106" stroke="#2a1a0c"/><line x1="20" y1="58" x2="116" y2="58" stroke="#2a1a0c"/><line x1="68" y1="10" x2="68" y2="106" stroke="#2a1a0c"/><line x1="20" y1="82" x2="116" y2="82" stroke="#2a1a0c"/><line x1="92" y1="10" x2="92" y2="106" stroke="#2a1a0c"/><line x1="20" y1="106" x2="116" y2="106" stroke="#2a1a0c"/><line x1="116" y1="10" x2="116" y2="106" stroke="#2a1a0c"/><circle cx="68" cy="58" r="10" fill="#f7f3ea" stroke="#1a1714" stroke-width="1"/><circle cx="68" cy="34" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="44" cy="58" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="92" cy="58" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="68" cy="82" r="10" fill="none" stroke="#c8372b" stroke-width="2.5" stroke-dasharray="3 3"/><text x="160" y="58" font-size="22" text-anchor="middle" fill="currentColor">→</text><rect x="198" y="2" width="120" height="112" rx="4" fill="#dcb46e"/><line x1="210" y1="10" x2="306" y2="10" stroke="#2a1a0c"/><line x1="210" y1="10" x2="210" y2="106" stroke="#2a1a0c"/><line x1="210" y1="34" x2="306" y2="34" stroke="#2a1a0c"/><line x1="234" y1="10" x2="234" y2="106" stroke="#2a1a0c"/><line x1="210" y1="58" x2="306" y2="58" stroke="#2a1a0c"/><line x1="258" y1="10" x2="258" y2="106" stroke="#2a1a0c"/><line x1="210" y1="82" x2="306" y2="82" stroke="#2a1a0c"/><line x1="282" y1="10" x2="282" y2="106" stroke="#2a1a0c"/><line x1="210" y1="106" x2="306" y2="106" stroke="#2a1a0c"/><line x1="306" y1="10" x2="306" y2="106" stroke="#2a1a0c"/><circle cx="258" cy="34" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="234" cy="58" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="282" cy="58" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><circle cx="258" cy="82" r="10" fill="#1a1714" stroke="#1a1714" stroke-width="1"/><text x="258" y="62" font-size="13" text-anchor="middle" fill="#c8372b">×</text></svg>', cap: '마지막 활로(빨간 점선)에 흑을 두면 백 1개를 따내요' }, p: [
+        '「활로」 = 돌 바로 옆(위·아래·왼쪽·오른쪽)의 빈 점. 돌이 숨 쉬는 구멍이에요. 대각선은 활로가 아니에요.',
+        '가로·세로로 붙은 같은 색 돌은 한 덩어리예요. 덩어리의 활로를 모두 막으면 그 덩어리를 통째로 따내요.',
+        '활로가 하나만 남은 상태를 「단수」라고 해요. 단수가 되면 도망가거나 살릴 방법을 찾아야 해요.',
+        '자충수 금지: 상대 돌을 따내는 것도 아닌데 내 돌의 활로가 0이 되는 자리에는 못 둬요.'] },
+      { h: '패 (같은 수 반복 금지)', p: [
+        '돌 하나를 서로 번갈아 따내는 모양을 「패」라고 해요. 그대로 두면 끝없이 반복돼요.',
+        '그래서 상대가 방금 돌 하나를 따냈으면, 나는 바로 그 자리에서 되따낼 수 없어요. 금지된 자리는 빨간 네모로 보여요.',
+        '다른 곳에 한 수(「팻감」) 두고 나서 다음 차례에는 되따낼 수 있어요.'] },
+      { h: '끝내기 · 계가 (집 세기)', p: [
+        '더 둘 곳이 없으면 「패스」. 양쪽이 연달아 패스하면 계가로 넘어가요.',
+        '「죽은 돌」 = 상대 집 안에 갇혀 살 수 없는 돌. 계가 때 자동으로 ✕ 표시(흐리게)되고, 사석으로 셈해요. 그 자리는 집이 돼요. 자동 판정은 끝까지 여러 번 두어 본 결과로 정하고, 눈이 둘인 확실한 삶은 절대 죽은 돌로 표시하지 않아요.',
+        '표시가 틀렸으면 돌을 탭해 그 덩어리의 ✕를 켜고 끌 수 있어요(바꾸면 동의가 처음부터).',
+        '둘 다 「계가 동의」를 누르면 끝! 의견이 다르면 「계속 두기」로 이어 두며 직접 결론을 내요.',
+        '점수(한국 규칙): 흑 = 집 + 사석, 백 = 집 + 사석 + 덤. 양쪽 돌 사이의 빈 자리(공배)는 누구의 집도 아니에요.',
+        '계가 중엔 집이 작은 네모로 표시되고, 이름표 오른쪽에 지금 점수가 보여요. 끝나면 결과 화면에 집 · 따낸 돌 · 죽은 돌 · 덤 · 총점이 표로 나와요.',
+        '수 제한: 9줄 162수 · 13줄 338수 · 19줄 600수에 닿으면 자동으로 계가로 넘어가요.',
+        '「기권」(3초 안에 「기권 확인」)이면 불계패예요.'] },
+      { h: '옵션', p: [
+        '판 크기 9·13·19줄(기본 9줄, 처음엔 9줄이 쉬워요). 덤 6.5·0.5·없음(기본 6.5).',
+        '접바둑: 흑이 2–4점을 화점(판의 굵은 점)에 깔고 시작하고 백이 먼저 둬요. 덤은 고른 값 그대로라, 보통 0.5집을 함께 골라요.'] },
+      { h: '조작', p: [
+        '놓을 자리를 탭하면 반투명 돌 · 십자선 · 좌표가 보여요. 같은 자리를 한 번 더 탭하거나 「놓기」로 확정해요. 끌면 미리보기 돌이 따라와요.',
+        '마지막 수는 돌 위 고리로 표시돼요. 「번호」를 켜면 돌마다 둔 순서가 보여요(기기에 기억).',
+        '↶ 무르기: 이 폰에서 사람 1명 대 AI일 때만. 내 직전 수와 AI 응수를 함께 되돌려요(한 번에 한 수).',
+        '판 아래 안내 줄이 지금 할 일을 알려 줘요.'] },
+      { h: '예시', p: [
+        '백 돌 하나의 위·아래·왼쪽에 흑 돌이 있다 → 백은 단수! 흑이 오른쪽에 두면 백 돌을 따내고 사석 1개.',
+        '흑이 귀(모서리)에 돌 5개로 빈 자리 9칸을 둘러쌌다 → 흑 9집.',
+        '계가: 흑 집 30 + 사석 4 = 34 / 백 집 25 + 사석 3 + 덤 6.5 = 34.5 → 백이 0.5집 차이로 승리.'] },
+      { h: 'AI', p: [
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움 = 막 배운 사람(빠른 감각, 실수 잦음), 보통 = 동네 기원 수준, 어려움 = 판을 직접 끝까지 수천 번 두어 보는 탐색(몬테카를로 트리 탐색)으로 둬요.',
+        '생각 시간: 9줄 보통 약 0.4초 · 어려움 약 1.5초, 13줄 어려움 약 2.5초, 19줄 어려움 약 3.5초. 생각하는 동안에도 화면은 멈추지 않아요.',
+        '어려움은 단수·따내기·살리기와 마지막 수 근처의 모양(붙이기·젖히기·끊기)을 먼저 봐요. 13·19줄 보통은 형세(집 추정)를 보는 빠른 판단으로 둬요.',
+        '판이 정리되면 패스하고, 상대가 패스했을 때 이기고 있으면 따라 패스해요. 계가에서는 자기 추정과 같으면 동의해요.'] },
+      { h: '형세 판단', p: ['📊 버튼을 켜면 판 위에 지금 누가 몇 집쯤 앞서는지 막대로 보여 줘요(무작위로 끝까지 둬 보는 어림값이라 정확하진 않아요). 이 기기에만 저장돼요.', '온라인에서는 방장이 옵션 「형세 판단」을 「둘 다 보기」로 켰을 때만 두 사람 모두에게 보여요.'] },
+      { h: '영역 미리보기', p: ['🗺 버튼(판 아래 왼쪽)을 켜면 빈 점마다 어느 쪽 세력이 센지 옅게 칠해요. 검게 칠한 곳은 흑, 하얗게 칠한 곳은 백 쪽이에요.', '돌에서 가까울수록 세력이 세다고 보는 간단한 어림이라, 죽은 돌·사활까지 따지진 않아요. 수를 둘 때마다 바뀌고, 이 기기에만 저장돼요(기본 끔). 온라인에서는 「형세 판단」 옵션이 켜졌을 때만 쓸 수 있어요.'] }
+    ],
+    tutorial: [
+      { sel: '.bd-board', text: '바둑판이에요. 돌은 칸 안이 아니라 선이 만나는 점에 놓아요. 나는 흑, 먼저 둬요. 목표는 「집」(내 돌로 둘러싼 빈 자리)을 상대보다 많이 짓는 것!' },
+      { sel: '.bd-corner', text: '귀(모서리)는 판 가장자리가 벽 역할을 해서 적은 돌로 집을 짓기 쉬워요. 처음엔 귀 → 변 → 가운데 순서로 두면 좋아요.' },
+      { sel: '.bd-board', text: '놓을 자리를 탭하면 반투명 돌이 보여요. 같은 자리를 한 번 더 탭하거나 아래 「놓기」를 누르면 확정이에요.' },
+      { sel: '.bd-board', text: '따내기: 상대 돌의 위·아래·왼쪽·오른쪽 빈 점(활로)을 모두 막으면 그 돌을 따내요. 따낸 돌은 1개당 1집! 내 돌도 활로가 하나만 남으면(단수) 위험해요.' },
+      { sel: '.bd-hint', text: '방금 따낸 자리를 상대가 바로 되따낼 수 없는 「패」 규칙이 있어요. 못 두는 자리는 빨간 네모로 보이고, 두려고 하면 이유를 알려 줘요. 이 안내 줄은 늘 지금 할 일을 보여 줘요.' },
+      { sel: '.bd-pass', text: '더 둘 곳이 없으면 「패스」(한 번 더 눌러 확인). 둘 다 연달아 패스하면 계가 — 죽은 돌에 ✕가 자동 표시되고, 둘 다 「계가 동의」를 누르면 끝나요.' },
+      { sel: '.bd-me', text: '아래가 나, 위가 상대예요. 오른쪽에 따낸 돌(사석) 수가 보이고, 계가 때는 집 + 사석(백은 + 덤) 점수가 보여요. 더 많은 쪽이 승리! 시작해 볼까요?' },
+    ],
+    undo: false,
+    init, actor, apply, ai, aiDelayFor, result, mount,
+    _t: { BH, Board, replay, scoreOf, mcts, bensonAlive, budgetFor, heuristic, ownership, deadChains, starPoints, moveCap, pOf, spOf, enc },
+  });
+})();

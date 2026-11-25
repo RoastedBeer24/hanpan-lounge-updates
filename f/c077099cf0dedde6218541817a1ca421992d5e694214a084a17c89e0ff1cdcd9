@@ -1,0 +1,355 @@
+/* 도시 예선 (citytrial) — 근미래 도시에서 부유 기체를 몰아 능력치 조각을 모으고(1부), 무작위 결판 종목 하나로 순위를 가리는(2부) 2~8인 3D 실시간 게임.
+   구조만 참고(도시에서 탈것을 키움 → 무작위 종목). 세계관 · 이름 · 기체 · 그림은 모두 독자.
+
+   파일 구성
+   - 이 파일: 자료(능력치 8 · 물품 5 · 기체 16 · 돌발 사건 12 · 결판 종목 10 · 구획 12) · 판 상태(init/result) · 규칙 · 도감 · 옵션 · L.register · 입구 화면(3D 불러오기).
+   - assets/citytrial/sim.js: 순수 시뮬(도시 · 종목 경기장 생성, 기체 물리, 조각 · 상자 · 사건 · 종목 판정, 봇, 네트워크 묶기). node에서도 돎.
+   - assets/citytrial/view.js: 3D 화면(three.js — assets/hyperrace/lib/three.min.js 공용), HUD, 조작, 소리, 온라인.
+   온라인: 각 기기가 자기 기체를 직접 시뮬(예측)하고 15Hz로 알림. 조각 줍기 · 충돌 · 사건 · 종목 판정은 호스트(hostSend 10Hz). 단계 · 결과는 api.setState. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'citytrial';
+  const TITLE = '도시 예선';
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  /* ======================= 능력치(조각) ======================= */
+  const STAT_MAX = 18;
+  const STATS = [
+    { id: 'top', nm: '최고 속도', sh: '속도', col: '#e8574f', d: '낼 수 있는 가장 빠른 속도. 단계마다 +4.5%.' },
+    { id: 'acc', nm: '가속', sh: '가속', col: '#f0a13a', d: '속도가 붙는 빠르기. 단계마다 +7%.' },
+    { id: 'turn', nm: '선회', sh: '선회', col: '#e6d24a', d: '방향을 트는 빠르기. 단계마다 +4%.' },
+    { id: 'chg', nm: '충전', sh: '충전', col: '#63c76a', d: '모으기 게이지가 차는 빠르기와 부스트 세기. 단계마다 +6% · +5%.' },
+    { id: 'gl', nm: '활공', sh: '활공', col: '#58b8e8', d: '공중에서 덜 가라앉음. 단계마다 +7%.' },
+    { id: 'wt', nm: '무게', sh: '무게', col: '#8c7be0', d: '부딪혔을 때 덜 밀리고 더 세게 밂. 단계마다 +8%. 가속 · 활공은 조금 줄어듦.' },
+    { id: 'hp', nm: '내구', sh: '내구', col: '#d977b4', d: '기체가 버티는 피해량. 단계마다 +8%.' },
+    { id: 'atk', nm: '공격', sh: '공격', col: '#c9c2b4', d: '들이받을 때 주는 피해와 상자 · 표적을 부수는 힘. 단계마다 +10%.' },
+  ];
+  /* 물품(조각 자리 · 물품 상자에서 나옴). ch = 자리 문자 */
+  const ITEMS = [
+    { id: 'rep', ch: 'r', nm: '수리 키트', col: '#7fe0a0', d: '내구를 절반 회복.' },
+    { id: 'all', ch: 'A', nm: '종합 조각', col: '#ffffff', d: '모든 능력치 +1. 드묾.' },
+    { id: 'spd', ch: 'S', nm: '과급기', col: '#ff8a3d', d: '15초 동안 최고 속도 · 가속 +30%.', dur: 15 },
+    { id: 'shd', ch: 'B', nm: '방호막', col: '#7fb4ff', d: '12초 동안 피해를 받지 않고 조각을 떨어뜨리지 않음.', dur: 12 },
+    { id: 'mag', ch: 'M', nm: '견인 자석', col: '#e06cc0', d: '20초 동안 주변 조각을 끌어당김(줍는 거리 3배).', dur: 20 },
+  ];
+  const STAT_CH = 'abcdefgh';
+
+  /* ======================= 기체 ======================= */
+  /* b: [최고 속도, 가속, 선회, 충전, 활공, 무게, 내구, 공격] 배수 · q: 특성(grip 접지, thr 평소 추진 배수, bst 부스트 배수, keep 모으는 동안 감속 배수,
+     regen 초당 내구 회복 비율, mag 줍는 거리 배수, crush 상자를 속도와 무관하게 부숨, rare 사건으로만 등장)
+     sh: 겉모습(view · 도감 아이콘이 함께 씀) — L 길이, W 몸통 폭, wing 날개 폭, sweep 날개 젖힘, eng 추진기 수, fin 꼬리 날개 높이, nose 코 뾰족함, wheel 바퀴 */
+  const CRAFTS = [
+    { id: 'std', nm: '기준기', cls: '표준형', b: [1, 1, 1, 1, 1, 1, 1, 1], q: {}, d: '모든 조종사가 처음 타는 기체. 모난 데 없이 고름.',
+      sh: { L: 4.6, W: 1.7, wing: 3.6, sweep: 0.5, eng: 1, fin: 0.7, nose: 0.6, col: '#c8ccd2', ac: '#e3ae45' } },
+    { id: 'dart', nm: '화살촉', cls: '고속형', b: [1.28, 0.9, 0.78, 0.9, 0.9, 0.8, 0.7, 1], q: {}, d: '가장 빠름. 선회가 둔하고 내구가 얇음.',
+      sh: { L: 6.0, W: 1.2, wing: 2.4, sweep: 1.4, eng: 1, fin: 0.5, nose: 1, col: '#b33a3a', ac: '#f2e9d8' } },
+    { id: 'shell', nm: '철갑', cls: '중장갑형', b: [0.9, 0.72, 0.85, 0.9, 0.55, 1.7, 1.75, 1.2], q: {}, d: '무겁고 단단함. 느리게 붙고 거의 날지 못함.',
+      sh: { L: 4.8, W: 2.6, wing: 3.0, sweep: 0.1, eng: 2, fin: 0.3, nose: 0.2, col: '#5d6470', ac: '#d0863a' } },
+    { id: 'sail', nm: '돛날개', cls: '활공형', b: [0.95, 0.95, 1.05, 1, 1.75, 0.7, 0.8, 0.7], q: {}, d: '공중에서 가장 오래 뜸. 가볍고 약함.',
+      sh: { L: 4.4, W: 1.3, wing: 6.6, sweep: 0.3, eng: 1, fin: 0.9, nose: 0.7, col: '#e4e7ea', ac: '#58b8e8' } },
+    { id: 'hop', nm: '도약기', cls: '가속형', b: [0.92, 1.7, 1.1, 1.15, 0.9, 0.85, 0.9, 0.9], q: {}, d: '정지에서 가장 빨리 튀어 나감. 최고 속도는 낮음.',
+      sh: { L: 3.6, W: 1.8, wing: 2.6, sweep: 0.2, eng: 2, fin: 0.5, nose: 0.4, col: '#d8a23a', ac: '#2e2640' } },
+    { id: 'edge', nm: '칼선회', cls: '선회형', b: [1, 1, 1.5, 1, 1, 0.9, 0.9, 0.9], q: { keep: 0.35 }, d: '가장 잘 돎. 모으는 동안에도 속도를 거의 잃지 않음.',
+      sh: { L: 4.2, W: 1.4, wing: 3.2, sweep: 1.0, eng: 1, fin: 1.1, nose: 0.9, col: '#3f8f86', ac: '#f2e9d8' } },
+    { id: 'ram', nm: '파쇄기', cls: '충돌형', b: [0.97, 0.95, 0.9, 1, 0.7, 1.3, 1.2, 1.7], q: { crush: 1 }, d: '들이받는 힘이 가장 셈. 상자는 속도와 무관하게 부숨.',
+      sh: { L: 5.0, W: 2.2, wing: 2.4, sweep: 0.0, eng: 2, fin: 0.4, nose: 0.05, col: '#7a3b2e', ac: '#c9c2b4' } },
+    { id: 'cap', nm: '축전기', cls: '충전형', b: [1, 0.55, 1, 1.6, 0.9, 1, 0.9, 1], q: { bst: 1.35 }, d: '평소 추진은 약하지만 게이지가 빨리 차고 부스트가 가장 셈.',
+      sh: { L: 4.4, W: 1.9, wing: 2.0, sweep: 0.3, eng: 3, fin: 0.6, nose: 0.5, col: '#3d4f8f', ac: '#63c76a' } },
+    { id: 'slick', nm: '활주판', cls: '미끄럼형', b: [1.22, 1.1, 1.15, 0.9, 1.1, 0.8, 0.8, 0.9], q: { grip: 1.6 }, d: '빠르지만 옆으로 많이 미끄러짐. 다루기 까다로움.',
+      sh: { L: 4.0, W: 2.4, wing: 0, sweep: 0, eng: 1, fin: 0.2, nose: 0.3, col: '#9fb8c8', ac: '#e8574f' } },
+    { id: 'wheel', nm: '지상 주행기', cls: '차륜형', b: [1.05, 1.2, 1.1, 0.8, 0.12, 1.2, 1.15, 1.1], q: { grip: 14 }, d: '바퀴로 땅을 움켜쥠. 미끄러지지 않고 빠르지만 날지 못함.',
+      sh: { L: 4.4, W: 2.0, wing: 0, sweep: 0, eng: 0, fin: 0.3, nose: 0.3, wheel: 1, col: '#4a5a3c', ac: '#e3ae45' } },
+    { id: 'mend', nm: '자가 수복기', cls: '수복형', b: [0.95, 0.95, 1, 1, 0.95, 1.05, 1.1, 0.9], q: { regen: 0.02 }, d: '내구가 초당 2%씩 스스로 회복됨.',
+      sh: { L: 4.4, W: 2.0, wing: 3.0, sweep: 0.4, eng: 1, fin: 0.6, nose: 0.4, col: '#6f9a6a', ac: '#f2e9d8' } },
+    { id: 'twin', nm: '쌍발기', cls: '추진형', b: [1.15, 1.25, 0.9, 0.7, 0.75, 1.1, 1, 1.05], q: {}, d: '속도와 가속이 모두 높음. 충전이 느리고 활공이 짧음.',
+      sh: { L: 5.2, W: 1.6, wing: 3.4, sweep: 0.8, eng: 2, fin: 0.8, nose: 0.8, col: '#2f3a48', ac: '#f0a13a' } },
+    { id: 'mag', nm: '집게 수집기', cls: '수집형', b: [0.9, 1, 1.05, 1, 0.9, 1, 1, 0.8], q: { mag: 2.2 }, d: '조각을 줍는 거리가 2.2배. 느린 편.',
+      sh: { L: 3.8, W: 2.2, wing: 2.8, sweep: -0.4, eng: 1, fin: 0.4, nose: 0.2, col: '#8a5a9a', ac: '#e06cc0' } },
+    { id: 'feather', nm: '깃털', cls: '경량형', b: [1, 1.35, 1.2, 1.1, 1.4, 0.5, 0.55, 0.6], q: {}, d: '아주 가벼움. 잘 튀고 잘 뜨지만 부딪히면 멀리 밀리고 쉽게 부서짐.',
+      sh: { L: 3.4, W: 1.0, wing: 4.6, sweep: 0.6, eng: 1, fin: 0.6, nose: 0.9, col: '#f2e9d8', ac: '#d977b4' } },
+    { id: 'proto', nm: '시제 영호', cls: '희귀 · 만능형', b: [1.15, 1.15, 1.15, 1.15, 1.15, 1, 1.1, 1.1], q: { rare: 1 }, d: '사건 「희귀 기체 출현」으로만 나타남. 모든 성능이 고르게 높음.',
+      sh: { L: 5.0, W: 1.6, wing: 4.0, sweep: 1.1, eng: 2, fin: 1.0, nose: 0.9, col: '#16181d', ac: '#58b8e8' } },
+    { id: 'titan', nm: '시제 중형', cls: '희귀 · 중량형', b: [1.1, 0.95, 0.95, 1, 0.7, 1.6, 1.6, 1.5], q: { rare: 1 }, d: '사건 「희귀 기체 출현」으로만 나타남. 무겁고 단단하면서 느리지 않음.',
+      sh: { L: 5.6, W: 2.8, wing: 3.2, sweep: 0.2, eng: 3, fin: 0.5, nose: 0.15, col: '#1d1a16', ac: '#e8574f' } },
+  ];
+  const CI = {}; CRAFTS.forEach((c, i) => { CI[c.id] = i; });
+
+  /* ======================= 돌발 사건 ======================= */
+  const EVENTS = [
+    { id: 'meteor', nm: '운석우', dur: 30, d: '붉은 원이 뜬 자리에 운석이 떨어짐. 맞으면 큰 피해. 떨어진 자리에 조각이 남음.' },
+    { id: 'fog', nm: '짙은 안개', dur: 40, d: '멀리 보이지 않음. 작은 지도는 그대로.' },
+    { id: 'cargo', nm: '수송기 통과', dur: 25, d: '수송기가 도시를 가로지르며 조각을 쏟음. 작은 지도에 항로가 보임.' },
+    { id: 'wreck', nm: '철거 구체', dur: 35, d: '거대한 쇠공이 큰길을 따라 굴러다님. 부딪히면 큰 피해와 함께 날아감.' },
+    { id: 'mono', nm: '단일 조각', dur: 30, d: '도시에 놓인 조각이 모두 한 종류로 바뀜.' },
+    { id: 'surplus', nm: '보급 과잉', dur: 30, d: '빈 조각 자리 여러 곳과 부서진 상자가 다시 채워짐.' },
+    { id: 'updraft', nm: '상승 기류', dur: 30, d: '공중에 뜬 기체가 위로 밀려 올라감. 옥상에 오르기 좋음.' },
+    { id: 'surge', nm: '전력 폭주', dur: 25, d: '모든 기체의 최고 속도 · 가속 +25%, 게이지가 2배로 빨리 참.' },
+    { id: 'gold', nm: '황금 상자', dur: 40, d: '교차로 다섯 곳에 황금 상자가 놓임. 부수면 조각 여섯 개. 작은 지도에 표시.' },
+    { id: 'rare', nm: '희귀 기체 출현', dur: 45, d: '시제 기체 한 대가 도시 어딘가에 나타남. 작은 지도에 표시.' },
+    { id: 'lowg', nm: '중력 이상', dur: 30, d: '중력이 약해져 멀리 뜀.' },
+    { id: 'jam', nm: '교란 전파', dur: 30, d: '작은 지도가 먹통이 됨.' },
+  ];
+  const EI = {}; EVENTS.forEach((e, i) => { EI[e.id] = i; });
+
+  /* ======================= 결판 종목 ======================= */
+  /* fav: 유리한 능력치(STATS 번호) · cap: 제한 시간(초) · unit/dec: 기록 단위 · low: 작을수록 좋음 */
+  const FINALS = [
+    { id: 'sprint', nm: '관문 경주', fav: [0, 2, 1], cap: 110, unit: '초', low: 1, d: '같은 도시의 관문 여덟 곳을 차례로 통과. 먼저 마친 순.', how: '다음 관문은 화면 표시와 작은 지도에 보임.' },
+    { id: 'drag', nm: '직선 가속전', fav: [0, 1, 3], cap: 40, unit: '초', low: 1, d: '직선 600m. 먼저 들어온 순.', how: '출발 신호 전에 모아 두었다 신호에 맞춰 놓으면 출발 부스트.' },
+    { id: 'far', nm: '멀리 날기', fav: [4, 3, 0], cap: 50, unit: 'm', d: '내리막을 달려 도약대에서 뜀. 처음 땅에 닿은 곳까지의 거리.', how: '공중에서는 모으기를 누르지 않아야 오래 뜸.' },
+    { id: 'high', nm: '높이 날기', fav: [0, 3, 4], cap: 40, unit: 'm', d: '곡면 도약대를 타고 솟구침. 가장 높이 오른 높이.', how: '도약대 직전에 부스트를 쓰면 더 높이 오름.' },
+    { id: 'sumo', nm: '밀어내기', fav: [5, 7, 2], cap: 80, unit: '초', d: '난간 없는 원형 판 위에서 서로 밀어냄. 오래 남은 순. 판은 점점 좁아짐.', how: '부스트로 들이받으면 멀리 밀림. 판 위에서는 출력이 60%로 제한됨.' },
+    { id: 'smash', nm: '표적 부수기', fav: [7, 0, 2], cap: 50, unit: '점', d: '50초 동안 표적을 들이받아 부숨. 단단한 표적일수록 점수가 큼.', how: '공격이 낮으면 단단한 표적은 튕겨 나옴.' },
+    { id: 'survive', nm: '버티기', fav: [6, 2, 0], cap: 60, unit: '초', d: '점점 거세지는 운석우 속에서 버팀. 오래 남은 순.', how: '붉은 원을 피함. 끝까지 남으면 남은 내구 비율로 가림.' },
+    { id: 'derby', nm: '충돌전', fav: [7, 6, 5], cap: 50, unit: '점', d: '50초 동안 서로 들이받음. 준 피해가 점수, 격파하면 +50.', how: '부서지면 2초 뒤 다시 나옴.' },
+    { id: 'rush', nm: '조각 쟁탈', fav: [2, 1, 0], cap: 45, unit: '개', d: '45초 동안 쏟아지는 조각을 가장 많이 주움. 금빛 조각은 3개로 침.', how: '여기서 주운 조각은 점수로만 셈.' },
+    { id: 'land', nm: '정밀 착지', fav: [4, 0, 2], cap: 45, unit: '점', d: '도약대에서 떠 과녁 한가운데에 가깝게 내려앉음. 100점 만점.', how: '모으기를 누르면 급강하. 좌우로 방향을 맞춤.' },
+  ];
+  const FI = {}; FINALS.forEach((f, i) => { FI[f.id] = i; });
+
+  /* ======================= 도시 구획 ======================= */
+  const DISTRICTS = [
+    { id: 'tower', nm: '고층가', n: 5, d: '높은 빌딩 사이 골목. 낮은 건물 옥상에 조각.' },
+    { id: 'mid', nm: '상업가', n: 4, d: '중간 높이 건물. 경사로로 옥상을 이어 달림.' },
+    { id: 'res', nm: '주거지', n: 3, d: '낮은 집과 마당. 상자가 많음.' },
+    { id: 'park', nm: '공원', n: 2, d: '트인 잔디와 둔덕. 달리기 편하고 조각이 고리로 놓임.' },
+    { id: 'plaza', nm: '전파탑 광장', n: 1, d: '도시에서 가장 높은 전파탑. 어디서나 보이는 길잡이.' },
+    { id: 'dock', nm: '항만', n: 2, d: '컨테이너 더미와 기중기. 더미 위에 조각.' },
+    { id: 'plant', nm: '공장', n: 2, d: '큰 작업동과 저장 탱크, 냉각탑.' },
+    { id: 'arena', nm: '훈련장', n: 1, d: '담으로 둘러싼 운동장. 조각과 상자가 몰려 있음.' },
+    { id: 'strip', nm: '활주로', n: 1, d: '긴 직선 끝의 큰 도약대. 그 너머 공중에 조각.' },
+    { id: 'under', nm: '지하 차도', n: 1, d: '땅 밑으로 꺼진 길. 덮개 아래에 조각과 물품 상자.' },
+    { id: 'site', nm: '공사장', n: 2, d: '철골 발판과 경사로. 상자가 많음.' },
+    { id: 'garage', nm: '주차 타워', n: 1, d: '경사로를 두 번 돌아 오르는 옥상. 도약대와 기체 한 대.' },
+  ];
+
+  /* ======================= 판 상태 ======================= */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length;
+    const dur = [3, 5, 7].includes(+opts.dur) ? +opts.dur * 60 : 420;
+    const seed = (Math.random() * 0x7fffffff) | 0;
+    const fixed = FI[opts.fin] != null;
+    const fin = fixed ? FI[opts.fin] : (Math.random() * FINALS.length) | 0;
+    const others = FINALS.map((_, i) => i).filter((i) => i !== fin).sort(() => Math.random() - 0.5);
+    const c3 = [fin, others[0], others[1]].sort(() => Math.random() - 0.5);
+    const c2 = [fin, others[0]].sort(() => Math.random() - 0.5);
+    // 사건 일정: [시작 시각(초), 사건 번호] — 한 판에 같은 사건은 한 번
+    const evs = [];
+    if (opts.ev !== 'off') {
+      const gap = opts.ev === 'many' ? [24, 34] : [38, 52];
+      const pool = EVENTS.map((_, i) => i).sort(() => Math.random() - 0.5);
+      let t = 22 + Math.random() * 14;
+      while (pool.length && t + 26 < dur - 8) { const k = pool.pop(); evs.push([Math.round(t), k]); t += Math.max(EVENTS[k].dur + 6, gap[0] + Math.random() * (gap[1] - gap[0])); }
+    }
+    return { v: 1, seed, n, dur, fin, fixed: fixed ? 1 : 0, c3, c2, evs, tod: (Math.random() * 3) | 0, ph: 'city', seq: 1,
+      lv: players.map((p) => (p.ai ? p.lv || 2 : 0)), car: null, res: null };
+  }
+  function fmtScore(f, v) {
+    if (v == null) return '기록 없음';
+    const F = FINALS[f];
+    if (F.unit === '초') return (Math.round(v * 10) / 10).toFixed(1) + '초';
+    return Math.round(v).toLocaleString('en-US') + F.unit;
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.res) return null;
+    const r = s.res, F = FINALS[s.fin];
+    const winners = []; r.rk.forEach((k, i) => { if (k === 0) winners.push(i); });
+    return {
+      winners, title: '결판 종목 — ' + F.nm,
+      text: F.d,
+      stats: [
+        { label: '순위', values: r.rk.map((k) => (k + 1) + '등'), best: false },
+        { label: '기록', values: r.lab, best: false },
+        { label: '기체', values: r.k.map((k) => CRAFTS[k].nm), best: false },
+        { label: '모은 조각', values: r.tot },
+        { label: '가장 높은 능력치', values: r.top, best: false },
+      ],
+    };
+  }
+  function hint(s) {
+    if (!s) return null;
+    if (s.ph === 'city') return ['도시 — 조각을 주워 기체를 키움', '좌우로 방향, 모으기를 눌렀다 놓으면 부스트', '세워진 기체 옆에서 갈아타기', '시간이 끝나면 결판 종목 하나로 순위를 가림'];
+    if (s.ph === 'fin') { const F = FINALS[s.fin]; return ['결판 종목 — ' + F.nm, F.d, F.how, '유리한 능력치: ' + F.fav.map((i) => STATS[i].nm).join(' · ')]; }
+    return null;
+  }
+
+  /* ======================= 도감 ======================= */
+  const chip = (col) => '<svg viewBox="0 0 24 24" width="24" height="24"><path d="M12 2l8 10-8 10L4 12z" fill="' + col + '" stroke="rgba(0,0,0,.45)" stroke-width="1.2"/><path d="M12 2l8 10H4z" fill="rgba(255,255,255,.28)"/></svg>';
+  const box = (col) => '<svg viewBox="0 0 24 24" width="24" height="24"><rect x="3" y="5" width="18" height="15" rx="2" fill="' + col + '" stroke="rgba(0,0,0,.45)" stroke-width="1.2"/><path d="M3 10h18M12 5v15" stroke="rgba(0,0,0,.4)" stroke-width="1.4"/></svg>';
+  const mark = (t) => '<svg viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="10" fill="#2e2640" stroke="#e3ae45" stroke-width="1.4"/><text x="12" y="16" text-anchor="middle" font-size="11" font-weight="700" fill="#f2e9d8" font-family="sans-serif">' + t + '</text></svg>';
+  function craftIcon(c) {   // 위에서 본 실루엣(겉모습 자료에서 만듦)
+    const s = c.sh, k = 3.3, cx = 12, L2 = s.L * k / 2, W2 = s.W * k / 2, wg = s.wing * k / 2, sw = s.sweep * k;
+    let p = '';
+    if (s.wing > 0) p += '<path d="M' + (cx - W2 * 0.6) + ' ' + (12 - 1) + 'L' + (cx - wg) + ' ' + (12 + 2 + sw) + 'L' + (cx - wg) + ' ' + (12 + 4.5 + sw) + 'L' + (cx - W2 * 0.6) + ' ' + (12 + 4) + 'z M' + (cx + W2 * 0.6) + ' ' + (12 - 1) + 'L' + (cx + wg) + ' ' + (12 + 2 + sw) + 'L' + (cx + wg) + ' ' + (12 + 4.5 + sw) + 'L' + (cx + W2 * 0.6) + ' ' + (12 + 4) + 'z" fill="' + s.ac + '"/>';
+    const nw = W2 * (1 - s.nose * 0.85);
+    p += '<path d="M' + (cx - nw) + ' ' + (12 - L2) + 'L' + (cx + nw) + ' ' + (12 - L2) + 'L' + (cx + W2) + ' ' + (12 - L2 * 0.1) + 'L' + (cx + W2 * 0.85) + ' ' + (12 + L2) + 'L' + (cx - W2 * 0.85) + ' ' + (12 + L2) + 'L' + (cx - W2) + ' ' + (12 - L2 * 0.1) + 'z" fill="' + s.col + '" stroke="rgba(255,255,255,.35)" stroke-width=".8"/>';
+    if (s.wheel) p += '<rect x="' + (cx - W2 - 1.6) + '" y="' + (12 - L2 * 0.7) + '" width="2" height="4" fill="#111"/><rect x="' + (cx + W2 - 0.4) + '" y="' + (12 - L2 * 0.7) + '" width="2" height="4" fill="#111"/><rect x="' + (cx - W2 - 1.6) + '" y="' + (12 + L2 * 0.4) + '" width="2" height="4" fill="#111"/><rect x="' + (cx + W2 - 0.4) + '" y="' + (12 + L2 * 0.4) + '" width="2" height="4" fill="#111"/>';
+    return '<svg viewBox="0 0 24 24" width="24" height="24">' + p + '</svg>';
+  }
+  const pct = (m) => (m === 1 ? null : (m > 1 ? '+' : '−') + Math.round(Math.abs(m - 1) * 100) + '%');
+  function craftDesc(c) {
+    const parts = [];
+    c.b.forEach((m, i) => { const t = pct(m); if (t) parts.push(STATS[i].sh + ' ' + t); });
+    const q = c.q, ex = [];
+    if (q.grip && q.grip < 6) ex.push('옆 미끄러짐 큼'); if (q.grip && q.grip > 6) ex.push('옆 미끄러짐 없음');
+    if (q.bst) ex.push('부스트 ×' + q.bst); if (q.keep) ex.push('모으는 동안 감속 ' + Math.round(q.keep * 100) + '%');
+    if (q.regen) ex.push('내구 초당 ' + Math.round(q.regen * 100) + '% 회복'); if (q.mag) ex.push('줍는 거리 ×' + q.mag);
+    if (q.crush) ex.push('상자 즉시 파괴');
+    return c.d + ' ' + (parts.length ? parts.join(' · ') : '모든 성능 기준값') + (ex.length ? ' · ' + ex.join(' · ') : '');
+  }
+  function codexData() {
+    return [
+      { h: '기체', p: ['도시 곳곳에 세워져 있음. 옆에 서서 갈아타기를 누르면 바꿔 탐. 모은 조각은 조종사를 따라감.', '수치는 기준기 대비.'],
+        rows: CRAFTS.map((c) => ({ icon: craftIcon(c), name: c.nm, tag: c.cls, desc: craftDesc(c) })) },
+      { h: '조각 · 물품', p: ['조각은 한 종류에 ' + STAT_MAX + '단계까지 쌓임. 세게 부딪히거나 기체가 부서지면 몇 개를 떨어뜨림.'],
+        rows: STATS.map((s) => ({ icon: chip(s.col), name: s.nm + ' 조각', tag: '능력치', desc: s.d }))
+          .concat(ITEMS.map((s) => ({ icon: box(s.col), name: s.nm, tag: '물품', desc: s.d })))
+          .concat([
+            { icon: box('#b98b4a'), name: '보급 상자', tag: '상자', desc: '들이받으면 조각 2개. 너무 느리면 부서지지 않음.' },
+            { icon: box('#6b7686'), name: '강화 상자', tag: '상자', desc: '두 번 들이받거나 공격이 높으면 한 번에. 조각 3개.' },
+            { icon: box('#4aa58a'), name: '물품 상자', tag: '상자', desc: '물품 하나와 조각 1개.' },
+            { icon: box('#e3ae45'), name: '황금 상자', tag: '상자', desc: '사건 「황금 상자」 때만. 조각 6개.' },
+            { icon: mark('가'), name: '가속 발판', tag: '도시 시설', desc: '밟으면 잠깐 최고 속도를 넘겨 달림.' },
+            { icon: mark('풍'), name: '상승 환풍구', tag: '도시 시설', desc: '위를 지나면 솟구침. 옥상으로 오르는 길.' },
+          ]) },
+      { h: '돌발 사건', p: ['도시 단계 중간중간 일어남. 한 판에 같은 사건은 한 번. 시작 4초 전에 예고.'],
+        rows: EVENTS.map((e, i) => ({ icon: mark(String(i + 1)), name: e.nm, tag: e.dur + '초', desc: e.d })) },
+      { h: '결판 종목', p: ['도시 단계가 끝나면 하나가 무작위로 열림. 도시 시간의 35%에 후보 셋, 70%에 후보 둘을 알려 줌.'],
+        rows: FINALS.map((f, i) => ({ icon: mark(String(i + 1)), name: f.nm, tag: f.fav.map((k) => STATS[k].sh).join(' · '), desc: f.d + ' ' + f.how + ' 유리한 능력치: ' + f.fav.map((k) => STATS[k].nm).join(' · ') + '. 제한 ' + f.cap + '초.' })) },
+      { h: '도시 구획', p: ['가로 5 × 세로 5 구획. 배치는 판마다 무작위. 전파탑 · 냉각탑 · 기중기가 길잡이.'],
+        rows: DISTRICTS.map((d) => ({ icon: mark(d.nm[0]), name: d.nm, tag: d.n + '곳', desc: d.d })) },
+    ];
+  }
+
+  const RULES = [
+    { h: '목표', p: ['1부(도시)에서 조각을 모아 기체를 키우고, 2부(결판 종목)에서 1등을 합니다.', '도시에서 얼마나 모았는지는 순위에 들어가지 않습니다. 순위는 결판 종목 기록으로만 정합니다.'] },
+    { h: '도시', p: ['색이 있는 마름모가 능력치 조각입니다. 지나가면 주워지고 그 능력치가 한 단계 오릅니다(한 종류 ' + STAT_MAX + '단계까지).', '상자는 들이받아 부숩니다. 너무 느리면 부서지지 않습니다.', '조각은 길 위, 건물 옥상, 지하 차도, 도약대 너머 공중에도 있습니다.', '세워진 기체 옆에서 갈아타기를 누르면 그 기체로 바꿔 탑니다. 모은 조각은 그대로 따라옵니다.', '다른 기체를 세게 들이받으면 상대가 조각을 떨어뜨립니다. 내구가 바닥나면 기체가 부서지고, 조각 넷을 흘린 채 기준기로 다시 나옵니다.'] },
+    { h: '돌발 사건 · 종목 예고', p: ['도시 중간에 운석우 · 안개 · 수송기 같은 사건이 일어납니다. 화면 위쪽에 작게 알려 줍니다.', '도시 시간의 35%가 지나면 결판 종목 후보 셋, 70%가 지나면 후보 둘을 알려 줍니다. 후보에 맞는 능력치를 모으면 유리합니다.', '예시: 후보가 「멀리 날기 · 정밀 착지」라면 활공 조각(하늘색)을 우선합니다.'] },
+    { h: '결판 종목', p: ['키운 기체 그대로 종목 하나를 치릅니다. 종목마다 유리한 능력치가 다릅니다(📖 도감 「결판 종목」).', '설정에서 종목을 직접 고를 수도 있습니다. 그러면 예고 없이 처음부터 종목이 보입니다.'] },
+    { h: '조작', p: ['가속은 자동입니다.', '폰: 왼쪽 아래 ◀ ▶ 로 방향(가운데에서 멀리 누를수록 크게 꺾음), 오른쪽 아래 「모으기」.', 'PC: ← → 또는 A D 로 방향, Space(또는 Shift)로 모으기, E로 갈아타기. 게임패드도 됩니다.', '모으기: 누르는 동안 속도가 줄며 급하게 돌고 게이지가 찹니다. 놓으면 찬 만큼 부스트. 코너에서 누르고 빠져나오며 놓는 것이 기본입니다.', '공중에서는 모으기를 누르면 급강하합니다. 누르지 않으면 활공합니다.'] },
+    { h: '인원 · 난이도', p: ['2~8명. 한 기기에 한 명이고, 빈자리는 AI가 채웁니다. 친구와는 온라인 · LAN으로 합니다.', 'AI 난이도는 자리마다 쉬움 · 보통 · 어려움으로 고릅니다.'] },
+  ];
+
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#1c2440'); sky.addColorStop(0.62, '#c8744a'); sky.addColorStop(1, '#2a2030');
+    g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    let sd = 7; const rnd = () => ((sd = (sd * 16807) % 2147483647) / 2147483647);
+    for (let layer = 0; layer < 3; layer++) {
+      g.fillStyle = ['#3a2f48', '#261f33', '#15121c'][layer];
+      for (let x = -10; x < w;) { const bw = 22 + rnd() * 40, bh = 40 + rnd() * (150 - layer * 30); g.fillRect(x, h * (0.6 + layer * 0.1) - bh, bw, bh + 200);
+        if (layer > 0) { g.fillStyle = 'rgba(255,210,140,.5)'; for (let yy = 8; yy < bh - 6; yy += 9) for (let xx = 4; xx < bw - 5; xx += 7) if (rnd() < 0.3) g.fillRect(x + xx, h * (0.6 + layer * 0.1) - bh + yy, 3, 4); g.fillStyle = ['#3a2f48', '#261f33', '#15121c'][layer]; }
+        x += bw + 3; }
+    }
+    g.fillStyle = '#0e0c12'; g.fillRect(0, h * 0.86, w, h);
+    g.save(); g.translate(w * 0.36, h * 0.78);
+    g.fillStyle = 'rgba(88,184,232,.35)'; g.beginPath(); g.ellipse(0, 12, 70, 7, 0, 0, 7); g.fill();
+    g.fillStyle = '#c8ccd2'; g.beginPath(); g.moveTo(-70, 0); g.lineTo(40, -12); g.lineTo(78, -2); g.lineTo(40, 6); g.lineTo(-64, 6); g.closePath(); g.fill();
+    g.fillStyle = '#e3ae45'; g.beginPath(); g.moveTo(-40, -2); g.lineTo(-66, -24); g.lineTo(-50, -24); g.lineTo(-14, -4); g.closePath(); g.fill();
+    g.fillStyle = '#1c2440'; g.beginPath(); g.ellipse(22, -8, 18, 5, -0.1, 0, 7); g.fill();
+    g.restore();
+    g.fillStyle = 'rgba(10,8,14,.62)'; g.fillRect(0, h - 56, w, 56);
+    g.fillStyle = '#f2e9d8'; g.font = '30px "Black Han Sans","IBM Plex Sans KR",sans-serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 22, h - 28);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(242,233,216,.75)'; g.fillText('도시에서 기체를 키우고 · 무작위 종목으로 결판', 170, h - 27);
+  }
+
+  /* ======================= 입구 화면 (3D 불러오기) ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '그림자 없음 · 낮은 배율 — 끊길 때', pr: 1, shadow: 0, aa: false, far: 520 },
+    { id: 'mid', nm: '보통', tip: '해 그림자 · 보통 배율', pr: 1.5, shadow: 1024, aa: true, far: 760 },
+    { id: 'high', nm: '높음', tip: '고운 그림자 · 높은 배율', pr: 2, shadow: 2048, aa: true, far: 980 },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem(ID + '.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(ID + '.' + k, v); } catch (e) {} } };
+  function gfxTier() { const v = store.get('gfx', ''); if (TIERS.some((t) => t.id === v)) return v; return L && L.touchOnly && L.touchOnly() ? 'low' : 'mid'; }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  function loadCore() {
+    return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js'))
+      .then(() => (API.sim ? null : loadScript('assets/citytrial/sim.js')))
+      .then(() => (G.CITYTRIAL_VIEW ? null : loadScript('assets/citytrial/view.js')));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+  const CONTROLS = [
+    { id: 'left', label: '왼쪽', keys: ['ArrowLeft', 'KeyA'], pad: ['lx-', 'left'] },
+    { id: 'right', label: '오른쪽', keys: ['ArrowRight', 'KeyD'], pad: ['lx+', 'right'] },
+    { id: 'charge', label: '모으기(놓으면 부스트 · 공중에서는 급강하)', keys: ['Space', 'ShiftLeft', 'ArrowDown', 'KeyS'], pad: ['a', 'rt'] },
+    { id: 'swap', label: '갈아타기', keys: ['KeyE', 'ArrowUp', 'KeyW'], pad: ['x', 'y'] },
+    { id: 'map', label: '큰 지도', keys: ['KeyM'], pad: ['back'] },
+  ];
+
+  const API = { ID, TITLE, STATS, STAT_MAX, STAT_CH, ITEMS, CRAFTS, CI, EVENTS, EI, FINALS, FI, DISTRICTS, TIERS, store, gfxTier, clamp, init, result, fmtScore, hint, craftIcon };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 46%,#2b2a40,#0c0b12)', color: '#f2e9d8', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t1 = h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '30px', letterSpacing: '2px' }, text: TITLE });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '도시를 불러오는 중' });
+    const bar = h('div', { style: { width: '220px', height: '4px', borderRadius: '2px', background: 'rgba(255,240,210,.12)', overflow: 'hidden' } }, h('div', { style: { width: '8%', height: '100%', background: '#e3ae45', transition: 'width .2s' } }));
+    box.append(t1, t2, bar);
+    root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(clamp(f, 0.05, 1) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기(브라우저)에서는 3D 그래픽(WebGL)을 켤 수 없습니다.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.5, '구획을 배치하는 중');
+      view = G.CITYTRIAL_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'); });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<path d="M6 44V22h7v22zM15 44V12h8v32zM25 44V26h6v18zM33 44V16h8v28zM43 44V28h7v16z" fill="currentColor" opacity=".45"/><path d="M8 36l26-8 14 3-14 5H10z" fill="currentColor"/><path d="M18 33l-6-9h5l9 7z" fill="currentColor"/><rect x="6" y="46" width="44" height="3" rx="1.5" fill="currentColor" opacity=".7"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '3D 기체 육성 · 결판', cat: '스포츠', icon: ICON, tint: '#1f2a44',
+    blurb: '근미래 도시를 부유 기체로 달리며 능력치 조각을 모아 기체를 키우고, 도시 시간이 끝나면 무작위 결판 종목 하나로 순위를 가립니다. 기체 16종 · 돌발 사건 12종 · 결판 종목 10종. 2~8명(빈자리 AI).',
+    time: '4–9분', landscape: true, realtime: true, aiDelay: 0, sidePanel: false, ambient: false, menuCorner: 'tr',
+    minPlayers: 2, maxPlayers: 8, defaultPlayers: 6,
+    options: [
+      { id: 'dur', label: '도시 시간', tip: '조각을 모으는 시간. 짧으면 능력치가 덜 쌓인 채로 결판을 치릅니다.', choices: [{ v: '3', label: '3분' }, { v: '5', label: '5분' }, { v: '7', label: '7분' }], def: '7' },
+      { id: 'fin', label: '결판 종목', tip: '무작위면 도시 중간에 후보만 알려 줍니다. 고르면 처음부터 종목이 보입니다.', choices: [{ v: 'rnd', label: '무작위' }].concat(FINALS.map((f) => ({ v: f.id, label: f.nm, tip: f.d }))), def: 'rnd' },
+      { id: 'ev', label: '돌발 사건', choices: [{ v: 'on', label: '보통' }, { v: 'many', label: '자주' }, { v: 'off', label: '끔' }], def: 'on' },
+    ],
+    setupExtra(opts, ctx) {
+      if (ctx && ctx.readOnly) return null;
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', marginRight: '4px' }, text: '그래픽 품질(이 기기)' }));
+        for (const t of TIERS) wrap.append(h('button', { class: 'btn sm' + (gfxTier() === t.id ? ' primary' : ''), title: t.tip, style: { minHeight: '44px' }, text: t.nm, onclick() { store.set('gfx', t.id); draw(); } }));
+      };
+      draw(); void opts;
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['도시: 조각(색 마름모)을 주워 능력치를 올리고, 세워진 기체로 갈아탐', '좌우로 방향 · 「모으기」를 눌렀다 놓으면 부스트(가속은 자동)', '시간이 끝나면 무작위 결판 종목 하나 — 그 기록으로 순위를 가림'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.CITYTRIAL = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

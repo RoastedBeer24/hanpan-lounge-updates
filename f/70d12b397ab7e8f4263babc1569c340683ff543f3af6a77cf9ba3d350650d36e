@@ -1,0 +1,782 @@
+/* 여관 주인 (tavern) — 중세 가도의 여관을 1~4명이 함께 꾸려 가는 3D 경영 협동.
+   체계만 참고(여관 경영 시뮬레이션 장르: 양조 · 요리 · 저녁 영업 · 객실 · 꾸미기). 이름 · 그림 · 글은 모두 독자.
+
+   파일 구성 (결정 사항: docs/DECISIONS.md 「여관 주인」)
+   - 이 파일: 자료(재료 · 술 · 요리 · 작물 · 손님 · 꾸미기 · 확장 · 일꾼 · 사건 · 계절) · 판 상태 · 아침/밤 관리 행동(mg) · 하루 넘기기
+     · 관리 AI(계획) · 결과 · 규칙 · 도감 · 표지 · L.register — 와 가벼운 입구 화면(3D 파일 불러오기).
+   - assets/tavern/sim.js: 저녁 영업 세계(순수 로직 — 손님 · 자리 · 주문 · 화덕 · 설거지 · 소란 · 일꾼 · 봇 직원 AI · 네트워크 묶기).
+   - assets/tavern/view.js: 3D 화면(three.js — assets/hyperrace/lib/three.min.js 공용) · 관리 창 · 조작 · HUD · 온라인.
+   온라인: 판 상태(아침 · 밤 관리, 하루 결산)는 호스트가 api.setState. 손님 기기의 관리 요청과 영업 중 「쓰기」는 publish로 호스트에 보내고,
+   영업 세계는 호스트가 돌려 hostSend(12Hz)로 나눔. 자기 캐릭터 이동은 각 기기가 먼저 그림(예측). */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'tavern';
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  function prng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const pickW = (R, obj) => { let s = 0; for (const k in obj) s += Math.max(0, obj[k]); let x = R() * s; for (const k in obj) { x -= Math.max(0, obj[k]); if (x <= 0) return k; } return Object.keys(obj)[0]; };
+
+  /* ======================= 자료 ======================= */
+  /* 글 문체: 여관 장부 · 가도의 게시문처럼 짧고 절제된 명사형(느낌표 · 감탄사 · 의성어 · 귀여운 말투 없음). 규칙은 합니다체. */
+  const SEASONS = [
+    { id: 'spring', nm: '봄', g: 1.0, grow: 1.0, room: 1.0, d: '씨 뿌리기 좋은 때. 순례자가 길에 오름.' },
+    { id: 'summer', nm: '여름', g: 1.15, grow: 1.35, room: 0.9, d: '작물이 빨리 자람. 목마른 길손이 늘어 술이 잘 나감.' },
+    { id: 'autumn', nm: '가을', g: 1.2, grow: 0.8, room: 1.1, d: '거둘 때. 사과 · 보리 값이 내리고 사냥꾼 · 상단이 늘어남.' },
+    { id: 'winter', nm: '겨울', g: 0.75, grow: 0, room: 1.6, d: '밭일 불가. 손님은 줄지만 묵어 가는 사람이 많음. 국물 · 벌꿀술을 찾음.' },
+  ];
+  const ING = {
+    barley: { nm: '보리', p: 2, sm: [1, 1, 0.7, 1.2] },
+    malt: { nm: '맥아', p: 7, sm: [1, 1, 0.85, 1.1] },
+    hops: { nm: '홉', p: 3, sm: [1.1, 1, 0.8, 1.3] },
+    honey: { nm: '꿀', p: 6, sm: [1, 0.85, 1, 1.25] },
+    apple: { nm: '사과', p: 2, sm: [1.4, 1.2, 0.6, 1.3] },
+    potato: { nm: '감자', p: 1, sm: [1.2, 1, 0.8, 1.2] },
+    onion: { nm: '양파', p: 1, sm: [1, 0.9, 0.9, 1.3] },
+    meat: { nm: '돼지고기', p: 5, sm: [1, 1.1, 0.9, 1.1] },
+    fish: { nm: '민물고기', p: 4, sm: [1, 0.8, 1, 1.3] },
+    flour: { nm: '밀가루', p: 2, sm: [1, 1, 0.9, 1.1] },
+    cheese: { nm: '치즈', p: 4, sm: [1, 1, 1, 1] },
+    herb: { nm: '약초', p: 2, sm: [1, 0.8, 1, 1.4] },
+  };
+  const ING_IDS = Object.keys(ING);
+  /* 술: need 재료, days 발효 일수, sv 한 통 잔 수, p 한 잔 값, rep 필요 명성 단계 */
+  const DRINK = [
+    { id: 'ale', nm: '에일', need: { malt: 3, hops: 1 }, days: 2, sv: 12, p: 6, rep: 1, col: '#c98a2e', d: '맥아와 홉으로 빚은 호박색 맥주. 누구나 찾는 기본 술.' },
+    { id: 'cider', nm: '사과주', need: { apple: 5 }, days: 2, sv: 12, p: 6, rep: 1, col: '#d8b552', d: '사과즙을 통에서 삭힌 술. 가볍고 시원함. 여름에 잘 나감.' },
+    { id: 'stout', nm: '흑맥주', need: { malt: 4, hops: 1 }, days: 3, sv: 12, p: 9, rep: 2, col: '#3b2417', d: '볶은 맥아로 빚은 검은 맥주. 용병 · 사냥꾼이 즐김.' },
+    { id: 'mead', nm: '벌꿀술', need: { honey: 3, herb: 1 }, days: 4, sv: 12, p: 12, rep: 3, col: '#e2b23e', d: '꿀물을 오래 삭힌 술. 겨울 · 수사 · 기사가 찾음.' },
+    { id: 'herbal', nm: '약초술', need: { malt: 2, herb: 3, honey: 1 }, days: 5, sv: 10, p: 15, rep: 4, col: '#6f7d31', d: '약초를 우려 빚은 쌉쌀한 술. 학자 · 사절이 즐김. 비쌈.' },
+  ];
+  /* 요리: n 한 번 밑준비로 나오는 몫, st 내는 곳(솥 pot · 찬장 board · 화덕 oven), ck 화덕 굽는 시간(초) */
+  const DISH = [
+    { id: 'stew', nm: '감자 스튜', need: { potato: 3, onion: 1, meat: 1 }, n: 8, p: 7, st: 'pot', ck: 0, rep: 1, col: '#a5652f', d: '솥에서 바로 퍼 담는 든든한 국물. 농사꾼 · 용병이 찾음.' },
+    { id: 'bread', nm: '빵과 치즈', need: { flour: 2, cheese: 1 }, n: 6, p: 5, st: 'board', ck: 0, rep: 1, col: '#d9b46a', d: '찬장 도마에서 썰어 내는 가벼운 한 접시. 순례자 · 행상인.' },
+    { id: 'soup', nm: '양파 수프', need: { onion: 3, herb: 1, flour: 1 }, n: 8, p: 6, st: 'pot', ck: 0, rep: 2, col: '#c8923f', d: '약초를 넣고 오래 끓인 수프. 값싸고 수사 · 순례자가 즐김.' },
+    { id: 'fish', nm: '구운 생선', need: { fish: 3, herb: 1 }, n: 6, p: 10, st: 'oven', ck: 5, rep: 2, col: '#b9a07a', d: '화덕에 5초 구워 냄. 사냥꾼 · 행상인 · 학자.' },
+    { id: 'pie', nm: '고기 파이', need: { flour: 2, meat: 2, onion: 1 }, n: 6, p: 12, st: 'oven', ck: 6, rep: 3, col: '#b4743a', d: '화덕에 6초 구워 냄. 상단 호위 · 용병 · 기사.' },
+    { id: 'tart', nm: '사과 타르트', need: { flour: 1, apple: 3, honey: 1 }, n: 6, p: 9, st: 'board', ck: 0, rep: 3, col: '#d79a4a', d: '찬장에서 잘라 내는 단 과자. 학자 · 사절.' },
+    { id: 'roast', nm: '꿀 바른 구이', need: { meat: 4, honey: 1, herb: 1 }, n: 6, p: 16, st: 'oven', ck: 7, rep: 4, col: '#8e4a24', d: '화덕에 7초 구워 냄. 가장 비싼 요리. 기사 · 사냥꾼 · 사절.' },
+  ];
+  const CROP = [
+    { id: 'barley', nm: '보리', seed: 3, days: 5, y: 8, d: '맥아의 재료. 거둔 뒤 건조대에서 하룻밤 말리면 맥아.' },
+    { id: 'hops', nm: '홉', seed: 4, days: 6, y: 5, d: '에일 · 흑맥주에 들어감.' },
+    { id: 'potato', nm: '감자', seed: 2, days: 4, y: 8, d: '스튜의 바탕.' },
+    { id: 'onion', nm: '양파', seed: 2, days: 3, y: 6, d: '스튜 · 수프 · 파이.' },
+    { id: 'herb', nm: '약초', seed: 2, days: 2, y: 4, d: '수프 · 생선 · 벌꿀술 · 약초술.' },
+  ];
+  /* 손님: pat 기다리는 시간(초), w 씀씀이(팁), dr/fd 좋아하는 술/요리(가중), pd/pf 술/요리를 시킬 확률, row 소란 확률(두 잔째부터),
+     room 묵어 갈 확률, re 한 잔 더 시킬 확률, rep 나타나는 명성 단계, fus 까다로움(품질 · 편안함을 더 봄), look 모습 */
+  const GUEST = [
+    { id: 'farm', nm: '농사꾼', pat: 55, w: 0.8, dr: { ale: 3, cider: 2 }, fd: { stew: 3, bread: 2, soup: 1 }, pd: 0.85, pf: 0.55, row: 0.05, room: 0, re: 0.3, rep: 1, fus: 0, sw: [1, 1, 1.25, 0.8], look: { hat: 'cap', body: '#6d5a3c', cloak: '', skin: 1 }, d: '근처 마을 사람. 값싼 에일과 스튜. 묵지 않음.' },
+    { id: 'merc', nm: '떠돌이 용병', pat: 40, w: 1.0, dr: { ale: 2, stout: 3 }, fd: { stew: 2, roast: 3, pie: 2, fish: 1 }, pd: 1, pf: 0.6, row: 0.22, room: 0.25, re: 0.5, rep: 1, fus: 0, sw: [1, 1.1, 1, 0.9], look: { hat: 'coif', body: '#5b4a42', cloak: '#4a2c24', skin: 2 }, d: '참을성이 짧고 잔을 자주 비움. 두 잔째부터 소란을 피우기도 함.' },
+    { id: 'pilg', nm: '순례자', pat: 75, w: 0.7, dr: { cider: 2, mead: 1, ale: 1 }, fd: { bread: 3, soup: 3, stew: 1 }, pd: 0.5, pf: 0.85, row: 0, room: 0.45, re: 0.1, rep: 1, fus: 0, sw: [1.5, 1.2, 0.8, 0.6], look: { hat: 'hood', body: '#8a8170', cloak: '#6f6656', skin: 0 }, d: '오래 기다려 주고 국물 · 빵을 찾음. 자주 묵어 감.' },
+    { id: 'peddler', nm: '행상인', pat: 55, w: 1.1, dr: { cider: 3, ale: 2 }, fd: { bread: 2, fish: 2, pie: 1, tart: 1 }, pd: 0.8, pf: 0.7, row: 0.03, room: 0.4, re: 0.25, rep: 1, fus: 0, sw: [1, 1.1, 1.1, 0.8], look: { hat: 'brim', body: '#4f5f3a', cloak: '', skin: 1, pack: 1 }, d: '등짐을 진 장사꾼. 사과주를 좋아하고 종종 묵음.' },
+    { id: 'guard', nm: '상단 호위', pat: 45, w: 1.2, dr: { ale: 3, stout: 2 }, fd: { stew: 2, pie: 2, roast: 2 }, pd: 0.95, pf: 0.75, row: 0.1, room: 0.35, re: 0.4, rep: 2, fus: 0, sw: [1, 1.1, 1.2, 0.7], look: { hat: 'helm', body: '#5a4f45', cloak: '#2f3b4f', skin: 2 }, d: '상단을 따라다니는 무장 호위. 잘 먹고 잘 마심.' },
+    { id: 'hunter', nm: '사냥꾼', pat: 50, w: 1.0, dr: { stout: 3, ale: 1 }, fd: { fish: 2, roast: 3, stew: 1 }, pd: 0.9, pf: 0.7, row: 0.05, room: 0.2, re: 0.3, rep: 2, fus: 0, sw: [0.9, 1, 1.4, 1], look: { hat: 'brim', body: '#3f4a2e', cloak: '#5a4428', skin: 1 }, d: '흑맥주와 구이. 가을에 많아짐.' },
+    { id: 'friar', nm: '탁발 수사', pat: 85, w: 0.8, dr: { mead: 3, herbal: 1, cider: 1 }, fd: { soup: 3, bread: 2 }, pd: 0.6, pf: 0.8, row: 0, room: 0.4, re: 0.15, rep: 2, fus: 0, sw: [1.2, 1, 1, 1.2], look: { hat: 'cowl', body: '#5c4632', cloak: '#5c4632', skin: 0 }, d: '참을성이 가장 김. 수프와 벌꿀술.' },
+    { id: 'knight', nm: '편력 기사', pat: 45, w: 1.8, dr: { mead: 2, stout: 2, herbal: 1 }, fd: { roast: 3, pie: 2 }, pd: 0.9, pf: 0.85, row: 0.04, room: 0.6, re: 0.3, rep: 3, fus: 1, sw: [1, 1.2, 1, 0.8], look: { hat: 'helm', body: '#7a6a52', cloak: '#6b1f22', skin: 0 }, d: '씀씀이가 크고 품질을 봄. 구이를 찾고 묵어 감.' },
+    { id: 'scholar', nm: '떠돌이 학자', pat: 70, w: 1.3, dr: { herbal: 2, mead: 2, cider: 1 }, fd: { tart: 2, soup: 2, fish: 1 }, pd: 0.8, pf: 0.7, row: 0, room: 0.5, re: 0.2, rep: 3, fus: 1, sw: [1, 0.9, 1.1, 1.2], look: { hat: 'cap', body: '#2f3550', cloak: '#3b2f4a', skin: 0 }, d: '편안함을 따짐. 약초술과 타르트.' },
+    { id: 'envoy', nm: '영주의 사절', pat: 50, w: 2.6, dr: { herbal: 2, mead: 3 }, fd: { roast: 3, tart: 2 }, pd: 1, pf: 0.9, row: 0, room: 0.8, re: 0.25, rep: 5, fus: 2, sw: [1, 1, 1, 1], look: { hat: 'brim', body: '#4a1f2a', cloak: '#1e2a44', skin: 0, plume: 1 }, d: '명성 5단계부터. 팁이 가장 크지만 품질 · 편안함 · 기다림에 가장 까다로움.' },
+  ];
+  /* 꾸미기: c 편안함, a 분위기 */
+  const DECO = [
+    { id: 'rug', nm: '양모 깔개', c: 2, a: 0, p: 25, rep: 1, d: '난롯가 바닥에 까는 두꺼운 깔개.' },
+    { id: 'candle', nm: '철제 촛대', c: 0, a: 2, p: 30, rep: 1, d: '홀 구석을 밝히는 키 큰 촛대.' },
+    { id: 'herbs', nm: '말린 약초 다발', c: 1, a: 1, p: 15, rep: 1, d: '들보에 거는 향기로운 약초.' },
+    { id: 'ivy', nm: '담쟁이 화분', c: 1, a: 1, p: 20, rep: 1, d: '창가에 두는 화분.' },
+    { id: 'map', nm: '가도 지도 액자', c: 0, a: 2, p: 45, rep: 1, d: '길손이 들여다보는 큰 지도.' },
+    { id: 'antler', nm: '사슴뿔 장식', c: 0, a: 3, p: 60, rep: 2, d: '난로 위 벽에 거는 뿔.' },
+    { id: 'banner', nm: '문장 깃발', c: 0, a: 3, p: 70, rep: 2, d: '영지 문장을 수놓은 깃발 한 쌍.' },
+    { id: 'furs', nm: '털가죽 의자 덮개', c: 3, a: 0, p: 70, rep: 2, d: '의자마다 덮는 털가죽.' },
+    { id: 'lantern', nm: '색유리 등', c: 1, a: 3, p: 90, rep: 3, d: '들보에 매다는 색유리 등.' },
+    { id: 'settle', nm: '난롯가 긴 의자', c: 4, a: 1, p: 110, rep: 3, d: '등받이 높은 나무 긴 의자.' },
+    { id: 'tapestry', nm: '사냥 태피스트리', c: 1, a: 4, p: 120, rep: 3, d: '뒷벽을 덮는 큰 직물.' },
+    { id: 'chandelier', nm: '철 고리 샹들리에', c: 0, a: 5, p: 160, rep: 4, d: '초를 여럿 꽂는 쇠 고리 등.' },
+    { id: 'stage', nm: '음유시인 단상', c: 1, a: 4, p: 180, rep: 4, d: '낮은 나무 단. 음유시인의 밤이 더 자주 열림.' },
+    { id: 'armor', nm: '갑옷 장식', c: 0, a: 5, p: 220, rep: 4, d: '옛 기사의 판금 갑옷 한 벌.' },
+  ];
+  /* 확장 · 시설: lv 단계별 값 · 필요 명성 */
+  const UPG = [
+    { id: 'hall', nm: '홀 넓히기', lv: [{ p: 120, rep: 2, d: '창고를 비워 식탁 2개(자리 7) 추가' }, { p: 260, rep: 4, d: '식탁 1개 + 바 의자 4개 추가' }] },
+    { id: 'cask', nm: '발효통 들이기', lv: [{ p: 60, rep: 1 }, { p: 90, rep: 2 }, { p: 130, rep: 3 }], d: '발효통 +1 (3 → 최대 6)' },
+    { id: 'tray', nm: '나무 쟁반', lv: [{ p: 50, rep: 1 }], d: '한 번에 드는 개수 2 → 3' },
+    { id: 'ware', nm: '잔과 접시', lv: [{ p: 40, rep: 1 }, { p: 60, rep: 2 }], d: '잔 +6 · 접시 +4' },
+    { id: 'beds', nm: '객실 침대', lv: [{ p: 45, rep: 1 }, { p: 45, rep: 1 }, { p: 60, rep: 2 }, { p: 60, rep: 2 }, { p: 80, rep: 3 }, { p: 80, rep: 3 }], d: '침대 +1 (2 → 최대 8)' },
+    { id: 'linen', nm: '침구 바꾸기', lv: [{ p: 100, rep: 2, d: '짚 → 양모 침구 (방값 8 → 14)' }, { p: 200, rep: 4, d: '양모 → 깃털 침구 (방값 14 → 22)' }] },
+    { id: 'plots', nm: '텃밭 이랑', lv: [{ p: 40, rep: 1 }, { p: 80, rep: 3 }], d: '밭 4 → 6 → 8' },
+    { id: 'kiln', nm: '맥아 건조대 늘리기', lv: [{ p: 50, rep: 2 }], d: '하룻밤에 말리는 보리 8 → 16' },
+    { id: 'oven', nm: '화덕 넓히기', lv: [{ p: 90, rep: 2 }], d: '화덕 자리 2 → 3' },
+    { id: 'kettle', nm: '구리 양조솥', lv: [{ p: 150, rep: 3 }], d: '새로 빚는 술 품질 +1' },
+  ];
+  const STAFF = [
+    { id: 'scullion', nm: '설거지꾼', wage: 5, rep: 1, d: '설거지통 옆에 서서 쌓인 잔 · 접시를 씻음.' },
+    { id: 'hand', nm: '잡일꾼', wage: 7, rep: 1, d: '빈 식탁을 치워 설거지통으로 나르고 쏟은 술을 닦음.' },
+    { id: 'cookhand', nm: '견습 요리사', wage: 8, rep: 2, d: '주문이 들어온 구이 · 생선 · 파이를 화덕에 올림(꺼내 나르는 일은 하지 않음).' },
+    { id: 'bouncer', nm: '문지기', wage: 9, rep: 2, d: '문가에 서 있다가 소란 피우는 손님을 달래거나 내보냄.' },
+  ];
+  /* 사건(다음 날): g 손님 배수, mix 손님 종류 가중, room 묵는 손님 배수, row 소란 배수, price 장터 값 배수, fee 비용 */
+  const EVENT = [
+    { id: 'bard', nm: '음유시인의 밤', w: [1, 1, 1, 1], g: 1.3, amb: 4, fee: 15, d: '음유시인이 난롯가에서 노래함. 손님 증가 · 분위기 +4 · 사례 15.' },
+    { id: 'harvest', nm: '수확 축제', w: [0, 0, 3, 0], g: 1.5, re: 1.4, d: '마을 축제. 손님이 크게 늘고 잔을 자주 비움.' },
+    { id: 'market', nm: '장날', w: [1, 1, 1, 1], price: 0.75, d: '장터 값 25% 내림.' },
+    { id: 'tax', nm: '세금 징수관', w: [1, 1, 1, 1.2], tax: 0.12, d: '아침에 은화의 12%(최소 10)를 세금으로 냄.' },
+    { id: 'merc', nm: '용병단 도착', w: [1, 1.2, 1, 0.8], mix: { merc: 3, guard: 1 }, row: 1.6, g: 1.15, d: '용병이 몰려옴. 술이 잘 나가지만 소란이 잦음.' },
+    { id: 'plague', nm: '역병 소문', w: [0.6, 1, 0.6, 1], g: 0.6, room: 0.5, mix: { friar: 2, pilg: 1 }, d: '길손이 줄고 묵어 가는 사람도 줄어듦.' },
+    { id: 'caravan', nm: '상단 도착', w: [1, 1, 1.3, 0.6], g: 1.2, room: 1.6, mix: { guard: 2, peddler: 2 }, d: '상단이 묵어 감. 호위 · 행상인 증가 · 객실 수요 증가.' },
+    { id: 'pilgrims', nm: '순례 행렬', w: [2, 1, 0.5, 0], g: 1.3, mix: { pilg: 4, friar: 1 }, d: '순례자 무리. 술보다 국물 · 빵을 찾음.' },
+    { id: 'frost', nm: '때 아닌 서리', w: [0.5, 0, 1, 1], frost: 1, d: '밤사이 서리. 자라던 작물 하나가 상함.' },
+    { id: 'storm', nm: '폭풍우', w: [0.8, 1.5, 1, 0.5], g: 0.75, room: 2, d: '비바람에 손님은 줄지만 대부분 묵어 감.' },
+    { id: 'hunt', nm: '사냥 대회', w: [0, 0.6, 2, 0.6], mix: { hunter: 4 }, meat: 0.7, d: '사냥꾼 증가 · 돼지고기 값 30% 내림.' },
+    { id: 'envoy', nm: '영주의 사절단', w: [1, 1, 1, 1], minRep: 4, mix: { envoy: 2, knight: 2 }, g: 1.1, d: '사절과 기사가 들름. 까다롭지만 팁이 큼.' },
+  ];
+  const LEVELS = [
+    { nm: '길가 주막', xp: 0 },
+    { nm: '마을 여관', xp: 50 },
+    { nm: '가도의 여관', xp: 170 },
+    { nm: '이름난 여관', xp: 380 },
+    { nm: '고을의 자랑', xp: 720 },
+    { nm: '왕도까지 알려진 여관', xp: 1400 },
+  ];
+  const LENS = { d3: { days: 3, goal: 2, nm: '맛보기 3일' }, d7: { days: 7, goal: 3, nm: '한 계절 7일' }, d14: { days: 14, goal: 4, nm: '두 계절 14일' }, d28: { days: 28, goal: 6, nm: '사계절 28일' } };
+  const LINEN = [{ nm: '짚 침구', p: 8 }, { nm: '양모 침구', p: 14 }, { nm: '깃털 침구', p: 22 }];
+
+  const byId = (arr) => { const o = {}; arr.forEach((x, i) => { o[x.id] = x; x.i = i; }); return o; };
+  const DR = byId(DRINK), DS = byId(DISH), CR = byId(CROP), GU = byId(GUEST), DC = byId(DECO), UP = byId(UPG), SF = byId(STAFF), EV = byId(EVENT);
+
+  /* ======================= 판 상태 ======================= */
+  const lvOf = (xp) => { let l = 1; for (let i = 0; i < LEVELS.length; i++) if (xp >= LEVELS[i].xp) l = i + 1; return l; };
+  const ssnOf = (st, day) => (st.ssn0 + Math.floor(((day || st.day) - 1) / 7)) % 4;
+  const upLv = (st, id) => st.up[id] || 0;
+  const caskCap = (st) => 3 + upLv(st, 'cask');
+  const plotCap = (st) => 4 + 2 * upLv(st, 'plots');
+  const kilnCap = (st) => 8 + 8 * upLv(st, 'kiln');
+  const ovenCap = (st) => 2 + upLv(st, 'oven');
+  const carryCap = (st) => 2 + upLv(st, 'tray');
+  const bedCap = (st) => 2 + upLv(st, 'beds');
+  const roomPrice = (st) => LINEN[upLv(st, 'linen')].p;
+  const mugCap = (st) => 10 + 6 * upLv(st, 'ware');
+  const plateCap = (st) => 8 + 4 * upLv(st, 'ware');
+  const labMax = (st) => 4 + 2 * st.n + st.staff.length;
+  function comfort(st) { let c = 0; for (const d of st.deco) c += DC[d] ? DC[d].c : 0; return c; }
+  function ambience(st, evId) { let a = 0; for (const d of st.deco) a += DC[d] ? DC[d].a : 0; const e = EV[evId || st.ev]; if (e && e.amb) a += e.amb; return a; }
+  const unlockedD = (st) => DRINK.filter((d) => d.rep <= lvOf(st.xp));
+  const unlockedF = (st) => DISH.filter((d) => d.rep <= lvOf(st.xp));
+  function price(st, it) {
+    const b = ING[it]; if (!b) return 99;
+    let p = b.p * b.sm[ssnOf(st)];
+    const e = EV[st.ev];
+    if (e && e.price) p *= e.price;
+    if (e && e.meat && it === 'meat') p *= e.meat;
+    return Math.max(1, Math.round(p));
+  }
+  const cQ = (st, c) => { const D = DR[c.r]; return Math.min(5, c.q + (c.d >= D.days ? Math.min(2, Math.floor((c.d - D.days) / 2)) : 0)); };
+  const cReady = (c) => !!c && c.d >= DR[c.r].days;
+  const QM = [0, 0.8, 1.0, 1.2, 1.4, 1.6];
+  const dishStock = (st, r) => { const a = st.dish[r]; return a ? a[0] + a[1] : 0; };
+  /* 오늘 저녁 예상 손님 수 */
+  function expGuests(st) {
+    const lv = lvOf(st.xp), S = SEASONS[ssnOf(st)], e = EV[st.ev];
+    let g = (6 + 4.5 * lv) * S.g * (e && e.g ? e.g : 1) * Math.min(1.6, 1 + ambience(st) * 0.018);
+    if (st.clean < 50) g *= 0.88;
+    return Math.max(4, Math.round(g));
+  }
+
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = Math.random;
+    const len = LENS[opts.len] ? opts.len : 'd7';
+    const ssnOpt = { spring: 0, summer: 1, autumn: 2, winter: 3 };
+    const ssn0 = opts.ssn in ssnOpt ? ssnOpt[opts.ssn] : Math.floor(R() * 4);
+    const st = {
+      v: 1, rid: 1 + Math.floor(R() * 1e6), n, nm: players.map((p) => String(p.name || '').slice(0, 12)), ai: players.map((p) => !!p.ai), lvs: players.map((p) => (p.ai ? p.lv || 2 : 0)),
+      len, days: LENS[len].days, goal: LENS[len].goal, day: 1, ssn0, ph: 'morn', seq: 1,
+      money: 140, xp: 0, lab: 0,
+      inv: { barley: 4, malt: 3, hops: 2, honey: 0, apple: 5, potato: 7, onion: 3, meat: 2, fish: 0, flour: 4, cheese: 2, herb: 2 },
+      kiln: 0, ck: [{ r: 'ale', d: 3, q: 2, sv: 12 }, { r: 'cider', d: 1, q: 2, sv: 12 }, null],
+      dish: {}, plots: [{ c: 'herb', g: 1 }, { c: 'potato', g: 2 }, null, null],
+      clean: 85, deco: [], up: {}, staff: [], ev: null, evN: null,
+      rdy: Array(n).fill(0), log: [], rpt: null, hist: [], brk: 0, sv: 1 + Math.floor(R() * 2e9),
+      tot: { g: 0, lost: 0, angry: 0, inc: 0, tip: 0, room: 0, cost: 0, srv: Array(n).fill(0), best: 0, brawl: 0 },
+    };
+    for (const d of DISH) st.dish[d.id] = [0, 0];
+    st.lab = labMax(st);
+    logp(st, '1일째 아침 · ' + SEASONS[ssn0].nm + '. 발효통 하나는 에일이 다 익어 꼭지를 달았음.');
+    return st;
+  }
+  function logp(st, s) { st.log.push(s); if (st.log.length > 8) st.log.splice(0, st.log.length - 8); }
+  const fmtNeed = (need) => Object.keys(need).map((k) => ING[k].nm + ' ' + need[k]).join(' · ');
+  function hasNeed(st, need) { for (const k in need) if ((st.inv[k] || 0) < need[k]) return false; return true; }
+  function takeNeed(st, need) { for (const k in need) st.inv[k] -= need[k]; }
+  function needCost(st, need) { let c = 0; for (const k in need) c += Math.max(0, need[k] - (st.inv[k] || 0)) * price(st, k); return c; }
+
+  /* ======================= 관리 행동 (아침 · 밤) =======================
+     mg(st, seat, a) → st를 고쳐 돌려줌. 안 되면 Error(이유) 던짐. 호스트(로컬)만 부름. */
+  function useLab(st, n) { if (st.lab < n) throw new Error('일손이 모자람 (남은 일손 ' + st.lab + ')'); st.lab -= n; }
+  function pay(st, p) { if (st.money < p) throw new Error('은화가 모자람 (필요 ' + p + ')'); st.money -= p; st.tot.cost += p; }
+  function mg(st, seat, a) {
+    if (!a || typeof a !== 'object') throw new Error('잘못된 요청');
+    const k = a.k, lv = lvOf(st.xp);
+    if (k === 'rdy') { if (seat >= 0 && seat < st.n) st.rdy[seat] = a.on ? 1 : 0; return st; }
+    if (st.ph === 'morn') {
+      if (k === 'buy') {
+        const it = a.it, n = clamp(a.n | 0, 1, 40);
+        if (!ING[it]) throw new Error('없는 재료');
+        pay(st, price(st, it) * n); st.inv[it] = (st.inv[it] || 0) + n;
+        return st;
+      }
+      if (k === 'malt') {
+        const n = Math.min(st.inv.barley || 0, kilnCap(st) - st.kiln, a.n == null ? 99 : a.n | 0);
+        if (n <= 0) throw new Error(st.kiln >= kilnCap(st) ? '건조대가 가득 참' : '보리가 없음');
+        useLab(st, 1); st.inv.barley -= n; st.kiln += n;
+        logp(st, '보리 ' + n + '자루를 건조대에 펼침 · 내일 아침 맥아');
+        return st;
+      }
+      if (k === 'brew') {
+        const i = a.i | 0, D = DR[a.r];
+        if (!D || D.rep > lv) throw new Error('아직 빚을 수 없는 술');
+        if (i < 0 || i >= caskCap(st) || st.ck[i]) throw new Error('빈 발효통이 아님');
+        if (!hasNeed(st, D.need)) throw new Error('재료 부족 · ' + fmtNeed(D.need));
+        useLab(st, 1); takeNeed(st, D.need);
+        st.ck[i] = { r: D.id, d: 0, q: 2 + upLv(st, 'kettle'), sv: D.sv };
+        logp(st, (i + 1) + '번 통에 ' + D.nm + ' 담금 · ' + D.days + '일 뒤 완성');
+        return st;
+      }
+      if (k === 'dump') {
+        const i = a.i | 0; if (!st.ck[i]) throw new Error('빈 통');
+        st.ck[i] = null; return st;
+      }
+      if (k === 'prep') {
+        const D = DS[a.r];
+        if (!D || D.rep > lv) throw new Error('아직 만들 수 없는 요리');
+        if (!hasNeed(st, D.need)) throw new Error('재료 부족 · ' + fmtNeed(D.need));
+        useLab(st, 1); takeNeed(st, D.need); st.dish[D.id][0] += D.n;
+        logp(st, D.nm + ' 밑준비 · ' + D.n + '인분');
+        return st;
+      }
+      if (k === 'plant') {
+        const i = a.i | 0, C = CR[a.c];
+        if (!C) throw new Error('없는 작물');
+        if (i < 0 || i >= plotCap(st) || st.plots[i]) throw new Error('빈 이랑이 아님');
+        if (SEASONS[ssnOf(st)].grow <= 0) throw new Error('겨울에는 씨를 뿌릴 수 없음');
+        pay(st, C.seed); useLab(st, 1);
+        st.plots[i] = { c: C.id, g: 0 };
+        return st;
+      }
+      if (k === 'harvest') {
+        const i = a.i | 0, p = st.plots[i];
+        if (!p || p.g < CR[p.c].days) throw new Error('아직 거둘 때가 아님');
+        st.inv[p.c] = (st.inv[p.c] || 0) + CR[p.c].y; st.plots[i] = null;
+        logp(st, CR[p.c].nm + ' ' + CR[p.c].y + ' 거둠');
+        return st;
+      }
+      if (k === 'clean') {
+        if (st.clean >= 100) throw new Error('이미 깨끗함');
+        useLab(st, 2); st.clean = 100; logp(st, '홀 청소 · 청결 100');
+        return st;
+      }
+    }
+    if (st.ph === 'night') {
+      if (k === 'up') {
+        const U = UP[a.id]; if (!U) throw new Error('없는 항목');
+        const l = upLv(st, U.id), L_ = U.lv[l];
+        if (!L_) throw new Error('이미 끝까지 들임');
+        if ((L_.rep || 1) > lv) throw new Error('명성 ' + L_.rep + '단계부터');
+        pay(st, L_.p); st.up[U.id] = l + 1;
+        if (U.id === 'cask') st.ck.push(null);
+        if (U.id === 'plots') st.plots.push(null, null);
+        logp(st, U.nm + (U.lv.length > 1 ? ' ' + (l + 1) + '단계' : '') + ' · 은화 ' + L_.p);
+        return st;
+      }
+      if (k === 'deco') {
+        const D = DC[a.id]; if (!D) throw new Error('없는 꾸미기');
+        if (st.deco.includes(D.id)) throw new Error('이미 들임');
+        if (D.rep > lv) throw new Error('명성 ' + D.rep + '단계부터');
+        pay(st, D.p); st.deco.push(D.id);
+        logp(st, D.nm + ' 들임 · 은화 ' + D.p);
+        return st;
+      }
+      if (k === 'hire') {
+        const S = SF[a.id]; if (!S) throw new Error('없는 일꾼');
+        if (st.staff.includes(S.id)) throw new Error('이미 고용 중');
+        if (S.rep > lv) throw new Error('명성 ' + S.rep + '단계부터');
+        st.staff.push(S.id); logp(st, S.nm + ' 고용 · 하루 품삯 ' + S.wage);
+        return st;
+      }
+      if (k === 'fire') {
+        const i = st.staff.indexOf(a.id); if (i < 0) throw new Error('고용하지 않음');
+        st.staff.splice(i, 1); logp(st, SF[a.id].nm + ' 내보냄');
+        return st;
+      }
+    }
+    throw new Error('지금은 할 수 없는 일');
+  }
+
+  /* ======================= 하루 흐름 ======================= */
+  function startSvc(st) {
+    const ns = JSON.parse(JSON.stringify(st));
+    ns.ph = 'svc'; ns.rdy = Array(ns.n).fill(0); ns.sv = 1 + Math.floor(Math.random() * 2e9); ns.seq++;
+    return ns;
+  }
+  /* 영업 결과(out: 시뮬이 돌려준 값) → 밤 결산 */
+  function endSvc(st, out) {
+    const ns = JSON.parse(JSON.stringify(st));
+    const e = EV[ns.ev], S = SEASONS[ssnOf(ns)];
+    // 영업 수입 · 남은 재고
+    ns.money += out.inc + out.tip;
+    ns.xp = Math.max(0, ns.xp + out.xp);
+    for (let i = 0; i < ns.ck.length; i++) if (ns.ck[i] && out.ck && out.ck[i] != null) { ns.ck[i].sv = out.ck[i]; if (ns.ck[i].sv <= 0) ns.ck[i] = null; }
+    if (out.dish) for (const r in out.dish) if (ns.dish[r]) { let used = dishStock(ns, r) - out.dish[r]; const a = ns.dish[r]; const o = Math.min(a[1], used); a[1] -= o; used -= o; a[0] = Math.max(0, a[0] - used); }
+    // 객실
+    const req = Math.round((out.roomReq || 0) * (e && e.room ? e.room : 1));
+    const beds = bedCap(ns), rooms = Math.min(beds, req);
+    const rp = Math.round(roomPrice(ns) * (1 + comfort(ns) * 0.03));
+    const roomInc = rooms * rp;
+    ns.money += roomInc;
+    // 비용
+    let wages = 0; for (const s of ns.staff) wages += SF[s].wage;
+    const upkeep = 4 + Math.round((ns.up.hall || 0) * 2);
+    const repair = (out.brk || 0) * 6;
+    const fee = e && e.fee ? e.fee : 0;
+    const cost = wages + upkeep + repair + fee;
+    ns.money -= cost; ns.tot.cost += cost;
+    // 청결
+    ns.clean = clamp(Math.round(ns.clean - 8 - 4 * (out.spill || 0) - 3 * (out.dirty || 0) - 5 * (out.brawl || 0)), 0, 100);
+    // 기록
+    const net = out.inc + out.tip + roomInc - cost;
+    ns.tot.g += out.served; ns.tot.lost += out.lost; ns.tot.angry += out.angry; ns.tot.inc += out.inc; ns.tot.tip += out.tip; ns.tot.room += roomInc; ns.tot.brawl += out.brawl || 0;
+    if (out.srv) out.srv.forEach((v, i) => { if (i < ns.n) ns.tot.srv[i] += v; });
+    ns.tot.best = Math.max(ns.tot.best, out.inc + out.tip + roomInc);
+    const lv0 = lvOf(st.xp), lv1 = lvOf(ns.xp);
+    ns.rpt = { day: ns.day, inc: out.inc, tip: out.tip, room: roomInc, rooms, req, beds, rp, wages, upkeep, repair, fee, net, served: out.served, lost: out.lost, angry: out.angry,
+      xp: out.xp, brawl: out.brawl || 0, spill: out.spill || 0, dirty: out.dirty || 0, sat: out.sat == null ? 0 : out.sat, up: lv1 > lv0 ? lv1 : 0, top: out.top || null };
+    ns.hist.push([ns.day, out.inc + out.tip + roomInc, out.served, out.lost, net]);
+    if (ns.hist.length > 40) ns.hist.shift();
+    // 내일 사건
+    ns.evN = rollEvent(ns);
+    if (lv1 > lv0) logp(ns, '명성이 올라 「' + LEVELS[lv1 - 1].nm + '」로 불리기 시작함');
+    logp(ns, ns.day + '일째 결산 · 손님 ' + out.served + '명 · 순이익 ' + net);
+    ns.ph = 'night'; ns.rdy = Array(ns.n).fill(0); ns.seq++;
+    void S;
+    return ns;
+  }
+  function rollEvent(st) {
+    const nd = st.day + 1, ss = ssnOf(st, nd), R = Math.random, lv = lvOf(st.xp);
+    if (nd > st.days) return null;
+    let p = 0.42; if (st.deco.includes('stage')) p += 0.08;
+    if (R() > p) return null;
+    const w = {};
+    for (const e of EVENT) { if (e.minRep && lv < e.minRep) continue; let x = e.w[ss]; if (e.id === 'bard' && st.deco.includes('stage')) x *= 2.5; if (x > 0) w[e.id] = x; }
+    return pickW(R, w);
+  }
+  function nextDay(st) {
+    const ns = JSON.parse(JSON.stringify(st));
+    if (ns.day >= ns.days) { ns.ph = 'done'; ns.seq++; return ns; }
+    ns.day++; ns.ev = ns.evN; ns.evN = null; ns.brk = 0;
+    const S = SEASONS[ssnOf(ns)];
+    if (ssnOf(ns) !== ssnOf(ns, ns.day - 1)) logp(ns, S.nm + '이 왔음 · ' + S.d);
+    // 발효 · 숙성
+    for (const c of ns.ck) if (c) c.d++;
+    // 맥아
+    if (ns.kiln) { ns.inv.malt = (ns.inv.malt || 0) + ns.kiln; logp(ns, '맥아 ' + ns.kiln + ' 마름'); ns.kiln = 0; }
+    // 작물
+    for (const p of ns.plots) if (p && p.g < CR[p.c].days) p.g = Math.min(CR[p.c].days, p.g + S.grow);
+    // 음식: 이틀 지난 것 버림
+    let spoil = 0;
+    for (const r in ns.dish) { const a = ns.dish[r]; spoil += a[1]; a[1] = a[0]; a[0] = 0; }
+    if (spoil) logp(ns, '이틀 지난 음식 ' + spoil + '인분 버림');
+    const e = EV[ns.ev];
+    if (e) {
+      logp(ns, '오늘 · ' + e.nm + ' — ' + e.d);
+      if (e.tax) { const t = Math.max(10, Math.round(Math.max(0, ns.money) * e.tax)); ns.money -= t; ns.tot.cost += t; logp(ns, '세금 은화 ' + t + ' 냄'); }
+      if (e.frost) { const live = ns.plots.map((p, i) => (p && p.g < CR[p.c].days ? i : -1)).filter((i) => i >= 0); if (live.length) { const i = live[Math.floor(Math.random() * live.length)]; logp(ns, '서리로 ' + CR[ns.plots[i].c].nm + ' 이랑이 상함'); ns.plots[i] = null; } }
+    }
+    ns.lab = labMax(ns); ns.rdy = Array(ns.n).fill(0); ns.ph = 'morn'; ns.seq++;
+    logp(ns, ns.day + '일째 아침 · ' + S.nm);
+    return ns;
+  }
+
+  /* ======================= 관리 AI (아침 · 밤 계획) =======================
+     계획은 순수 함수: 상태 복사본에 mg를 차례로 해 보며 성공한 행동만 모은다. lv 1 쉬움(어림 · 엉뚱한 고르기) · 2 보통 · 3 어려움(수요 · 숙성 · 손익을 꼼꼼히). */
+  function habitsOf(seed, s) { const R = prng((seed ^ Math.imul(s + 1, 2654435761)) >>> 0); return { bar: R(), kit: R(), cln: R(), brave: R(), spend: R(), thrift: R(), nz: R() }; }
+  function demandMix(st) {
+    // 오늘 손님 종류 기대 비율로 술 · 요리 선호 가중
+    const lv = lvOf(st.xp), ss = ssnOf(st), e = EV[st.ev], dr = {}, fd = {};
+    for (const g of GUEST) {
+      if (g.rep > lv && !(e && e.mix && e.mix[g.id])) continue;
+      const w = g.sw[ss] * (e && e.mix && e.mix[g.id] ? 1 + e.mix[g.id] : 1);
+      let s = 0; for (const k in g.dr) s += g.dr[k];
+      for (const k in g.dr) dr[k] = (dr[k] || 0) + w * g.pd * g.dr[k] / s;
+      s = 0; for (const k in g.fd) s += g.fd[k];
+      for (const k in g.fd) fd[k] = (fd[k] || 0) + w * g.pf * g.fd[k] / s;
+    }
+    return { dr, fd };
+  }
+  function plan(st, lv, R, hab) {
+    R = R || Math.random; hab = hab || { spend: 0.5, thrift: 0.5, nz: 0.5 };
+    const s = JSON.parse(JSON.stringify(st)), acts = [];
+    const tryA = (a) => { try { mg(s, -1, a); acts.push(a); return true; } catch (e) { return false; } };
+    const noise = lv === 1 ? 0.6 : lv === 2 ? 0.2 : 0.05;
+    const jit = () => 1 + (R() - 0.5) * 2 * noise;
+    const reserve = () => 12 + (lv === 3 ? 10 : 0);
+    const buyFor = (need, mult) => {
+      for (const it in need) { const lack = need[it] * (mult || 1) - (s.inv[it] || 0); if (lack > 0) { const c = price(s, it) * lack; if (s.money - c < reserve()) return false; if (!tryA({ k: 'buy', it, n: lack })) return false; } }
+      return true;
+    };
+    if (s.ph === 'morn') {
+      // 1) 거두기
+      s.plots.forEach((p, i) => { if (p && p.g >= CR[p.c].days) tryA({ k: 'harvest', i }); });
+      // 2) 청소
+      if (s.clean < (lv === 1 ? 40 : lv === 2 ? 62 : 72) && s.lab >= 2 + Math.min(3, s.n)) tryA({ k: 'clean' });
+      const E = expGuests(s), mix = demandMix(s);
+      // 3) 술: 빈 통 채우기
+      const onTap = () => s.ck.reduce((a, c) => a + (cReady(c) ? c.sv : 0), 0);
+      const soon = () => s.ck.reduce((a, c) => a + (c && !cReady(c) && DR[c.r].days - c.d <= 1 ? c.sv : 0), 0);
+      if (lv >= 2) s.ck.forEach((c, i) => { if (cReady(c) && c.sv <= (lv === 3 ? 3 : 2) && s.ck.filter((x) => !x).length === 0) tryA({ k: 'dump', i }); });
+      for (let i = 0; i < s.ck.length && s.lab > 0; i++) {
+        if (s.ck[i]) continue;
+        const cand = unlockedD(s).map((D) => {
+          const have = s.ck.filter((c) => c && c.r === D.id).length;
+          let sc = (mix.dr[D.id] || 0.05) * D.p * D.sv / (1 + have * 0.9) - needCost(s, D.need) * 0.6 - D.days * (lv === 3 ? 2.5 : 1.2);
+          if (s.day + D.days > s.days + (lv === 3 ? 0 : 1)) sc -= 60;   // 판이 끝나기 전에 익지 않음
+          return { D, sc: sc * jit() };
+        }).sort((a, b) => b.sc - a.sc);
+        let pick = cand[0];
+        if (lv === 1 && R() < 0.3) pick = cand[Math.floor(R() * cand.length)];
+        if (!pick || pick.sc < -40) break;
+        const D = pick.D;
+        if (!hasNeed(s, D.need) && !buyFor(D.need)) continue;
+        tryA({ k: 'brew', i, r: D.id });
+      }
+      // 맥아 미리 말리기(보리가 싸면)
+      if (s.lab > 1 && s.kiln === 0 && lv >= 2 && s.day < s.days - 1) {
+        const want = Math.min(kilnCap(s), 8);
+        const lack = want - (s.inv.barley || 0);
+        if ((s.inv.malt || 0) < 7 && (lack <= 0 || s.money - lack * price(s, 'barley') > reserve() + 40)) { if (lack > 0) tryA({ k: 'buy', it: 'barley', n: lack }); tryA({ k: 'malt', n: want }); }
+      } else if (lv === 1 && s.inv.barley >= 4 && s.lab > 2 && R() < 0.5) tryA({ k: 'malt' });
+      // 4) 요리: 예상 요리 수요만큼
+      let foodNeed = Math.round(E * (lv === 1 ? 0.55 + R() * 0.4 : 0.78) * jit());
+      let stock = DISH.reduce((a, d) => a + dishStock(s, d.id), 0);
+      let guard = 0;
+      while (stock < foodNeed && s.lab > (lv === 3 ? 1 : 0) && guard++ < 6) {
+        const cand = unlockedF(s).map((D) => {
+          const have = dishStock(s, D.id);
+          const sc = (mix.fd[D.id] || 0.05) * D.p * D.n / (1 + have / D.n) - needCost(s, D.need) * 0.8;
+          return { D, sc: sc * jit() };
+        }).sort((a, b) => b.sc - a.sc);
+        let pick = cand[0];
+        if (lv === 1 && R() < 0.3) pick = cand[Math.floor(R() * cand.length)];
+        if (!pick) break;
+        const D = pick.D;
+        if (!hasNeed(s, D.need) && !buyFor(D.need)) { if (cand.length < 2) break; const alt = cand.find((c) => hasNeed(s, c.D.need)); if (!alt || !tryA({ k: 'prep', r: alt.D.id })) break; stock = DISH.reduce((a, d) => a + dishStock(s, d.id), 0); continue; }
+        if (!tryA({ k: 'prep', r: D.id })) break;
+        stock = DISH.reduce((a, d) => a + dishStock(s, d.id), 0);
+      }
+      // 5) 텃밭
+      if (SEASONS[ssnOf(s)].grow > 0) {
+        for (let i = 0; i < s.plots.length && s.lab > 0; i++) {
+          if (s.plots[i]) continue;
+          const left = s.days - s.day;
+          const opts = CROP.filter((C) => C.days / SEASONS[ssnOf(s)].grow <= left).map((C) => {
+            let sc = C.y * (ING[C.id] ? ING[C.id].p : 2) - C.seed;
+            if (C.id === 'barley' || C.id === 'hops') sc *= 1.25;
+            return { C, sc: sc * jit() };
+          }).sort((a, b) => b.sc - a.sc);
+          if (!opts.length) break;
+          if (s.money - opts[0].C.seed < reserve()) break;
+          tryA({ k: 'plant', i, c: opts[0].C.id });
+        }
+      }
+      void onTap; void soon;
+    } else if (s.ph === 'night') {
+      const lvl = lvOf(s.xp), rpt = s.rpt || {};
+      const left = s.days - s.day;
+      const keep = 50 + (lv === 3 ? 20 : 0) + hab.thrift * 30;
+      const opts = [];
+      const upNext = (id) => { const U = UP[id], l = upLv(s, id); return U.lv[l] && (U.lv[l].rep || 1) <= lvl ? U.lv[l] : null; };
+      const add = (k, id, p, val) => { if (p != null) opts.push({ a: { k, id }, p, v: val * jit() }); };
+      if (left > 0) {
+        let u;
+        if ((u = upNext('cask'))) add('up', 'cask', u.p, 70 + (s.ck.every((c) => c) ? 40 : 0));
+        if ((u = upNext('tray'))) add('up', 'tray', u.p, 60);
+        if ((u = upNext('hall'))) add('up', 'hall', u.p, 55 + (rpt.lost || 0) * 8);
+        if ((u = upNext('ware'))) add('up', 'ware', u.p, 30 + (rpt.served > 18 ? 25 : 0));
+        if ((u = upNext('beds'))) add('up', 'beds', u.p, 20 + Math.max(0, (rpt.req || 0) - (rpt.beds || 2)) * 18);
+        if ((u = upNext('linen'))) add('up', 'linen', u.p, 18 + bedCap(s) * 6);
+        if ((u = upNext('oven'))) add('up', 'oven', u.p, 25);
+        if ((u = upNext('kettle'))) add('up', 'kettle', u.p, 30);
+        if ((u = upNext('plots')) && left > 5) add('up', 'plots', u.p, 15);
+        if ((u = upNext('kiln')) && left > 4) add('up', 'kiln', u.p, 10);
+        for (const D of DECO) if (!s.deco.includes(D.id) && D.rep <= lvl) add('deco', D.id, D.p, (D.c * 9 + D.a * 8) * (1 + Math.min(1, left / 6)) - D.p * 0.15);
+        if (!s.staff.includes('scullion') && left > 1) opts.push({ a: { k: 'hire', id: 'scullion' }, p: 0, v: (s.n <= 2 ? 40 : 20) * jit(), wage: 5 });
+        if (!s.staff.includes('hand') && left > 1 && lvl >= 2) opts.push({ a: { k: 'hire', id: 'hand' }, p: 0, v: 30 * jit(), wage: 7 });
+        if (!s.staff.includes('bouncer') && left > 1 && lvl >= 2 && (rpt.brawl || 0) > 0) opts.push({ a: { k: 'hire', id: 'bouncer' }, p: 0, v: 45 * jit(), wage: 9 });
+        if (!s.staff.includes('cookhand') && left > 1 && lvl >= 3) opts.push({ a: { k: 'hire', id: 'cookhand' }, p: 0, v: 25 * jit(), wage: 8 });
+      }
+      opts.sort((a, b) => b.v / Math.max(30, b.p || 30) - a.v / Math.max(30, a.p || 30));
+      let n = 0;
+      for (const o of opts) {
+        if (n >= (lv === 1 ? 2 : 4)) break;
+        if (o.v <= 0) continue;
+        if (o.wage) { if (s.money < keep + o.wage * 3) continue; }
+        else if (s.money - o.p < keep) continue;
+        if (lv === 1 && R() < 0.35) continue;
+        if (tryA(o.a)) n++;
+      }
+    }
+    return acts;
+  }
+
+  /* ======================= 결과 · 도움말 ======================= */
+  function result(s) {
+    if (!s || s.ph !== 'done') return null;
+    const lv = lvOf(s.xp), ok = lv >= s.goal, T = s.tot;
+    const all = [...Array(s.n).keys()];
+    const net = T.inc + T.tip + T.room - T.cost;
+    const best = s.hist.reduce((b, h) => (h[1] > b[1] ? h : b), [0, 0]);
+    return {
+      winners: ok ? all : [],
+      title: ok ? '목표 달성 · ' + LEVELS[lv - 1].nm : '영업 마감 · ' + LEVELS[lv - 1].nm,
+      text: s.days + '일 영업 · 목표 명성 ' + s.goal + '단계(' + LEVELS[s.goal - 1].nm + ')' + (ok ? ' 달성' : ' 미달') + '\n남은 은화 ' + s.money + ' · 받은 손님 ' + T.g + '명 · 놓친 손님 ' + T.lost + '명',
+      highlights: [
+        '명성 ' + lv + '단계 「' + LEVELS[lv - 1].nm + '」 · 명성 점수 ' + s.xp,
+        '가장 잘된 날 · ' + best[0] + '일째 수입 ' + best[1],
+        '꾸민 것 ' + s.deco.length + '가지 · 일꾼 ' + s.staff.length + '명 · 침대 ' + bedCap(s) + '개',
+        T.brawl ? '싸움 ' + T.brawl + '번' : '싸움 없이 마감',
+      ],
+      stats: [
+        { label: '내준 술 · 음식', values: T.srv.map((v) => String(v)) },
+        { label: '영업 매출', value: String(T.inc) }, { label: '팁', value: String(T.tip) }, { label: '방값', value: String(T.room) },
+        { label: '쓴 돈', value: String(T.cost) }, { label: '순이익', value: String(net) },
+      ],
+    };
+  }
+  const PH_NM = { morn: '아침 준비', svc: '저녁 영업', night: '밤 결산', done: '마감' };
+  function hint(st, seat) {
+    if (!st) return null;
+    const lv = lvOf(st.xp), out = [st.day + '일째 · ' + SEASONS[ssnOf(st)].nm + ' · ' + PH_NM[st.ph] + ' · 명성 ' + lv + '단계(' + LEVELS[lv - 1].nm + ')'];
+    if (st.ev && EV[st.ev]) out.push('오늘 사건: ' + EV[st.ev].nm + ' — ' + EV[st.ev].d);
+    if (st.ph === 'morn') {
+      out.push('남은 일손 ' + st.lab + ' · 은화 ' + st.money + ' · 예상 손님 약 ' + expGuests(st) + '명');
+      const tap = st.ck.filter(cReady).map((c) => DR[c.r].nm + ' ' + c.sv + '잔').join(' · ');
+      out.push('꼭지 단 술: ' + (tap || '없음 — 오늘 밤 팔 술이 없음'));
+      out.push('요리 몫: ' + (DISH.filter((d) => dishStock(st, d.id)).map((d) => d.nm + ' ' + dishStock(st, d.id)).join(' · ') || '없음 — 주방에서 밑준비'));
+      out.push('다 되면 「영업 시작」. 막히면 「맡기기」가 오늘 준비를 대신 짜 줌.');
+    } else if (st.ph === 'svc') {
+      out.push('술통에서 따르고(잔 필요) · 솥/찬장에서 담고 · 화덕에 굽고(접시 필요) · 손님 자리에 내주기.');
+      out.push('떠난 자리의 빈 그릇은 설거지통으로 · 쏟은 술은 닦기 · 붉은 표시 손님은 달래기.');
+      out.push('조작: 왼쪽 아래 이동 막대(또는 눌러서 걷기) · 오른쪽 아래 버튼(E) 쓰기 · 버리기(Q).');
+    } else if (st.ph === 'night') {
+      const r = st.rpt; if (r) out.push('오늘 손님 ' + r.served + '명 · 순이익 ' + r.net + ' · 객실 ' + r.rooms + '/' + r.req);
+      out.push('확장 · 꾸미기 · 일꾼을 들인 뒤 「다음 날로」.');
+      if (st.evN && EV[st.evN]) out.push('내일 사건: ' + EV[st.evN].nm);
+    }
+    void seat;
+    return out.slice(0, 6);
+  }
+  const saveLabel = (s) => s.day + '일째 ' + PH_NM[s.ph] + ' · 은화 ' + s.money + ' · ' + LEVELS[lvOf(s.xp) - 1].nm;
+
+  /* ======================= 아이콘 (SVG, 이모지 없음) ======================= */
+  const svgW = (inner, sz) => '<svg viewBox="0 0 56 56" width="' + (sz || 28) + '" height="' + (sz || 28) + '">' + inner + '</svg>';
+  const IC = {
+    mug: (c) => '<path d="M14 14h22v28a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4z" fill="#6b4a2c"/><rect x="16" y="18" width="18" height="24" rx="2" fill="' + c + '"/><path d="M36 20h5a5 5 0 0 1 5 5v6a5 5 0 0 1-5 5h-5" fill="none" stroke="#6b4a2c" stroke-width="4"/><rect x="13" y="12" width="24" height="5" rx="2" fill="#efe6cf"/><path d="M14 22h22M14 34h22" stroke="#3d2a18" stroke-width="2"/>',
+    dish: (c) => '<ellipse cx="28" cy="36" rx="22" ry="9" fill="#d9cfb8"/><ellipse cx="28" cy="34" rx="16" ry="6" fill="#b9ae97"/><ellipse cx="28" cy="31" rx="12" ry="7" fill="' + c + '"/><ellipse cx="24" cy="29" rx="4" ry="2" fill="#fff" opacity=".25"/>',
+    sack: (c) => '<path d="M18 16q10 -6 20 0l4 26q-14 8 -28 0z" fill="' + c + '"/><path d="M20 16q8 4 16 0" stroke="#4a3520" stroke-width="3" fill="none"/>',
+    sprout: (c) => '<path d="M28 46V26" stroke="#5c7a2e" stroke-width="4"/><path d="M28 30q-12 -2 -14 -14q12 0 14 14zM28 26q12 -2 14 -14q-12 0 -14 14z" fill="' + c + '"/><rect x="12" y="44" width="32" height="6" rx="3" fill="#5a3f26"/>',
+    person: (c, hat) => '<circle cx="28" cy="17" r="7" fill="#c9a07c"/><path d="M16 50q0 -22 12 -24q12 2 12 24z" fill="' + c + '"/>' + ({ hood: '<path d="M19 20q0 -14 9 -14t9 14l-3 -2q-6 -8 -12 0z" fill="#6f6656"/>', brim: '<ellipse cx="28" cy="12" rx="13" ry="3" fill="#3b2c1c"/><rect x="21" y="5" width="14" height="7" rx="2" fill="#3b2c1c"/>', helm: '<path d="M20 16a8 8 0 0 1 16 0z" fill="#9aa0a6"/>', cap: '<path d="M20 14a8 7 0 0 1 16 0z" fill="#7a3b2b"/>', cowl: '<path d="M18 22q0 -16 10 -16t10 16l-4 -4q-6 -6 -12 0z" fill="#4a3826"/>', coif: '<path d="M19 18q0 -12 9 -12t9 12v6l-3 -2v-4q-6 -6 -12 0v4l-3 2z" fill="#8d9298"/>' }[hat] || ''),
+    deco: (c) => '<rect x="10" y="10" width="36" height="36" rx="3" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M18 36l8 -10 6 7 4 -4 6 7" stroke="' + c + '" stroke-width="3" fill="none"/>',
+    tool: (c) => '<rect x="12" y="30" width="32" height="14" rx="2" fill="' + c + '"/><path d="M16 30V18h24v12" fill="none" stroke="' + c + '" stroke-width="4"/>',
+    staff: (c) => '<circle cx="28" cy="16" r="7" fill="#c9a07c"/><path d="M16 50q0 -22 12 -24q12 2 12 24z" fill="' + c + '"/><rect x="22" y="30" width="12" height="18" fill="#e8dcc0" opacity=".9"/>',
+    event: (c) => '<path d="M14 8h28v40l-14 -8 -14 8z" fill="' + c + '"/><path d="M20 18h16M20 26h16" stroke="#1d140c" stroke-width="3"/>',
+    star: (c) => '<path d="M28 6l6 14 15 1 -12 9 4 15 -13 -8 -13 8 4 -15 -12 -9 15 -1z" fill="' + c + '"/>',
+  };
+  const ING_COL = { barley: '#c8a85a', malt: '#9a6b30', hops: '#7c9a3a', honey: '#e0a52e', apple: '#b8432e', potato: '#a68350', onion: '#c9a173', meat: '#b55a4a', fish: '#7f95a0', flour: '#e9e1cc', cheese: '#e3c25a', herb: '#5f8a3a' };
+  /* 그림 아이콘: 이 PC에서 생성(sd_xl_base_1.0)해 배경을 지운 96px webp — assets/tavern/icons/<키>.webp. 그림이 없는 키는 위 SVG로 그린다. */
+  const PIC_DIR = 'assets/tavern/icons/';
+  const PICS = 'ale cider stout mead herbal stew bread soup fish pie tart roast barley malt hops honey apple potato onion meat fishraw flour cheese herb mug plate dirty coin fame mop'.split(' ');
+  const hasPic = (k) => PICS.indexOf(k) >= 0;
+  const pic = (k, sz) => '<img class="tv-pic" src="' + PIC_DIR + k + '.webp" width="' + (sz || 28) + '" height="' + (sz || 28) + '" alt="" draggable="false" style="object-fit:contain;vertical-align:middle;flex:none">';
+  const ico = {
+    drink: (id, sz) => (hasPic(id) ? pic(id, sz) : svgW(IC.mug(DR[id].col), sz)),
+    dish: (id, sz) => (hasPic(id) ? pic(id, sz) : svgW(IC.dish(DS[id].col), sz)),
+    ing: (k, sz) => { const f = k === 'fish' ? 'fishraw' : k; return hasPic(f) ? pic(f, sz) : svgW(IC.sack(ING_COL[k]), sz); },
+    misc: (k, sz, alt) => (hasPic(k) ? pic(k, sz) : alt ? svgW(alt, sz) : ''),
+  };
+
+  /* ======================= 규칙 · 도감 ======================= */
+  const RULES = [
+    { h: '목표', p: ['가도의 낡은 여관을 함께 꾸려 정한 날 수 안에 목표 명성 단계에 오르면 모두 함께 이깁니다.', '맛보기 3일 → 2단계, 한 계절 7일 → 3단계, 두 계절 14일 → 4단계, 사계절 28일 → 6단계.', '1~4명이 각자 기기로 함께합니다(한 기기에 한 명). 빈자리는 AI 직원이 채웁니다.'] },
+    { h: '하루', p: ['아침 준비 — 장보기 · 양조 · 밑준비 · 텃밭 · 청소. 일손(사람 수에 따라 6~12)을 나눠 씁니다. 장보기와 거두기는 일손이 들지 않습니다.', '저녁 영업 — 17시부터 자정까지(약 3분) 손님을 받습니다. 모두가 직접 걸어 다니며 술을 따르고 음식을 내갑니다.', '밤 결산 — 수입 · 방값 · 품삯을 셈하고 확장 · 꾸미기 · 일꾼을 들입니다. 내일 사건이 미리 알려집니다.', '모두 「영업 시작」 · 「다음 날로」를 누르면 넘어갑니다. 방장은 「지금 시작」으로 기다리지 않고 넘길 수 있습니다.'] },
+    { h: '양조', p: ['보리를 건조대에 펼치면 다음 날 아침 맥아가 됩니다(장터에서 맥아를 바로 살 수도 있지만 비쌉니다).', '빈 발효통에 술을 담그면 정해진 날 수 뒤에 다 익어 꼭지를 답니다. 한 통에 10~12잔.', '다 익은 뒤에도 통에 두면 이틀마다 품질이 한 단계 오릅니다(최대 +2). 품질이 높을수록 값 · 팁이 오릅니다.'] },
+    { h: '주방', p: ['밑준비 한 번에 요리 6~8인분이 생깁니다. 남은 몫은 다음 날까지 쓰고, 이틀이 지나면 버립니다.', '스튜 · 수프는 솥에서, 빵과 치즈 · 타르트는 찬장에서 바로 담고, 생선 · 파이 · 구이는 화덕에 올려 5~7초 구운 뒤 꺼냅니다. 오래 두면 탑니다.'] },
+    { h: '저녁 영업', p: ['손님이 자리에 앉으면 머리 위에 주문 그림과 기다림 고리가 뜹니다. 고리가 얼마 남지 않으면 말풍선 테두리가 붉어지고, 지금 들고 있는 것을 주문한 손님은 그림에 초록 테두리가 둘립니다.',
+      '술통 · 솥 · 찬장 · 화덕 · 설거지통 위 표지에 남은 양이 뜹니다. 가까이 가면 그 자리에 지금 할 수 있는 일이 이름표로 뜨고, 오른쪽 위 재고 표의 「주문」은 지금 기다리는 주문 수입니다.', '술통에서 따르기(깨끗한 잔 필요) → 손님 식탁에서 내주기. 음식도 같습니다(깨끗한 접시 필요). 한 번에 둘(쟁반이면 셋)까지 듭니다.', '손님이 떠난 식탁의 빈 그릇은 치워서 설거지통에 넣고, 설거지통에서 씻으면 잔 · 접시가 돌아옵니다.', '쏟은 술은 닦고, 붉은 표시가 뜬 손님은 가서 달랩니다. 내버려 두면 싸움이 나서 의자가 부서지고 손님이 떠납니다.', '고리가 다 닳으면 손님이 화를 내고 떠납니다. 빨리 · 좋은 술로 · 편안한 홀에서 대접할수록 팁과 명성이 큽니다.'] },
+    { h: '객실 · 명성', p: ['늦게까지 머문 손님 일부는 묵어 갑니다. 침대 수만큼 방값(침구 · 편안함에 따라)을 받습니다.', '흡족한 손님마다 명성이 오르고 화난 손님은 깎습니다. 명성 단계가 오르면 새 술 · 요리 · 손님 · 확장이 열립니다.', '편안함은 기다림을 늘리고 방값 · 팁을 올립니다. 분위기는 손님 수와 팁을 늘립니다. 청결이 50 아래면 손님이 줄고 불만이 늡니다.'] },
+    { h: '계절 · 사건', p: SEASONS.map((s) => s.nm + ' — ' + s.d).concat(['밤마다 다음 날 사건이 정해질 수 있습니다: ' + EVENT.map((e) => e.nm).join(' · ') + '.']) },
+    { h: '조작', p: ['폰: 왼쪽 아래를 누른 채 끌면 그 자리에 이동 막대가 생겨 걷습니다. 끝까지 밀지 않아도 빠르게 걷고, 손을 떼면 멈춥니다.', '오른쪽 아래 큰 버튼 = 가까운 것 쓰기, 작은 버튼 = 든 것 버리기. 걸으면서 함께 누를 수 있습니다.', '쓰기를 누르고 있으면 같은 자리에서 같은 일을 이어서 합니다(잔 둘 연달아 따르기 · 한 식탁에 둘 내주기). 화덕에 올리기는 한 번에 하나씩입니다.',
+      '「눌러서 걷기」: 바닥이나 식탁 · 술통 · 화덕을 누르면 걸어가서 바로 씁니다. 설정 화면 「휴대폰 이동(이 기기)」이나 아침 장부 갈래에서 고릅니다.', 'PC: WASD 걷기 · E(또는 Space) 쓰기 · Q 버리기 · 마우스 클릭으로 걸어가 쓰기. 게임패드: 왼쪽 스틱 · A 쓰기 · X 버리기. 키는 「⌨ 조작 설정」에서 바꿉니다.'] },
+    { h: 'AI 직원', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움. 쉬움은 굼뜨고 엉뚱한 일을 먼저 하며, 어려움은 급한 주문부터 묶어서 나릅니다.', '직원마다 버릇(바 · 주방 · 청소 선호, 대담함)이 다릅니다. 사람이 없으면 아침 · 밤 관리도 AI가 맡습니다.', '사람이 있으면 관리는 사람이 하고, 「맡기기」를 누르면 그날 준비를 AI가 대신 짭니다.'] },
+    { h: '그래픽 · 저장', p: ['설정 화면 「그래픽 품질(이 기기)」: 낮음(폰 기본) · 보통 · 높음. 끊기면 낮음으로.', '「휴대폰 이동(이 기기)」: 이동 막대(기본) · 눌러서 걷기.', '저장 · 이어하기를 지원합니다. 영업 중에 저장한 판은 그날 저녁 영업 처음부터 다시 시작합니다.'] },
+    { h: '만든 사람', p: ['여관 · 가구 · 사람 · 불빛은 모두 코드로 만든 3D 형상과 결(외부 모델 없음). 효과음 · 음악은 앱 합성음.', '술 · 요리 · 재료 · 그릇 아이콘 그림은 제작 PC에서 직접 생성한 것입니다(모델 sd_xl_base_1.0, 내려받은 그림 없음).', '3D 엔진: three.js (MIT, 하이퍼 레이스와 같은 파일). 출처: app/assets/tavern/CREDITS.txt', '체계 참고: 여관 경영 시뮬레이션 장르(양조 · 요리 · 영업 · 객실). 이름 · 그림 · 글은 이 게임만의 것입니다.'] },
+  ];
+  function codexData() {
+    const r = (icon, name, tag, desc) => ({ icon: /^<img/.test(icon) ? icon : svgW(icon), name, tag, desc });
+    return [
+      { h: '술', p: ['발효통에 담가 날 수가 지나면 꼭지를 답니다. 다 익은 뒤 이틀마다 품질 +1(최대 +2).'], rows: DRINK.map((d) => r(ico.drink(d.id, 30), d.nm, '명성 ' + d.rep + '단계', fmtNeed(d.need) + ' · ' + d.days + '일 · ' + d.sv + '잔 · 한 잔 ' + d.p + ' · ' + d.d)) },
+      { h: '요리', p: ['밑준비 한 번에 나오는 몫과 값. 화덕 요리는 영업 중 굽는 시간이 듭니다.'], rows: DISH.map((d) => r(ico.dish(d.id, 30), d.nm, { pot: '솥', board: '찬장', oven: '화덕 ' + d.ck + '초' }[d.st] + ' · 명성 ' + d.rep, fmtNeed(d.need) + ' · ' + d.n + '인분 · 한 접시 ' + d.p + ' · ' + d.d)) },
+      { h: '재료 · 작물', p: ['장터 기본 값(계절 · 사건에 따라 바뀜)과 텃밭 작물.'], rows: ING_IDS.map((k) => r(ico.ing(k, 30), ING[k].nm, '장터 ' + ING[k].p, '계절 값 ' + SEASONS.map((s, i) => s.nm + ' ×' + ING[k].sm[i]).join(' · '))).concat(CROP.map((c) => r(ico.ing(c.id, 30), c.nm + ' (텃밭)', '씨 ' + c.seed, c.days + '일(봄 기준) · ' + c.y + ' 거둠 · ' + c.d))) },
+      { h: '손님', p: ['명성 단계가 오르면 새 손님이 옵니다. 기다림은 편안함으로 늘어납니다.'], rows: GUEST.map((g) => r(IC.person(g.look.body, g.look.hat), g.nm, '명성 ' + g.rep + '단계', '기다림 ' + g.pat + '초 · 씀씀이 ×' + g.w + ' · 술 ' + Object.keys(g.dr).map((k) => DR[k].nm).join('/') + ' · 음식 ' + Object.keys(g.fd).map((k) => DS[k].nm).join('/') + (g.row ? ' · 소란 ' + Math.round(g.row * 100) + '%' : '') + (g.room ? ' · 묵음 ' + Math.round(g.room * 100) + '%' : '') + ' · ' + g.d)) },
+      { h: '꾸미기', p: ['한 번 들이면 판 끝까지 효과. 편안함 1당 기다림 · 방값 · 팁이 조금씩 오르고, 분위기 1당 손님 수 약 2% 증가.'], rows: DECO.map((d) => r(IC.deco('#c9a45a'), d.nm, '은화 ' + d.p + ' · 명성 ' + d.rep, (d.c ? '편안함 +' + d.c : '') + (d.c && d.a ? ' · ' : '') + (d.a ? '분위기 +' + d.a : '') + ' · ' + d.d)) },
+      { h: '확장 · 일꾼', p: ['밤 결산에서 들입니다. 일꾼은 밤마다 품삯을 받습니다.'], rows: UPG.map((u) => r(IC.tool('#8a6a44'), u.nm, u.lv.length + '단계', u.lv.map((l, i) => (i + 1) + '단계 은화 ' + l.p + (l.rep > 1 ? '(명성 ' + l.rep + ')' : '') + (l.d ? ' ' + l.d : '')).join(' · ') + (u.d ? ' · ' + u.d : ''))).concat(STAFF.map((s) => r(IC.staff('#5a4a36'), s.nm, '품삯 ' + s.wage + ' · 명성 ' + s.rep, s.d))) },
+      { h: '사건', p: ['밤마다 약 40% 확률로 다음 날 사건이 정해집니다(계절별 가중).'], rows: EVENT.map((e) => r(IC.event('#8c3a2c'), e.nm, '봄 ' + e.w[0] + ' · 여름 ' + e.w[1] + ' · 가을 ' + e.w[2] + ' · 겨울 ' + e.w[3], e.d)) },
+      { h: '명성 단계', p: ['흡족한 손님 1명당 명성 1~4점, 화나서 떠난 손님 −3점.'], rows: LEVELS.map((l, i) => r(IC.star(i < 3 ? '#b08d57' : '#e3ae45'), (i + 1) + '단계 · ' + l.nm, '명성 ' + l.xp, '여는 것: ' + [].concat(DRINK.filter((d) => d.rep === i + 1).map((d) => d.nm), DISH.filter((d) => d.rep === i + 1).map((d) => d.nm), GUEST.filter((g) => g.rep === i + 1).map((g) => g.nm)).join(' · '))) },
+    ];
+  }
+
+  /* ======================= 표지 (640×360) ======================= */
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const bg = g.createLinearGradient(0, 0, 0, h); bg.addColorStop(0, '#1d140e'); bg.addColorStop(1, '#3a2616'); g.fillStyle = bg; g.fillRect(0, 0, w, h);
+    // 뒷벽 돌
+    g.fillStyle = '#2c2420'; g.fillRect(0, 0, w, h * 0.55);
+    for (let y = 0; y < h * 0.55; y += 22) for (let x = (y / 22) % 2 ? -20 : 0; x < w; x += 46) { g.fillStyle = 'rgba(255,230,200,' + (0.03 + ((x * 7 + y * 3) % 5) * 0.008) + ')'; g.fillRect(x + 2, y + 2, 42, 18); }
+    // 난로 불빛
+    const fx = w * 0.22, fy = h * 0.45;
+    const gl = g.createRadialGradient(fx, fy, 6, fx, fy, w * 0.5); gl.addColorStop(0, 'rgba(255,170,80,.75)'); gl.addColorStop(0.3, 'rgba(230,110,40,.25)'); gl.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = '#1a120c'; g.fillRect(fx - 70, fy - 70, 140, 100); g.fillStyle = '#4a3a30'; g.fillRect(fx - 84, fy - 86, 168, 18);
+    g.fillStyle = '#ffb347'; g.beginPath(); g.moveTo(fx - 30, fy + 28); g.quadraticCurveTo(fx - 18, fy - 30, fx, fy - 46); g.quadraticCurveTo(fx + 20, fy - 26, fx + 30, fy + 28); g.fill();
+    g.fillStyle = '#ffe2a0'; g.beginPath(); g.moveTo(fx - 14, fy + 28); g.quadraticCurveTo(fx - 4, fy - 6, fx + 2, fy - 22); g.quadraticCurveTo(fx + 10, fy - 4, fx + 14, fy + 28); g.fill();
+    g.fillStyle = gl; g.fillRect(0, 0, w, h);
+    // 바닥
+    g.fillStyle = '#4a3220'; g.fillRect(0, h * 0.55, w, h * 0.45);
+    for (let x = -40; x < w + 40; x += 34) { g.strokeStyle = 'rgba(0,0,0,.25)'; g.beginPath(); g.moveTo(x, h * 0.55); g.lineTo(x - 60, h); g.stroke(); }
+    // 술통
+    for (let i = 0; i < 3; i++) { const x = w * 0.62 + i * 64, y = h * 0.36; g.fillStyle = '#6b4424'; g.beginPath(); g.ellipse(x, y, 28, 34, 0, 0, Math.PI * 2); g.fill(); g.strokeStyle = '#2a2a2a'; g.lineWidth = 4; g.beginPath(); g.ellipse(x, y, 28, 34, 0, 0, Math.PI * 2); g.stroke(); g.beginPath(); g.moveTo(x - 27, y - 12); g.lineTo(x + 27, y - 12); g.moveTo(x - 27, y + 12); g.lineTo(x + 27, y + 12); g.stroke(); }
+    // 식탁 · 잔 · 촛불
+    g.fillStyle = '#5c3a20'; g.fillRect(w * 0.36, h * 0.68, w * 0.4, 20); g.fillStyle = '#3e2714'; g.fillRect(w * 0.38, h * 0.68 + 20, 12, 60); g.fillRect(w * 0.73, h * 0.68 + 20, 12, 60);
+    for (let i = 0; i < 3; i++) { const x = w * 0.42 + i * 70, y = h * 0.6; g.fillStyle = '#6b4a2c'; g.fillRect(x, y, 26, 34); g.fillStyle = '#e6dcc4'; g.fillRect(x - 1, y - 4, 28, 7); g.strokeStyle = '#6b4a2c'; g.lineWidth = 4; g.beginPath(); g.arc(x + 28, y + 16, 8, -1.2, 1.2); g.stroke(); }
+    const cx = w * 0.58, cy = h * 0.6; g.fillStyle = '#efe4c6'; g.fillRect(cx - 4, cy - 20, 8, 22); g.fillStyle = '#ffcf6a'; g.beginPath(); g.ellipse(cx, cy - 26, 4, 8, 0, 0, Math.PI * 2); g.fill();
+    const cg = g.createRadialGradient(cx, cy - 24, 2, cx, cy - 24, 90); cg.addColorStop(0, 'rgba(255,200,110,.45)'); cg.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = cg; g.fillRect(0, 0, w, h);
+    // 제목
+    g.fillStyle = 'rgba(15,10,6,.55)'; g.fillRect(0, h - 64, w, 64);
+    g.fillStyle = '#f0e2c0'; g.font = '30px "Nanum Myeongjo","Noto Serif KR",Batang,serif'; g.textBaseline = 'middle'; g.fillText('여관 주인', 24, h - 32);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(240,226,192,.75)'; g.fillText('양조 · 요리 · 저녁 영업 · 객실 — 1~4명 협동', 170, h - 30);
+  }
+
+  /* ======================= 입구 화면 (3D 불러오기) ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '폰 권장 — 그림자 없음 · 불빛 둘 · 배율 낮게', pr: 1, shadow: 0, aa: false, lights: 2 },
+    { id: 'mid', nm: '보통', tip: '창빛 그림자 · 불빛 넷 · 보통 배율', pr: 1.5, shadow: 1024, aa: true, lights: 4 },
+    { id: 'high', nm: '높음', tip: 'PC 권장 — 고운 그림자 · 불빛 여섯 · 고해상도', pr: 2, shadow: 2048, aa: true, lights: 6 },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem('tavern.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('tavern.' + k, v); } catch (e) {} } };
+  // 휴대폰 이동 방식(이 기기 설정 — 판 규칙과 무관, 온라인에서도 사람마다 따로): 기본 이동 막대
+  const MOVES = [['stick', '이동 막대'], ['tap', '눌러서 걷기']];
+  function touchOnly() { try { if (L && L.touchOnly) return !!L.touchOnly(); return typeof matchMedia === 'function' && matchMedia('(pointer:coarse)').matches; } catch (e) { return false; } }   // 갤럭시(S펜)는 any-pointer:fine도 true — 코어 판정(주 포인터·실제 터치)을 따른다
+  function gfxTier() { const v = store.get('gfx', ''); return TIERS.some((t) => t.id === v) ? v : (touchOnly() ? 'low' : 'mid'); }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  function loadCore() {
+    return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js'))
+      .then(() => (API.sim ? null : loadScript('assets/tavern/sim.js')))
+      .then(() => loadScript('assets/tavern/view.js'));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+  const CONTROLS = [
+    { id: 'up', label: '앞으로', keys: ['KeyW', 'ArrowUp'], pad: ['ly-', 'up'] },
+    { id: 'down', label: '뒤로', keys: ['KeyS', 'ArrowDown'], pad: ['ly+', 'down'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA', 'ArrowLeft'], pad: ['lx-', 'left'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD', 'ArrowRight'], pad: ['lx+', 'right'] },
+    { id: 'use', label: '쓰기(따르기 · 담기 · 내주기 · 치우기)', keys: ['KeyE', 'Space'], pad: ['a'] },
+    { id: 'drop', label: '든 것 버리기', keys: ['KeyQ'], pad: ['x'] },
+    { id: 'panel', label: '관리 창 열기 · 닫기', keys: ['Tab'], pad: ['y'] },
+  ];
+
+  const API = { ID, SEASONS, ING, ING_IDS, ING_COL, DRINK, DISH, CROP, GUEST, DECO, UPG, STAFF, EVENT, LEVELS, LENS, LINEN, DR, DS, CR, GU, DC, UP, SF, EV, QM, TIERS, IC, svgW, ico, pic, hasPic,
+    clamp, prng, pickW, lvOf, ssnOf, upLv, caskCap, plotCap, kilnCap, ovenCap, carryCap, bedCap, roomPrice, mugCap, plateCap, labMax, comfort, ambience, unlockedD, unlockedF,
+    price, cQ, cReady, dishStock, expGuests, init, mg, startSvc, endSvc, nextDay, plan, habitsOf, demandMix, result, hint, saveLabel, fmtNeed, hasNeed, needCost, store, gfxTier, touchOnly, MOVES, PH_NM };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 42%,#3b2616,#120c08)', color: '#efe2c4', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t1 = h('div', { style: { fontFamily: '"Nanum Myeongjo","Noto Serif KR",Batang,serif', fontSize: '28px', letterSpacing: '2px' }, text: '여관 주인' });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '여관 문을 여는 중' });
+    const bar = h('div', { style: { width: '220px', height: '5px', borderRadius: '3px', background: 'rgba(255,240,210,.12)', overflow: 'hidden' } }, h('div', { style: { width: '8%', height: '100%', background: '#c9963f', transition: 'width .2s' } }));
+    box.append(t1, t2, bar);
+    root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(clamp(f, 0.05, 1) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기(브라우저)에서는 3D 그래픽(WebGL)을 켤 수 없습니다.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.5, '홀 정리 중');
+      view = G.TAVERN_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'); });
+    const out = {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+      saveState() { return api.online && !api.isHost ? false : { v: 1 }; },
+      loadState() {},
+    };
+    return out;
+  }
+
+  const ICON = '<path d="M10 8h36" stroke="currentColor" stroke-width="3"/><path d="M16 8v6M40 8v6" stroke="currentColor" stroke-width="2"/><rect x="10" y="14" width="36" height="24" rx="3" fill="currentColor"/><path d="M20 20h11v12a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2z" fill="#000" opacity=".55"/><path d="M31 23h3a3 3 0 0 1 3 3v2a3 3 0 0 1-3 3h-3" fill="none" stroke="#000" stroke-width="2" opacity=".55"/><path d="M14 44h28M18 44v6M38 44v6" stroke="currentColor" stroke-width="3"/>';
+
+  if (L) L.register({
+    id: ID, name: '여관 주인', tag: '협동 여관 경영', cat: '협동', icon: ICON, tint: '#3a2412', coop: true,
+    blurb: '가도의 낡은 여관을 1~4명이 함께 꾸립니다. 아침에는 술을 빚고 밑준비를 하고 장을 보며, 저녁에는 직접 걸어 다니며 손님에게 술과 음식을 냅니다. 밤에는 방값을 받고 홀을 넓히고 꾸밉니다.',
+    time: '10–60분', landscape: true, realtime: true, aiDelay: 0, mood: 'folk', ambient: 'lounge', sidePanel: false, save: true, saveLabel,
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2,
+    options: [
+      { id: 'len', label: '영업 기간', tip: '정한 날 수 안에 목표 명성 단계에 오르면 승리. 3일 2단계 · 7일 3단계 · 14일 4단계 · 28일 6단계.', choices: Object.keys(LENS).map((k) => ({ v: k, label: LENS[k].nm, tip: '목표 명성 ' + LENS[k].goal + '단계 「' + LEVELS[LENS[k].goal - 1].nm + '」' })), def: 'd7' },
+      { id: 'ssn', label: '시작 계절', tip: '7일마다 다음 계절로 넘어갑니다.', choices: [{ v: 'rnd', label: '무작위' }].concat(SEASONS.map((s) => ({ v: s.id, label: s.nm, tip: s.d }))), def: 'rnd' },
+    ],
+    setupExtra(opts, ctx) {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        const line = (label) => { const r = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', width: '100%' } }); r.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '4px 2px 0', width: '100%' }, text: label })); wrap.append(r); return r; };
+        const g = line('그래픽 품질(이 기기)');
+        for (const t of TIERS) g.append(h('button', { class: 'btn sm' + (gfxTier() === t.id ? ' primary' : ''), title: t.tip, style: { minHeight: '44px' }, text: t.nm, onclick() { store.set('gfx', t.id); draw(); } }));
+        const mv = line('휴대폰 이동(이 기기)'), cur = store.get('move', 'stick') === 'tap' ? 'tap' : 'stick';
+        for (const [k, nm] of MOVES) mv.append(h('button', { class: 'btn sm' + (cur === k ? ' primary' : ''), title: k === 'stick' ? '왼쪽 아래를 누른 채 끌어 걷기' : '바닥 · 술통 · 식탁을 눌러 걸어가기', style: { minHeight: '44px' }, text: nm, onclick() { store.set('move', k); draw(); } }));
+      };
+      draw(); void ctx;
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['아침: 장보기 · 양조 · 밑준비 · 텃밭 · 청소에 일손을 나눠 씀', '저녁(약 3분): 직접 걸어 다니며 따르고 · 담고 · 굽고 · 내주고 · 치우기', '밤: 방값 · 품삯 결산 후 확장 · 꾸미기 · 일꾼 들이기', '정한 날 수 안에 목표 명성 단계에 오르면 모두 승리'],
+    rules: RULES,
+    tutorial: [
+      { text: '아침 준비 창입니다. 위쪽 갈래에서 장터 · 양조 · 주방 · 텃밭을 고릅니다. 일을 하나 할 때마다 일손이 듭니다.', sel: '.tv-tabs' },
+      { text: '오늘 밤 팔 술(꼭지 단 통)과 요리 몫을 확인합니다. 모자라면 주방에서 밑준비를 합니다.', sel: '.tv-head' },
+      { text: '막히면 「맡기기」가 오늘 준비를 대신 짜 줍니다. 다 되면 「영업 시작」.', sel: '.tv-foot' },
+      { text: '영업 중 이동: 폰은 왼쪽 아래 이동 막대(설정에서 눌러서 걷기로 바꿈), PC는 WASD. 오른쪽 아래 큰 버튼은 가까운 것 쓰기.' },
+    ],
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.TAVERN = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

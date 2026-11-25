@@ -1,0 +1,2764 @@
+/* 우주선 승무원 — 4~6명 실시간 협동 우주선 로그라이크 (한 폰에 한 명, 빈 자리는 AI 승무원).
+   자리: 선장 1(자유 2D 조종 · 수리 지휘 · 동력 배분 · 특수 무기) / 부선장(포수 중 한 명이 겸함, 선장 부상 시 지휘) / 포수 3~5(각자 포탑 조준·발사, 비상시 수리 돕기).
+   흐름(state, setState/act): hangar(배·역할) → map(항로 투표) ⇄ fight | ev(사건 투표) | shop → … → 기함(중간) → 최종 보스 → done.
+   전투는 호스트 권한 실시간 시뮬(1/30 s). 배(우리·적)는 부위(함교·엔진·동력실·방어막 발생기·포탑·선체 구역…)로 나뉘고,
+   맞은 부위가 망가지면 기능을 잃고, 더 맞으면 관통해 그 자리 승무원이 다쳐요.
+   게스트는 작은 조작 객체를 publish, 호스트는 hostSend로 스냅샷(~15 Hz, <4096 B)을 보낸다. 상태(st)는 <2500 B. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+  const TAU = Math.PI * 2, PI = Math.PI;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const hyp = (x, y) => Math.sqrt(x * x + y * y);
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const rnd = () => Math.random();
+  const angN = (a) => { a %= TAU; if (a > PI) a -= TAU; else if (a < -PI) a += TAU; return a; };
+  const H = 1 / 30, AW = 520, AH = 520, MAXC = 6;
+  const EHP = 1.1, EHPD = 1, EHPB = 0.5, ESH = 0.55, EDM = 2.1;
+
+  /* ======================= data ======================= */
+  // 포탑 13종 (lv 1~3: 피해 +25%/단계, 재장전 −10%/단계)
+  const TUR = [
+    { nm: '레이저포', d: '무난한 기본 포. 피해 3', dmg: 3, cd: 0.5, sp: 150, l: 1.5, pr: 30, c: '#ffd27a' },
+    { nm: '연사 기관포', d: '작은 탄을 아주 빠르게 쏴요', dmg: 1.2, cd: 0.14, sp: 170, l: 1.25, spr: 0.07, pr: 45, c: '#ffe9a8' },
+    { nm: '쌍열 레이저', d: '광선 2발을 나란히 쏴요', dmg: 2.6, cd: 0.62, n: 2, par: 1, sp: 150, l: 1.5, pr: 50, c: '#ffcf6a' },
+    { nm: '중포', d: '느리지만 한 방이 커요. 피해 9', dmg: 9, cd: 1.4, sp: 115, l: 2.1, big: 1, pr: 60, c: '#ff9b6b' },
+    { nm: '산탄포', d: '5발을 부채꼴로. 가까이서 강해요', dmg: 1.7, cd: 0.85, n: 5, spr: 0.32, sp: 140, l: 0.85, pr: 45, c: '#ffb36b' },
+    { nm: '이온포', d: '적 방어막을 4배로 깎아요', dmg: 1.6, cd: 0.6, sp: 140, l: 1.5, ion: 1, pr: 45, c: '#7fe3ff' },
+    { nm: '레일건', d: '방어막을 뚫는 초고속 탄. 피해 8', dmg: 8, cd: 1.6, sp: 300, l: 1.1, pierce: 1, pr: 70, c: '#ffffff' },
+    { nm: '유도 미사일', d: '적을 따라가요. 피해 7', dmg: 7, cd: 1.5, sp: 90, l: 3.2, hom: 1, pr: 65, c: '#c9f07a' },
+    { nm: '화염 분사기', d: '가까이 붙으면 엄청난 연속 피해', dmg: 0.9, cd: 0.07, sp: 90, l: 0.55, spr: 0.18, pd: 1.5, pr: 50, c: '#ff8a3d' },
+    { nm: '플라즈마포', d: '터지면서 주변 부위까지 피해 5', dmg: 5, cd: 1.0, sp: 110, l: 1.8, spl: 1, pr: 60, c: '#d58aff' },
+    { nm: '대공 파편포', d: '미사일·드론 근처에서 터져 떨어뜨려요', dmg: 1.6, cd: 0.3, sp: 165, l: 1.2, flak: 1, pr: 40, c: '#e8e8b8' },
+    { nm: '감속 빔', d: '맞은 적이 2초 동안 느려져요', dmg: 2, cd: 0.45, sp: 160, l: 1.4, slow: 1, pr: 45, c: '#8ab8ff' },
+    { nm: '정밀 저격포', d: '부위에 2.5배 피해. 부위 노리기용', dmg: 4, cd: 1.0, sp: 260, l: 1.3, pd: 2.5, pr: 55, c: '#ff7aa8' },
+  ];
+  const TB_TORP = 13, TB_DRONE = 14;   // 특수 탄 모양 번호
+  // 특수 무기 10종 (선장이 쏨)
+  const SPC = [
+    { nm: '충격파', d: '둘레의 적에게 피해 25, 밀쳐내고 적 탄을 지워요', ch: 18, pr: 60 },
+    { nm: '어뢰 일제 사격', d: '적을 쫓는 어뢰 4발 (각 피해 25, 방어막 무시)', ch: 22, pr: 70 },
+    { nm: '차원 도약', d: '움직이는 쪽으로 순간 이동 + 1초 무적', ch: 12, pr: 55 },
+    { nm: '방어막 과충전', d: '방어막을 1.6배로 채우고 8초 유지', ch: 20, pr: 60 },
+    { nm: '드론 출격', d: '전투 드론 3대가 14초 동안 함께 싸워요', ch: 20, pr: 65 },
+    { nm: '기뢰 살포', d: '배 둘레에 기뢰 6개 (각 피해 25)', ch: 16, pr: 55 },
+    { nm: '거대 광선포', d: '뱃머리 쪽 일직선에 피해 60, 방어막 무시', ch: 24, pr: 75 },
+    { nm: '나노 수리구름', d: '모든 부위 +50%, 선체 +8', ch: 25, pr: 60 },
+    { nm: '전자 교란', d: '가까운 적의 방어막과 무기를 4초 동안 꺼요', ch: 22, pr: 65 },
+    { nm: '중력 덫', d: '앞에 중력장: 적을 끌어당겨 느리게, 적 탄을 빨아들여요', ch: 20, pr: 60 },
+  ];
+  // 배 개조 10종
+  const UPG = [
+    { nm: '선체 보강', mx: 3, pr: 40, d: '최대 선체 +25 (바로 채워요)' },
+    { nm: '엔진 개량', mx: 2, pr: 40, d: '속도·선회 +15%' },
+    { nm: '방어막 강화', mx: 2, pr: 50, d: '방어막 최대치 +35%' },
+    { nm: '원자로 확장', mx: 3, pr: 45, d: '동력 +1 (모든 장치가 조금씩 강해져요)' },
+    { nm: '수리반 확충', mx: 2, pr: 35, d: '전투 중 부위 수리 +60%' },
+    { nm: '승무원 숙소', mx: 2, pr: 30, d: '부상 회복 시간 −30%' },
+    { nm: '장갑판', mx: 2, pr: 40, d: '부위 내구도 +30%' },
+    { nm: '특수 충전기', mx: 2, pr: 40, d: '특수 무기 충전 +25%' },
+    { nm: '표적 컴퓨터', mx: 1, pr: 45, d: '우리 탄속 +20%, 빈 포탑 조준이 좋아져요' },
+    { nm: '고철 자석', mx: 1, pr: 30, d: '전투 보상 고철 +30%' },
+  ];
+  // 부위 종류: B 함교 R 동력실 S 방어막 발생기 E 엔진 H 선체 구역 T 포탑(우리) W 무기(적) G 격납고/투하기 C 중심핵
+  const PN = { B: '함교', R: '동력실', S: '방어막 발생기', E: '엔진', H: '선체', T: '포탑', W: '무기', G: '격납고', C: '중심핵' };
+  const PRAD = { B: 3.2, R: 3.2, S: 2.8, E: 3.4, H: 3.4, T: 2.7, W: 2.6, G: 3, C: 3.8 };
+  const PHP = { B: 30, R: 34, S: 26, E: 30, H: 40, T: 24, G: 26 };
+  // 우리 배 7종: mt = 포탑 자리 [x, y, 중심각, 반폭], pt = 부위 [종류, x, y], tt = 시작 포탑, sp = 기본 특수 무기
+  const SHIPS = [
+    { nm: '순양함', d: '모든 게 무난한 균형형', hm: 130, P: 6, v: 54, ac: 100, tr: 2.6, shm: 24, r: 15, sp: 0, dr: 85,
+      tt: [0, 0, 0, 1, 0], col: '#d9c7a3', acc: '#e3ae45',
+      pg: [17, 0, 9, -6, -3, -8.5, -14, -7, -16, -3, -16, 3, -14, 7, -3, 8.5, 9, 6],
+      mt: [[12, 0, 0, 1.9], [1, -6.5, -1.57, 1.8], [1, 6.5, 1.57, 1.8], [-9, -4.6, -2.5, 1.7], [-9, 4.6, 2.5, 1.7]],
+      pt: [['B', 6, 0], ['R', -2, 0], ['S', -7, 0], ['E', -14, 0], ['H', 8, -4], ['H', 8, 4], ['H', -4, -7], ['H', -4, 7]] },
+    { nm: '전함', d: '포탑 7개, 아주 튼튼. 대신 느려요', hm: 175, P: 7, v: 40, ac: 66, tr: 1.7, shm: 26, r: 20, sp: 1, dr: 100,
+      tt: [3, 0, 0, 0, 0, 1, 1], col: '#a9b3c4', acc: '#e3ae45',
+      pg: [22, 0, 15, -6, 4, -10, -12, -10, -20, -7, -21, 0, -20, 7, -12, 10, 4, 10, 15, 6],
+      mt: [[16, 0, 0, 1.8], [8, -7, -1.4, 1.6], [8, 7, 1.4, 1.6], [-3, -8.6, -1.57, 1.6], [-3, 8.6, 1.57, 1.6], [-10, 0, 0, 3.15], [-17, 0, 3.14, 1.7]],
+      pt: [['B', 10, 0], ['R', 2, 0], ['S', -4, 0], ['E', -19, -4.5], ['E', -19, 4.5], ['H', 13, -4], ['H', 13, 4], ['H', -11, -8], ['H', -11, 8], ['H', 2, -7], ['H', 2, 7]] },
+    { nm: '쾌속선', d: '빠르고 잘 돌아요. 선체는 약해요', hm: 100, P: 6, v: 74, ac: 150, tr: 3.8, shm: 18, r: 13, sp: 2, dr: 70,
+      tt: [1, 0, 0, 0, 0], col: '#9fbde6', acc: '#5bb3e6',
+      pg: [17, 0, 4, -4, -6, -11, -10, -10, -9, -3, -13, -2, -13, 2, -9, 3, -10, 10, -6, 11, 4, 4],
+      mt: [[12, 0, 0, 1.5], [5, -3.6, -0.5, 1.6], [5, 3.6, 0.5, 1.6], [-5, -8, -1.4, 1.7], [-5, 8, 1.4, 1.7]],
+      pt: [['B', 7, 0], ['R', -2, 0], ['S', -7, 0], ['E', -11, -5], ['E', -11, 5], ['H', 1, -3], ['H', 1, 3]] },
+    { nm: '요새선', d: '가장 튼튼하고 방어막이 두꺼워요. 가장 느려요', hm: 200, P: 6, v: 34, ac: 55, tr: 1.5, shm: 44, r: 18, sp: 3, dr: 95,
+      tt: [0, 0, 0, 5, 0], col: '#93b89c', acc: '#5fd0b0',
+      pg: [16, -5, 12, -12, 0, -16, -12, -13, -17, -5, -17, 5, -12, 13, 0, 16, 12, 12, 16, 5],
+      mt: [[11, 0, 0, 3.15], [1, -11, 0, 3.15], [1, 11, 0, 3.15], [-10, -6, 0, 3.15], [-10, 6, 0, 3.15]],
+      pt: [['B', 5, 0], ['R', -4, 0], ['S', 3, -6], ['S', 3, 6], ['E', -15, 0], ['H', 10, -8], ['H', 10, 8], ['H', -10, -11], ['H', -10, 11], ['H', -4, -7], ['H', -4, 7]] },
+    { nm: '드론 모함', d: '호위 드론 2대가 늘 따라다녀요', hm: 140, P: 6, v: 48, ac: 85, tr: 2.2, shm: 26, r: 18, sp: 4, dr: 100,
+      tt: [0, 0, 1, 1, 0], col: '#c7b3d9', acc: '#b48cf0', esc: 1,
+      pg: [19, -6, 19, 6, 10, 9, -14, 9, -19, 5, -19, -5, -14, -9, 10, -9],
+      mt: [[15, -3.2, 0, 1.7], [15, 3.2, 0, 1.7], [0, -9, -1.57, 1.7], [0, 9, 1.57, 1.7], [-13, 0, 3.14, 2]],
+      pt: [['B', 7, -6], ['R', -5, 0], ['S', -5, -6], ['G', 4, 2], ['E', -17, -4], ['E', -17, 4], ['H', 9, 6], ['H', -10, 7], ['H', -10, -7]] },
+    { nm: '기뢰선', d: '움직이면 뒤로 기뢰를 흘려요', hm: 135, P: 6, v: 52, ac: 92, tr: 2.4, shm: 24, r: 16, sp: 5, dr: 75,
+      tt: [0, 0, 0, 4, 4], col: '#c9b57a', acc: '#e8c04e', mine: 1,
+      pg: [17, 0, 8, -7, -8, -9, -16, -6, -16, 6, -8, 9, 8, 7],
+      mt: [[13, 0, 0, 1.8], [3, -7, -1.57, 1.7], [3, 7, 1.57, 1.7], [-9, -6, 3.0, 1.7], [-9, 6, -3.0, 1.7]],
+      pt: [['B', 7, 0], ['R', -2, 0], ['S', -6, -3], ['G', -14, 0], ['E', -14, -5], ['E', -14, 5], ['H', 9, -4], ['H', 9, 4], ['H', -3, -7], ['H', -3, 7]] },
+    { nm: '함포선', d: '뱃머리 주포가 아주 세요(피해 ×1.4). 잘 못 돌아요', hm: 150, P: 6, v: 44, ac: 75, tr: 1.8, shm: 28, r: 19, sp: 6, dr: 110,
+      tt: [3, 0, 0, 0, 0], col: '#d6a58a', acc: '#ee6a55', main: 1,
+      pg: [24, -2, 24, 2, 12, 5, 4, 10, -10, 10, -19, 6, -19, -6, -10, -10, 4, -10, 12, -5],
+      mt: [[18, 0, 0, 0.9], [5, -7, -1.2, 1.7], [5, 7, 1.2, 1.7], [-8, -7, -2.2, 1.7], [-8, 7, 2.2, 1.7]],
+      pt: [['B', 6, 0], ['R', -3, 0], ['S', -10, 0], ['E', -17, 0], ['H', 12, -3], ['H', 12, 3], ['H', -4, -8], ['H', -4, 8], ['H', -12, -6], ['H', -12, 6]] },
+  ];
+  // 적 무기
+  const WK = {
+    las: { cd: 1.6, rng: 175, sp: 82, d: 4 },
+    brs: { cd: 2.7, rng: 165, sp: 88, d: 3 },
+    spr: { cd: 2.3, rng: 125, sp: 72, d: 3 },
+    msl: { cd: 3.8, rng: 230, sp: 46, d: 9 },
+    hvy: { cd: 3.3, rng: 190, sp: 52, d: 12 },
+    bem: { cd: 4.6, rng: 240, d: 14 },
+    ion: { cd: 2.0, rng: 165, sp: 78, d: 2 },
+    min: { cd: 3.4, rng: 200, d: 10 },
+    rng: { cd: 4.2, rng: 260, sp: 52, d: 4 },
+    spi: { cd: 0.16, rng: 300, sp: 56, d: 3 },
+  };
+  // 적 모양 틀 (크기 10 기준, 앞 = +x)
+  const TPL = {
+    dart: [10, 0, -4, -6, -8, -3, -6, 0, -8, 3, -4, 6],
+    wedge: [10, 0, 2, -7, -8, -8, -6, 0, -8, 8, 2, 7],
+    block: [9, -3, 9, 3, 4, 7, -8, 7, -10, 0, -8, -7, 4, -7],
+    diamond: [10, 0, 0, -8, -10, 0, 0, 8],
+    hex: [10, 0, 5, -8.6, -5, -8.6, -10, 0, -5, 8.6, 5, 8.6],
+    crescent: [10, -3, 4, -9, -7, -7, -3, 0, -7, 7, 4, 9, 10, 3],
+    claw: [10, -2, 6, -9, -2, -6, -9, -9, -7, 0, -9, 9, -2, 6, 6, 9, 10, 2],
+    star: (() => { const o = []; for (let j = 0; j < 16; j++) { const a = j / 16 * TAU, r = j % 2 ? 7.6 : 10; o.push(Math.cos(a) * r, Math.sin(a) * r); } return o; })(),
+    blob: (() => { const o = []; for (let j = 0; j < 14; j++) { const a = j / 14 * TAU, r = 8.4 + 1.6 * Math.sin(j * 2.7) + (j === 0 ? 1.4 : 0); o.push(Math.cos(a) * r * 1.1, Math.sin(a) * r * 0.85); } return o; })(),
+  };
+  // 적 16종: beh = 움직임, dr = 좋아하는 거리, pt = [종류, x, y(틀 단위), 무기, 등장 단계]
+  const EN = [
+    { nm: '해적 쾌속정', tp: 'dart', r: 7, hp: 60, v: 60, tr: 3, beh: 'fln', dr: 72, sc: 12, col: '#c9533f',
+      pt: [['B', -1, 0], ['E', -7, 0], ['W', 5, 0, 'las'], ['H', -3, -4], ['H', -3, 4]] },
+    { nm: '해적 포함', tp: 'block', r: 10, hp: 120, v: 38, tr: 1.8, beh: 'orb', dr: 95, sc: 18, col: '#d0703a',
+      pt: [['B', 3, 0], ['E', -8, 0], ['R', -3, 0], ['W', 6, -4, 'brs'], ['W', 6, 4, 'las'], ['H', -1, -5.5], ['H', -1, 5.5]] },
+    { nm: '공격 드론', tp: 'diamond', r: 4, hp: 18, v: 74, tr: 4, beh: 'swm', dr: 50, sc: 4, col: '#b0607a', drone: 1,
+      pt: [['C', 0, 0, 'las']] },
+    { nm: '자폭 드론', tp: 'diamond', r: 4, hp: 14, v: 86, tr: 4, beh: 'kam', dr: 0, sc: 4, col: '#e0405e', drone: 1,
+      pt: [['C', 0, 0]] },
+    { nm: '미사일 순양함', tp: 'block', r: 12, hp: 160, v: 32, tr: 1.4, beh: 'kit', dr: 135, sh: 20, sc: 22, col: '#9b4a5f',
+      pt: [['B', 4, 0], ['E', -8, 0], ['S', -3, 0], ['W', 6, -5, 'msl'], ['W', 6, 5, 'msl'], ['H', -2, -6], ['H', -2, 6]] },
+    { nm: '저격함', tp: 'dart', r: 10, hp: 110, v: 34, tr: 1.6, beh: 'snp', dr: 175, sc: 20, col: '#7a5bd0',
+      pt: [['B', -1, 0], ['E', -7, 0], ['W', 6, 0, 'bem'], ['H', -3, -4.5], ['H', -3, 4.5]] },
+    { nm: '방패 호위함', tp: 'hex', r: 11, hp: 130, v: 38, tr: 1.8, beh: 'orb', dr: 100, sh: 40, sc: 20, col: '#4a7ad0',
+      pt: [['S', 0, 0], ['B', 5, 0], ['E', -8, 0], ['W', 4, -6, 'ion'], ['W', 4, 6, 'las'], ['H', -4, -6], ['H', -4, 6]] },
+    { nm: '기뢰 부설정', tp: 'wedge', r: 9, hp: 100, v: 48, tr: 2.2, beh: 'kit', dr: 85, sc: 18, col: '#8a8a40',
+      pt: [['B', 2, 0], ['E', -7, 0], ['W', -6, 0, 'min'], ['W', 6, 0, 'las'], ['H', 0, -6], ['H', 0, 6]] },
+    { nm: '드론 운반선', tp: 'block', r: 14, hp: 200, v: 24, tr: 1, beh: 'kit', dr: 145, sh: 20, sc: 28, col: '#6a5a8a',
+      pt: [['B', 5, 0], ['E', -9, 0], ['S', -4, 0], ['G', 0, -5], ['G', 0, 5], ['W', 8, 0, 'las'], ['H', -6, -6], ['H', -6, 6]] },
+    { nm: '충각선', tp: 'wedge', r: 11, hp: 170, v: 52, tr: 2.2, beh: 'ram', dr: 70, sc: 22, col: '#b05030',
+      pt: [['H', 8, 0], ['B', 0, 0], ['E', -7, 0], ['W', 2, -6, 'spr'], ['W', 2, 6, 'spr'], ['H', -4, -6], ['H', -4, 6]] },
+    { nm: '사냥꾼 순양함', tp: 'crescent', r: 15, hp: 320, v: 46, tr: 2, beh: 'fln', dr: 95, sh: 30, sc: 45, col: '#d8873a', el: 1,
+      pt: [['B', 4, 0], ['R', -2, 0], ['S', -5, 0], ['E', -7, -5], ['E', -7, 5], ['W', 8, 0, 'msl'], ['W', 4, -7, 'brs'], ['W', 4, 7, 'brs'], ['H', -1, -8], ['H', -1, 8]] },
+    { nm: '정예 포격함', tp: 'hex', r: 16, hp: 360, v: 28, tr: 1.2, beh: 'orb', dr: 125, sh: 25, sc: 45, col: '#a04848', el: 1,
+      pt: [['B', 0, 0], ['R', -5, 0], ['S', -3, -5], ['E', -9, 0], ['W', 6, -5, 'hvy'], ['W', 6, 5, 'hvy'], ['W', 3, 0, 'spr'], ['H', -4, -7], ['H', -4, 7], ['H', 8, 0]] },
+    { nm: '유령 함선', tp: 'crescent', r: 13, hp: 260, v: 52, tr: 2.4, beh: 'snp', dr: 150, sh: 15, sc: 45, col: '#5a9a9a', el: 1, cloak: 1,
+      pt: [['B', 3, 0], ['S', -3, 0], ['E', -7, 0], ['W', 8, 0, 'bem'], ['W', 4, -7, 'brs'], ['H', -1, -8], ['H', -1, 8], ['H', 4, 7]] },
+    { nm: '강철 기함', tp: 'block', r: 28, hp: 650, v: 17, tr: 0.6, beh: 'orb', dr: 140, sh: 50, sc: 80, col: '#7a7a90', boss: 1, phs: [0.5],
+      pt: [['B', 3, 0], ['R', -3, 0], ['S', -6, -4], ['E', -9, -5], ['E', -9, 5], ['W', 8, -5, 'brs'], ['W', 8, 5, 'las'], ['W', 2, -6.5, 'msl'], ['W', 2, 6.5, 'hvy'], ['G', -4, 3.5, '', 1], ['W', 0, 0, 'rng', 1], ['H', 6, 0], ['H', -6, 5.5]] },
+    { nm: '검은 별 요새', tp: 'star', r: 36, hp: 760, v: 10, tr: 0.3, beh: 'sta', dr: 0, sh: 60, sc: 0, col: '#6c2440', boss: 2, phs: [0.66, 0.33],
+      pt: [['C', 0, 0, 'spi', 2], ['B', 3, 0], ['R', -3, 0], ['S', 0, -4], ['S', 0, 4], ['W', 8, 0, 'brs'], ['W', 4, 7, 'las'], ['W', -4, 7, 'msl'], ['W', -8, 0, 'hvy'], ['W', -4, -7, 'las'], ['W', 4, -7, 'msl'], ['G', 0, 6.5, '', 1], ['G', 0, -6.5, '', 1], ['W', 1, 1, 'rng', 1]] },
+    { nm: '공허 포식자', tp: 'blob', r: 32, hp: 720, v: 30, tr: 1.2, beh: 'eat', dr: 110, sc: 0, col: '#3a7a4a', boss: 2, phs: [0.66, 0.33],
+      pt: [['C', 7, 0, 'spr'], ['B', 0, 0], ['E', -7, 0], ['W', 3, -6, 'spr'], ['W', 3, 6, 'spr'], ['W', -4, -6, 'hvy'], ['W', -4, 6, 'hvy'], ['W', 0, 1, 'spi', 2], ['H', -3, -3], ['H', -3, 3]] },
+  ];
+  const ESTAT = EN.map((D) => { const s = D.r / 10; return { pg: TPL[D.tp].map((v) => v * s), pt: D.pt.map((p) => ({ t: p[0], x: p[1] * s, y: p[2] * s, r: PRAD[p[0]] * Math.max(0.8, Math.min(2.2, s * 0.9)), w: p[3] || '', ph: p[4] || 0 })) }; });
+  const PF = { B: 0.17, E: 0.18, R: 0.2, S: 0.18, W: 0.16, H: 0.25, G: 0.18, C: 0.5 };
+
+  const PIR = 0, ELI = 1, DRO = 2, NEB = 3, AST = 4, STM = 5, SHP = 6, EVT = 7, REP = 8, SLV = 9, MID = 10, BOS = 11;
+  const NT = [
+    { nm: '해적', c: '#ee6a55', d: '해적 함대와 싸워요' },
+    { nm: '강적', c: '#ff9a3d', d: '정예 함선. 이기면 장비를 얻어요' },
+    { nm: '드론 떼', c: '#e0708f', d: '작은 드론이 우르르 몰려와요' },
+    { nm: '성운', c: '#a98ae8', d: '안개 속 전투. 멀리가 잘 안 보여요. 보상 1.5배' },
+    { nm: '소행성대', c: '#c4a57a', d: '바위가 떠다니는 곳에서 싸워요' },
+    { nm: '이온 폭풍', c: '#5bb3e6', d: '번개가 떨어지는 곳에서 싸워요' },
+    { nm: '정거장', c: '#e3ae45', d: '상점: 포탑·특수 무기·개조·수리' },
+    { nm: '신호', c: '#7cc66a', d: '무슨 일이 생길지 몰라요. 선택해요' },
+    { nm: '정비소', c: '#5fd0b0', d: '선체를 공짜로 고쳐요' },
+    { nm: '잔해', c: '#b9b0a0', d: '고철을 주워요. 가끔 매복이 있어요' },
+    { nm: '기함', c: '#c9c9e0', d: '중간 보스 「강철 기함」' },
+    { nm: '최종 보스', c: '#e0405e', d: '마지막 적' },
+  ];
+  const NI = [
+    '<path d="M5 5l14 14M19 5L5 19" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>',
+    '<path d="M12 2.5l2.7 5.8 6.3.7-4.7 4.3 1.3 6.2L12 16.4l-5.6 3.1 1.3-6.2L3 9l6.3-.7z" fill="currentColor"/>',
+    '<circle cx="7" cy="8" r="3.2" fill="currentColor"/><circle cx="17" cy="8" r="3.2" fill="currentColor"/><circle cx="12" cy="17" r="3.2" fill="currentColor"/>',
+    '<path d="M6.5 18a4.3 4.3 0 01-.4-8.6 5.5 5.5 0 0110.4-1.2A4.9 4.9 0 1117.5 18z" fill="currentColor"/>',
+    '<path d="M6 8l5-4 6 2 3 6-3 7-7 1-5-5z" fill="currentColor"/>',
+    '<path d="M13.5 2L5 14h6l-2 8 9.5-13h-6z" fill="currentColor"/>',
+    '<path d="M4.5 9h15l-1.6 11.5H6.1z" fill="currentColor"/><path d="M8.5 9V7.5a3.5 3.5 0 017 0V9" fill="none" stroke="currentColor" stroke-width="2.2"/>',
+    '<path d="M8.5 9a3.5 3.5 0 117 0c0 2.6-3.5 3-3.5 5.5" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"/><circle cx="12" cy="19" r="1.8" fill="currentColor"/>',
+    '<path d="M10 4h4v6h6v4h-6v6h-4v-6H4v-4h6z" fill="currentColor"/>',
+    '<rect x="4" y="9" width="16" height="10" rx="2" fill="currentColor"/><path d="M5 9l2.5-4h9L19 9" fill="none" stroke="currentColor" stroke-width="2.2"/>',
+    '<path d="M3 10h18v6H3z M7 6h10v4H7z M10 16h4v4h-4z" fill="currentColor"/>',
+    '<path d="M3 18.5l2-11 4.2 5 2.8-7.5 2.8 7.5 4.2-5 2 11z" fill="currentColor"/>',
+  ];
+
+  /* ---- events: 26종, 선택지마다 확률 결과 ---- */
+  // 결과 키: sc 고철, hp 선체, P 동력, up 개조('r' 무작위), wp 포탑 획득, sp 특수 무기 획득, tu 포탑 강화, fight 전투, fs 적 다친 채 시작
+  const EVS = [
+    { t: '조난 신호', d: '엔진이 멈춘 낡은 화물선이 도와 달라고 신호를 보내요.', c: [
+      { l: '도와준다', ai: 3, r: [[0.65, { sc: 22, x: '고맙다며 고철을 나눠 줬어요.' }], [0.35, { fight: PIR, x: '함정이었어요! 숨어 있던 해적이 덤벼요.' }]] },
+      { l: '못 본 척 지나간다', ai: 1, r: [[1, { x: '조용히 지나갔어요.' }]] }] },
+    { t: '떠도는 보급 상자', d: '주인 없는 보급 상자가 천천히 빙글빙글 돌고 있어요.', c: [
+      { l: '집게팔로 끌어온다', ai: 3, r: [[0.7, { sc: 16, x: '쓸 만한 고철이 가득!' }], [0.3, { hp: -6, x: '상자가 터졌어요!' }]] },
+      { l: '포탑으로 쏴서 연다', ai: 2.5, r: [[1, { sc: 8, x: '부서진 조각만 조금 건졌어요.' }]] }] },
+    { t: '수상한 떠돌이 상인', d: '"좋은 물건 있어요. 고철 25면 하나 드리지."', c: [
+      { l: '산다 (고철 25)', q: { sc: 25 }, ai: 3.5, r: [[0.5, { sc: -25, wp: 1, x: '상자를 열어 보니 포탑이에요.' }], [0.5, { sc: -25, up: 'r', x: '상자를 열어 보니 개조 부품이에요.' }]] },
+      { l: '값을 깎아 본다 (고철 12)', q: { sc: 12 }, ai: 2, r: [[0.5, { sc: -12, up: 'r', x: '반값에 샀어요!' }], [0.5, { x: '상인이 휙 토라져 떠났어요.' }]] },
+      { l: '거절한다', ai: 1, r: [[1, { x: '상인이 아쉬운 듯 떠났어요.' }]] }] },
+    { t: '버려진 정거장', d: '불 꺼진 정거장 안쪽에서 무언가 깜빡이고 있어요.', c: [
+      { l: '안을 뒤진다', ai: 3, r: [[0.35, { P: 1, x: '예비 원자로 부품을 찾았어요!' }], [0.35, { sc: 18, x: '창고에서 고철을 찾았어요.' }], [0.3, { hp: -8, x: '낡은 배선에서 불꽃이 튀었어요.' }]] },
+      { l: '그냥 간다', ai: 1, r: [[1, { x: '괜히 위험할 필요는 없죠.' }]] }] },
+    { t: '해적의 통행료', d: '해적선이 길을 막고 "고철 15를 내면 보내 주지"라고 해요.', c: [
+      { l: '낸다 (고철 15)', q: { sc: 15 }, ai: 2, r: [[1, { sc: -15, x: '해적이 낄낄대며 비켜 줬어요.' }]] },
+      { l: '싸운다', ai: 3, r: [[1, { fight: PIR, x: '거절하자 해적이 쏘기 시작해요!' }]] },
+      { l: '전속력으로 도망친다', ai: 1.5, r: [[0.5, { x: '간신히 따돌렸어요.' }], [0.5, { hp: -8, x: '도망치다 몇 발 맞았어요.' }]] }] },
+    { t: '유성우', d: '반짝이는 유성우가 지나가요. 희귀 광석이 섞여 있대요.', c: [
+      { l: '가까이 붙어 줍는다', ai: 2.5, r: [[0.55, { sc: 24, x: '반짝이는 광석을 잔뜩 주웠어요.' }], [0.45, { hp: -7, x: '유성에 긁혔어요.' }]] },
+      { l: '멀리서 구경만 한다', ai: 1.5, r: [[1, { hp: 3, x: '기분 좋아진 승무원들이 배를 닦았어요.' }]] }] },
+    { t: '고장 난 수리 로봇', d: '작은 수리 로봇이 빙글빙글 떠다녀요.', c: [
+      { l: '고쳐서 데려간다', ai: 3, r: [[0.6, { up: 4, x: '로봇이 수리반에 들어왔어요.' }], [0.4, { hp: -5, x: '로봇이 찌릿! 감전시키고 달아났어요.' }]] },
+      { l: '분해해서 판다', ai: 2, r: [[1, { sc: 12, x: '부품을 고철로 챙겼어요.' }]] }] },
+    { t: '이상한 반복 신호', d: '같은 음이 계속 되풀이되는 신호가 들려요.', c: [
+      { l: '신호를 따라간다', ai: 2.5, r: [[0.45, { wp: 1, x: '버려진 무기 보관함을 찾았어요!' }], [0.55, { fight: DRO, x: '경비 드론의 신호였어요!' }]] },
+      { l: '무시한다', ai: 1, r: [[1, { x: '신호가 점점 멀어졌어요.' }]] }] },
+    { t: '떠돌이 정비공', d: '"고철 10이면 선체를 손봐 드려요."', c: [
+      { l: '맡긴다 (고철 10)', q: { sc: 10 }, ai: 2.5, r: [[1, { sc: -10, hp: 20, x: '깔끔하게 고쳐 줬어요.' }]] },
+      { l: '포탑을 손봐 달라 한다 (고철 20)', q: { sc: 20 }, ai: 2.8, r: [[1, { sc: -20, tu: 1, x: '포탑 하나가 더 세졌어요.' }]] },
+      { l: '괜찮다고 한다', ai: 1, r: [[1, { x: '정비공이 손을 흔들었어요.' }]] }] },
+    { t: '우주 고래 떼', d: '거대한 우주 고래들이 천천히 헤엄쳐 가요.', c: [
+      { l: '뒤를 따라간다', ai: 2.5, r: [[0.5, { sc: 20, x: '고래가 지나간 자리에 광물이 남았어요.' }], [0.5, { hp: -5, x: '꼬리에 살짝 치였어요.' }]] },
+      { l: '조용히 비켜 준다', ai: 1.5, r: [[1, { sc: 4, x: '평화로운 광경이었어요.' }]] }] },
+    { t: '현상금 게시판', d: '근처를 떠도는 사나운 정예 함선에 현상금이 걸렸어요.', c: [
+      { l: '사냥을 맡는다', ai: 2.5, r: [[1, { fight: ELI, x: '정예 함선을 찾았어요. 조심!' }]] },
+      { l: '모른 척한다', ai: 1.5, r: [[1, { x: '다음 기회에요.' }]] }] },
+    { t: '버려진 방어막 발전기', d: '아직 윙윙 소리가 나는 발전기가 떠 있어요.', c: [
+      { l: '우리 배에 연결한다', ai: 2.5, r: [[0.5, { up: 2, x: '방어막이 더 단단해졌어요!' }], [0.5, { hp: -7, x: '과부하로 펑!' }]] },
+      { l: '고철로 뜯는다', ai: 2, r: [[1, { sc: 15, x: '쓸 만한 금속을 뜯어냈어요.' }]] }] },
+    { t: '도박 위성', d: '반짝이는 간판: "고철을 걸고 두 배로!"', c: [
+      { l: '고철 10을 건다', q: { sc: 10 }, ai: 1.8, r: [[0.5, { sc: 15, x: '이겼어요!' }], [0.5, { sc: -10, x: '졌어요…' }]] },
+      { l: '안 한다', ai: 2, r: [[1, { x: '현명한 선택이에요.' }]] }] },
+    { t: '피난 셔틀', d: '작은 셔틀이 다음 정거장까지 태워 달래요.', c: [
+      { l: '태워 준다', ai: 3, r: [[1, { hp: 12, x: '타고 가던 기술자들이 선체를 고쳐 줬어요.' }]] },
+      { l: '고철을 나눠 준다 (고철 10)', q: { sc: 10 }, ai: 2.5, r: [[1, { sc: -10, up: 'r', x: '고맙다며 장비를 선물했어요.' }]] }] },
+    { t: '블랙홀 가장자리', d: '빛도 휘어지는 곳이에요. 중력을 타면 큰 고철 더미에 닿을 수 있어요.', c: [
+      { l: '중력을 탄다', ai: 2, r: [[0.6, { sc: 22, x: '멋지게 돌아 나왔어요!' }], [0.4, { hp: -10, x: '선체가 비틀렸어요.' }]] },
+      { l: '멀리 돌아간다', ai: 1.5, r: [[1, { x: '안전 운행!' }]] }] },
+    { t: '고대 유적선', d: '아주 오래된 배 안에 문 하나가 굳게 닫혀 있어요.', c: [
+      { l: '문을 연다', ai: 2.8, r: [[0.3, { sp: 1, x: '옛날 특수 무기가 있었어요!' }], [0.4, { sc: 20, x: '귀한 금속 장식을 찾았어요.' }], [0.3, { fight: DRO, x: '유적 경비 드론이 깨어났어요!' }]] },
+      { l: '사진만 찍는다', ai: 1.5, r: [[1, { sc: 5, x: '사진을 팔 수 있겠어요.' }]] }] },
+    { t: '무기 시험장', d: '관리인이 표적을 맞히면 상금을 준대요.', c: [
+      { l: '시험 사격에 나간다', ai: 2.5, r: [[0.6, { sc: 18, x: '표적 한가운데!' }], [0.4, { hp: -5, x: '튕겨 나온 파편에 맞았어요.' }]] },
+      { l: '새 포탑을 시험해 본다', ai: 2, r: [[1, { wp: 1, x: '시험용 포탑을 그냥 가져가래요.' }]] }] },
+    { t: '거대한 고철 더미', d: '부서진 배들이 뭉쳐 섬처럼 떠 있어요.', c: [
+      { l: '오래 뒤진다', ai: 2.5, r: [[0.55, { sc: 28, x: '고철을 산더미처럼!' }], [0.45, { fight: PIR, x: '같은 걸 노리던 해적과 마주쳤어요!' }]] },
+      { l: '빨리 줍고 간다', ai: 2, r: [[1, { sc: 10, x: '조금만 챙겼어요.' }]] }] },
+    { t: '승무원 생일', d: '오늘은 승무원 한 명의 생일이에요!', c: [
+      { l: '파티를 연다', ai: 2, r: [[1, { hp: 6, x: '신난 승무원들이 배를 반짝반짝 닦았어요.' }]] },
+      { l: '일하고 나중에 축하한다', ai: 2, r: [[1, { sc: 8, x: '열심히 일해서 고철을 모았어요.' }]] }] },
+    { t: '이온 구름', d: '파직파직 전기가 튀는 구름이에요.', c: [
+      { l: '뚫고 지나간다', ai: 2.2, r: [[0.5, { up: 7, x: '전기를 모아 특수 충전기를 만들었어요!' }], [0.5, { hp: -7, x: '전기가 회로를 태웠어요.' }]] },
+      { l: '돌아간다', ai: 1.5, r: [[1, { x: '시간은 걸렸지만 안전해요.' }]] }] },
+    { t: '불 꺼진 배', d: '불을 모두 끈 배 한 척이 슬금슬금 다가와요.', c: [
+      { l: '인사를 보낸다', ai: 2.2, r: [[0.5, { sc: 15, x: '수줍은 상인이었어요. 선물을 줬어요.' }], [0.5, { fight: PIR, x: '해적이었어요!' }]] },
+      { l: '먼저 쏜다', ai: 2.5, r: [[1, { fight: PIR, fs: 1, x: '선제공격! 적이 다친 채로 시작해요.' }]] }] },
+    { t: '냉동 수면 캡슐', d: '얼어붙은 캡슐 안에 누군가 잠들어 있어요.', c: [
+      { l: '깨운다', ai: 2.5, r: [[0.5, { up: 1, x: '엔진 기술자였어요! 엔진을 손봐 줬어요.' }], [0.5, { up: 5, x: '의사였어요! 숙소를 꾸며 줬어요.' }]] },
+      { l: '캡슐째 판다', ai: 2, r: [[1, { sc: 14, x: '…좀 미안하지만요.' }]] }] },
+    { t: '망가진 원자로', d: '고치면 쓸 수 있을 것 같은 원자로가 떠 있어요.', c: [
+      { l: '고친다 (고철 25)', q: { sc: 25 }, ai: 3.2, r: [[1, { sc: -25, P: 1, x: '동력이 늘었어요!' }]] },
+      { l: '그냥 간다', ai: 1.5, r: [[1, { x: '아까운 걸 두고 떠났어요.' }]] }] },
+    { t: '무기 밀수꾼', d: '"특수 무기 하나 있는데… 고철 35."', c: [
+      { l: '산다 (고철 35)', q: { sc: 35 }, ai: 3, r: [[1, { sc: -35, sp: 1, x: '묵직한 특수 무기를 받았어요.' }]] },
+      { l: '신고한다', ai: 2, r: [[0.6, { sc: 15, x: '포상금을 받았어요.' }], [0.4, { fight: PIR, x: '밀수꾼이 화가 나서 덤벼요!' }]] }] },
+    { t: '포탑 공방', d: '떠돌이 장인이 포탑을 다듬어 준대요.', c: [
+      { l: '맡긴다 (고철 18)', q: { sc: 18 }, ai: 3, r: [[1, { sc: -18, tu: 1, x: '포탑이 반짝반짝 세졌어요.' }]] },
+      { l: '구경만 한다', ai: 1.5, r: [[1, { x: '멋진 솜씨였어요.' }]] }] },
+    { t: '정예 함선의 잔해', d: '방금 부서진 정예 함선이 떠 있어요. 무기가 멀쩡해 보여요.', c: [
+      { l: '무기를 떼어 온다', ai: 2.8, r: [[0.6, { wp: 1, x: '포탑을 떼어 왔어요!' }], [0.4, { fight: DRO, x: '잔해를 지키던 드론이 깨어났어요!' }]] },
+      { l: '고철만 줍는다', ai: 2, r: [[1, { sc: 12, x: '고철을 챙겼어요.' }]] }] },
+  ];
+
+  /* ======================= map ======================= */
+  function mkRng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const SYL = ['아', '라', '베', '노', '카', '시', '온', '루', '미', '도', '타', '세', '린', '펠', '오', '하', '주', '네', '소', '키'];
+  function secName(seed, c) {
+    const R = mkRng((seed * 31 + c * 977 + 7) >>> 0);
+    const n = R() < 0.4 ? 3 : 2; let s = '';
+    for (let i = 0; i < n; i++) s += SYL[(R() * SYL.length) | 0];
+    return s;
+  }
+  const midCol = (len) => Math.max(2, Math.round(len / 2));
+  function genMap(seed, len) {
+    const R = mkRng(seed), mc = midCol(len);
+    const M = [];
+    for (let c = 0; c <= len; c++) {
+      const n = c === 0 || c === len || c === mc ? 1 : c === 1 ? 2 + Math.floor(R() * 2) : 2 + Math.floor(R() * 3);
+      const col = [];
+      for (let i = 0; i < n; i++) col.push({ t: -1, x: n === 1 ? 0.5 : 0.12 + 0.76 * i / (n - 1) + (R() - 0.5) * 0.07, e: [] });
+      M.push(col);
+    }
+    for (let c = 0; c < len; c++) {
+      const A = M[c], B = M[c + 1], n = A.length, m = B.length, E = [];
+      const add = (i, j) => { if (!E.some((e) => e[0] === i && e[1] === j)) E.push([i, j]); };
+      for (let j = 0; j < m; j++) add(n === 1 ? 0 : Math.round(j * (n - 1) / Math.max(1, m - 1)), j);
+      for (let i = 0; i < n; i++) add(i, m === 1 ? 0 : Math.round(i * (m - 1) / Math.max(1, n - 1)));
+      for (let i = 0; i < n; i++) {
+        if (R() >= 0.45 || m < 2) continue;
+        const j = clamp((m === 1 ? 0 : Math.round(i * (m - 1) / Math.max(1, n - 1))) + (R() < 0.5 ? -1 : 1), 0, m - 1);
+        if (!E.some((e) => (e[0] - i) * (e[1] - j) < 0)) add(i, j);
+      }
+      for (const e of E) A[e[0]].e.push(e[1]);
+      A.forEach((nd) => nd.e.sort((a, b) => a - b));
+    }
+    const shopC = [Math.max(2, mc - 1), Math.min(len - 1, mc + Math.max(1, Math.round((len - mc) / 2)))];
+    const POOL = [[PIR, 24], [EVT, 20], [SLV, 7], [AST, 8], [STM, 7], [DRO, 8], [NEB, 6], [ELI, 7], [SHP, 5], [REP, 4]];
+    const roll = (c) => {
+      const pool = POOL.filter((p) => (c === 1 ? [PIR, EVT, SLV, AST].includes(p[0]) : true) && (p[0] !== ELI || c >= 3) && (p[0] !== SHP || c >= 2) && (p[0] !== REP || c >= 3));
+      let tot = 0; for (const p of pool) tot += p[1];
+      let x = R() * tot; for (const p of pool) { x -= p[1]; if (x < 0) return p[0]; }
+      return PIR;
+    };
+    for (let c = 1; c < len; c++) {
+      const col = M[c];
+      if (c === mc) { col[0].t = MID; continue; }
+      col.forEach((nd, i) => { let t = roll(c); if (i > 0 && t === col[i - 1].t) t = roll(c); nd.t = t; });
+      if (shopC.includes(c)) col[(R() * col.length) | 0].t = SHP;
+      if (c === len - 1 && c !== mc) { const a = (R() * col.length) | 0; col[a].t = REP; if (col.length > 1) col[(a + 1) % col.length].t = SHP; }
+    }
+    M[0][0].t = -1; M[len][0].t = BOS;
+    return M;
+  }
+  const mapCache = {};
+  function getMap(st) { const k = st.seed + ':' + st.len; return mapCache[k] || (mapCache[k] = genMap(st.seed, st.len)); }
+  function nextRows(st) { if (st.col >= st.len) return []; const M = getMap(st), nd = M[st.col][st.row]; return nd ? nd.e.slice() : []; }
+  const finalBoss = (st) => (st.seed % 2 ? 14 : 15);
+
+  /* ======================= coarse state ======================= */
+  const B36 = '0123456789abcdefghijklmnopqrstuvwxyz';
+  function upA(st) { const s = st.up || ''; const o = []; for (let i = 0; i < UPG.length; i++) o.push(+s[i] || 0); return o; }
+  function setUp(st, a) { st.up = a.join(''); }
+  function tmA(st) { const o = []; for (let i = 0; i + 1 < st.tm.length; i += 2) o.push([B36.indexOf(st.tm[i]), +st.tm[i + 1] || 1]); return o; }
+  function setTm(st, a) { st.tm = a.map((x) => B36[x[0]] + x[1]).join(''); }
+  function humans(st) { const o = []; for (let i = 0; i < st.NC; i++) if (st.hu[i]) o.push(i); return o; }
+  function decider(st) { if (st.hu[st.cap]) return st.cap; const h = humans(st); return h.length ? h[0] : -1; }
+  // 포수 → 포탑 자리 (사람 먼저, 자리 번호 순)
+  function gunOrder(st, cap, hu) {
+    const o = [];
+    for (const pass of [1, 0]) for (let i = 0; i < st.NC; i++) if (i !== cap && (hu[i] ? 1 : 0) === pass) o.push(i);
+    return o;
+  }
+  function setShip(st, h) {
+    const D = SHIPS[h]; st.sh = h; st.hp = st.hm = D.hm; st.P = D.P; st.sp = D.sp; st.up = '0'.repeat(UPG.length); st.cg = [];
+    setTm(st, D.tt.map((t) => [t, 1]));
+  }
+  function init(players, opts) {
+    const o = opts || {};
+    const np = clamp(players.length | 0, 1, MAXC);
+    let len = Math.round(+o.len); if (!(len >= 4 && len <= 18)) len = 10;
+    let co = Math.round(+o.crew); if (!(co >= 4 && co <= 6)) co = 0;
+    const NC = clamp(Math.max(np, co || 4), 4, MAXC);
+    const nm = [], hu = [], lv = [];
+    for (let i = 0; i < NC; i++) {
+      const p = i < np ? players[i] : null;
+      nm.push(p ? String(p.name || '').slice(0, 10) || (i + 1) + '번' : 'AI 승무원');
+      hu.push(p && !p.ai ? 1 : 0);
+      lv.push(p ? (p.ai ? clamp((p.lv | 0) || 2, 1, 3) : 0) : 2);
+    }
+    let cap = hu.indexOf(1); if (cap < 0) cap = 0;
+    const st = { rid: 1 + U.rand(99999), np, NC, nm, hu, lv, cap, vc: -1, seed: 1 + U.rand(2147483000), len, sh: 0, col: 0, row: 0, path: '0',
+      ph: 'hangar', vt: new Array(NC).fill(-1), hp: 130, hm: 130, sc: 20, P: 6, tm: '', sp: 0, up: '', cg: [],
+      fk: 0, fi: null, ev: -1, eu: 0, shop: null, msg: '', k: 0, cp: 0, fw: 0, ga: 0, win: 0 };
+    st.vc = gunOrder(st, cap, hu)[0];
+    setShip(st, 0);
+    return st;
+  }
+  function actor(st) {
+    if (!st || st.ph === 'fight' || st.ph === 'done') return null;
+    const h = humans(st);
+    return h.length ? h : null;
+  }
+  const sgn = (n) => (n > 0 ? '+' : '−') + Math.abs(n);
+  function randUp(st) { const u = upA(st); const ok = UPG.map((x, i) => i).filter((i) => u[i] < UPG[i].mx); return ok.length ? ok[(rnd() * ok.length) | 0] : -1; }
+  function addUp(st, id) {
+    const u = upA(st); if (id < 0 || id >= UPG.length || u[id] >= UPG[id].mx) return false;
+    u[id]++; setUp(st, u);
+    if (id === 0) { st.hm += 25; st.hp += 25; }
+    if (id === 3) st.P = Math.min(12, st.P + 1);
+    return true;
+  }
+  const tVal = (t, lv) => TUR[t].pr * (1 + 0.45 * (lv - 1));
+  function weakestMount(st) { const tm = tmA(st); let j = 0; tm.forEach((x, i) => { if (tVal(x[0], x[1]) < tVal(tm[j][0], tm[j][1])) j = i; }); return j; }
+  function toCargo(st, code) {
+    if (st.cg.length < 4) { st.cg.push(code); return ''; }
+    const g = code >= 1000 ? 20 : Math.round(TUR[(code / 10) | 0].pr / 2); st.sc += g; return ' (창고가 꽉 차 고철 +' + g + ')';
+  }
+  // 새 포탑: 가장 약한 자리보다 좋으면 바로 장착(헌 포탑은 창고로), 아니면 창고로
+  function gainTurret(st, t, lv) {
+    lv = lv || 1;
+    const tm = tmA(st), j = weakestMount(st), N = TUR[t].nm + (lv > 1 ? ' Lv' + lv : '');
+    if (tVal(t, lv) > tVal(tm[j][0], tm[j][1]) + 4) {
+      const old = tm[j]; tm[j] = [t, lv]; setTm(st, tm);
+      return '「' + N + '」을 ' + (j + 1) + '번 포탑에 달았어요' + toCargo(st, old[0] * 10 + old[1]);
+    }
+    return '「' + N + '」을 창고에 넣었어요' + toCargo(st, t * 10 + lv);
+  }
+  function gainSpecial(st, s) {
+    if (s === st.sp) { st.sc += 20; return '같은 특수 무기라 고철로 (+20)'; }
+    const old = st.sp; st.sp = s;
+    return '특수 무기 「' + SPC[s].nm + '」 장착!' + toCargo(st, 1000 + old);
+  }
+  function upTurret(st, m) {
+    const tm = tmA(st);
+    if (m == null || m < 0) { const ok = tm.map((x, i) => i).filter((i) => tm[i][1] < 3); if (!ok.length) return ''; m = ok[0]; for (const i of ok) if (tVal(tm[i][0], 1) > tVal(tm[m][0], 1)) m = i; }
+    if (!tm[m] || tm[m][1] >= 3) return '';
+    tm[m][1]++; setTm(st, tm);
+    return (m + 1) + '번 포탑 「' + TUR[tm[m][0]].nm + '」 Lv' + tm[m][1];
+  }
+  function startRun(st) { st.ph = 'map'; st.vt = new Array(st.NC).fill(-1); st.msg = '출발! 다음에 갈 곳을 골라요.'; return st; }
+  const POOLS = [
+    [[[0, 0], [1], [0, 2, 2]], [[0, 2, 2], [0, 0], [1]], [[1], [0, 0], [7]], [[7], [0, 2], [1]], [[0, 3, 3], [1], [0, 0]]],
+    [[[1, 0], [4], [0, 0, 2]], [[5, 0], [1, 2, 2], [0, 0]], [[6, 0], [7, 0], [1]], [[9], [1, 0], [0, 3, 3]], [[4, 2, 2], [0, 0], [6]], [[8], [0, 0], [1]]],
+    [[[1, 1], [4, 0], [9, 2]], [[8], [5, 0], [1, 1]], [[6, 9], [1, 2, 2], [4, 0]], [[4, 5], [9, 0], [6, 1]], [[1, 7, 0], [6, 4], [9, 3, 3]], [[9, 0], [8, 3, 3], [5, 1]]],
+  ];
+  function compose(ty, f, st) {
+    const T = f < 0.34 ? 0 : f < 0.67 ? 1 : 2;
+    const pick = (a) => a[(rnd() * a.length) | 0];
+    if (ty === ELI) { const e = 10 + ((rnd() * 3) | 0); return T === 0 ? [[0, 0], [e]] : T === 1 ? [[0, 2, 2], [e, 0]] : [[1, 0], [e, 0], [pick([1, 4, 6])]]; }
+    if (ty === DRO) return T === 0 ? [[2, 2, 2, 3], [2, 2, 3, 3], [2, 2, 2, 2]] : T === 1 ? [[2, 2, 2, 3, 3], [2, 2, 8], [3, 3, 3, 2, 2]] : [[2, 2, 2, 2, 3, 3], [8, 3, 3, 2], [8, 2, 2]];
+    if (ty === MID) return [[13]];
+    if (ty === BOS) return [[finalBoss(st)]];
+    return pick(POOLS[T]).map((w) => w.slice());
+  }
+  function startFight(st, ty, msg, fs) {
+    const f = Math.min(1, st.col / st.len);
+    st.fk++;
+    st.fi = { k: st.fk, ty, en: compose(ty, f, st), f: r2(f), fs: fs ? 1 : 0 };
+    st.ph = 'fight'; st.msg = msg || '';
+    return st;
+  }
+  function pickEvent(st) {
+    let ok = []; for (let i = 0; i < EVS.length; i++) if (!(st.eu & (1 << i))) ok.push(i);
+    if (!ok.length) { st.eu = 0; ok = EVS.map((e, i) => i); }
+    const i = ok[(rnd() * ok.length) | 0]; st.eu |= 1 << i; return i;
+  }
+  function genShop(st) {
+    const items = [], u = upA(st), tm = tmA(st);
+    const price = (p) => Math.round(p * (0.9 + rnd() * 0.25));
+    const ts = U.shuffle(TUR.map((w, i) => i).filter((i) => !tm.some((x) => x[0] === i)));
+    ts.slice(0, 2).forEach((i) => items.push([0, i, price(TUR[i].pr), 0]));
+    const ups = U.shuffle(UPG.map((x, i) => i).filter((i) => u[i] < UPG[i].mx));
+    ups.slice(0, 3).forEach((i) => items.push([1, i, price(UPG[i].pr), 0]));
+    const ms = U.shuffle(tm.map((x, i) => i).filter((i) => tm[i][1] < 3));
+    ms.slice(0, 2).forEach((m) => items.push([3, m, price(28 + 14 * tm[m][1]), 0]));
+    const sps = SPC.map((x, i) => i).filter((i) => i !== st.sp);
+    const s = sps[(rnd() * sps.length) | 0]; items.push([4, s, price(SPC[s].pr), 0]);
+    items.push([2, 0, 10, 0]);
+    return items;
+  }
+  function enterNode(st, row) {
+    st.col++; st.row = row; st.path += B36[row]; st.vt = new Array(st.NC).fill(-1); st.msg = '';
+    const t = getMap(st)[st.col][row].t;
+    if (t === REP) { const g = Math.min(st.hm - st.hp, Math.round(st.hm * 0.4)); st.hp += g; st.msg = '정비소에서 선체를 고쳤어요. (선체 +' + g + ')'; st.ph = 'map'; }
+    else if (t === SLV) {
+      if (rnd() < 0.25) startFight(st, PIR, '잔해 뒤에 해적이 숨어 있었어요!');
+      else { const g = 14 + U.rand(14); st.sc += g; st.ga += g; st.msg = '잔해에서 고철을 주웠어요. (고철 +' + g + ')'; st.ph = 'map'; }
+    } else if (t === SHP) { st.ph = 'shop'; st.shop = genShop(st); st.msg = ''; }
+    else if (t === EVT) { st.ph = 'ev'; st.ev = pickEvent(st); }
+    else startFight(st, t, '');
+    return st;
+  }
+  function choiceOk(st, c) {
+    const E = EVS[st.ev], ch = E && E.c[c];
+    if (!ch) return false;
+    if (ch.q && ch.q.sc && st.sc < ch.q.sc) return false;
+    return true;
+  }
+  function resolveEvent(st, c) {
+    const E = EVS[st.ev];
+    if (!E) { st.ph = 'map'; return st; }
+    if (!choiceOk(st, c)) c = E.c.length - 1;
+    const ch = E.c[c];
+    let x = rnd(), o = ch.r[ch.r.length - 1][1];
+    for (const pr of ch.r) { if (x < pr[0]) { o = pr[1]; break; } x -= pr[0]; }
+    st.vt = new Array(st.NC).fill(-1); st.ev = -1;
+    const parts = [];
+    if (o.sc) { st.sc = Math.max(0, st.sc + o.sc); if (o.sc > 0) st.ga += o.sc; parts.push('고철 ' + sgn(o.sc)); }
+    if (o.hp) { const b = st.hp; st.hp = clamp(st.hp + o.hp, 1, st.hm); if (st.hp !== b) parts.push('선체 ' + sgn(st.hp - b)); }
+    if (o.P) { if (st.P < 12) { st.P++; parts.push('동력 +1'); } else { st.sc += 15; parts.push('고철 +15'); } }
+    if (o.up != null) {
+      const id = o.up === 'r' ? randUp(st) : o.up;
+      if (addUp(st, id)) parts.push('「' + UPG[id].nm + '」'); else { st.sc += 15; parts.push('고철 +15'); }
+    }
+    if (o.wp) { const ok = TUR.map((w, i) => i).filter((i) => i > 0); parts.push(gainTurret(st, ok[(rnd() * ok.length) | 0], st.col / st.len > 0.6 && rnd() < 0.4 ? 2 : 1)); }
+    if (o.sp) { const ok = SPC.map((w, i) => i).filter((i) => i !== st.sp); parts.push(gainSpecial(st, ok[(rnd() * ok.length) | 0])); }
+    if (o.tu) { const r = upTurret(st, -1); parts.push(r || '고철 +15'); if (!r) st.sc += 15; }
+    st.msg = o.x + (parts.length ? ' (' + parts.join(', ') + ')' : '');
+    if (o.fight != null) startFight(st, o.fight, st.msg, o.fs); else st.ph = 'map';
+    return st;
+  }
+  function buy(st, i) {
+    const it = st.shop && st.shop[i];
+    if (!it || it[3] || st.sc < it[2]) return false;
+    if (it[0] === 2) { if (st.hp >= st.hm) return false; st.sc -= it[2]; st.hp = Math.min(st.hm, st.hp + 15); st.msg = '선체를 고쳤어요 (+15)'; return true; }
+    if (it[0] === 1) { if (upA(st)[it[1]] >= UPG[it[1]].mx) return false; st.sc -= it[2]; addUp(st, it[1]); it[3] = 1; st.msg = '「' + UPG[it[1]].nm + '」 설치!'; return true; }
+    if (it[0] === 3) { const r = upTurret(st, it[1]); if (!r) return false; st.sc -= it[2]; it[3] = 1; st.msg = r + '!'; return true; }
+    if (it[0] === 4) { st.sc -= it[2]; it[3] = 1; st.msg = gainSpecial(st, it[1]); return true; }
+    st.sc -= it[2]; it[3] = 1; st.msg = gainTurret(st, it[1], 1); return true;
+  }
+  function equip(st, c, m) {
+    const code = st.cg[c]; if (code == null) return false;
+    if (code >= 1000) { const s = code - 1000; st.cg.splice(c, 1); st.cg.push(1000 + st.sp); st.sp = s; st.msg = '특수 무기 「' + SPC[s].nm + '」 장착!'; return true; }
+    const tm = tmA(st); if (!tm[m]) return false;
+    const old = tm[m]; tm[m] = [(code / 10) | 0, code % 10 || 1]; setTm(st, tm);
+    st.cg[c] = old[0] * 10 + old[1];
+    st.msg = (m + 1) + '번 포탑을 「' + TUR[tm[m][0]].nm + '」(으)로 바꿨어요';
+    return true;
+  }
+  function leaveShop(st) { st.ph = 'map'; st.shop = null; st.vt = new Array(st.NC).fill(-1); st.msg = '정거장을 떠나요. 다음 갈 곳을 골라요.'; return st; }
+  function tally(st) {
+    const cnt = {}; let best = -1, bc = 0;
+    for (const i of humans(st)) { const v = st.vt[i]; if (v < 0) continue; cnt[v] = (cnt[v] || 0) + 1; if (cnt[v] > bc) { bc = cnt[v]; best = v; } }
+    return best;
+  }
+  function tryResolve(st, force) {
+    const h = humans(st);
+    if (!force && h.some((i) => st.vt[i] < 0)) return st;
+    const v = tally(st);
+    if (st.ph === 'map') { const nx = nextRows(st); return enterNode(st, nx.includes(v) ? v : nx[0]); }
+    if (st.ph === 'ev') return resolveEvent(st, v >= 0 ? v : 0);
+    if (st.ph === 'shop') return leaveShop(st);
+    return st;
+  }
+  function apply(st, seat, a) {
+    if (!a || typeof a !== 'object') throw new Error('bad action');
+    const coarse = ['hangar', 'map', 'shop', 'ev'].includes(st.ph);
+    switch (a.t) {
+      case 'ship': { if (st.ph !== 'hangar' || seat !== decider(st)) throw new Error('decider only'); const h = a.h | 0; if (h < 0 || h >= SHIPS.length) throw new Error('bad ship'); setShip(st, h); return st; }
+      case 'role': {
+        if (!coarse) throw new Error('not now');
+        if (a.r === 'cap') { if (seat === st.cap) return st; const old = st.cap; st.cap = seat; if (st.vc === seat) st.vc = old; return st; }
+        if (a.r === 'gun') {
+          if (seat !== st.cap) return st;
+          let nc = st.vc >= 0 && st.vc !== seat ? st.vc : -1;
+          if (nc < 0) for (let i = 0; i < st.NC; i++) if (i !== seat) { nc = i; break; }
+          st.cap = nc; st.vc = seat; return st;
+        }
+        throw new Error('bad role');
+      }
+      case 'vc': { if (!coarse || seat !== st.cap) throw new Error('captain only'); const s = a.s | 0; if (s < 0 || s >= st.NC || s === st.cap) throw new Error('bad seat'); st.vc = s; return st; }
+      case 'go': { if (st.ph !== 'hangar' || seat !== decider(st)) throw new Error('decider only'); return startRun(st); }
+      case 'vote': { if (st.ph !== 'map') throw new Error('not map'); const n = a.n | 0; if (!nextRows(st).includes(n)) throw new Error('bad node'); st.vt[seat] = n; return tryResolve(st); }
+      case 'ch': { if (st.ph !== 'ev') throw new Error('not event'); const c = a.c | 0; if (!choiceOk(st, c)) throw new Error('bad choice'); st.vt[seat] = c; return tryResolve(st); }
+      case 'buy': { if (st.ph !== 'shop') throw new Error('not shop'); if (!buy(st, a.i | 0)) throw new Error('cannot buy'); return st; }
+      case 'eq': { if (!['map', 'shop'].includes(st.ph)) throw new Error('not now'); if (!equip(st, a.c | 0, a.m | 0)) throw new Error('cannot equip'); return st; }
+      case 'leave': { if (st.ph !== 'shop') throw new Error('not shop'); st.vt[seat] = 1; return tryResolve(st); }
+      case 'unvote': { if (!['map', 'ev', 'shop'].includes(st.ph)) throw new Error('not now'); st.vt[seat] = -1; return st; }
+    }
+    throw new Error('unknown action');
+  }
+
+  /* ---- AI for coarse decisions (only when no humans are aboard) ---- */
+  function aiNode(st) {
+    const M = getMap(st), rows = nextRows(st), hr = st.hp / st.hm;
+    let best = rows[0], bs = -1e9;
+    for (const r of rows) {
+      const t = M[st.col + 1][r].t;
+      const base = [4, hr > 0.65 ? 4.5 : -2, 3.5, 4, 3.5, 3, st.sc >= 45 ? 6 : 1 + (hr < 0.6 && st.sc >= 10 ? 3 : 0), 4, (1 - hr) * 10, 3.5, 0, 0][t] || 0;
+      const s = base + rnd() * 2;
+      if (s > bs) { bs = s; best = r; }
+    }
+    return best;
+  }
+  function aiChoice(st) {
+    const E = EVS[st.ev]; let best = E.c.length - 1, bs = -1e9;
+    E.c.forEach((ch, i) => {
+      if (!choiceOk(st, i)) return;
+      let s = ch.ai + rnd() * 0.8;
+      if (st.hp < st.hm * 0.45 && ch.r.some((r) => r[1].fight != null || r[1].hp < 0)) s -= 2;
+      if (s > bs) { bs = s; best = i; }
+    });
+    return best;
+  }
+  const UPW = [4.5, 3, 3.5, 4.5, 3, 2, 2.5, 2.5, 3, 2];
+  function aiShop(st) {
+    let guard = 0;
+    while (guard++ < 14) {
+      let best = -1, bs = 0.5;
+      st.shop.forEach((it, i) => {
+        if (it[3] || st.sc < it[2]) return;
+        let s = 0;
+        if (it[0] === 2) s = st.hp < st.hm * 0.7 ? 6 : st.hp < st.hm - 15 ? 1.2 : 0;
+        else if (it[0] === 1) s = UPW[it[1]];
+        else if (it[0] === 3) s = it[1] <= 2 ? 3.6 : 2.4;
+        else if (it[0] === 4) s = SPC[it[1]].pr > SPC[st.sp].pr + 8 ? 2.6 : 0;
+        else { const tm = tmA(st), j = weakestMount(st); s = TUR[it[1]].pr > tVal(tm[j][0], tm[j][1]) + 8 ? 4 : 0; }
+        if (s > bs) { bs = s; best = i; }
+      });
+      if (best < 0) break;
+      buy(st, best);
+    }
+    return leaveShop(st);
+  }
+  function aiCoarse(st, shipPick) {
+    if (st.ph === 'hangar') { if (shipPick != null) setShip(st, shipPick); return startRun(st); }
+    if (st.ph === 'map') return enterNode(st, aiNode(st));
+    if (st.ph === 'ev') return resolveEvent(st, aiChoice(st));
+    if (st.ph === 'shop') return aiShop(st);
+    return st;
+  }
+
+  /* ======================= fight sim ======================= */
+  // 동력 배분 [무기, 방어막, 엔진] 비율: 균형 / 공격 / 방어 / 기동
+  const PRE = [[1 / 3, 1 / 3, 1 / 3], [0.56, 0.2, 0.24], [0.2, 0.56, 0.24], [0.2, 0.2, 0.6]];
+  const PREN = ['균형', '공격', '방어', '기동'];
+  function fx(W, t, a, b, c) { W.fid++; W.fx.push([W.fid, t, r1(a || 0), r1(b || 0), r1(c || 0)]); if (W.fx.length > 24) W.fx.shift(); }
+  function mkOurShip(st, up) {
+    const D = SHIPS[st.sh], tm = tmA(st), am = 1 + 0.3 * up[6];
+    const S = { x: AW * 0.5, y: AH * 0.68, a: -PI / 2, vx: 0, vy: 0, r: D.r, hp: st.hp, hm: st.hm, sh: 0, shm: D.shm * (1 + 0.35 * up[2]), shT: 0, oc: 0,
+      P: st.P, pre: 0, sc: 0.35, sp: st.sp, rp: -1, cl: 0, inv: 0, mineT: 4, sl: 0, pt: [], M: [] };
+    for (const p of D.pt) { const hm = Math.round(PHP[p[0]] * am); S.pt.push({ t: p[0], x: p[1], y: p[2], r: PRAD[p[0]], hp: hm, hm, dis: 0 }); }
+    D.mt.forEach((m, i) => {
+      const hm = Math.round(PHP.T * am), part = { t: 'T', x: m[0], y: m[1], r: PRAD.T, hp: hm, hm, dis: 0, m: i };
+      S.pt.push(part);
+      const t = tm[i] || [0, 1];
+      S.M.push({ x: m[0], y: m[1], a: m[2], w: m[3], tt: t[0], lv: t[1], ang: m[2], cd: rnd() * 0.4, p: part, seat: -1, pi: S.pt.length - 1 });
+    });
+    S.sh = S.shm;
+    return S;
+  }
+  function mkEnemy(W, k, x, y, f, fs) {
+    const D = EN[k], ES = ESTAT[k];
+    // 교전 시간 단축: 체력 배율 EHP(보스 EHPB), 방어막 ESH, 적 화력 EDM
+    const hm = Math.round(D.hp * (D.boss ? EHPB * (1 + 0.3 * f) : (D.drone ? EHPD : EHP) * (1 + 0.7 * f)) * (fs ? 0.7 : 1));
+    const pm = D.boss ? 0.45 : 1;
+    const e = { k, x, y, a: Math.atan2(W.S.y - y, W.S.x - x), vx: 0, vy: 0, r: D.r, hp: hm, hm, sh: D.sh ? Math.round(D.sh * ESH * (1 + 0.5 * f)) : 0, shm: 0, shT: 0,
+      cw: 1, ph: 0, slow: 0, emp: 0, ck: 0, ckT: 5 + rnd() * 3, oa: rnd() * TAU, od: rnd() < 0.5 ? -1 : 1, side: rnd() < 0.5 ? -1 : 1, rs: 0, rT: 0, dead: 0,
+      dm: EDM * (1 + 0.45 * f), fr: 1 + 0.3 * f, gT: 3 + rnd() * 3, pt: [] };
+    e.shm = e.sh;
+    for (const p of ES.pt) {
+      const phm = Math.max(6, Math.round(hm * PF[p.t] * pm * (p.t === 'H' && k === 9 && p.x > 0 ? 2 : 1)));
+      e.pt.push({ t: p.t, x: p.x, y: p.y, r: p.r, hp: phm, hm: phm, dis: 0, w: p.w, ph: p.ph, cd: (WK[p.w] ? WK[p.w].cd : 2) * (0.5 + rnd() * 0.8), bq: 0, bt: 0 });
+    }
+    W.E.push(e);
+    return e;
+  }
+  function spawnWave(W, list) {
+    const S = W.S, n = list.length;
+    const base = Math.atan2(AH * 0.3 - S.y, AW * 0.5 - S.x);
+    list.forEach((k, i) => {
+      const D = EN[k], a = base + (n > 1 ? (i / (n - 1) - 0.5) * 1.6 : 0) + (rnd() - 0.5) * 0.3;
+      const d = D.boss ? 160 : 125 + rnd() * 40;
+      mkEnemy(W, k, clamp(S.x + Math.cos(a) * d, 30, AW - 30), clamp(S.y + Math.sin(a) * d, 30, AH - 30), W.f, W.fs);
+    });
+  }
+  function newFight(st) {
+    const fi = st.fi, up = upA(st);
+    const haz = fi.ty === AST ? 'ast' : fi.ty === STM ? 'stm' : fi.ty === NEB ? 'neb' : '';
+    const W = { k: fi.k, ty: fi.ty, f: fi.f, fs: fi.fs, haz, boss: fi.ty === MID || fi.ty === BOS ? 1 : 0, up, sh: st.sh, NC: st.NC,
+      T: 0, S: null, E: [], B: [], X: [], MN: [], DR: [], RK: [], Z: [], LB: null, GW: null, waves: fi.en.slice(1), wT: 0,
+      inj: new Array(st.NC).fill(0), slw: new Array(st.NC).fill(0), cap: st.cap, vc: st.vc, gm: new Array(st.NC).fill(-1), hu: st.hu.slice(),
+      fx: [], fid: 0, sqs: {}, autoCap: null, autoMem: null, m0: st.sc, earn: 0, kills: 0, capt: 0, over: 0, win: 0, lose: 0, fled: 0, endT: 0, done: 0, rkT: 0, zT: 3, sys: null };
+    W.S = mkOurShip(st, up);
+    const go = gunOrder(st, st.cap, st.hu);
+    go.forEach((s, i) => { if (i < W.S.M.length) { W.gm[s] = i; W.S.M[i].seat = s; } });
+    if (W.vc < 0 || W.vc === W.cap || W.gm[W.vc] < 0) W.vc = go[0];
+    spawnWave(W, fi.en[0]);
+    if (SHIPS[st.sh].esc) for (let j = 0; j < 2; j++) W.DR.push({ x: W.S.x, y: W.S.y, l: 1e9, cd: 1 + j * 0.3, ph: j * PI, esc: 1 });
+    if (haz === 'ast') for (let j = 0; j < 9; j++) addRock(W, true);
+    sysCalc(W);
+    return W;
+  }
+  function addRock(W, any) {
+    const r = 4 + rnd() * 6;
+    let x, y, vx, vy;
+    if (any) { x = 20 + rnd() * (AW - 40); y = 20 + rnd() * (AH - 40); if (hyp(x - W.S.x, y - W.S.y) < 60) y = (y + AH / 2) % AH; const a = rnd() * TAU, v = 6 + rnd() * 10; vx = Math.cos(a) * v; vy = Math.sin(a) * v; }
+    else { const s = (rnd() * 4) | 0; x = s === 0 ? -8 : s === 1 ? AW + 8 : rnd() * AW; y = s === 2 ? -8 : s === 3 ? AH + 8 : rnd() * AH; const a = Math.atan2(AH / 2 - y + (rnd() - 0.5) * 200, AW / 2 - x + (rnd() - 0.5) * 200), v = 8 + rnd() * 14; vx = Math.cos(a) * v; vy = Math.sin(a) * v; }
+    W.RK.push({ x, y, vx, vy, r, hp: Math.round(r * 2), s: (rnd() * 16) | 0 });
+  }
+  const money = (W) => W.m0 + W.earn;
+  function sysOf(s, t) { let n = 0, f = 0, d = 0; for (const p of s.pt) if (p.t === t) { n++; f += p.hp / p.hm; if (p.dis) d++; } return n ? { f: f / n, dis: d === n, n } : { f: 1, dis: false, n: 0 }; }
+  function sysCalc(W) { const S = W.S; W.sys = { B: sysOf(S, 'B'), R: sysOf(S, 'R'), S: sysOf(S, 'S'), E: sysOf(S, 'E'), G: sysOf(S, 'G') }; }
+  function powOf(W) {
+    const S = W.S, R = W.sys.R, P = S.P * (R.dis ? 0.45 : 0.65 + 0.35 * R.f), fr = PRE[S.pre];
+    return [P * fr[0], P * fr[1], P * fr[2]];
+  }
+  const toLocal = (s, x, y) => { const dx = x - s.x, dy = y - s.y, c = Math.cos(s.a), n = Math.sin(s.a); return [dx * c + dy * n, -dx * n + dy * c]; };
+  const toWorld = (s, lx, ly) => { const c = Math.cos(s.a), n = Math.sin(s.a); return [s.x + lx * c - ly * n, s.y + lx * n + ly * c]; };
+  function nearestPart(s, x, y, skipDead) {
+    const p = toLocal(s, x, y); let best = null, bd = 1e9;
+    for (const q of s.pt) { if (skipDead && q.dis) continue; const d = hyp(q.x - p[0], q.y - p[1]) - q.r * 0.4; if (d < bd) { bd = d; best = q; } }
+    return best || s.pt[0];
+  }
+  function actCap(W) { if (W.inj[W.cap] <= 0) return W.cap; if (W.vc >= 0 && W.inj[W.vc] <= 0) return W.vc; return -1; }
+  function injure(W, seat) {
+    if (seat < 0 || seat >= W.NC || W.inj[seat] > 0) return;
+    W.inj[seat] = 7 * (1 - 0.3 * W.up[5]); W.slw[seat] = W.inj[seat] + 5;
+    fx(W, 7, seat, seat === W.cap ? 1 : 0, 0);
+  }
+  function crewOfPart(W, p) { if (p.t === 'B') return W.cap; if (p.t === 'T') return W.S.M[p.m] ? W.S.M[p.m].seat : -1; return -1; }
+  function hitUs(W, x, y, d, ion, pierce, tag) {
+    const S = W.S;
+    if (S.inv > 0 || W.over) return;
+    if (S.sh > 0.5 && !pierce) { S.sh = Math.max(0, S.sh - d * (ion ? 4 : 1)); S.shT = 1.0; fx(W, 3, x, y, 1); return; }
+    const p = nearestPart(S, x, y), pen = p.dis;
+    p.hp = Math.max(0, p.hp - d);
+    if (p.hp <= 0 && !p.dis) { p.dis = 1; fx(W, 6, S.pt.indexOf(p), -1, 0); }
+    S.hp = Math.max(0, S.hp - d * (pen ? 1 : 0.35));
+    if (W.dl) W.dl[tag || '?'] = (W.dl[tag || '?'] || 0) + d * (pen ? 1 : 0.35);
+    if (pen && rnd() < 0.75) injure(W, crewOfPart(W, p));
+    fx(W, 5, x, y, d);
+  }
+  function killEnemy(W, e, captured) {
+    if (e.dead) return;
+    e.dead = captured ? 2 : 1; e.hp = Math.max(0, e.hp); W.kills++; if (captured) W.capt++;
+    const D = EN[e.k];
+    W.earn += Math.round(D.sc * (1 + 0.6 * W.f) * (0.85 + 0.3 * rnd()) * (W.haz === 'neb' ? 1.5 : 1) * (W.up[9] ? 1.3 : 1) * (captured ? 1.5 : 1));
+    fx(W, 4, e.x, e.y, e.r * (captured ? -1 : 1));
+    if (D.boss) for (const o of W.E) if (!o.dead && o !== e) { o.dead = 1; fx(W, 4, o.x, o.y, o.r); }
+  }
+  function dmgEnemy(W, e, p, d, pd) {
+    const pen = p.dis;
+    p.hp = Math.max(0, p.hp - pd);
+    if (p.hp <= 0 && !p.dis) { p.dis = 1; fx(W, 6, e.pt.indexOf(p), W.E.indexOf(e), 0); if (p.t === 'S') e.sh = 0; }
+    e.hp -= d * (pen ? 1.3 : 1);
+    if (pen && !EN[e.k].boss && !EN[e.k].drone) { e.cw -= p.t === 'B' ? 0.14 : 0.025; if (e.cw <= 0) { killEnemy(W, e, true); return; } }
+    if (e.hp <= 0) killEnemy(W, e, false);
+  }
+  function hitEnemy(W, e, b) {
+    if (e.sh > 0.5 && !(b.f & 1)) { e.sh = Math.max(0, e.sh - b.d * (b.f & 2 ? 4 : 1)); e.shT = 1.5; fx(W, 3, b.x, b.y, 0); return; }
+    const p = nearestPart(e, b.x, b.y);
+    dmgEnemy(W, e, p, b.d, b.pd);
+    if (b.f & 8) for (const q of e.pt) if (q !== p && !e.dead) { const w = toWorld(e, q.x, q.y); if (hyp(w[0] - b.x, w[1] - b.y) < 10) dmgEnemy(W, e, q, b.d * 0.4, b.d * 0.6); }
+    if (b.f & 32) e.slow = 2;
+    fx(W, 2, b.x, b.y, b.tt);
+  }
+  function fireMount(W, m, rate) {
+    const S = W.S, T = TUR[m.tt], lm = 1 + 0.25 * (m.lv - 1);
+    const c = Math.cos(S.a), s = Math.sin(S.a), ox = S.x + m.x * c - m.y * s, oy = S.y + m.x * s + m.y * c;
+    const a0 = S.a + m.ang, n = T.n || 1, spd = T.sp * (1 + 0.2 * W.up[8]);
+    const main = SHIPS[W.sh].main && m === S.M[0] ? 1.4 : 1;
+    const f = (T.pierce ? 1 : 0) | (T.ion ? 2 : 0) | (T.hom ? 4 : 0) | (T.spl ? 8 : 0) | (T.flak ? 16 : 0) | (T.slow ? 32 : 0) | (T.big ? 64 : 0);
+    for (let j = 0; j < n; j++) {
+      if (W.B.length >= 90) break;
+      let a = a0, px = ox, py = oy;
+      if (T.par) { const o = (j - (n - 1) / 2) * 2.4; px -= Math.sin(a0) * o; py += Math.cos(a0) * o; }
+      else if (n > 1) a += (j - (n - 1) / 2) * T.spr / (n - 1);
+      if (T.spr && n === 1) a += (rnd() - 0.5) * T.spr;
+      W.B.push({ x: px + Math.cos(a) * 3, y: py + Math.sin(a) * 3, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd, l: T.l, d: T.dmg * lm * main, pd: T.dmg * lm * main * (T.pd || 1), f, tt: m.tt, o: S.M.indexOf(m) });
+    }
+    m.cd = T.cd * (1 - 0.1 * (m.lv - 1)) / Math.max(0.2, rate);
+    fx(W, 1, S.M.indexOf(m), 0, 0);
+  }
+  function lead(ox, oy, tx, ty, tvx, tvy, sp) {
+    let t = hyp(tx - ox, ty - oy) / sp, px = tx, py = ty;
+    for (let k = 0; k < 3; k++) { px = tx + tvx * t; py = ty + tvy * t; t = hyp(px - ox, py - oy) / sp; }
+    return [px, py, t];
+  }
+  function mountWorld(S, m) { const c = Math.cos(S.a), s = Math.sin(S.a); return [S.x + m.x * c - m.y * s, S.y + m.x * s + m.y * c]; }
+  function arcClamp(m, la) { if (m.w >= 3.1) return angN(la); const d = clamp(angN(la - m.a), -m.w, m.w); return m.a + d; }
+  const inArc = (m, la) => m.w >= 3.1 || Math.abs(angN(la - m.a)) <= m.w + 0.02;
+  function autoAim(W, m, h) {
+    const S = W.S, o = mountWorld(S, m), T = TUR[m.tt], sp = T.sp * (1 + 0.2 * W.up[8]);
+    let best = null, bd = 1e9;
+    for (const e of W.E) {
+      if (e.dead || e.ck > 0.5) continue;
+      const d = hyp(e.x - o[0], e.y - o[1]);
+      if (d > sp * T.l * 0.95) continue;
+      const la = Math.atan2(e.y - o[1], e.x - o[0]) - S.a;
+      if (!inArc(m, la)) continue;
+      if (d < bd) { bd = d; best = e; }
+    }
+    if (!best) return false;
+    const p = lead(o[0], o[1], best.x, best.y, best.vx, best.vy, sp);
+    const nz = W.up[8] ? 0.04 : 0.09;
+    const la = arcClamp(m, Math.atan2(p[1] - o[1], p[0] - o[0]) - S.a + (rnd() - 0.5) * nz * 2);
+    turnMount(m, la, h);
+    return Math.abs(angN(la - m.ang)) < 0.12;
+  }
+  function turnMount(m, la, h) { const T = TUR[m.tt], mx = (T.big ? 3 : 5.5) * h; m.ang = angN(m.ang + clamp(angN(la - m.ang), -mx, mx)); if (m.w < 3.1) m.ang = m.a + clamp(angN(m.ang - m.a), -m.w, m.w); }
+  function doSpecial(W, id, ctl) {
+    const S = W.S, c = Math.cos(S.a), s = Math.sin(S.a);
+    fx(W, 8, id, S.x, S.y);
+    if (id === 0) {
+      for (const e of W.E) { if (e.dead) continue; const d = hyp(e.x - S.x, e.y - S.y); if (d < 62 + e.r) { const p = nearestPart(e, S.x, S.y); dmgEnemy(W, e, p, 25, 25); const k = 90 / Math.max(10, d); e.vx += (e.x - S.x) * k * 0.3; e.vy += (e.y - S.y) * k * 0.3; } }
+      W.X = W.X.filter((x) => x.k === 4 || hyp(x.x - S.x, x.y - S.y) > 62);
+    } else if (id === 1) {
+      for (let j = 0; j < 4; j++) { const a = S.a + (j - 1.5) * 0.5; W.B.push({ x: S.x + Math.cos(a) * 6, y: S.y + Math.sin(a) * 6, vx: Math.cos(a) * 70, vy: Math.sin(a) * 70, l: 5, d: 25, pd: 25, f: 1 | 4 | 128, tt: TB_TORP, o: -1 }); }
+    } else if (id === 2) {
+      let mx = ctl ? ctl.mx : 0, my = ctl ? ctl.my : 0;
+      if (hyp(mx, my) < 0.3) { mx = c; my = s; }
+      const l = hyp(mx, my); S.x = clamp(S.x + mx / l * 65, 14, AW - 14); S.y = clamp(S.y + my / l * 65, 14, AH - 14); S.inv = 1.0;
+      fx(W, 8, id, S.x, S.y);
+    } else if (id === 3) { S.oc = 8; S.sh = S.shm * 1.6; }
+    else if (id === 4) { for (let j = 0; j < 3; j++) W.DR.push({ x: S.x, y: S.y, l: 14, cd: 0.5 + j * 0.2, ph: j * TAU / 3, esc: 0 }); }
+    else if (id === 5) { for (let j = 0; j < 6; j++) { const a = j / 6 * TAU; W.MN.push({ x: clamp(S.x + Math.cos(a) * 20, 5, AW - 5), y: clamp(S.y + Math.sin(a) * 20, 5, AH - 5), l: 25, arm: 0.8, o: 0, d: 25 }); } }
+    else if (id === 6) { W.LB = { x: S.x + c * S.r, y: S.y + s * S.r, a: S.a, t: 0.45, l: 0.8, hit: 0 }; }
+    else if (id === 7) { for (const p of S.pt) { p.hp = Math.min(p.hm, p.hp + p.hm * 0.5); if (p.dis && p.hp >= p.hm * 0.35) p.dis = 0; } S.hp = Math.min(S.hm, S.hp + 8); }
+    else if (id === 8) {
+      for (const e of W.E) if (!e.dead && hyp(e.x - S.x, e.y - S.y) < 150) { e.sh = 0; e.shT = 4; e.emp = 4; }
+      W.X = W.X.filter((x) => !(x.k === 1 && hyp(x.x - S.x, x.y - S.y) < 150));
+    } else if (id === 9) { W.GW = { x: clamp(S.x + c * 75, 10, AW - 10), y: clamp(S.y + s * 75, 10, AH - 10), l: 5 }; }
+  }
+  function lineDist(px, py, x0, y0, a, len) { const dx = px - x0, dy = py - y0, c = Math.cos(a), s = Math.sin(a), t = clamp(dx * c + dy * s, 0, len); return [hyp(dx - c * t, dy - s * t), t]; }
+  function shootE(W, e, p, ox, oy, kind) {
+    const S = W.S, K = WK[kind];
+    if (W.X.length >= 70 && kind !== 'bem') return;
+    const D = EN[e.k], acc = 0.5 + 0.5 * W.f;
+    const noise = 0.1 - 0.05 * W.f + (W.sys && e.pt.some((q) => q.t === 'B' && q.dis) ? 0.25 : 0) + (1 - e.cw) * 0.2 + (W.haz === 'neb' ? 0.05 : 0);
+    const dm = e.dm;
+    const aimAt = (sp) => { const l = lead(ox, oy, S.x, S.y, S.vx * acc, S.vy * acc, sp); return Math.atan2(l[1] - oy, l[0] - ox) + (rnd() - 0.5) * 2 * noise; };
+    const bolt = (a, sp, d, k, r) => W.X.push({ x: ox, y: oy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, l: 4, k, d: d * dm, r: r || 1.6, hp: 0 });
+    if (kind === 'las') bolt(aimAt(K.sp), K.sp, K.d, 0);
+    else if (kind === 'brs') { p.bq = 3; p.bt = 0; }
+    else if (kind === 'spr') { const a = aimAt(K.sp); for (let j = -2; j <= 2; j++) bolt(a + j * 0.16, K.sp, K.d, 0); }
+    else if (kind === 'msl') { const a = Math.atan2(S.y - oy, S.x - ox) + (rnd() - 0.5) * 1.2; W.X.push({ x: ox, y: oy, vx: Math.cos(a) * K.sp, vy: Math.sin(a) * K.sp, l: 7, k: 1, d: K.d * dm, r: 2, hp: 3 }); }
+    else if (kind === 'hvy') bolt(aimAt(K.sp), K.sp, K.d, 2, 3.4);
+    else if (kind === 'ion') bolt(aimAt(K.sp), K.sp, K.d, 3, 1.8);
+    else if (kind === 'bem') { const l = lead(ox, oy, S.x, S.y, S.vx * acc * 0.6, S.vy * acc * 0.6, 220); W.X.push({ x: ox, y: oy, vx: 0, vy: 0, l: 1.45, k: 4, d: K.d * dm, a: Math.atan2(l[1] - oy, l[0] - ox), t: 1.1, len: K.rng + 20, r: 3.5, e: W.E.indexOf(e), hp: 0 }); }
+    else if (kind === 'min') { if (W.MN.length < 30) W.MN.push({ x: ox, y: oy, l: 20, arm: 1, o: 1, d: K.d * dm }); }
+    else if (kind === 'rng') { const a0 = rnd() * TAU; for (let j = 0; j < 14; j++) bolt(a0 + j / 14 * TAU, K.sp, K.d, 0); }
+    else if (kind === 'spi') { const a0 = W.T * 2.1; for (let j = 0; j < 3; j++) bolt(a0 + j * TAU / 3, K.sp, K.d, 0); }
+    fx(W, 12, ox, oy, 0);
+  }
+  function enemyStep(W, e, h) {
+    const S = W.S, D = EN[e.k];
+    if (e.slow > 0) e.slow -= h;
+    if (e.emp > 0) e.emp -= h;
+    if (D.cloak) { e.ckT -= h; if (e.ckT <= 0) { if (e.ck > 0) { e.ck = 0; e.ckT = 6 + rnd() * 3; } else { e.ck = 3; e.ckT = 3; } } if (e.ck > 0) e.ck = Math.max(0.01, e.ck - h); }
+    let ef = 0, en = 0, ed = 0, bDis = false, rDis = false, sAlive = false;
+    for (const p of e.pt) { if (p.t === 'E') { en++; ef += p.hp / p.hm; if (p.dis) ed++; } else if (p.t === 'B' && p.dis) bDis = true; else if (p.t === 'R' && p.dis) rDis = true; else if (p.t === 'S' && !p.dis) sAlive = true; }
+    const eng = en ? (ed === en ? 0.35 : 0.55 + 0.45 * ef / en) : 1;
+    if (D.boss && D.phs) { const fr = e.hp / e.hm; while (e.ph < D.phs.length && fr < D.phs[e.ph]) { e.ph++; fx(W, 9, W.E.indexOf(e), e.ph, 0); if (e.k === 13) spawnWave(W, [0, 0]); else if (e.k === 14) spawnWave(W, e.ph === 1 ? [2, 2, 3] : [1, 3, 3]); else spawnWave(W, [3, 3, 3]); } }
+    const rage = D.boss ? (W.T > 300 ? 3 : W.T > 180 ? 1.7 : 1) : 1;
+    let vmax = D.v * eng * (e.slow > 0 ? 0.55 : 1) * (W.GW && hyp(W.GW.x - e.x, W.GW.y - e.y) < 110 ? 0.35 : 1);
+    const dx = S.x - e.x, dy = S.y - e.y, dist = hyp(dx, dy) || 1, toA = Math.atan2(dy, dx);
+    let tx = e.x, ty = e.y, face = toA;
+    const beh = D.beh;
+    if (beh === 'orb' || (beh === 'eat' && e.rs === 0)) {
+      e.oa += e.od * (D.v * 0.7) / Math.max(40, D.dr) * h; tx = S.x + Math.cos(e.oa) * D.dr; ty = S.y + Math.sin(e.oa) * D.dr;
+      if (beh === 'eat') { e.rT -= h; if (e.rT <= 0 && e.ph >= 1) { e.rs = 1; e.rT = 2.4; } }
+      if (rnd() < 0.002) e.od *= -1;
+    } else if (beh === 'fln') {
+      const ba = S.a + PI + e.side * 0.7; tx = S.x + Math.cos(ba) * D.dr; ty = S.y + Math.sin(ba) * D.dr;
+      if (rnd() < 0.003) e.side *= -1;
+    } else if (beh === 'snp') { tx = S.x - dx / dist * D.dr + Math.cos(toA + PI / 2) * 30 * Math.sin(W.T * 0.4 + e.oa); ty = S.y - dy / dist * D.dr + Math.sin(toA + PI / 2) * 30 * Math.sin(W.T * 0.4 + e.oa); }
+    else if (beh === 'kit') { if (dist < D.dr * 0.75) { tx = e.x - dx; ty = e.y - dy; } else { e.oa += e.od * 0.25 * h; tx = S.x + Math.cos(e.oa) * D.dr; ty = S.y + Math.sin(e.oa) * D.dr; } }
+    else if (beh === 'swm') { e.oa += e.od * 1.6 * h; const rr = D.dr + 14 * Math.sin(W.T * 1.3 + e.side * 2); tx = S.x + Math.cos(e.oa) * rr; ty = S.y + Math.sin(e.oa) * rr; }
+    else if (beh === 'kam') { tx = S.x + S.vx * 0.4; ty = S.y + S.vy * 0.4; }
+    else if (beh === 'sta') { tx = AW / 2 + Math.cos(W.T * 0.15) * 40; ty = AH * 0.35 + Math.sin(W.T * 0.2) * 30; }
+    if (beh === 'ram' || (beh === 'eat' && e.rs)) {
+      e.rT -= h;
+      if (e.rs === 0) { tx = S.x + Math.cos(e.oa) * D.dr; ty = S.y + Math.sin(e.oa) * D.dr; e.oa += 0.4 * h; if (e.rT <= 0) { e.rs = 1; e.rT = 2.4; } }
+      else if (e.rs === 1) { tx = S.x + S.vx * 0.5; ty = S.y + S.vy * 0.5; vmax *= 1.8; if (e.rT <= 0) { e.rs = 2; e.rT = 1.6; } }
+      else { tx = e.x - dx; ty = e.y - dy; if (e.rT <= 0) { e.rs = 0; e.rT = 2.5 + rnd() * 2; } }
+    }
+    // separation from other enemies
+    let sx = 0, sy = 0;
+    for (const o of W.E) { if (o === e || o.dead) continue; const ox = e.x - o.x, oy = e.y - o.y, d = hyp(ox, oy), m = e.r + o.r + 6; if (d < m && d > 0.01) { sx += ox / d * (m - d); sy += oy / d * (m - d); } }
+    let wx = tx - e.x + sx * 3, wy = ty - e.y + sy * 3; const wl = hyp(wx, wy);
+    const sp = Math.min(vmax, wl * 1.5);
+    const tvx = wl > 0.1 ? wx / wl * sp : 0, tvy = wl > 0.1 ? wy / wl * sp : 0;
+    const ac = (D.v * 1.6 + 20) * h;
+    e.vx += clamp(tvx - e.vx, -ac, ac); e.vy += clamp(tvy - e.vy, -ac, ac);
+    if (W.GW) { const gx = W.GW.x - e.x, gy = W.GW.y - e.y, gd = hyp(gx, gy); if (gd < 110 && gd > 3) { e.vx += gx / gd * 60 * h; e.vy += gy / gd * 60 * h; } }
+    e.x = clamp(e.x + e.vx * h, 8, AW - 8); e.y = clamp(e.y + e.vy * h, 8, AH - 8);
+    const sp2 = hyp(e.vx, e.vy);
+    if (beh === 'snp' || beh === 'sta' || beh === 'kit' || D.boss || sp2 < 8) face = toA; else face = Math.atan2(e.vy, e.vx);
+    const tr = D.tr * (bDis ? 0.5 : 1) * h;
+    e.a = angN(e.a + clamp(angN(face - e.a), -tr, tr));
+    // shields
+    if (e.shm > 0) { if (e.shT > 0) e.shT -= h; else if (sAlive && !rDis && e.sh < e.shm) e.sh = Math.min(e.shm, e.sh + 4 * h); }
+    if (!sAlive) e.sh = 0;
+    // collisions with our ship
+    const md = e.r + S.r * 0.85;
+    if (dist < md) {
+      const nx = -dx / dist, ny = -dy / dist, push = md - dist;
+      e.x += nx * push * 0.6; e.y += ny * push * 0.6; S.x -= nx * push * 0.4; S.y -= ny * push * 0.4;
+      const rv = (e.vx - S.vx) * -nx + (e.vy - S.vy) * -ny;
+      if (beh === 'kam') { hitUs(W, e.x - nx * e.r, e.y - ny * e.r, 8 * e.dm, 0, 0, 'kam'); killEnemy(W, e, false); return; }
+      if (rv > 10 && W.T > (e.hitT || 0)) {
+        const big = (beh === 'ram' || beh === 'eat') && e.rs === 1;
+        e.hitT = W.T + 0.9;
+        hitUs(W, e.x - nx * e.r, e.y - ny * e.r, big ? 10 * e.dm : 2, 0, big ? 1 : 0, 'ram');
+        e.vx += nx * 40; e.vy += ny * 40; S.vx -= nx * 30; S.vy -= ny * 30;
+        if (e.rs === 1) { e.rs = 2; e.rT = 1.6; }
+      }
+    }
+    // weapons
+    if (e.emp > 0 || e.ck > 0.5) return;
+    const rate = e.fr * rage * (bDis ? 0.65 : 1) * (rDis ? 0.6 : 1) * (0.5 + 0.5 * e.cw) * (W.haz === 'neb' && dist > 120 ? 0.6 : 1);
+    for (const p of e.pt) {
+      if (p.dis) continue;
+      if (p.ph > e.ph) continue;
+      if (p.t === 'G') {
+        p.cd -= h * rate;
+        if (p.cd <= 0) { p.cd = 9 + rnd() * 3; let n = 0; for (const o of W.E) if (!o.dead && EN[o.k].drone) n++; if (n < 4) { const w = toWorld(e, p.x, p.y); mkEnemy(W, rnd() < 0.7 ? 2 : 3, w[0], w[1], W.f, 0); fx(W, 10, w[0], w[1], 0); } }
+        continue;
+      }
+      if (!p.w) continue;
+      const K = WK[p.w], w = toWorld(e, p.x, p.y);
+      if (p.bq > 0) { p.bt -= h; if (p.bt <= 0) { p.bq--; p.bt = 0.16; const l = lead(w[0], w[1], S.x, S.y, S.vx * 0.7, S.vy * 0.7, K.sp); const a = Math.atan2(l[1] - w[1], l[0] - w[0]) + (rnd() - 0.5) * 0.14; if (W.X.length < 70) W.X.push({ x: w[0], y: w[1], vx: Math.cos(a) * K.sp, vy: Math.sin(a) * K.sp, l: 4, k: 0, d: K.d * e.dm, r: 1.6, hp: 0 }); } }
+      p.cd -= h * rate;
+      if (p.cd <= 0) {
+        p.cd = K.cd * (0.8 + 0.4 * rnd());
+        if (hyp(S.x - w[0], S.y - w[1]) <= K.rng) shootE(W, e, p, w[0], w[1], p.w);
+      }
+    }
+  }
+  function capStep(W, C, h) {
+    const S = W.S, D = SHIPS[W.sh], sys = W.sys, up = W.up;
+    const ac = actCap(W), ctl = ac >= 0 ? C[ac] : W.autoCap;
+    const pw = powOf(W);
+    W.pw = pw;
+    // 특수 무기
+    const sqv = ctl ? ctl.sq | 0 : 0;
+    if (ac >= 0) { if (W.sqs[ac] == null) W.sqs[ac] = sqv; if (sqv !== W.sqs[ac]) { W.sqs[ac] = sqv; if (S.sc >= 1) { doSpecial(W, S.sp, ctl); S.sc = 0; } } }
+    else if (ctl && ctl.go) { ctl.go = 0; if (S.sc >= 1) { doSpecial(W, S.sp, ctl); S.sc = 0; } }
+    if (S.sc < 1) S.sc = Math.min(1, S.sc + h / SPC[S.sp].ch * (sys.B.dis ? 0.3 : 1) * (1 + 0.25 * up[7]));
+    if (ctl) {
+      const ps = ctl.ps | 0; if (ps >= 0 && ps <= 3) S.pre = ps;
+      S.rp = fin(ctl.rp) && ctl.rp >= -1 && ctl.rp < S.pt.length ? ctl.rp | 0 : -1;
+      S.cl = ctl.cl ? 1 : 0;
+      W.fo = fin(ctl.fo) ? ctl.fo | 0 : -1;
+    }
+    // 움직임
+    let mx = ctl ? clamp(+ctl.mx || 0, -1, 1) : 0, my = ctl ? clamp(+ctl.my || 0, -1, 1) : 0;
+    const mg = hyp(mx, my); if (mg > 1) { mx /= mg; my /= mg; }
+    const eng = sys.E.dis ? 0.35 : 0.6 + 0.4 * sys.E.f;
+    const vmul = (0.65 + 0.175 * pw[2]) * eng * (1 + 0.15 * up[1]);
+    const vmax = D.v * vmul, acc = D.ac * vmul * (sys.B.dis ? 0.6 : 1);
+    W.vmax = vmax;
+    const tvx = mx * vmax, tvy = my * vmax;
+    const dvx = tvx - S.vx, dvy = tvy - S.vy, dl = hyp(dvx, dvy), am = acc * h * (mg < 0.1 ? 0.7 : 1);
+    if (dl > am) { S.vx += dvx / dl * am; S.vy += dvy / dl * am; } else { S.vx = tvx; S.vy = tvy; }
+    if (W.GW && hyp(W.GW.x - S.x, W.GW.y - S.y) < 40) { S.vx *= 0.98; S.vy *= 0.98; }
+    S.x += S.vx * h; S.y += S.vy * h;
+    if (S.x < S.r) { S.x = S.r; S.vx = Math.abs(S.vx) * 0.3; } else if (S.x > AW - S.r) { S.x = AW - S.r; S.vx = -Math.abs(S.vx) * 0.3; }
+    if (S.y < S.r) { S.y = S.r; S.vy = Math.abs(S.vy) * 0.3; } else if (S.y > AH - S.r) { S.y = AH - S.r; S.vy = -Math.abs(S.vy) * 0.3; }
+    if (mg > 0.2) { const tr = D.tr * (sys.B.dis ? 0.5 : 1) * (1 + 0.15 * up[1]) * h; S.a = angN(S.a + clamp(angN(Math.atan2(my, mx) - S.a), -tr, tr)); }
+    // 방어막
+    const shMax = S.shm * (0.7 + 0.15 * pw[1]) * (S.oc > 0 ? 1.6 : 1);
+    if (S.oc > 0) S.oc -= h;
+    if (sys.S.dis) S.sh = Math.max(0, S.sh - 20 * h);
+    else if (S.shT > 0) S.shT -= h;
+    else if (S.sh < shMax) S.sh = Math.min(shMax, S.sh + (1.4 * pw[1] + (W.haz === 'stm' ? -0.4 : 0)) * h * (0.4 + 0.6 * sys.S.f));
+    if (S.sh > shMax) S.sh = Math.max(shMax, S.sh - 6 * h);
+    W.shMax = shMax;
+    if (S.inv > 0) S.inv -= h;
+  }
+  function repairStep(W, C, h) {
+    const S = W.S, up = W.up;
+    let tgt = S.rp >= 0 ? S.pt[S.rp] : null;
+    if (!tgt || tgt.hp >= tgt.hm) tgt = autoRepairTarget(W);
+    W.rpT = tgt ? S.pt.indexOf(tgt) : -1;
+    const heal = (p, v) => { if (!p || p.hp >= p.hm) return; p.hp = Math.min(p.hm, p.hp + v); if (p.dis && p.hp >= p.hm * 0.35) { p.dis = 0; fx(W, 11, S.pt.indexOf(p), 0, 0); } };
+    heal(tgt, (1.6 + 1.0 * up[4]) * h);
+    W.helpN = 0;
+    for (let s = 0; s < W.NC; s++) {
+      const m = W.gm[s] >= 0 ? S.M[W.gm[s]] : null;
+      if (!m || W.inj[s] > 0 || s === actCap(W)) continue;
+      const c = C[s]; if (!c || !c.hl) continue;
+      if (!(S.cl || m.p.dis || m.p.hp < m.p.hm)) continue;
+      W.helpN++;
+      const sl = W.slw[s] > 0 ? 0.6 : 1;
+      heal(m.p.dis || (!tgt && m.p.hp < m.p.hm) ? m.p : tgt || m.p, 3.2 * sl * h * (1 + 0.3 * up[4]));
+    }
+  }
+  const RPRI = { B: 5, S: 4.2, E: 4, T: 3.4, R: 3.6, G: 2, H: 1 };
+  function autoRepairTarget(W) {
+    const S = W.S; let best = null, bs = 0;
+    for (const p of S.pt) { if (p.hp >= p.hm) continue; const s = RPRI[p.t] * (p.dis ? 3 : 1) * (1.2 - p.hp / p.hm); if (s > bs) { bs = s; best = p; } }
+    return best;
+  }
+  function stepFight(W, C, h) {
+    if (W.done) return;
+    W.T += h;
+    for (let i = 0; i < W.NC; i++) { if (W.inj[i] > 0) { W.inj[i] -= h; if (W.inj[i] <= 0) { W.inj[i] = 0; fx(W, 7, i, 0, 1); } } if (W.slw[i] > 0) W.slw[i] -= h; }
+    if (W.over) { W.endT -= h; stepBullets(W, h); if (W.endT <= 0) W.done = 1; return; }
+    sysCalc(W);
+    autoPilot(W, h);
+    capStep(W, C, h);
+    repairStep(W, C, h);
+    const S = W.S, pw = W.pw, ac = actCap(W);
+    const wrate = (0.55 + 0.225 * pw[0]);
+    // 포탑
+    for (let i = 0; i < S.M.length; i++) {
+      const m = S.M[i]; if (m.cd > 0) m.cd -= h;
+      if (m.p.dis) continue;
+      const s = m.seat, c = s >= 0 ? C[s] : null;
+      const manned = s >= 0 && s !== ac && W.inj[s] <= 0;
+      if (manned) {
+        if (!c || c.hl && (S.cl || m.p.hp < m.p.hm)) continue;
+        if (fin(c.a)) turnMount(m, arcClamp(m, c.a - S.a), h * (W.slw[s] > 0 ? 0.6 : 1));
+        if (c.f && m.cd <= 0) fireMount(W, m, wrate * (W.slw[s] > 0 ? 0.7 : 1));
+      } else if (s < 0 || s === ac) {
+        const ok = autoAim(W, m, h);
+        if (ok && m.cd <= 0) fireMount(W, m, wrate * 0.55);
+      }
+    }
+    // 기뢰선 자동 기뢰
+    if (SHIPS[W.sh].mine && !W.sys.G.dis) { S.mineT -= h; if (S.mineT <= 0 && hyp(S.vx, S.vy) > 15) { S.mineT = 6; const w = toWorld(S, -S.r, 0); if (W.MN.length < 30) W.MN.push({ x: w[0], y: w[1], l: 25, arm: 0.8, o: 0, d: 18 }); } }
+    stepBullets(W, h);
+    for (const e of W.E) if (!e.dead) enemyStep(W, e, h);
+    stepShots(W, h);
+    stepMisc(W, h);
+    // waves
+    let alive = 0; for (const e of W.E) if (!e.dead) alive++;
+    W.wT += h;
+    if (W.waves.length && (alive <= 1 || W.wT > 35)) { spawnWave(W, W.waves.shift()); W.wT = 0; fx(W, 13, 0, 0, 0); }
+    if (W.E.length > 40) W.E = W.E.filter((e) => !e.dead || EN[e.k].boss);
+    alive = 0; for (const e of W.E) if (!e.dead) alive++;
+    if (S.hp <= 0) { S.hp = 0; W.over = 1; W.lose = 1; W.endT = 2; fx(W, 15, S.x, S.y, 0); }
+    else if (!alive && !W.waves.length) { W.over = 1; W.win = 1; W.endT = 1.6; W.X.length = 0; }
+    else if (!W.boss && W.T > 200) { W.over = 1; W.fled = 1; W.endT = 1; fx(W, 14, 0, 0, 0); }
+    else if (W.boss && W.T > 420) { S.hp = 0; W.over = 1; W.lose = 1; W.endT = 2; fx(W, 15, S.x, S.y, 0); }
+  }
+  function stepBullets(W, h) {
+    for (let i = W.B.length - 1; i >= 0; i--) {
+      const b = W.B[i];
+      if (b.f & 4) {
+        let best = null, bd = 1e9;
+        for (const e of W.E) if (!e.dead && e.ck <= 0.5) { const d = hyp(e.x - b.x, e.y - b.y); if (d < bd) { bd = d; best = e; } }
+        if (best && bd < 220) {
+          const sp = hyp(b.vx, b.vy), a = Math.atan2(b.vy, b.vx), want = Math.atan2(best.y - b.y, best.x - b.x);
+          const tr = (b.f & 128 ? 3.2 : 2.6) * h, na = a + clamp(angN(want - a), -tr, tr);
+          b.vx = Math.cos(na) * sp; b.vy = Math.sin(na) * sp;
+        }
+      }
+      b.x += b.vx * h; b.y += b.vy * h; b.l -= h;
+      let hit = false;
+      if (!W.over) {
+        for (const e of W.E) {
+          if (e.dead || e.ck > 0.5) continue;
+          const rr = e.r + (e.sh > 0.5 && !(b.f & 1) ? 4 : 0) + (b.f & 64 ? 1.5 : 0.5);
+          const dx = e.x - b.x, dy = e.y - b.y;
+          if (dx * dx + dy * dy < rr * rr) { hitEnemy(W, e, b); hit = true; break; }
+          if (b.f & 16 && dx * dx + dy * dy < (e.r + 7) * (e.r + 7) && EN[e.k].drone) { dmgEnemy(W, e, e.pt[0], b.d * 2, b.d * 2); fx(W, 2, b.x, b.y, b.tt); hit = true; break; }
+        }
+        if (!hit) for (let j = W.X.length - 1; j >= 0; j--) {
+          const x = W.X[j]; if (x.k !== 1) continue;
+          const rr = b.f & 16 ? 8 : 3.2;
+          if (hyp(x.x - b.x, x.y - b.y) < rr) { x.hp -= b.f & 16 ? 4 : b.d; if (x.hp <= 0) { fx(W, 16, x.x, x.y, 0); W.X.splice(j, 1); } hit = true; break; }
+        }
+        if (!hit) for (let j = W.RK.length - 1; j >= 0; j--) {
+          const rk = W.RK[j];
+          if (hyp(rk.x - b.x, rk.y - b.y) < rk.r + 1) { rk.hp -= b.d; hit = true; if (rk.hp <= 0) { fx(W, 17, rk.x, rk.y, rk.r); W.RK.splice(j, 1); W.earn += 1; } break; }
+        }
+      }
+      if (hit || b.l <= 0 || b.x < -10 || b.y < -10 || b.x > AW + 10 || b.y > AH + 10) W.B.splice(i, 1);
+    }
+  }
+  function stepShots(W, h) {
+    const S = W.S;
+    for (let i = W.X.length - 1; i >= 0; i--) {
+      const x = W.X[i]; x.l -= h;
+      if (x.k === 4) {
+        const e = W.E[x.e];
+        if (x.t > 0) { if (e && !e.dead) { const w = toWorld(e, ESTAT[e.k].pt.find((p) => p.w === 'bem').x, 0); x.x = w[0]; x.y = w[1]; } else { W.X.splice(i, 1); continue; } x.t -= h; if (x.t <= 0) { const ld = lineDist(S.x, S.y, x.x, x.y, x.a, x.len); if (ld[0] < S.r * 0.6 + x.r) { const px = x.x + Math.cos(x.a) * ld[1], py = x.y + Math.sin(x.a) * ld[1]; hitUs(W, px, py, x.d, 0, 0, 'bem'); } fx(W, 12, x.x, x.y, 1); } }
+        if (x.l <= 0) W.X.splice(i, 1);
+        continue;
+      }
+      if (x.k === 1) {
+        const sp = Math.min(64, hyp(x.vx, x.vy) + 18 * h), a = Math.atan2(x.vy, x.vx), want = Math.atan2(S.y - x.y, S.x - x.x);
+        const na = a + clamp(angN(want - a), -1.5 * h, 1.5 * h); x.vx = Math.cos(na) * sp; x.vy = Math.sin(na) * sp;
+      }
+      if (W.GW && hyp(W.GW.x - x.x, W.GW.y - x.y) < 30) { W.X.splice(i, 1); continue; }
+      x.x += x.vx * h; x.y += x.vy * h;
+      const rr = S.r * 0.8 + x.r + (S.sh > 0.5 ? 3 : 0);
+      if (hyp(S.x - x.x, S.y - x.y) < rr) { hitUs(W, x.x, x.y, x.d, x.k === 3, 0, 'x' + x.k); W.X.splice(i, 1); continue; }
+      let gone = false;
+      for (const d of W.DR) if (hyp(d.x - x.x, d.y - x.y) < 3 && x.k !== 2) { gone = true; break; }
+      if (gone || x.l <= 0 || x.x < -10 || x.y < -10 || x.x > AW + 10 || x.y > AH + 10) W.X.splice(i, 1);
+    }
+  }
+  function stepMisc(W, h) {
+    const S = W.S;
+    // 드론(우리)
+    for (let i = W.DR.length - 1; i >= 0; i--) {
+      const d = W.DR[i]; d.l -= h;
+      if (d.l <= 0) { W.DR.splice(i, 1); continue; }
+      if (d.esc && W.sys.G.dis) { d.x += (S.x - d.x) * 0.2; d.y += (S.y - d.y) * 0.2; continue; }
+      d.ph += h * (d.esc ? 1.4 : 2);
+      const rr = S.r + (d.esc ? 10 : 18), tx = S.x + Math.cos(d.ph) * rr, ty = S.y + Math.sin(d.ph) * rr;
+      d.x += (tx - d.x) * Math.min(1, 6 * h); d.y += (ty - d.y) * Math.min(1, 6 * h);
+      d.cd -= h;
+      if (d.cd <= 0) {
+        let best = null, bd = 150;
+        for (const e of W.E) if (!e.dead && e.ck <= 0.5) { const q = hyp(e.x - d.x, e.y - d.y); if (q < bd) { bd = q; best = e; } }
+        if (best) { const l = lead(d.x, d.y, best.x, best.y, best.vx, best.vy, 160); const a = Math.atan2(l[1] - d.y, l[0] - d.x) + (rnd() - 0.5) * 0.1; if (W.B.length < 90) W.B.push({ x: d.x, y: d.y, vx: Math.cos(a) * 160, vy: Math.sin(a) * 160, l: 1, d: 2, pd: 2, f: 0, tt: TB_DRONE, o: -2 }); d.cd = 0.7; }
+        else d.cd = 0.3;
+      }
+    }
+    // 기뢰
+    for (let i = W.MN.length - 1; i >= 0; i--) {
+      const m = W.MN[i]; m.l -= h; if (m.arm > 0) m.arm -= h;
+      let boom = m.l <= 0 && m.o === 1 ? false : false;
+      if (m.arm <= 0) {
+        if (m.o === 0) { for (const e of W.E) if (!e.dead && hyp(e.x - m.x, e.y - m.y) < 9 + e.r * 0.7) { boom = true; break; } }
+        else if (hyp(S.x - m.x, S.y - m.y) < 8 + S.r * 0.7) boom = true;
+      }
+      if (boom) {
+        if (m.o === 0) { for (const e of W.E) if (!e.dead && hyp(e.x - m.x, e.y - m.y) < 18 + e.r) dmgEnemy(W, e, nearestPart(e, m.x, m.y), m.d, m.d); }
+        else hitUs(W, m.x, m.y, m.d, 0, 0, 'min');
+        fx(W, 18, m.x, m.y, m.o); W.MN.splice(i, 1); continue;
+      }
+      if (m.l <= 0) W.MN.splice(i, 1);
+    }
+    // 거대 광선포
+    if (W.LB) {
+      const B = W.LB; B.l -= h;
+      if (B.t > 0) { B.x = S.x + Math.cos(S.a) * S.r; B.y = S.y + Math.sin(S.a) * S.r; B.a = S.a; B.t -= h; if (B.t <= 0) { for (const e of W.E) { if (e.dead || e.ck > 0.5) continue; const ld = lineDist(e.x, e.y, B.x, B.y, B.a, 270); if (ld[0] < e.r + 4) { const px = B.x + Math.cos(B.a) * ld[1], py = B.y + Math.sin(B.a) * ld[1]; dmgEnemy(W, e, nearestPart(e, px, py), 60, 60); } } fx(W, 19, B.x, B.y, 0); } }
+      if (B.l <= 0) W.LB = null;
+    }
+    if (W.GW) { W.GW.l -= h; if (W.GW.l <= 0) W.GW = null; }
+    // 소행성
+    if (W.haz === 'ast') {
+      W.rkT -= h; if (W.rkT <= 0 && W.RK.length < 14) { W.rkT = 2 + rnd() * 2; addRock(W, false); }
+      for (let i = W.RK.length - 1; i >= 0; i--) {
+        const rk = W.RK[i]; rk.x += rk.vx * h; rk.y += rk.vy * h;
+        if (hyp(S.x - rk.x, S.y - rk.y) < S.r * 0.8 + rk.r) { hitUs(W, rk.x, rk.y, Math.round(rk.r * 0.9), 0, 0, 'rk'); fx(W, 17, rk.x, rk.y, rk.r); W.RK.splice(i, 1); continue; }
+        let gone = false;
+        for (const e of W.E) if (!e.dead && hyp(e.x - rk.x, e.y - rk.y) < e.r * 0.8 + rk.r) { dmgEnemy(W, e, nearestPart(e, rk.x, rk.y), rk.r, rk.r); fx(W, 17, rk.x, rk.y, rk.r); gone = true; break; }
+        if (gone || rk.x < -20 || rk.y < -20 || rk.x > AW + 20 || rk.y > AH + 20) W.RK.splice(i, 1);
+      }
+    }
+    // 이온 폭풍 번개
+    if (W.haz === 'stm') {
+      W.zT -= h;
+      if (W.zT <= 0 && W.Z.length < 4) { W.zT = 3.2 + rnd() * 1.6; const a = rnd() * TAU, d = rnd() * 50; W.Z.push({ x: clamp(S.x + Math.cos(a) * d + S.vx * 0.8, 20, AW - 20), y: clamp(S.y + Math.sin(a) * d + S.vy * 0.8, 20, AH - 20), r: 24, t: 1.6 }); }
+      for (let i = W.Z.length - 1; i >= 0; i--) {
+        const z = W.Z[i]; z.t -= h;
+        if (z.t <= 0) {
+          if (hyp(S.x - z.x, S.y - z.y) < z.r + S.r * 0.5) hitUs(W, S.x, S.y, 5, 1, 0, 'z');
+          for (const e of W.E) if (!e.dead && hyp(e.x - z.x, e.y - z.y) < z.r + e.r * 0.5) dmgEnemy(W, e, nearestPart(e, z.x, z.y), 8, 8);
+          fx(W, 20, z.x, z.y, z.r); W.Z.splice(i, 1);
+        }
+      }
+    }
+  }
+  function summary(W) { return { hp: W.S.hp, earn: W.earn, win: W.win, fled: W.fled, lose: W.lose, kills: W.kills, capt: W.capt, T: W.T }; }
+  function endFight(st, sm) {
+    const ty = st.fi ? st.fi.ty : PIR;
+    st.hp = clamp(Math.round(sm.hp), 0, st.hm);
+    st.sc = Math.max(0, st.sc + (sm.earn | 0)); st.ga += sm.earn | 0; st.k += sm.kills | 0; st.cp += sm.capt | 0;
+    st.fi = null; st.vt = new Array(st.NC).fill(-1);
+    if (st.hp <= 0) { st.ph = 'done'; st.win = 0; st.msg = '배가 부서졌어요.'; return st; }
+    if (ty === BOS && sm.win) { st.ph = 'done'; st.win = 1; st.fw++; st.msg = '최종 보스를 물리쳤어요!'; return st; }
+    if (st.col >= st.len) { st.ph = 'done'; st.win = 0; return st; }
+    const g = sm.earn ? ' (고철 +' + sm.earn + ')' : '';
+    if (sm.fled) st.msg = '적이 물러갔어요.' + g;
+    else {
+      st.fw++; st.msg = '승리!' + g + (sm.capt ? ' 나포 ' + sm.capt + '척!' : '');
+      if (ty === ELI) { st.msg += ' 전리품: ' + (rnd() < 0.55 ? gainTurret(st, 1 + ((rnd() * (TUR.length - 1)) | 0), rnd() < 0.3 ? 2 : 1) : (() => { const id = randUp(st); if (addUp(st, id)) return '「' + UPG[id].nm + '」'; st.sc += 20; return '고철 +20'; })()); }
+      if (ty === MID) { const ok = SPC.map((x, i) => i).filter((i) => i !== st.sp); st.msg += ' 전리품: ' + gainSpecial(st, ok[(rnd() * ok.length) | 0]); const r = upTurret(st, -1); if (r) st.msg += ', ' + r; }
+    }
+    st.ph = 'map';
+    return st;
+  }
+
+  /* ======================= crew AI ======================= */
+  // 조작 객체: mx,my 이동 · sq 특수(번호) · ps 동력 프리셋 · rp 수리 우선 부위 · cl 수리 호출 · fo 집중 목표 · a 조준(세계 각) · f 발사 · hl 수리 돕기
+  const newCtl = () => ({ mx: 0, my: 0, sq: 0, ps: 0, rp: -1, cl: 0, fo: -1, a: -PI / 2, f: 0, hl: 0 });
+  function threatCost(W, px, py, vx, vy, hor, lv) {
+    const S = W.S; let cost = 0;
+    const samp = lv === 1 ? [0.3] : lv === 2 ? [0.25, 0.55, 0.9] : [0.2, 0.45, 0.75, 1.1, 1.5];
+    for (const x of W.X) {
+      if (x.k === 4) {
+        if (x.t <= 0 || x.t > hor + 0.2) continue;
+        const ld = lineDist(px + vx * x.t, py + vy * x.t, x.x, x.y, x.a, x.len);
+        if (ld[0] < S.r + 6) cost += x.d * (1 - ld[0] / (S.r + 6)) * 1.5;
+        continue;
+      }
+      const dx0 = x.x - px, dy0 = x.y - py;
+      if (dx0 * dx0 + dy0 * dy0 > 160 * 160) continue;
+      if (lv === 1 && rnd() < 0.4) continue;
+      const rad = S.r * 0.85 + x.r + 3;
+      for (const t of samp) {
+        if (t > hor) break;
+        const qx = x.x + x.vx * t, qy = x.y + x.vy * t, ox = px + vx * t, oy = py + vy * t;
+        const d = hyp(qx - ox, qy - oy) / rad;
+        if (d < 2) cost += x.d * Math.exp(-d * d) * (S.sh > x.d * 1.5 ? 0.35 : 1);
+      }
+    }
+    for (const m of W.MN) if (m.o === 1) { const d = hyp(m.x - (px + vx * 0.5), m.y - (py + vy * 0.5)); if (d < 22) cost += m.d * (1 - d / 22); }
+    for (const z of W.Z) { const d = hyp(z.x - (px + vx * z.t), z.y - (py + vy * z.t)); if (d < z.r + 12) cost += 6 * (1 - d / (z.r + 12)); }
+    for (const rk of W.RK) { const d = hyp(rk.x + rk.vx * 0.5 - (px + vx * 0.5), rk.y + rk.vy * 0.5 - (py + vy * 0.5)); if (d < rk.r + S.r + 6) cost += rk.r * 0.8; }
+    for (const e of W.E) {
+      if (e.dead) continue;
+      const D = EN[e.k];
+      if (D.beh === 'kam' || ((D.beh === 'ram' || D.beh === 'eat') && e.rs === 1)) { const t = 0.4, d = hyp(e.x + e.vx * t - (px + vx * t), e.y + e.vy * t - (py + vy * t)); if (d < e.r + S.r + 10) cost += 12 * (1 - d / (e.r + S.r + 10)); }
+      const d = hyp(e.x - (px + vx * 0.5), e.y - (py + vy * 0.5)); if (d < e.r + S.r + 4) cost += 4;
+    }
+    return cost;
+  }
+  function focusOf(W, c) { const e = c && c.fo >= 0 ? W.E[c.fo] : null; return e && !e.dead ? e : null; }
+  function aiCaptain(W, seat, c, m, lv, h) {
+    const S = W.S, D = SHIPS[W.sh];
+    m.ct = (m.ct || 0) - h;
+    if (m.ct > 0) return;
+    m.ct = [0, 0.32, 0.16, 0.07][lv] * (0.8 + 0.4 * rnd());
+    const al = W.E.filter((e) => !e.dead);
+    // 목표
+    let tg = focusOf(W, c);
+    if (!tg || (m.ftT = (m.ftT || 0) - 1) < 0) {
+      tg = null; let bs = 1e9;
+      for (const e of al) { const d = hyp(e.x - S.x, e.y - S.y); const s = lv === 3 ? d * 0.5 + e.hp * 0.6 / (1 + (EN[e.k].el || EN[e.k].boss ? 0 : 1)) : d; if (s < bs) { bs = s; tg = e; } }
+      m.ftT = 10;
+    }
+    c.fo = tg && lv >= 2 ? W.E.indexOf(tg) : -1;
+    // 움직임 후보
+    const nd = lv === 1 ? 6 : lv === 2 ? 10 : 14, hor = [0, 0.5, 1.0, 1.5][lv], vmax = Math.max(15, W.vmax || D.v);
+    m.odT = (m.odT || 0) - 1; if (m.odT < 0) { m.od = rnd() < 0.5 ? -1 : 1; m.odT = 60 + rnd() * 60; }
+    let best = [0, 0], bc = 1e9;
+    for (let k = 0; k <= nd; k++) {
+      const dx = k < nd ? Math.cos(k / nd * TAU + (m.rot || 0)) : 0, dy = k < nd ? Math.sin(k / nd * TAU + (m.rot || 0)) : 0;
+      const vx = dx * vmax, vy = dy * vmax;
+      let cost = threatCost(W, S.x, S.y, vx * 0.85 + S.vx * 0.15, vy * 0.85 + S.vy * 0.15, hor, lv) * (lv === 3 ? 1.8 : 1);
+      const fx2 = S.x + vx * 0.8, fy2 = S.y + vy * 0.8;
+      if (tg) {
+        // 보스전이 길어지면(1분 반 넘게) 더 붙어서 끝내요 — 포탑 사거리 밖에서 피하기만 하다 질질 끄는 것 방지
+        const late = EN[tg.k].boss && W.T > 90 ? Math.min(1, (W.T - 90) / 60) : 0;
+        const d = hyp(tg.x - fx2, tg.y - fy2), want = (EN[tg.k].boss ? 1.25 - 0.45 * late : 1) * D.dr * (lv === 1 ? 0.8 : 1);
+        cost += Math.abs(d - want) / want * (lv === 1 ? 1.2 : 2 + 2 * late);
+        if (m.rg == null || m.rgK !== W.k) { m.rgK = W.k; let a = 0, n2 = 0; for (const mt of S.M) { const T = TUR[mt.tt]; if (T) { a += T.sp * T.l; n2++; } } m.rg = n2 ? a / n2 : 200; }
+        if (lv >= 2 && d > m.rg * 0.9) cost += (d - m.rg * 0.9) / m.rg * (2 + 3 * late);
+        const ta = Math.atan2(tg.y - S.y, tg.x - S.x), tang = Math.cos(Math.atan2(dy, dx) - (ta + m.od * PI / 2));
+        if (k < nd) cost -= tang * (lv === 3 ? 0.5 : 0.25);
+        if (lv === 3 && D.main && S.sc >= 1 && S.sp === 6) cost += Math.abs(angN(Math.atan2(dy, dx) - ta)) * 0.4;
+      }
+      const wm = 40; if (fx2 < wm) cost += (wm - fx2) / wm * 3; if (fy2 < wm) cost += (wm - fy2) / wm * 3; if (fx2 > AW - wm) cost += (fx2 - AW + wm) / wm * 3; if (fy2 > AH - wm) cost += (fy2 - AH + wm) / wm * 3;
+      if (m.lx != null && k < nd && Math.abs(dx - m.lx) + Math.abs(dy - m.ly) < 0.3) cost -= 0.15;
+      if (cost < bc) { bc = cost; best = [dx, dy]; }
+    }
+    m.rot = lv === 1 ? rnd() : 0;
+    m.lx = best[0]; m.ly = best[1];
+    c.mx = best[0] * (lv === 1 ? 0.75 : 1); c.my = best[1] * (lv === 1 ? 0.75 : 1);
+    // 동력
+    m.pT = (m.pT || 0) - 1;
+    if (m.pT <= 0) {
+      m.pT = [0, 40, 12, 5][lv];
+      let near = 0; for (const x of W.X) if (hyp(x.x - S.x, x.y - S.y) < 80) near++;
+      const shF = S.sh / Math.max(1, W.shMax || S.shm);
+      let ps = 0;
+      if (lv === 1) ps = rnd() < 0.7 ? 0 : (rnd() * 4) | 0;
+      else if (W.sys.S.dis) ps = near > 5 ? 3 : 1;
+      else if (near > (lv === 3 ? 6 : 8) && shF < 0.5) ps = 2;
+      else if (lv === 3 && W.X.some((x) => x.k === 4 && x.t > 0) && hyp(S.vx, S.vy) < 20) ps = 3;
+      else if (!al.length) ps = 0;
+      else ps = lv === 3 && near < 3 ? 1 : shF > 0.6 ? 1 : 0;
+      c.ps = ps;
+    }
+    // 수리 우선·호출
+    if (lv === 1) { c.rp = -1; c.cl = 0; }
+    else {
+      let bp = -1, bs = 0;
+      S.pt.forEach((p, i) => { if (p.hp >= p.hm) return; let s = RPRI[p.t] * (p.dis ? 3 : 1) * (1.2 - p.hp / p.hm); if (lv === 3 && p.t === 'T' && W.hu[S.M[p.m].seat]) s *= 1.4; if (lv === 3 && p.t === 'S' && W.X.length > 10) s *= 1.3; if (s > bs) { bs = s; bp = i; } });
+      c.rp = bp;
+      const crit = S.pt.some((p) => p.dis && (p.t === 'B' || p.t === 'E' || p.t === 'S' || p.t === 'R'));
+      c.cl = crit || (lv === 3 && S.pt.filter((p) => p.dis).length >= 2) ? 1 : 0;
+    }
+    // 특수 무기
+    if (S.sc >= 1) {
+      m.spD = m.spD == null ? (lv === 1 ? 2 + rnd() * 6 : 0) : m.spD - 1 / 8;
+      let use = false;
+      if (lv === 1) use = m.spD <= 0 && al.length > 0;
+      else {
+        const id = S.sp, nearE = al.filter((e) => hyp(e.x - S.x, e.y - S.y) < 70).length, nearX = W.X.filter((x) => hyp(x.x - S.x, x.y - S.y) < 50).length;
+        const danger = threatCost(W, S.x, S.y, S.vx, S.vy, 0.8, 2);
+        const bigE = al.some((e) => EN[e.k].el || EN[e.k].boss);
+        if (id === 0) use = nearE >= (lv === 3 ? 1 : 2) || nearX >= 4;
+        else if (id === 1) use = al.length > 0 && (lv === 2 || bigE || al.length >= 2 || al.some((e) => e.hp > 60));
+        else if (id === 2) use = danger > (lv === 3 ? 6 : 9);
+        else if (id === 3) use = S.sh < (W.shMax || S.shm) * 0.4 && W.X.length > 4;
+        else if (id === 4) use = al.length > 0;
+        else if (id === 5) use = al.some((e) => hyp(e.x - S.x, e.y - S.y) < 95);
+        else if (id === 6) use = al.some((e) => { const d = hyp(e.x - S.x, e.y - S.y); return d < 240 && Math.abs(angN(Math.atan2(e.y - S.y, e.x - S.x) - S.a)) < Math.atan2(e.r + 3, d) + 0.05; });
+        else if (id === 7) use = S.pt.some((p) => p.dis) || S.pt.reduce((a, p) => a + p.hp / p.hm, 0) / S.pt.length < 0.6;
+        else if (id === 8) use = al.filter((e) => hyp(e.x - S.x, e.y - S.y) < 150).length >= (lv === 3 ? 2 : 1) || W.X.filter((x) => x.k === 1).length >= 3;
+        else if (id === 9) use = al.filter((e) => hyp(e.x - S.x, e.y - S.y) < 160).length >= 2 || nearX > 6;
+        if (!use && S.sc >= 1 && (m.spW = (m.spW || 0) + 1) > (lv === 3 ? 400 : 160)) use = al.length > 0;
+      }
+      if (use) { c.sq = (c.sq | 0) + 1; c.go = 1; m.spD = null; m.spW = 0; }
+    }
+  }
+  const GNZ = [0, 0.11, 0.045, 0.012];
+  const WPRI = { W: 5, G: 4.5, S: 3, B: 2.5, R: 2.2, E: 2, C: 4, H: 0.5 };
+  function aiGunner(W, seat, c, m, lv, h, capC) {
+    const S = W.S, mi = W.gm[seat], mt = mi >= 0 ? S.M[mi] : null;
+    if (!mt) return;
+    const T = TUR[mt.tt], sp = T.sp * (1 + 0.2 * W.up[8]), rng = sp * T.l * 0.92;
+    const o = mountWorld(S, mt);
+    // 수리 돕기
+    m.hT = (m.hT || 0) - h;
+    if (m.hT <= 0) {
+      m.hT = [0, 1.5, 0.8, 0.4][lv];
+      const mine = mt.p.dis || (mt.p.hp < mt.p.hm * 0.3);
+      if (mine) c.hl = lv === 1 ? (rnd() < 0.5 ? 1 : 0) : 1;
+      else if (S.cl) {
+        const hasT = W.E.some((e) => !e.dead && hyp(e.x - o[0], e.y - o[1]) < rng && inArc(mt, Math.atan2(e.y - o[1], e.x - o[0]) - S.a));
+        c.hl = lv === 1 ? (rnd() < 0.15 ? 1 : 0) : lv === 2 ? (hasT ? 0 : 1) : (!hasT || (W.helpN < 1 && T.pr <= 45) ? 1 : 0);
+      } else c.hl = 0;
+    }
+    if (c.hl) { c.f = 0; return; }
+    // 목표 고르기
+    m.gt = (m.gt || 0) - h;
+    let tg = m.tg && !m.tg.dead && (m.tg.ck || 0) <= 0.5 ? m.tg : null;
+    if (m.gt <= 0 || !tg) {
+      m.gt = [0, 0.9, 0.45, 0.2][lv];
+      tg = null; m.tp = null;
+      let bs = -1e9;
+      if (lv >= 2) {
+        for (const x of W.X) {
+          if (x.k !== 1) continue;
+          const d = hyp(x.x - o[0], x.y - o[1]);
+          if (d > (lv === 3 ? 90 : 60) || !inArc(mt, Math.atan2(x.y - o[1], x.x - o[0]) - S.a)) continue;
+          const s = 100 - d; if (s > bs) { bs = s; tg = x; }
+        }
+      }
+      if (!tg) {
+        const foc = focusOf(W, capC);
+        for (const e of W.E) {
+          if (e.dead || e.ck > 0.5) continue;
+          const d = hyp(e.x - o[0], e.y - o[1]);
+          if (d > rng * (lv === 1 ? 1.2 : 1)) continue;
+          const la = Math.atan2(e.y - o[1], e.x - o[0]) - S.a;
+          if (!inArc(mt, la)) continue;
+          let s = -d;
+          if (lv === 1) s += rnd() * 60;
+          if (lv >= 2 && e === foc) s += 70;
+          if (lv === 3) { s += (EN[e.k].beh === 'kam' ? 80 : 0) + (1 - e.hp / e.hm) * 40; if (T.ion && e.sh > 0) s += 40; }
+          if (s > bs) { bs = s; tg = e; }
+        }
+        if (tg && lv >= 2) {
+          let bp = null, bq = -1e9;
+          for (const p of tg.pt) {
+            if (p.ph > tg.ph) continue;
+            let s = (WPRI[p.t] || 1) + rnd() * (lv === 2 ? 2 : 0.5);
+            if (p.dis) s = p.t === 'B' && lv === 3 && !EN[tg.k].boss ? 4.5 : -2;
+            if (lv === 3 && tg.sh > 0 && !T.pierce && p.t === 'S') s += 3;
+            if (s > bq) { bq = s; bp = p; }
+          }
+          m.tp = bp;
+        }
+      }
+      m.tg = tg; m.nz = (rnd() * 2 - 1) * GNZ[lv];
+    }
+    if (!tg) { c.f = 0; return; }
+    let tx = tg.x, ty = tg.y;
+    if (m.tp && tg.pt) { const w = toWorld(tg, m.tp.x, m.tp.y); tx = w[0]; ty = w[1]; }
+    let p;
+    if (lv === 1) p = rnd() < 0.5 ? [tx, ty] : lead(o[0], o[1], tx, ty, tg.vx, tg.vy, sp);
+    else p = lead(o[0], o[1], tx, ty, tg.vx, tg.vy, sp);
+    c.a = Math.atan2(p[1] - o[1], p[0] - o[0]) + m.nz;
+    const la = c.a - S.a;
+    const tol = [0, 0.25, 0.12, 0.06][lv] + Math.atan2(tg.r || 2, hyp(p[0] - o[0], p[1] - o[1])) * 0.5;
+    c.f = inArc(mt, la) && Math.abs(angN(la - mt.ang)) < tol ? 1 : 0;
+    if (c.f && lv === 3 && T.big && tg.sh > 0 && !T.pierce) c.f = Math.abs(angN(la - mt.ang)) < tol * 0.5 ? 1 : 0;
+    if (c.f) m.nz = m.nz * 0.5 + (rnd() * 2 - 1) * GNZ[lv] * 0.5;
+  }
+  function aiCrew(W, seat, c, m, lv, h, capC) {
+    lv = lv >= 1 && lv <= 3 ? lv : 2;
+    if (W.inj[seat] > 0) return;
+    if (seat === actCap(W)) aiCaptain(W, seat, c, m, lv, h);
+    else aiGunner(W, seat, c, m, lv, h, capC);
+  }
+  // 선장·부선장 모두 부상: 함교 자동 조종(쉬움 수준)
+  function autoPilot(W, h) {
+    if (actCap(W) >= 0) return;
+    if (!W.autoCap) { W.autoCap = newCtl(); W.autoMem = {}; }
+    aiCaptain(W, -1, W.autoCap, W.autoMem, 1, h);
+  }
+
+  /* ======================= net snapshot ======================= */
+  const ri = Math.round;
+  function encode(W, q) {
+    const S = W.S;
+    const o = { k: W.k, q, T: r1(W.T), o: W.over ? (W.lose ? 3 : W.fled ? 2 : 1) : 0, e: W.earn,
+      s: [r1(S.x), r1(S.y), r2(S.a), ri(S.vx), ri(S.vy), r1(S.hp), r1(S.sh), r1(W.shMax || S.shm), ri(S.sc * 100), S.pre, S.rp, S.cl, S.inv > 0 ? 1 : 0, S.oc > 0 ? 1 : 0, S.sp, W.rpT == null ? -1 : W.rpT, W.helpN | 0, actCap(W), W.fo == null ? -1 : W.fo],
+      p: S.pt.map((p) => ri(p.hp) * (p.dis ? -1 : 1) - (p.dis ? 1 : 0)), m: S.M.map((m) => r2(m.ang)), md: S.M.map((m) => ri(Math.max(0, m.cd) * 10)),
+      j: W.inj.map((v) => Math.ceil(v)), E: [], B: [], X: [], M: [], D: [], R: [], Z: [], L: W.LB ? [r1(W.LB.x), r1(W.LB.y), r2(W.LB.a), r1(W.LB.t), r1(W.LB.l)] : 0, G: W.GW ? [ri(W.GW.x), ri(W.GW.y), r1(W.GW.l)] : 0,
+      fx: W.fx.slice(-12) };
+    for (const e of W.E) {
+      if (e.dead && !EN[e.k].boss) continue;
+      const a = [e.k, r1(e.x), r1(e.y), r2(e.a), ri(e.vx), ri(e.vy), ri(e.hp), e.hm, ri(e.sh), e.shm, (e.dead ? 1 : 0) | (e.ck > 0.5 ? 2 : 0) | (e.emp > 0 ? 4 : 0) | (e.slow > 0 ? 8 : 0) | (e.ph << 4), W.E.indexOf(e)];
+      for (const p of e.pt) a.push(ri(p.hp) * (p.dis ? -1 : 1) - (p.dis ? 1 : 0));
+      o.E.push(a);
+    }
+    const bl = W.B.length > 50 ? W.B.slice(-50) : W.B;
+    for (const b of bl) o.B.push(ri(b.x), ri(b.y), ri(b.vx), ri(b.vy), b.tt);
+    const xl = W.X.length > 45 ? W.X.slice(-45) : W.X;
+    for (const x of xl) o.X.push(ri(x.x), ri(x.y), ri(x.vx), ri(x.vy), x.k, x.k === 4 ? r2(x.a) : 0, x.k === 4 ? r1(x.t) : 0, x.k === 4 ? ri(x.len) : 0);
+    for (const m of W.MN) o.M.push(ri(m.x), ri(m.y), m.o + (m.arm > 0 ? 2 : 0));
+    for (const d of W.DR) o.D.push(ri(d.x), ri(d.y));
+    for (const rk of W.RK) o.R.push(ri(rk.x), ri(rk.y), ri(rk.vx), ri(rk.vy), ri(rk.r * 10), rk.s);
+    for (const z of W.Z) o.Z.push(ri(z.x), ri(z.y), z.r, r1(z.t));
+    return o;
+  }
+  // 게스트 화면용 세계: 같은 모양(S, E, B, X …)으로 만들어 그리기 코드를 함께 씀
+  function guestWorld(st) {
+    const up = upA(st), fi = st.fi;
+    const W = { k: fi.k, ty: fi.ty, f: fi.f, haz: fi.ty === AST ? 'ast' : fi.ty === STM ? 'stm' : fi.ty === NEB ? 'neb' : '', boss: fi.ty === MID || fi.ty === BOS ? 1 : 0, up, sh: st.sh, NC: st.NC,
+      T: 0, S: mkOurShip(st, up), E: [], B: [], X: [], MN: [], DR: [], RK: [], Z: [], LB: null, GW: null, inj: new Array(st.NC).fill(0), cap: st.cap, vc: st.vc, gm: new Array(st.NC).fill(-1), hu: st.hu.slice(),
+      fx: [], m0: st.sc, earn: 0, over: 0, got: 0, tS: 0, ac: st.cap, rpT: -1, helpN: 0, shMax: 0, sys: null, guest: 1 };
+    const go = gunOrder(st, st.cap, st.hu);
+    go.forEach((s, i) => { if (i < W.S.M.length) { W.gm[s] = i; W.S.M[i].seat = s; } });
+    if (W.vc < 0 || W.vc === W.cap || W.gm[W.vc] < 0) W.vc = go[0];
+    sysCalc(W);
+    return W;
+  }
+  const decHp = (v, p) => { if (v < 0) { p.hp = -v - 1; p.dis = 1; } else { p.hp = v; p.dis = 0; } };
+  function applySnap(G, o, now) {
+    const S = G.S, s = o.s;
+    G.T = o.T; G.over = o.o; G.earn = o.e;
+    S.x = s[0]; S.y = s[1]; S.a = s[2]; S.vx = s[3]; S.vy = s[4]; S.hp = s[5]; S.sh = s[6]; G.shMax = s[7]; S.sc = s[8] / 100; S.pre = s[9]; S.rp = s[10]; S.cl = s[11]; S.inv = s[12]; S.oc = s[13]; S.sp = s[14]; G.rpT = s[15]; G.helpN = s[16]; G.ac = s[17]; G.fo = s[18];
+    o.p.forEach((v, i) => { if (S.pt[i]) decHp(v, S.pt[i]); });
+    o.m.forEach((v, i) => { if (S.M[i]) S.M[i].ang = v; });
+    if (o.md) o.md.forEach((v, i) => { if (S.M[i]) S.M[i].cd = v / 10; });
+    G.inj = o.j.slice();
+    const prev = {}; for (const e of G.E) prev[e.id] = e;
+    G.E = o.E.map((a) => {
+      const k = a[0], ES = ESTAT[k], old = prev[a[11]];
+      const e = old && old.k === k ? old : { k, r: EN[k].r, pt: ES.pt.map((p) => ({ t: p.t, x: p.x, y: p.y, r: p.r, w: p.w, ph: p.ph, hp: 1, hm: 1, dis: 0 })), id: a[11] };
+      e.x = a[1]; e.y = a[2]; e.a = a[3]; e.vx = a[4]; e.vy = a[5]; e.hp = a[6]; e.hm = a[7]; e.sh = a[8]; e.shm = a[9];
+      e.dead = a[10] & 1; e.ck = a[10] & 2 ? 1 : 0; e.emp = a[10] & 4 ? 1 : 0; e.slow = a[10] & 8 ? 1 : 0; e.ph = a[10] >> 4;
+      for (let i = 0; i < e.pt.length; i++) { decHp(a[12 + i], e.pt[i]); if (!old) e.pt[i].hm = Math.max(e.pt[i].hp, 1); else e.pt[i].hm = Math.max(e.pt[i].hm, e.pt[i].hp, 1); }
+      return e;
+    });
+    G.B = []; for (let i = 0; i + 4 < o.B.length; i += 5) G.B.push({ x: o.B[i], y: o.B[i + 1], vx: o.B[i + 2], vy: o.B[i + 3], tt: o.B[i + 4] });
+    G.X = []; for (let i = 0; i + 7 < o.X.length; i += 8) { const k = o.X[i + 4]; G.X.push({ x: o.X[i], y: o.X[i + 1], vx: o.X[i + 2], vy: o.X[i + 3], k, a: o.X[i + 5], t: o.X[i + 6], len: o.X[i + 7], r: k === 2 ? 3.4 : k === 4 ? 3.5 : 1.6 }); }
+    G.MN = []; for (let i = 0; i + 2 < o.M.length; i += 3) G.MN.push({ x: o.M[i], y: o.M[i + 1], o: o.M[i + 2] & 1, arm: o.M[i + 2] & 2 ? 1 : 0 });
+    G.DR = []; for (let i = 0; i + 1 < o.D.length; i += 2) G.DR.push({ x: o.D[i], y: o.D[i + 1] });
+    G.RK = []; for (let i = 0; i + 5 < o.R.length; i += 6) G.RK.push({ x: o.R[i], y: o.R[i + 1], vx: o.R[i + 2], vy: o.R[i + 3], r: o.R[i + 4] / 10, s: o.R[i + 5] });
+    G.Z = []; for (let i = 0; i + 3 < o.Z.length; i += 4) G.Z.push({ x: o.Z[i], y: o.Z[i + 1], r: o.Z[i + 2], t: o.Z[i + 3] });
+    G.LB = o.L ? { x: o.L[0], y: o.L[1], a: o.L[2], t: o.L[3], l: o.L[4] } : null;
+    G.GW = o.G ? { x: o.G[0], y: o.G[1], l: o.G[2] } : null;
+    sysCalc(G);
+    G.tS = now; G.got = 1;
+  }
+
+  /* ======================= view ======================= */
+  const CSS = `
+.cw-pn{position:absolute;left:0;right:0;bottom:0;box-sizing:border-box;padding:7px 8px 8px;display:flex;gap:8px;background:linear-gradient(180deg,#231b31,#15101d);border-top:1px solid rgba(227,174,69,.4);font-family:var(--f-body);color:var(--ink);user-select:none;-webkit-user-select:none;touch-action:none;z-index:3}
+.cw-stick{flex:0 0 40%;position:relative;border-radius:16px;background:radial-gradient(circle at 50% 50%,#2c2340,#1a1424 72%);border:1px solid #3e3256;touch-action:none;overflow:hidden}
+.cw-stick .base{position:absolute;width:92px;height:92px;margin:-46px 0 0 -46px;border-radius:50%;border:2px solid rgba(227,174,69,.45);background:rgba(227,174,69,.06);pointer-events:none}
+.cw-stick .knob{position:absolute;width:44px;height:44px;margin:-22px 0 0 -22px;border-radius:50%;background:radial-gradient(circle at 40% 35%,#ffe2a0,#c98f2c);box-shadow:0 2px 6px rgba(0,0,0,.5);pointer-events:none}
+.cw-stick .lbl{position:absolute;left:0;right:0;top:6px;text-align:center;font:600 11px var(--f-body);color:#9d90b0;pointer-events:none}
+.cw-rc{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
+.cw-row{display:flex;gap:6px;flex:1;min-height:44px}
+.cw-b{flex:1;min-width:0;min-height:44px;border-radius:12px;border:1px solid #574871;background:#30263f;color:var(--ink);font:700 14px var(--f-body);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:1px;position:relative;overflow:hidden;touch-action:none;padding:0 4px;box-sizing:border-box;line-height:1.15;text-align:center}
+.cw-b:active,.cw-b.hold{background:#4a3c60;border-color:#e3ae45}
+.cw-b.on{background:#e3ae45;color:#2a1c08;border-color:#f0c56a}
+.cw-b.on small{color:#4a3510}
+.cw-b.dis{opacity:.5}
+.cw-b.rdy{border-color:#e3ae45;box-shadow:inset 0 0 0 1px #e3ae45, 0 0 12px -3px #e3ae45}
+.cw-b.warn{border-color:#ee6a55;background:#4a2229}
+.cw-b small{font:500 11px var(--f-body);color:#bfb3cf;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cw-b .ic{font-size:15px;line-height:1}
+.cw-fill{position:absolute;left:0;bottom:0;height:5px;background:#e3ae45}
+.cw-sp{flex:1.3}
+.cw-sp b{font:400 17px var(--f-display);letter-spacing:.5px}
+.cw-gi{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px;justify-content:flex-start}
+.cw-gi .cw-b{margin-top:auto}
+.cw-gt{font:700 14px/1.2 var(--f-body);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.cw-gt small{font:500 11.5px var(--f-body);color:#bfb3cf}
+.cw-badge{font:700 11px var(--f-body);padding:2px 7px;border-radius:9px;background:#e3ae45;color:#2a1c08}
+.cw-badge.v{background:#5bb3e6;color:#0f2433}
+.cw-bar2{height:8px;border-radius:4px;background:#2b2238;overflow:hidden;border:1px solid #4a3d60}
+.cw-bar2 i{display:block;height:100%;background:#e3ae45}
+.cw-hint{font:500 12px/1.35 var(--f-body);color:#cbbfdb}
+.cw-fire{flex:0 0 42%;min-height:44px;border-radius:16px;border:2px solid #8a5a3a;background:radial-gradient(circle at 50% 40%,#7a3a2a,#3a1c1a);color:#ffe2c8;font:400 24px var(--f-display);letter-spacing:2px;touch-action:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
+.cw-fire small{font:500 11px var(--f-body);letter-spacing:0;color:#e8c8b0}
+.cw-fire.hold{background:radial-gradient(circle at 50% 40%,#c0603a,#5a2a1a);border-color:#ffb36b}
+.cw-lock{position:absolute;inset:6px;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;background:rgba(40,12,20,.88);border-radius:14px;color:#ffd0c8;font:700 16px var(--f-body);text-align:center;padding:0 10px;z-index:2}
+.cw-lock small{font:500 12px var(--f-body);color:#e8b8b0}
+.cw-watch{flex:1;display:flex;align-items:center;justify-content:center;font:600 14px var(--f-body);color:#cbbfdb;text-align:center}
+.cw-tip{position:absolute;left:10px;right:10px;z-index:6;background:#2b2140;border:1.5px solid #e3ae45;border-radius:16px;padding:12px 14px;box-shadow:0 10px 30px rgba(0,0,0,.55);font:500 14px/1.45 var(--f-body);color:var(--ink);display:flex;flex-direction:column;gap:8px}
+.cw-tip h4{margin:0;font:400 18px var(--f-display);color:#e3ae45;letter-spacing:.5px}
+.cw-tip ul{margin:0;padding-left:18px}
+.cw-tip .btn{align-self:flex-end;min-height:44px;min-width:110px}
+.cw-scr{position:absolute;inset:0;box-sizing:border-box;padding:10px 10px 12px;display:flex;flex-direction:column;gap:8px;background:rgba(15,11,23,.8);font-family:var(--f-body);color:var(--ink);overflow-y:auto;overflow-x:hidden;touch-action:pan-y;z-index:4}
+.cw-scr.fix{overflow:hidden}
+.cw-head{display:flex;gap:6px;align-items:center;flex:none;flex-wrap:wrap}
+.cw-hp{flex:1 1 150px;display:flex;align-items:center;gap:6px;font:600 13px var(--f-body);min-width:0}
+.cw-bar{flex:1;height:12px;border-radius:6px;background:#2b2238;overflow:hidden;border:1px solid #4a3d60;min-width:40px}
+.cw-bar i{display:block;height:100%;background:linear-gradient(90deg,#e0604b,#e3ae45 50%,#7cc66a)}
+.cw-tag{padding:4px 10px;border-radius:14px;background:#2b2238;border:1px solid #4a3d60;font:600 13px var(--f-body);white-space:nowrap}
+.cw-tag b{font-family:var(--f-mono);color:#e3ae45}
+.cw-msg{flex:none;padding:8px 12px;border-radius:12px;background:#2a2238;border-left:3px solid #e3ae45;font:500 13.5px/1.45 var(--f-body)}
+.cw-gear{flex:none;font:500 12px/1.45 var(--f-body);color:#bfb3cf}
+.cw-gear b{color:var(--ink);font-weight:600}
+.cw-mapw{flex:1;min-height:150px;overflow-y:auto;overflow-x:hidden;border-radius:14px;background:radial-gradient(ellipse at 50% 30%,#241c3a,#120e1b 75%);border:1px solid #3a2f4d;touch-action:pan-y;position:relative}
+.cw-map{position:relative;width:100%}
+.cw-map svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.cw-node{position:absolute;width:46px;height:46px;margin:-23px 0 0 -23px;border-radius:50%;border:2px solid #4a3d60;background:#1c1628;color:#6d6080;display:flex;align-items:center;justify-content:center;padding:0;touch-action:manipulation}
+.cw-node svg{position:static;width:24px;height:24px}
+.cw-node.past{opacity:.55;border-color:#6d5d40}
+.cw-node.cur{border-color:#fff;box-shadow:0 0 0 4px rgba(255,255,255,.18)}
+.cw-node.nx{border-color:var(--c);color:var(--c);background:#271f36;box-shadow:0 0 14px -2px var(--c)}
+.cw-node.sel{background:var(--c);color:#1a1222;transform:scale(1.12)}
+.cw-node.fut{color:var(--c);opacity:.55}
+.cw-node.big{width:56px;height:56px;margin:-28px 0 0 -28px}
+.cw-vd{position:absolute;bottom:-8px;left:50%;transform:translateX(-50%);display:flex;gap:2px}
+.cw-vd i{width:9px;height:9px;border-radius:50%;border:1.5px solid #120e1b}
+.cw-nl{position:absolute;transform:translate(-50%,0);font:600 10.5px var(--f-body);color:#a597b8;white-space:nowrap;pointer-events:none}
+.cw-foot{flex:none;display:flex;flex-direction:column;gap:6px}
+.cw-sel{font:500 13px/1.4 var(--f-body);color:#d8cde6;min-height:18px}
+.cw-sel b{color:var(--c,#e3ae45)}
+.cw-big{min-height:50px;font-size:16px}
+.cw-two{display:flex;gap:6px}
+.cw-two .btn{flex:1;min-height:46px}
+.cw-card{background:#241c31;border:1px solid #4a3d60;border-radius:16px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;flex:none}
+.cw-card h3{margin:0;font:400 21px var(--f-display);color:#e3ae45;letter-spacing:.5px}
+.cw-card p{margin:0;font:500 14px/1.55 var(--f-body)}
+.cw-chx{display:block;font:500 12px var(--f-body);color:#b9a9cf;margin-top:2px}
+.cw-ch{min-height:52px;border-radius:12px;border:1px solid #5a4a75;background:#30263f;color:var(--ink);font:600 15px var(--f-body);text-align:left;padding:8px 14px;position:relative;touch-action:manipulation;flex:none}
+.cw-ch.me{border-color:#e3ae45;background:#43361f}
+.cw-ch[disabled]{opacity:.45}
+.cw-ch .cw-vd{position:static;transform:none;display:inline-flex;margin-left:8px;vertical-align:middle}
+.cw-item{display:flex;gap:10px;align-items:center;background:#241c31;border:1px solid #42365a;border-radius:13px;padding:8px 8px 8px 12px;flex:none}
+.cw-item .t{flex:1;min-width:0;font:700 14.5px var(--f-body)}
+.cw-item .t small{display:block;font:500 12px/1.35 var(--f-body);color:#bfb3cf;margin-top:2px}
+.cw-item .t em{font-style:normal;font-size:11px;padding:1px 6px;border-radius:8px;background:#3a2e52;color:#d9cee8;margin-right:5px;vertical-align:1px}
+.cw-item .btn{min-height:44px;min-width:78px;flex:none}
+.cw-hull{display:flex;gap:10px;align-items:center;border:1.5px solid #42365a;border-radius:14px;padding:6px 10px;background:#221a2e;min-height:60px;text-align:left;color:var(--ink);font-family:var(--f-body);touch-action:manipulation;flex:none}
+.cw-hull.on{border-color:#e3ae45;background:#33281e}
+.cw-hull canvas{flex:none}
+.cw-hull .t{flex:1;min-width:0;font:700 15px var(--f-body)}
+.cw-hull .t small{display:block;font:500 11.5px/1.35 var(--f-body);color:#bfb3cf}
+.cw-sub{font:600 13px var(--f-body);color:#bfb3cf;margin-top:2px;flex:none}
+.cw-wait{font:500 13px/1.4 var(--f-body);color:#bfb3cf;text-align:center}
+.cw-crew{display:flex;align-items:center;gap:8px;min-height:46px;padding:4px 6px 4px 10px;border-radius:12px;background:#221a2e;border:1px solid #3a2f4d;flex:none}
+.cw-crew .dot{width:12px;height:12px;border-radius:50%;flex:none}
+.cw-crew .nm{flex:1;min-width:0;font:600 14px var(--f-body);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cw-crew .nm small{font:500 11.5px var(--f-body);color:#bfb3cf;margin-left:4px}
+.cw-crew .btn{min-height:44px;padding:0 10px;font-size:13px;flex:none}
+.cw-mt{display:flex;align-items:center;gap:8px;min-height:44px;padding:4px 8px;border-radius:11px;background:#2a2139;border:1px solid #3a2f4d;font:600 13.5px var(--f-body);flex:none;color:var(--ink);text-align:left;width:100%;box-sizing:border-box}
+.cw-mt small{color:#bfb3cf;font-weight:500;font-size:11.5px}
+.cw-mt.can{border-color:#e3ae45;background:#3a2e1f}
+.cw-cg{display:flex;flex-wrap:wrap;gap:6px}
+.cw-cg button{min-height:44px;border-radius:22px;border:1px solid #5a4a75;background:#30263f;color:var(--ink);font:600 13px var(--f-body);padding:0 12px}
+.cw-cg button.on{border-color:#e3ae45;background:#e3ae45;color:#2a1c08}
+`;
+  const TIPS = {
+    C: { h: '선장', l: ['왼쪽 동그라미를 끌면 배가 그쪽으로 날아가요. 빨간 탄을 피하고, 적의 옆·뒤로 돌아 포수들이 쏘기 좋게 해 주세요.', '「특수」가 다 차면 눌러서 쏴요.', '동력: 공격(포탑 빨리) · 방어(방어막) · 기동(속도).', '「🔧 우선」을 누르면 먼저 고칠 부위를 골라요(위 화면에서 우리 배 부위를 눌러도 돼요). 「📢 호출」을 켜면 포수들이 수리를 도와요.', '적을 누르면 집중 공격 목표가 돼요.'] },
+    G: { h: '포수', l: ['위 화면을 손가락으로 끌면 그쪽으로 조준하며 쏴요. 「발사」를 누르고 있어도 쏴요.', '점선 유령 = 탄이 닿을 때 적이 있을 자리예요. 유령의 부위(포탑·엔진·함교)를 노려요.', '적 포탑을 부수면 덜 맞고, 엔진을 부수면 느려지고, 함교를 계속 맞히면 적 승무원이 쓰러져 나포해요.', '선장이 수리를 부르거나 내 포탑이 부서지면 「🔧 수리 돕기」를 눌러요.'] },
+    V: { h: '부선장', l: ['평소엔 포수예요. 선장이 다치면 내가 선장 화면으로 바뀌어 배를 지휘해요.'] },
+  };
+  const ROCKS = []; { const R = mkRng(99); for (let k = 0; k < 16; k++) { const p = []; for (let j = 0; j < 8; j++) { const a = j / 8 * TAU, rr = 0.75 + R() * 0.35; p.push(Math.cos(a) * rr, Math.sin(a) * rr); } ROCKS.push(p); } }
+  function lsGet(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function shade(hex, f) {
+    const n = parseInt(hex.slice(1), 16); let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+    if (f > 0) { r += (255 - r) * f; g += (255 - g) * f; b += (255 - b) * f; } else { r *= 1 + f; g *= 1 + f; b *= 1 + f; }
+    return 'rgb(' + (r | 0) + ',' + (g | 0) + ',' + (b | 0) + ')';
+  }
+  function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')'; }
+  const mountSide = (m) => (m[3] >= 3.1 ? '사방' : Math.abs(m[2]) < 0.7 ? '앞' : Math.abs(m[2]) > 2.4 ? '뒤' : m[2] < 0 ? '왼쪽' : '오른쪽');
+  const CREWC = ['#ee6a55', '#5bb3e6', '#e8c04e', '#5fd3a0', '#b48cf0', '#f07fb8'];
+  function polyPath(c, pg) { c.beginPath(); c.moveTo(pg[0], pg[1]); for (let i = 2; i < pg.length; i += 2) c.lineTo(pg[i], pg[i + 1]); c.closePath(); }
+  // 배 그리기 (로컬 좌표, 1단위 = 1) — 우리 배와 적이 함께 씀
+  function drawHull(c, pg, col, t, ours) {
+    polyPath(c, pg);
+    const gr = c.createLinearGradient(0, -12, 0, 12); gr.addColorStop(0, shade(col, 0.28)); gr.addColorStop(0.5, col); gr.addColorStop(1, shade(col, -0.45));
+    c.fillStyle = gr; c.fill();
+    c.lineWidth = 0.7; c.strokeStyle = 'rgba(15,8,20,.85)'; c.stroke();
+    c.save(); c.scale(0.62, 0.62); polyPath(c, pg); c.restore();
+    c.lineWidth = 0.35; c.strokeStyle = ours ? 'rgba(255,255,255,.22)' : 'rgba(0,0,0,.28)'; c.stroke();
+  }
+  function drawPart(c, p, col, acc, t, ang, ours, hi) {
+    const f = p.hm ? p.hp / p.hm : 1, r = p.r;
+    c.save(); c.translate(p.x, p.y);
+    if (p.t === 'B') { c.beginPath(); c.ellipse(0, 0, r * 1.05, r * 0.7, 0, 0, TAU); const g = c.createRadialGradient(-r * 0.3, -r * 0.3, 0.2, 0, 0, r); g.addColorStop(0, p.dis ? '#3a2a2a' : '#e8fbff'); g.addColorStop(1, p.dis ? '#1a1010' : acc); c.fillStyle = g; c.fill(); c.lineWidth = 0.4; c.strokeStyle = 'rgba(0,0,0,.6)'; c.stroke(); }
+    else if (p.t === 'R' || p.t === 'C') { const pul = 0.75 + 0.25 * Math.sin(t * 6 + p.x); c.beginPath(); c.arc(0, 0, r * (p.t === 'C' ? 0.95 : 0.8), 0, TAU); const g = c.createRadialGradient(0, 0, 0.1, 0, 0, r); g.addColorStop(0, p.dis ? '#552' : ours ? '#d8fbff' : '#fff2c0'); g.addColorStop(0.5, p.dis ? '#311' : hexA(ours ? '#5fe0ff' : p.t === 'C' ? '#ff4a6a' : '#ffa040', pul)); g.addColorStop(1, 'rgba(0,0,0,0)'); c.fillStyle = g; c.fill(); }
+    else if (p.t === 'S') { c.beginPath(); c.arc(0, 0, r * 0.75, 0, TAU); c.lineWidth = 0.7; c.strokeStyle = p.dis ? '#555' : '#8fdcff'; c.stroke(); c.beginPath(); c.arc(0, 0, r * 0.3, 0, TAU); c.fillStyle = p.dis ? '#444' : '#cff4ff'; c.fill(); }
+    else if (p.t === 'E') { c.fillStyle = '#2e2838'; c.fillRect(-r * 0.9, -r * 0.55, r * 1.2, r * 1.1); c.fillStyle = p.dis ? '#3a1a1a' : '#ff9a4a'; c.fillRect(-r * 1.0, -r * 0.35, r * 0.25, r * 0.7); }
+    else if (p.t === 'G') { c.fillStyle = '#2a2433'; c.fillRect(-r * 0.75, -r * 0.75, r * 1.5, r * 1.5); c.strokeStyle = p.dis ? '#533' : acc; c.lineWidth = 0.35; c.beginPath(); for (let k = -1; k <= 1; k++) { c.moveTo(-r * 0.6, k * r * 0.4); c.lineTo(r * 0.6, k * r * 0.4); } c.stroke(); }
+    else if (p.t === 'T' || p.t === 'W') {
+      c.beginPath(); c.arc(0, 0, r * 0.75, 0, TAU); c.fillStyle = p.dis ? '#2a2020' : ours ? '#4a4258' : '#3a2a2a'; c.fill(); c.lineWidth = 0.4; c.strokeStyle = hi ? '#fff' : 'rgba(0,0,0,.7)'; c.stroke();
+      if (!p.dis) { c.rotate(ang || 0); c.fillStyle = ours ? '#2a2433' : '#1e1418'; const big = p.big ? 1.5 : 1; c.fillRect(0, -0.55 * big, r * 1.55, 1.1 * big); c.fillStyle = ours ? acc : '#ff8a6a'; c.fillRect(r * 1.3, -0.45 * big, r * 0.3, 0.9 * big); }
+    }
+    if (p.t !== 'H' && hi) { c.beginPath(); c.arc(0, 0, r + 0.8, 0, TAU); c.lineWidth = 0.5; c.strokeStyle = hi; c.stroke(); }
+    if (f < 0.6 || p.dis) {
+      c.beginPath(); c.arc(0, 0, r * (p.t === 'H' ? 1 : 0.9), 0, TAU);
+      c.fillStyle = p.dis ? 'rgba(10,4,6,.72)' : 'rgba(20,10,10,' + (0.6 - f) * 0.9 + ')'; c.fill();
+      if (p.dis) { const fl = 0.5 + 0.5 * Math.sin(t * 17 + p.y * 3); c.fillStyle = 'rgba(255,' + (90 + 80 * fl | 0) + ',40,' + (0.55 + 0.35 * fl) + ')'; c.beginPath(); c.arc(r * 0.2, -r * 0.1, r * 0.28 * (0.7 + fl * 0.5), 0, TAU); c.fill(); }
+    }
+    c.restore();
+  }
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS });
+    root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    const host = () => !api.online || api.isHost;
+    const P = (s) => api.players[s] || null;
+    const localHuman = (s) => { const p = P(s); return !!p && !p.ai && !!p.local; };
+    const isAI = (s) => { const p = P(s); return !p || !!p.ai; };
+    const lvOf = (s) => { const p = P(s); if (!p) return st && st.lv[s] ? st.lv[s] : 2; const v = p.lv | 0; return v >= 1 && v <= 3 ? v : 2; };
+    const colOf = (s) => (P(s) && P(s).color) || CREWC[s % 6];
+    const nameOf = (s) => (P(s) && P(s).name) || 'AI 승무원';
+    let st = null, W = null, G = null, fkey = -1, cd = 0, acc = 0, sentEnd = false, aiT = 0, voteT = 0, lastFx = 0;
+    let tips = lsGet('lounge.crew.tips2', {}); if (!tips || typeof tips !== 'object') tips = {};
+    let g = { w: 1, h: 1, pnH: 190, hud: 30, ar: { x: 0, y: 30, w: 1, h: 1 }, s: 1 };
+    const cam = { x: AW / 2, y: AH / 2 };
+    const loc = newCtl(), aiC = [], mem = [], remC = {}, C = [];
+    for (let i = 0; i < MAXC; i++) { aiC.push(newCtl()); mem.push({}); }
+    function me() { if (!st) return -1; for (let s = 0; s < st.NC; s++) if (localHuman(s)) return s; return -1; }
+    const RW = () => (host() ? W : G);
+    const acOf = (R) => (R.guest ? R.ac : actCap(R));
+    function myRole() {
+      const R = RW(), m = me(); if (!R || m < 0) return '';
+      if (R.inj[m] > 0) return 'I';
+      if (m === acOf(R)) return 'C';
+      if (R.gm[m] >= 0) return 'G';
+      return 'I';
+    }
+    const roleName = (R, s) => (s === R.cap ? '선장' : s === R.vc ? '부선장' : '포수');
+
+    /* ---------- DOM ---------- */
+    const scr = L.h('div', { class: 'cw-scr' }); scr.hidden = true;
+    const pn = L.h('div', { class: 'cw-pn' }); pn.hidden = true;
+    const tipEl = L.h('div', { class: 'cw-tip' }); tipEl.hidden = true;
+    root.append(pn, scr, tipEl);
+
+    function layout() {
+      const w = cv.w, h = cv.h;
+      const hasPn = !!st && st.ph === 'fight' && me() >= 0;
+      const pnH = hasPn ? clamp(Math.round(h * 0.29), 172, 214) : 0;
+      const hud = 30;
+      const ar = { x: 0, y: hud, w, h: Math.max(120, h - pnH - hud) };
+      g = { w, h, pnH, hud, ar, s: Math.min(ar.w, ar.h) / 205 };
+      pn.style.height = pnH + 'px';
+      tipEl.style.top = (hud + 8) + 'px';
+      bgCache = null;
+    }
+    cv.onresize = layout;
+
+    /* ---------- fx & particles ---------- */
+    const sndT = {};
+    function snd(n, gap) { const t = performance.now(); if (t - (sndT[n] || 0) < (gap || 70)) return; sndT[n] = t; api.sfx(n); }
+    const banners = [], floats = [];
+    function banner(text, col, life) { if (banners.length && banners[banners.length - 1].text === text) return; banners.push({ text, col: col || '#e3ae45', t: 0, life: Math.min(life || 1.4, 1.6) }); /* 알림은 판을 오래 가리지 않게(최대 1.6초) */ if (banners.length > 2) banners.shift(); }
+    function flo(x, y, text, col) { floats.push({ x, y, text, col, t: 0, life: 1.2 }); if (floats.length > 14) floats.shift(); }
+    const MAXP = 420, parts = [];
+    function part(x, y, vx, vy, life, s, col, ty, rot) { if (parts.length >= MAXP) parts.shift(); parts.push({ x, y, vx, vy, t: 0, life, s, col, ty: ty || 0, rot: rot || 0, vr: (Math.random() - 0.5) * 8 }); }
+    function burst(x, y, col, n, sp, life, s, ty) { for (let k = 0; k < n; k++) { const a = Math.random() * TAU, v = sp * (0.3 + Math.random() * 0.9); part(x, y, Math.cos(a) * v, Math.sin(a) * v, life * (0.6 + Math.random() * 0.6), s, col, ty); } }
+    function explode(x, y, r, col) {
+      burst(x, y, '#fff1c8', 8 + r, 30 + r * 2, 0.4, 1.4);
+      burst(x, y, '#ffb35c', 14 + r * 2, 25 + r * 3, 0.8, 2);
+      burst(x, y, '#ff6a3a', 8 + r, 18 + r * 2, 1.0, 1.6);
+      burst(x, y, 'rgba(60,50,60,.6)', 6 + r, 10 + r, 1.8, 3, 1);
+      for (let k = 0; k < 4 + (r / 3 | 0); k++) { const a = Math.random() * TAU, v = 15 + Math.random() * (20 + r * 2); part(x, y, Math.cos(a) * v, Math.sin(a) * v, 1.4 + Math.random(), 1.2 + Math.random() * r * 0.15, col || '#8a7a90', 2, Math.random() * TAU); }
+      part(x, y, 0, 0, 0.55, r * 2.2 + 10, 'rgba(255,220,160,.8)', 3);
+    }
+    let shake = 0, flashS = 0, flashR = 0, zapF = 0, lastHitT = 0;
+    const evIdx = (i) => { const R = RW(); if (!R) return null; return R.guest ? R.E.find((e) => e.id === i) : R.E[i]; };
+    function onFx(e) {
+      const t = e[1], a = e[2], b = e[3], c = e[4], R = RW(); if (!R) return;
+      const S = R.S, m = me();
+      if (t === 1) { const mt = S.M[a]; if (mt) { const w = mountWorld(S, mt), an = S.a + mt.ang; part(w[0] + Math.cos(an) * 3, w[1] + Math.sin(an) * 3, Math.cos(an) * 20, Math.sin(an) * 20, 0.12, 2.2, TUR[mt.tt].c); if (m >= 0 && mt.seat === m) snd(TUR[mt.tt].big ? 'thud' : 'tick', TUR[mt.tt].cd < 0.2 ? 110 : 70); } }
+      else if (t === 2) { snd('hit', 55); burst(a, b, TUR[c] ? TUR[c].c : '#ffe0a0', 7, 32, 0.32, 1.1); }
+      else if (t === 3) { if (c) { flashS = 0.5; snd('bounce', 90); } else snd('bounce', 120); part(a, b, 0, 0, 0.3, c ? S.r + 4 : 6, c ? 'rgba(140,220,255,.9)' : 'rgba(140,220,255,.8)', 3); burst(a, b, '#9fe8ff', 5, 22, 0.3, 1); }
+      else if (t === 4) { const cap = c < 0, r = Math.abs(c); explode(a, b, r, cap ? '#7cc66a' : '#9a7a80'); snd('thud', 60); api.buzz(r > 20 ? 60 : 25); shake = Math.min(1, shake + (r > 20 ? 0.9 : 0.25)); if (cap) flo(a, b - r - 4, '나포!', '#9fe0a8'); }
+      else if (t === 5) { const n = performance.now(); if (n - lastHitT > 90) { lastHitT = n; snd('hit', 60); api.buzz(30); } shake = Math.min(1, shake + 0.25); flashR = 0.35; burst(a, b, '#ffcf8a', 9, 30, 0.4, 1.2); burst(a, b, 'rgba(70,60,70,.6)', 3, 8, 1, 2.5, 1); }
+      else if (t === 6) {
+        if (b < 0) { const p = S.pt[a]; if (p) { const nm = p.t === 'T' ? (p.m + 1) + '번 포탑' : PN[p.t]; banner(nm + ' 파손!', '#ff8a7a', 1.8); snd('thud', 100); const w = toWorld(S, p.x, p.y); explode(w[0], w[1], 3, '#6a5a70'); } }
+        else { const en = evIdx(b); const p = en && !EN[en.k].drone && en.pt[a]; if (p) { const w = toWorld(en, p.x, p.y); explode(w[0], w[1], 2, EN[en.k].col); flo(w[0], w[1] - 6, (p.t === 'W' ? '무기' : PN[p.t]) + ' 파괴!', '#ffd27a'); snd('pop', 80); } }
+      }
+      else if (t === 7) {
+        if (c) { if (a === m) api.toast('다 나았어요! 다시 자리로'); else banner(nameOf(a) + ' 복귀', '#9fe0a8', 1.4); }
+        else { banner(b ? '선장 부상! 부선장이 지휘해요' : roleName(R, a) + ' ' + nameOf(a) + ' 부상!', '#ff8a7a', 2.2); snd('lose', 300); if (a === m) api.buzz(120); }
+      }
+      else if (t === 8) {
+        const id = a; banner(SPC[id] ? SPC[id].nm + '!' : '특수 무기!', '#9fe0ff', 1.4); snd('whoosh', 120);
+        if (id === 0) { part(S.x, S.y, 0, 0, 0.5, 70, 'rgba(160,220,255,.9)', 3); shake = 0.5; }
+        else if (id === 2) { burst(b, c, '#9fe0ff', 20, 40, 0.5, 1.4); }
+        else if (id === 3) { part(S.x, S.y, 0, 0, 0.6, S.r + 10, 'rgba(120,220,255,.9)', 3); }
+        else if (id === 7) { burst(S.x, S.y, '#9fe0a8', 30, 30, 0.9, 1.4); }
+        else if (id === 8) { part(S.x, S.y, 0, 0, 0.7, 150, 'rgba(200,170,255,.8)', 3); }
+      }
+      else if (t === 9) { banner(EN[(evIdx(a) || { k: 13 }).k].nm + ' ' + (b + 1) + '단계!', '#ff9b6b', 2.2); shake = 0.8; snd('thud', 100); }
+      else if (t === 10) burst(a, b, '#e0708f', 6, 15, 0.4, 1);
+      else if (t === 11) { const p = S.pt[a]; if (p) { const w = toWorld(S, p.x, p.y); flo(w[0], w[1] - 5, '수리 완료', '#9fe0a8'); snd('click', 120); } }
+      else if (t === 12) { burst(a, b, c ? '#ff6a6a' : '#ff9a7a', c ? 10 : 2, c ? 30 : 12, 0.2, 1); if (c) snd('whoosh', 100); }
+      else if (t === 13) { banner('적 증원 함대!', '#ffcf7a', 1.8); snd('card', 200); }
+      else if (t === 14) banner('적이 물러갔어요', '#cbbfdb', 2);
+      else if (t === 15) { explode(a, b, 26, '#8a8090'); shake = 1; snd('lose', 100); }
+      else if (t === 16) { burst(a, b, '#c9f07a', 10, 25, 0.4, 1); flo(a, b - 5, '요격!', '#c9f07a'); snd('chip', 60); }
+      else if (t === 17) { burst(a, b, '#a08060', 10, 20, 0.6, 1.3); for (let k = 0; k < 3; k++) part(a, b, (Math.random() - 0.5) * 30, (Math.random() - 0.5) * 30, 1.2, c * 0.3, '#8a7259', 2, Math.random() * 6); snd('chip', 60); }
+      else if (t === 18) { explode(a, b, 4, b ? '#a04040' : '#406a60'); snd('pop', 60); }
+      else if (t === 19) { shake = 0.7; snd('thud', 100); }
+      else if (t === 20) { zapF = 0.3; part(a, b, 0, 0, 0.35, c, 'rgba(255,250,170,.95)', 3); snd('bounce', 80); }
+    }
+
+    /* ---------- tips ---------- */
+    let tipShown = '';
+    const tipQ = [];
+    function showTip(k) {
+      if ((L.debug && L.debug.noTut) || tips[k] || me() < 0 || !TIPS[k]) return;
+      if (tipShown) { if (tipShown !== k && !tipQ.includes(k)) tipQ.push(k); return; }
+      tipShown = k;
+      tipEl.innerHTML = '';
+      const ok = L.h('button', { class: 'btn primary', type: 'button', text: '알겠어요' });
+      ok.addEventListener('click', () => { tips[k] = 1; lsSet('lounge.crew.tips2', tips); tipEl.hidden = true; tipShown = ''; api.sfx('click'); const nx = tipQ.shift(); if (nx && st && st.ph === 'fight') showTip(nx); });
+      const ul = L.h('ul'); TIPS[k].l.forEach((x) => ul.append(L.h('li', { text: x })));
+      tipEl.append(L.h('h4', { text: TIPS[k].h + ' 하는 법' }), ul, ok);
+      tipEl.hidden = false;
+    }
+    const soloLocal = () => !api.online && api.mySeats().length === 1;
+
+    /* ---------- fight lifecycle ---------- */
+    function fightTitle(fi) {
+      const t = fi.ty, k = fi.en[0] && fi.en[0][0];
+      return t === BOS || t === MID ? EN[k].nm + ' 출현!' : t === ELI ? '정예 함선 출현!' : t === DRO ? '드론 떼 출현!' : t === NEB ? '성운 속 전투!' : t === AST ? '소행성대 전투!' : t === STM ? '이온 폭풍 속 전투!' : '해적 함대 출현!';
+    }
+    function startFightView() {
+      fkey = st.fi.k; sentEnd = false; acc = 0; cd = 2.2; lastFx = 0; parts.length = 0; floats.length = 0; banners.length = 0;
+      Object.assign(loc, newCtl()); aimPt = null; prevRole = '';
+      for (let i = 0; i < MAXC; i++) { aiC[i] = newCtl(); mem[i] = {}; }
+      for (const k in remC) delete remC[k];
+      if (host()) { W = newFight(st); W.hu = humanFlags(); G = null; cam.x = W.S.x; cam.y = W.S.y - 40; } else { G = guestWorld(st); W = null; cam.x = G.S.x; cam.y = G.S.y - 40; }
+      pnKey = ''; layout(); banner(fightTitle(st.fi), '#ffcf7a', 2.4); api.sfx('pop');
+      if (st.msg) setTimeout(() => api.toast(st.msg), 50);
+    }
+    function humanFlags() { const o = []; for (let i = 0; i < st.NC; i++) o.push(i < api.players.length && !isAI(i) ? 1 : 0); return o; }
+    let remCache = null, remAt = 0;
+    function remote() {
+      const t = performance.now();
+      if (remCache && t - remAt < 30) return remCache;
+      let r = null; try { r = api.net.remote(); } catch (e) { r = null; }
+      remCache = r && typeof r === 'object' ? r : {}; remAt = t;
+      return remCache;
+    }
+    function sanit(o) {
+      const n = (v) => (fin(v) ? v : 0);
+      return { mx: clamp(n(o.mx), -1, 1), my: clamp(n(o.my), -1, 1), sq: n(o.sq) | 0, ps: clamp(n(o.ps) | 0, 0, 3), rp: clamp(n(o.rp) | 0, -1, 40), cl: o.cl ? 1 : 0, fo: clamp(n(o.fo) | 0, -1, 60), a: fin(o.a) ? o.a : -PI / 2, f: o.f ? 1 : 0, hl: o.hl ? 1 : 0 };
+    }
+    function pollHost() {
+      if (!api.online || !api.isHost || !W) return;
+      const rem = remote();
+      for (const kk in rem) {
+        const s = +kk, o = rem[kk];
+        if (!(s >= 0 && s < st.NC) || isAI(s) || localHuman(s) || !o || typeof o !== 'object' || o.k !== fkey) continue;
+        remC[s] = sanit(o);
+      }
+    }
+    let pubT = 0, hsQ = 0, lastQ = -1;
+    function publish(rdt) {
+      if (!api.online || !st || st.ph !== 'fight') return;
+      pubT -= rdt; if (pubT > 0) return;
+      pubT = 1 / 15;
+      try {
+        if (api.isHost) { if (W) { hsQ = (hsQ + 1) % 100000; let o = encode(W, hsQ); if (JSON.stringify(o).length > 3900) { o.B = o.B.slice(-100); o.X = o.X.slice(-120); o.fx = o.fx.slice(-6); } api.net.hostSend(o); } }
+        else if (me() >= 0) api.net.publish({ k: fkey, mx: r2(loc.mx), my: r2(loc.my), sq: loc.sq, ps: loc.ps, rp: loc.rp, cl: loc.cl, fo: loc.fo, a: r2(loc.a), f: loc.f, hl: loc.hl });
+      } catch (e) {}
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !G) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || typeof hs !== 'object' || hs.k !== fkey || hs.q === lastQ) return;
+      lastQ = hs.q;
+      applySnap(G, hs, now);
+      if (Array.isArray(hs.fx)) for (const e of hs.fx) if (e[0] > lastFx) { lastFx = e[0]; onFx(e); }
+    }
+    function controls() { for (let i = 0; i < st.NC; i++) C[i] = localHuman(i) ? loc : isAI(i) ? aiC[i] : (remC[i] || null); }
+
+    /* ---------- input ---------- */
+    let aimPt = null, aimDrag = null, fireHeld = false, mouseFire = false, prevRole = '';
+    const SX = (x) => g.ar.x + g.ar.w / 2 + (x - cam.x) * g.s, SY = (y) => g.ar.y + g.ar.h / 2 + (y - cam.y) * g.s;
+    const WX = (px) => cam.x + (px - g.ar.x - g.ar.w / 2) / g.s, WY = (py) => cam.y + (py - g.ar.y - g.ar.h / 2) / g.s;
+    const inAr = (p) => p.y >= g.ar.y && p.y < g.ar.y + g.ar.h;
+    function myMount() { const R = RW(), m = me(); if (!R || m < 0) return null; const i = R.gm[m]; return i >= 0 ? R.S.M[i] : null; }
+    function onDown(e) {
+      if (!st || st.ph !== 'fight' || me() < 0) return;
+      const p = cv.local(e), R = RW(); if (!R || !inAr(p)) return;
+      const role = myRole(), wx = WX(p.x), wy = WY(p.y);
+      if (role === 'G') {
+        aimDrag = { id: e.pointerId }; aimPt = [wx, wy];
+        if (e.pointerType !== 'mouse' || e.button === 0) { fireHeld = true; if (e.pointerType === 'mouse') mouseFire = true; }
+        try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      } else if (role === 'C') {
+        const S = R.S;
+        let bp = -1, bd = 1e9;
+        S.pt.forEach((q, i) => { const w = toWorld(S, q.x, q.y), d = hyp(w[0] - wx, w[1] - wy); if (d < bd) { bd = d; bp = i; } });
+        if (bp >= 0 && bd < 5 + 14 / g.s) { loc.rp = loc.rp === bp ? -1 : bp; const q = S.pt[bp]; api.toast(loc.rp < 0 ? '수리 우선: 자동' : '수리 우선: ' + (q.t === 'T' ? (q.m + 1) + '번 포탑' : PN[q.t])); api.sfx('tick'); pnDirty = true; return; }
+        let be = -1; bd = 1e9;
+        R.E.forEach((en, i) => { if (en.dead) return; const d = hyp(en.x - wx, en.y - wy) - en.r; if (d < bd) { bd = d; be = i; } });
+        if (be >= 0 && bd < 14 / g.s + 4) { const idx = R.guest ? R.E[be].id : be; loc.fo = loc.fo === idx ? -1 : idx; api.sfx('tick'); api.toast(loc.fo < 0 ? '집중 공격 해제' : '집중 공격: ' + EN[R.E[be].k].nm); }
+      }
+    }
+    function onMove(e) {
+      if (!st || st.ph !== 'fight') return;
+      const p = cv.local(e);
+      if (aimDrag && e.pointerId === aimDrag.id) { aimPt = [WX(p.x), WY(p.y)]; return; }
+      if (e.pointerType === 'mouse' && myRole() === 'G' && inAr(p)) aimPt = [WX(p.x), WY(p.y)];
+    }
+    function onUp(e) { if (aimDrag && e.pointerId === aimDrag.id) { aimDrag = null; fireHeld = false; mouseFire = false; } }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    let keyFire = false;
+    const offIn = api.input ? api.input.on((type, id) => {
+      if (!st || st.ph !== 'fight') return;
+      const role = myRole();
+      if (id === 'fire') { if (role === 'G') keyFire = type === 'down'; else if (role === 'C' && type === 'down') doSpecial2(); return; }
+      if (type !== 'down') return;
+      if (id === 'alt') { if (role === 'G') toggleHelp(); else if (role === 'C') toggleCall(); }
+      else if (id === 'rep' && role === 'C') cycleRepair();
+      else if (id === 'pre' && role === 'C') setPreset(((loc.ps | 0) + 1) % 4);
+      else if (/^p[1-4]$/.test(id) && role === 'C') setPreset(+id[1] - 1);
+    }) : null;
+    function readKeys(dt) {
+      if (!api.input || !st || st.ph !== 'fight') return;
+      const role = myRole();
+      const ax = api.input.axis('left', 'right'), ay = api.input.axis('up', 'down');
+      if (role === 'C') { if (ax || ay) { loc.mx = ax; loc.my = ay; keyMove = true; } else if (keyMove) { loc.mx = 0; loc.my = 0; keyMove = false; } }
+      else if (role === 'G' && (ax || ay)) { aimPt = null; loc.a = angN(loc.a + (ax || ay) * 2.4 * dt); }
+    }
+    let keyMove = false, stickOn = false;
+    function doSpecial2() {
+      const R = RW(); if (!R) return;
+      if (R.S.sc < 1) { api.toast('특수 무기 충전 중… ' + Math.floor(R.S.sc * 100) + '%'); return; }
+      loc.sq++; api.sfx('click'); api.buzz(20);
+    }
+    function setPreset(k) { loc.ps = k; api.sfx('tick'); pnDirty = true; }
+    function toggleCall() { loc.cl = loc.cl ? 0 : 1; api.sfx('click'); if (loc.cl) api.toast('수리 호출! 포수들이 도와줘요'); pnDirty = true; }
+    function toggleHelp() { loc.hl = loc.hl ? 0 : 1; api.sfx('click'); pnDirty = true; }
+    function cycleRepair() {
+      const R = RW(); if (!R) return;
+      const S = R.S, list = [-1];
+      S.pt.forEach((p, i) => { if (p.hp < p.hm && p.t !== 'H') list.push(i); });
+      const j = list.indexOf(loc.rp); loc.rp = list[(j + 1) % list.length];
+      api.sfx('tick'); pnDirty = true;
+    }
+    function updateAim() {
+      const R = RW(), mt = myMount(); if (!R || !mt) return;
+      if (aimPt) { const o = mountWorld(R.S, mt); loc.a = Math.atan2(aimPt[1] - o[1], aimPt[0] - o[0]); }
+      loc.f = fireHeld || keyFire || btnFire ? 1 : 0;
+    }
+    let btnFire = false;
+
+    /* ---------- role panel ---------- */
+    let pnKey = '', pnEls = {}, pnDirty = true;
+    function tapBtn(cls, kids, fn) {
+      const b = L.h('button', { class: 'cw-b ' + (cls || ''), type: 'button' }, ...kids);
+      b.addEventListener('pointerdown', (e) => { e.preventDefault(); fn(); });
+      return b;
+    }
+    function buildPanel(R) {
+      const role = myRole(), m = me();
+      const key = role + ':' + (R.gm[m] | 0) + ':' + R.S.sp + ':' + m + ':' + (m === R.vc ? 1 : 0);
+      if (key === pnKey) return; pnKey = key; pnDirty = true;
+      pn.innerHTML = ''; pnEls = {}; stickOn = false; btnFire = false;
+      if (m < 0) return;
+      if (role === 'C' && prevRole !== 'C') { loc.ps = R.S.pre; loc.rp = R.S.rp; loc.cl = R.S.cl; loc.mx = 0; loc.my = 0; }
+      if (role === 'G' && prevRole !== 'G') { const mt = myMount(); if (mt) loc.a = R.S.a + mt.ang; }
+      prevRole = role;
+      if (role === 'C') {
+        showTip('C');
+        const stick = L.h('div', { class: 'cw-stick' }), base = L.h('div', { class: 'base' }), knob = L.h('div', { class: 'knob' });
+        stick.append(L.h('div', { class: 'lbl', text: '끌어서 조종' }), base, knob);
+        let sd = null;
+        const center = () => { const r = stick.getBoundingClientRect(); return [r.width / 2, r.height / 2 + 6]; };
+        const place = (bx, by, kx, ky) => { base.style.left = bx + 'px'; base.style.top = by + 'px'; knob.style.left = kx + 'px'; knob.style.top = ky + 'px'; };
+        const reset = () => { const c = center(); place(c[0], c[1], c[0], c[1]); };
+        stick.addEventListener('pointerdown', (e) => { e.preventDefault(); const r = stick.getBoundingClientRect(); sd = { id: e.pointerId, x: e.clientX - r.left, y: e.clientY - r.top }; place(sd.x, sd.y, sd.x, sd.y); stickOn = true; try { stick.setPointerCapture(e.pointerId); } catch (er) {} });
+        stick.addEventListener('pointermove', (e) => {
+          if (!sd || e.pointerId !== sd.id) return;
+          const r = stick.getBoundingClientRect(); let dx = e.clientX - r.left - sd.x, dy = e.clientY - r.top - sd.y; const l = hyp(dx, dy), R0 = 42;
+          if (l > R0) { sd.x += dx / l * (l - R0); sd.y += dy / l * (l - R0); dx = dx / l * R0; dy = dy / l * R0; }
+          loc.mx = dx / R0; loc.my = dy / R0; if (hyp(loc.mx, loc.my) < 0.12) { loc.mx = 0; loc.my = 0; }
+          place(sd.x, sd.y, sd.x + dx, sd.y + dy);
+        });
+        const up = (e) => { if (!sd || e.pointerId !== sd.id) return; sd = null; stickOn = false; loc.mx = 0; loc.my = 0; reset(); };
+        stick.addEventListener('pointerup', up); stick.addEventListener('pointercancel', up);
+        requestAnimationFrame(reset);
+        const rc = L.h('div', { class: 'cw-rc' });
+        const sp = tapBtn('cw-sp', [L.h('b', { text: '특수' }), L.h('small', { text: '' }), L.h('span', { class: 'cw-fill' })], doSpecial2);
+        const pr = L.h('div', { class: 'cw-row' }); pnEls.pre = [];
+        ['균형', '공격', '방어', '기동'].forEach((nm, k) => { const b = tapBtn('', [L.h('span', { class: 'ic', text: ['⚖', '⚔', '🛡', '➤'][k] }), L.h('small', { text: nm })], () => setPreset(k)); pr.append(b); pnEls.pre.push(b); });
+        const rr = L.h('div', { class: 'cw-row' });
+        const rep = tapBtn('', [L.h('span', { text: '🔧 우선' }), L.h('small', { text: '자동' })], cycleRepair); rep.style.flex = '1.3';
+        const call = tapBtn('', [L.h('span', { text: '📢 호출' }), L.h('small', { text: '꺼짐' })], toggleCall);
+        rr.append(rep, call);
+        rc.append(sp, pr, rr);
+        pn.append(stick, rc);
+        sp.dataset.action = 'fire'; rep.dataset.action = 'rep'; call.dataset.action = 'alt'; pnEls.pre.forEach((b, k) => { b.dataset.action = 'p' + (k + 1); });
+        Object.assign(pnEls, { sp, rep, call });
+      } else if (role === 'G') {
+        showTip('G'); if (m === R.vc) showTip('V');
+        const gi = L.h('div', { class: 'cw-gi' });
+        const tl = L.h('div', { class: 'cw-gt' }); const bar = L.h('div', { class: 'cw-bar2' }, L.h('i'));
+        const hint = L.h('div', { class: 'cw-hint', text: '위 화면을 끌면 조준하며 쏴요' });
+        const help = tapBtn('', [L.h('span', { text: '🔧 수리 돕기' }), L.h('small', { text: '' })], toggleHelp); help.style.flex = 'none'; help.style.minHeight = '46px';
+        const ord = L.h('div', { class: 'cw-hint', style: { color: '#ffb36b', fontWeight: '700' } });
+        gi.append(tl, bar, hint, ord, help);
+        const fire = L.h('button', { class: 'cw-fire', type: 'button' }, '발사', L.h('small', { text: '누르고 있기' }));
+        const fu = () => { btnFire = false; fire.classList.remove('hold'); };
+        fire.addEventListener('pointerdown', (e) => { e.preventDefault(); btnFire = true; fire.classList.add('hold'); try { fire.setPointerCapture(e.pointerId); } catch (er) {} });
+        fire.addEventListener('pointerup', fu); fire.addEventListener('pointercancel', fu); fire.addEventListener('lostpointercapture', fu);
+        help.dataset.action = 'alt'; fire.dataset.action = 'fire';
+        pn.append(gi, fire);
+        Object.assign(pnEls, { tl, bar: bar.firstChild, hint, ord, help, fire });
+      } else {
+        pn.append(L.h('div', { class: 'cw-watch', text: '' }));
+      }
+      const lock = L.h('div', { class: 'cw-lock' }, L.h('span', { text: '🩹 부상!' }), L.h('small', { text: '' })); lock.hidden = true;
+      pn.append(lock); pnEls.lock = lock;
+    }
+    const setTxt = (el, t) => { if (el && el.textContent !== t) el.textContent = t; };
+    const setCls = (el, c, on) => { if (el && el.classList.contains(c) !== on) el.classList.toggle(c, on); };
+    const partName = (S, i) => { const p = S.pt[i]; return !p ? '자동' : p.t === 'T' ? (p.m + 1) + '번 포탑' : PN[p.t]; };
+    function updatePanel(R) {
+      buildPanel(R);
+      const role = myRole(), m = me(), S = R.S;
+      if (m < 0) return;
+      if (role === 'C' && pnEls.sp) {
+        const sp = pnEls.sp, rd = S.sc >= 1;
+        setTxt(sp.querySelector('b'), SPC[S.sp].nm);
+        setTxt(sp.querySelector('small'), rd ? '준비! 눌러서 발사' : '충전 ' + Math.floor(S.sc * 100) + '%');
+        sp.querySelector('.cw-fill').style.width = Math.round(S.sc * 100) + '%';
+        setCls(sp, 'rdy', rd);
+        pnEls.pre.forEach((b, k) => setCls(b, 'on', (loc.ps | 0) === k));
+        const rp = loc.rp >= 0 && S.pt[loc.rp] ? loc.rp : -1;
+        setTxt(pnEls.rep.querySelector('small'), rp < 0 ? '자동' + (R.rpT >= 0 ? '·' + partName(S, R.rpT) : '') : partName(S, rp));
+        setCls(pnEls.rep, 'warn', S.pt.some((p) => p.dis));
+        setTxt(pnEls.call.querySelector('small'), loc.cl ? '켜짐 · 돕는 ' + (R.helpN | 0) : '꺼짐');
+        setCls(pnEls.call, 'on', !!loc.cl);
+      } else if (role === 'G' && pnEls.tl) {
+        const mt = myMount();
+        if (mt) {
+          const T = TUR[mt.tt];
+          const sig = mt.tt + ':' + mt.lv + ':' + (m === R.vc);
+          if (pnEls.tl.dataset.k !== sig) {
+            pnEls.tl.dataset.k = sig; pnEls.tl.innerHTML = '';
+            pnEls.tl.append(L.h('span', { text: (S.M.indexOf(mt) + 1) + '번 포탑' }), L.h('small', { text: T.nm + ' Lv' + mt.lv }));
+            if (m === R.vc) pnEls.tl.append(L.h('span', { class: 'cw-badge v', text: '부선장' }));
+          }
+          const cdv = clamp(1 - (mt.cd || 0) / Math.max(0.05, T.cd), 0, 1);
+          pnEls.bar.style.width = Math.round(cdv * 100) + '%';
+          pnEls.bar.style.background = mt.p.dis ? '#ee6a55' : '#e3ae45';
+          const need = !!S.cl || mt.p.dis || mt.p.hp < mt.p.hm * 0.6;
+          pnEls.help.hidden = !need && !loc.hl;
+          if (!need && loc.hl) loc.hl = 0;
+          setCls(pnEls.help, 'on', !!loc.hl); setCls(pnEls.help, 'warn', !loc.hl && (mt.p.dis || !!S.cl));
+          setTxt(pnEls.help.querySelector('small'), loc.hl ? '돕는 중 · 눌러서 포탑으로' : mt.p.dis ? '내 포탑이 부서졌어요!' : S.cl ? '선장이 불러요' : '포탑을 손봐요');
+          setTxt(pnEls.hint, mt.p.dis ? '포탑 파손! 고쳐야 쏠 수 있어요' : loc.hl ? '수리하는 동안은 못 쏴요' : aimInfo || '위 화면을 끌면 조준하며 쏴요');
+          const fe = R.fo >= 0 ? (R.guest ? R.E.find((e) => e.id === R.fo) : R.E[R.fo]) : null;
+          setTxt(pnEls.ord, fe && !fe.dead ? '선장 지시: 「' + EN[fe.k].nm + '」 집중 공격!' : '');
+          setCls(pnEls.fire, 'dis', mt.p.dis || !!loc.hl);
+        }
+      }
+      const inj = R.inj[m] > 0;
+      pnEls.lock.hidden = !inj;
+      if (inj) setTxt(pnEls.lock.querySelector('small'), Math.ceil(R.inj[m]) + '초 뒤 돌아와요' + (m === R.cap ? ' · 부선장이 지휘 중' : ''));
+      pnDirty = false;
+    }
+    let aimInfo = '';
+
+    /* ---------- coarse screens ---------- */
+    let scrKey = '', selNode = -1, mapScroll = null, selCg = -1, showEq = false;
+    function act(a) { api.act(a); }
+    function headBar() {
+      const pct = Math.round(st.hp / st.hm * 100);
+      return L.h('div', { class: 'cw-head' },
+        L.h('div', { class: 'cw-hp' }, L.h('span', { text: '선체' }), L.h('div', { class: 'cw-bar' }, L.h('i', { style: { width: pct + '%' } })), L.h('b', { class: 'mono', text: st.hp + '/' + st.hm })),
+        L.h('div', { class: 'cw-tag' }, '고철 ', L.h('b', { text: String(st.sc) })),
+        L.h('div', { class: 'cw-tag' }, '성계 ', L.h('b', { text: st.col + '/' + st.len })));
+    }
+    function gearLine() {
+      const u = upA(st), ups = UPG.map((x, i) => (u[i] ? x.nm + (u[i] > 1 ? '×' + u[i] : '') : '')).filter(Boolean);
+      const tm = tmA(st);
+      return L.h('div', { class: 'cw-gear' }, L.h('b', { text: SHIPS[st.sh].nm }), ' · 동력 ' + st.P + ' · 특수: ', L.h('b', { text: SPC[st.sp].nm }), ' · 포탑: ' + tm.map((x) => TUR[x[0]].nm + (x[1] > 1 ? '+' + (x[1] - 1) : '')).join(', ') + (ups.length ? ' · 개조: ' + ups.join(', ') : ''));
+    }
+    function votes(v) {
+      const box = L.h('span', { class: 'cw-vd' });
+      for (let i = 0; i < st.NC; i++) if (st.hu[i] && st.vt[i] === v) box.append(L.h('i', { style: { background: colOf(i) } }));
+      return box;
+    }
+    function roleOfSt(s) { if (s === st.cap) return '선장'; const go = gunOrder(st, st.cap, st.hu), i = go.indexOf(s); return (s === st.vc ? '부선장 · ' : '포수 · ') + (i + 1) + '번 포탑'; }
+    function crewList() {
+      const m = me(), box = L.h('div', { style: { display: 'flex', flexDirection: 'column', gap: '5px', flex: 'none' } });
+      for (let s = 0; s < st.NC; s++) {
+        const row = L.h('div', { class: 'cw-crew' }, L.h('span', { class: 'dot', style: { background: colOf(s) } }),
+          L.h('div', { class: 'nm' }, (s === m ? '나 · ' : '') + (st.hu[s] ? nameOf(s) : 'AI 승무원' + (st.lv[s] ? ' (' + ['', '쉬움', '보통', '어려움'][st.lv[s]] + ')' : '')), L.h('small', { text: roleOfSt(s) })));
+        if (s === m && s !== st.cap) row.append(L.h('button', { class: 'btn sm', type: 'button', text: '선장 맡기', onclick: () => { act({ t: 'role', r: 'cap' }); api.sfx('click'); } }));
+        else if (s === m && s === st.cap) row.append(L.h('button', { class: 'btn sm ghost', type: 'button', text: '포수로', onclick: () => { act({ t: 'role', r: 'gun' }); api.sfx('click'); } }));
+        else if (m >= 0 && m === st.cap && s !== st.vc) row.append(L.h('button', { class: 'btn sm ghost', type: 'button', text: '부선장으로', onclick: () => { act({ t: 'vc', s }); api.sfx('click'); } }));
+        box.append(row);
+      }
+      return box;
+    }
+    const waitLine = () => { const h = humans(st), n = h.filter((i) => st.vt[i] >= 0).length; return h.length > 1 ? L.h('div', { class: 'cw-wait', text: '다른 승무원을 기다려요 (' + n + '/' + h.length + ')' }) : null; };
+    function renderScreen(force) {
+      if (!st) return;
+      const ph = st.ph;
+      if (ph === 'fight' || ph === 'done') { scr.hidden = true; scrKey = ''; return; }
+      scr.hidden = false;
+      const key = JSON.stringify([ph, st.vt, st.cap, st.vc, st.sh, st.sc, st.hp, st.shop && st.shop.map((x) => x[3]), st.msg, st.col, selNode, st.hu, st.ev, me(), st.up, st.tm, st.sp, st.cg, selCg, showEq]);
+      if (key === scrKey && !force) return;
+      const mw = scr.querySelector('.cw-mapw'); if (mw) mapScroll = { col: +mw.dataset.col, top: mw.scrollTop };   // 그 지도를 그렸을 때의 칸 기준(새 칸이면 다음 줄로 다시 맞춰요)
+      const top = scr.scrollTop;
+      scrKey = key; scr.innerHTML = ''; scr.classList.toggle('fix', ph === 'map' && !showEq);
+      if (ph === 'hangar') hangarScreen(); else if (ph === 'map') mapScreen(); else if (ph === 'ev') eventScreen(); else if (ph === 'shop') shopScreen();
+      if (ph !== 'map' || showEq) scr.scrollTop = top;
+    }
+    function shipIcon(h) {
+      const c = document.createElement('canvas'), d = Math.min(3, window.devicePixelRatio || 1), w = 64, hh = 44;
+      c.width = w * d; c.height = hh * d; c.style.width = w + 'px'; c.style.height = hh + 'px';
+      const x = c.getContext('2d'); x.setTransform(d * 1.35, 0, 0, d * 1.35, w / 2 * d, hh / 2 * d);
+      const D = SHIPS[h];
+      drawHull(x, D.pg, D.col, 0, 1);
+      for (const p of D.pt) drawPart(x, { t: p[0], x: p[1], y: p[2], r: PRAD[p[0]], hp: 1, hm: 1, dis: 0 }, D.col, D.acc, 0.3, 0, 1, '');
+      for (const m of D.mt) drawPart(x, { t: 'T', x: m[0], y: m[1], r: PRAD.T, hp: 1, hm: 1, dis: 0 }, D.col, D.acc, 0.3, m[2], 1, '');
+      return c;
+    }
+    function hangarScreen() {
+      const m = me(), dc = decider(st), isD = m >= 0 && m === dc;
+      scr.append(L.h('div', { class: 'cw-card' }, L.h('h3', { text: '격납고' }), L.h('p', { text: '배를 고르고 역할을 정해요. 선장은 배를 몰고, 포수는 포탑을 하나씩 맡아요. 부선장은 포수이면서 선장이 다치면 대신 지휘해요.' })));
+      scr.append(L.h('div', { class: 'cw-sub', text: '배 고르기' + (isD ? '' : ' (' + nameOf(dc) + ' 님이 골라요)') }));
+      SHIPS.forEach((D, h) => {
+        const b = L.h('button', { type: 'button', class: 'cw-hull' + (st.sh === h ? ' on' : '') }, shipIcon(h),
+          L.h('div', { class: 't' }, D.nm + (st.sh === h ? '  ✓' : ''), L.h('small', { text: D.d }), L.h('small', { text: '선체 ' + D.hm + ' · 포탑 ' + D.mt.length + ' · 속도 ' + D.v + ' · 특수: ' + SPC[D.sp].nm })));
+        b.addEventListener('click', () => { if (!isD) { api.toast('배는 ' + nameOf(dc) + ' 님이 골라요'); return; } act({ t: 'ship', h }); api.sfx('click'); });
+        scr.append(b);
+      });
+      scr.append(L.h('div', { class: 'cw-sub', text: '승무원 ' + st.NC + '명' }));
+      scr.append(crewList());
+      if (isD) { const go = L.h('button', { class: 'btn primary cw-big', type: 'button', text: '출발!' }); go.addEventListener('click', () => { act({ t: 'go' }); api.sfx('pop'); }); scr.append(go); }
+      else if (m >= 0) scr.append(L.h('div', { class: 'cw-wait', text: nameOf(dc) + ' 님이 「출발!」을 누르면 시작해요' }));
+      else scr.append(L.h('div', { class: 'cw-wait', text: 'AI 승무원들이 출발 준비 중…' }));
+    }
+    function eqCard() {
+      const m = me(), tm = tmA(st), D = SHIPS[st.sh], go = gunOrder(st, st.cap, st.hu);
+      const card = L.h('div', { class: 'cw-card' }, L.h('h3', { text: '정비 · 포탑과 특수 무기' }));
+      const sel = selCg >= 0 ? st.cg[selCg] : null, selT = sel != null && sel < 1000;
+      tm.forEach((x, i) => {
+        const who = go[i] != null ? nameOf(go[i]) : '자동 사격';
+        const b = L.h('button', { type: 'button', class: 'cw-mt' + (selT ? ' can' : '') }, L.h('b', { text: (i + 1) + '번(' + mountSide(D.mt[i]) + ')' }), L.h('span', { text: TUR[x[0]].nm + ' Lv' + x[1] }), L.h('small', { text: who }));
+        b.addEventListener('click', () => { if (!selT || m < 0) { api.toast(TUR[x[0]].nm + ': ' + TUR[x[0]].d); return; } act({ t: 'eq', c: selCg, m: i }); selCg = -1; api.sfx('chip'); });
+        card.append(b);
+      });
+      card.append(L.h('div', { class: 'cw-gear' }, '특수 무기: ', L.h('b', { text: SPC[st.sp].nm }), ' — ' + SPC[st.sp].d));
+      if (st.cg.length) {
+        card.append(L.h('div', { class: 'cw-sub', text: '창고 (눌러서 고르고, 바꿀 포탑을 눌러요)' }));
+        const row = L.h('div', { class: 'cw-cg' });
+        st.cg.forEach((code, i) => {
+          const nm = code >= 1000 ? '특수: ' + SPC[code - 1000].nm : TUR[(code / 10) | 0].nm + ' Lv' + (code % 10 || 1);
+          row.append(L.h('button', { type: 'button', class: selCg === i ? 'on' : '', text: nm, onclick: () => { if (m < 0) return; if (code >= 1000) { act({ t: 'eq', c: i, m: 0 }); selCg = -1; api.sfx('chip'); return; } selCg = selCg === i ? -1 : i; api.sfx('tick'); renderScreen(); } }));
+        });
+        card.append(row);
+        if (sel != null && sel < 1000) card.append(L.h('div', { class: 'cw-sel', text: TUR[(sel / 10) | 0].d }));
+      } else card.append(L.h('div', { class: 'cw-gear', text: '창고가 비었어요. 새 포탑·특수 무기는 상점·사건·전리품으로 얻어요.' }));
+      return card;
+    }
+    function mapScreen() {
+      const M = getMap(st), nx = nextRows(st), m = me();
+      scr.append(headBar());
+      if (st.msg) scr.append(L.h('div', { class: 'cw-msg', text: st.msg }));
+      if (showEq) {
+        scr.append(eqCard());
+        scr.append(L.h('div', { class: 'cw-sub', text: '승무원' })); scr.append(crewList());
+        scr.append(L.h('button', { class: 'btn primary cw-big', type: 'button', text: '지도로 돌아가기', onclick: () => { showEq = false; selCg = -1; renderScreen(); } }));
+        return;
+      }
+      scr.append(gearLine());
+      const wrap = L.h('div', { class: 'cw-mapw', 'data-col': String(st.col) });
+      const rowH = 78, n = M.length, Hm = n * rowH + 20;
+      const map = L.h('div', { class: 'cw-map', style: { height: Hm + 'px' } });
+      const yOf = (c) => Hm - 10 - rowH / 2 - c * rowH;
+      let svg = '<svg viewBox="0 0 100 ' + Hm + '" preserveAspectRatio="none">';
+      const onPath = (c, i) => c <= st.col && B36.indexOf(st.path[c]) === i;
+      for (let c = 0; c < n - 1; c++) M[c].forEach((nd, i) => nd.e.forEach((j) => {
+        const done = onPath(c, i) && onPath(c + 1, j), nxt = c === st.col && i === st.row;
+        svg += '<line x1="' + (nd.x * 100).toFixed(1) + '" y1="' + yOf(c) + '" x2="' + (M[c + 1][j].x * 100).toFixed(1) + '" y2="' + yOf(c + 1) + '" stroke="' + (done ? '#e3ae45' : nxt ? '#d9cee8' : '#3d3252') + '" stroke-width="' + (done || nxt ? 2.4 : 1.4) + '" vector-effect="non-scaling-stroke"' + (nxt ? ' stroke-dasharray="5 4"' : '') + '/>';
+      }));
+      svg += '</svg>';
+      map.innerHTML = svg;
+      for (let c = 0; c < n; c++) {
+        M[c].forEach((nd, i) => {
+          const t = nd.t, D = t >= 0 ? NT[t] : null;
+          const isNx = c === st.col + 1 && nx.includes(i), past = c < st.col && onPath(c, i), cur = c === st.col && i === st.row;
+          const cls = 'cw-node' + (cur ? ' cur' : past ? ' past' : isNx ? ' nx' : c > st.col ? ' fut' : '') + (isNx && selNode === i ? ' sel' : '') + (t === MID || t === BOS ? ' big' : '');
+          const nm = t === BOS ? EN[finalBoss(st)].nm : D ? D.nm : '출발';
+          const b = L.h('button', { type: 'button', class: cls, style: { left: (nd.x * 100) + '%', top: yOf(c) + 'px', '--c': D ? D.c : '#e3ae45' }, 'aria-label': nm });
+          b.innerHTML = '<svg viewBox="0 0 24 24">' + (D ? NI[t] : '<circle cx="12" cy="12" r="5" fill="currentColor"/>') + '</svg>';
+          if (isNx) b.append(votes(i));
+          b.addEventListener('click', () => {
+            if (!isNx) { if (D) api.toast(nm + ': ' + D.d); return; }
+            if (m < 0) return;
+            selNode = selNode === i ? -1 : i; api.sfx('tick'); renderScreen();
+          });
+          map.append(b);
+          if (isNx || cur || t === MID || t === BOS) map.append(L.h('div', { class: 'cw-nl', style: { left: (nd.x * 100) + '%', top: (yOf(c) + (t === MID || t === BOS ? 30 : 25)) + 'px' }, text: nm }));
+        });
+        if (c === st.col + 1 || c === n - 1) map.append(L.h('div', { class: 'cw-nl', style: { left: '6px', transform: 'none', top: (yOf(c) - 46) + 'px', color: '#7d6f92' }, text: c === n - 1 ? '마지막 성계' : secName(st.seed, c) + ' 성계' }));
+      }
+      wrap.append(map); scr.append(wrap);
+      const foot = L.h('div', { class: 'cw-foot' });
+      if (m >= 0) {
+        const myV = st.vt[m];
+        const sel = selNode >= 0 && nx.includes(selNode) ? selNode : -1;
+        const t = sel >= 0 ? M[st.col + 1][sel].t : -1, D = t >= 0 ? NT[t] : null;
+        foot.append(L.h('div', { class: 'cw-sel', style: D ? { '--c': D.c } : {} }, D ? L.h('b', { text: (t === BOS ? EN[finalBoss(st)].nm : D.nm) + ' ' }) : '', D ? D.d : myV >= 0 ? '투표했어요. 바꾸려면 다른 곳을 눌러요.' : '빛나는 동그라미 중 다음 갈 곳을 눌러요.'));
+        const go = L.h('button', { class: 'btn primary', type: 'button', text: sel >= 0 ? (myV === sel ? '투표했어요' : '이곳으로 도약!') : '갈 곳을 골라요' });
+        if (sel < 0 || myV === sel) go.disabled = true;
+        go.addEventListener('click', () => { if (sel >= 0) { act({ t: 'vote', n: sel }); api.sfx('pop'); } });
+        const eq = L.h('button', { class: 'btn', type: 'button', text: '🔧 정비' + (st.cg.length ? ' (' + st.cg.length + ')' : ''), onclick: () => { showEq = true; api.sfx('click'); renderScreen(); } });
+        foot.append(L.h('div', { class: 'cw-two' }, eq, go));
+        const w = waitLine(); if (w) foot.append(w);
+      } else foot.append(L.h('div', { class: 'cw-wait', text: 'AI 승무원들이 항로를 고르는 중…' }));
+      scr.append(foot);
+      requestAnimationFrame(() => {
+        if (mapScroll && mapScroll.col === st.col) wrap.scrollTop = mapScroll.top;
+        else wrap.scrollTop = Math.max(0, yOf(st.col + 1) - wrap.clientHeight * 0.45);
+      });
+    }
+    // 고르기 전에 일어날 수 있는 일을 짧게 보여 줘요(확률은 숨김 — 여러 개면 「운에 따라」)
+    function chHint(ch) {
+      const cost = ch.q && ch.q.sc ? ch.q.sc : 0, seen = [];
+      for (const [, o] of ch.r) {
+        const p = [];
+        if (o.fight != null) p.push('⚔ 전투' + (o.fs ? '(선제)' : ''));
+        if (o.sc && !(o.sc < 0 && -o.sc === cost)) p.push('고철 ' + (o.sc > 0 ? '+' : '−') + Math.abs(o.sc));
+        if (o.hp) p.push('선체 ' + (o.hp > 0 ? '+' : '−') + Math.abs(o.hp));
+        if (o.P) p.push('동력 +' + o.P);
+        if (o.wp) p.push('새 포탑');
+        if (o.up) p.push('개조 부품');
+        if (o.sp) p.push('특수 무기');
+        if (o.tu) p.push('포탑 강화');
+        const t = p.length ? p.join(' ') : '별일 없음';
+        if (!seen.includes(t)) seen.push(t);
+      }
+      return (seen.length > 1 ? '운에 따라: ' : '') + seen.join(' / ');
+    }
+    function eventScreen() {
+      const E = EVS[st.ev], m = me();
+      scr.append(headBar());
+      if (!E) return;
+      scr.append(L.h('div', { class: 'cw-card' }, L.h('h3', { text: E.t }), L.h('p', { text: E.d })));
+      E.c.forEach((ch, i) => {
+        const ok = choiceOk(st, i);
+        const b = L.h('button', { type: 'button', class: 'cw-ch' + (m >= 0 && st.vt[m] === i ? ' me' : '') }, ch.l, L.h('span', { class: 'cw-chx', text: chHint(ch) }), votes(i));
+        if (!ok) { b.disabled = true; b.append(L.h('span', { style: { color: '#ff9b8a', fontSize: '12px', marginLeft: '6px' }, text: '고철 부족' })); }
+        b.addEventListener('click', () => { if (m < 0 || !ok) return; act({ t: 'ch', c: i }); api.sfx('click'); });
+        scr.append(b);
+      });
+      const w = waitLine(); if (w) scr.append(w);
+      if (m < 0) scr.append(L.h('div', { class: 'cw-wait', text: 'AI 승무원들이 고르는 중…' }));
+      scr.append(gearLine());
+    }
+    function shopScreen() {
+      const m = me(), tm = tmA(st);
+      scr.append(headBar());
+      scr.append(L.h('div', { class: 'cw-card' }, L.h('h3', { text: '정거장 상점' }), L.h('p', { text: '고철로 포탑·특수 무기·개조를 사요. 고철은 모두 함께 써요.' })));
+      if (st.msg) scr.append(L.h('div', { class: 'cw-msg', text: st.msg }));
+      (st.shop || []).forEach((it, i) => {
+        let nm, d, tag;
+        if (it[0] === 0) { nm = TUR[it[1]].nm; tag = '포탑'; d = TUR[it[1]].d + ' · 가장 약한 포탑보다 좋으면 바로 달아요'; }
+        else if (it[0] === 1) { nm = UPG[it[1]].nm; tag = '개조'; d = UPG[it[1]].d; }
+        else if (it[0] === 3) { const x = tm[it[1]] || [0, 1]; nm = (it[1] + 1) + '번 포탑 강화'; tag = '강화'; d = TUR[x[0]].nm + ' Lv' + x[1] + ' → Lv' + Math.min(3, x[1] + 1) + ' (피해 +25%, 재장전 −10%)'; }
+        else if (it[0] === 4) { nm = SPC[it[1]].nm; tag = '특수'; d = SPC[it[1]].d + ' · 지금 것(' + SPC[st.sp].nm + ')은 창고로'; }
+        else { nm = '선체 수리'; tag = '수리'; d = '선체 +15 (여러 번 살 수 있어요)'; }
+        const can = !it[3] && st.sc >= it[2] && !(it[0] === 2 && st.hp >= st.hm) && !(it[0] === 3 && tm[it[1]] && tm[it[1]][1] >= 3);
+        const b = L.h('button', { class: 'btn ' + (can ? 'primary' : 'ghost'), type: 'button', text: it[3] ? '샀어요' : it[2] + ' 고철' });
+        if (!can || m < 0) b.disabled = true;
+        b.addEventListener('click', () => { act({ t: 'buy', i }); api.sfx('chip'); });
+        scr.append(L.h('div', { class: 'cw-item' }, L.h('div', { class: 't' }, L.h('em', { text: tag }), nm, L.h('small', { text: d })), b));
+      });
+      if (m >= 0) {
+        const lv = L.h('button', { class: 'btn primary cw-big', type: 'button', text: st.vt[m] >= 0 ? '떠날 준비 완료' : '정거장 떠나기' });
+        if (st.vt[m] >= 0) lv.disabled = true;
+        lv.addEventListener('click', () => { act({ t: 'leave' }); api.sfx('pop'); });
+        scr.append(lv);
+        const w = waitLine(); if (w) scr.append(w);
+        scr.append(eqCard());
+      } else scr.append(L.h('div', { class: 'cw-wait', text: 'AI 승무원들이 쇼핑 중…' }));
+      scr.append(gearLine());
+    }
+
+    /* ---------- drawing ---------- */
+    const stars = []; for (let i = 0; i < 110; i++) stars.push({ x: Math.random() * 900, y: Math.random() * 900, z: 0.15 + Math.random() * 0.6, b: 0.3 + Math.random() * 0.7 });
+    let bgCache = null;
+    function drawSpace(R, now) {
+      const ar = g.ar, t = now / 1000;
+      ctx.fillStyle = '#0b0814'; ctx.fillRect(ar.x, ar.y, ar.w, ar.h);
+      // nebula backdrop (cached)
+      if (!bgCache || bgCache.k !== (R ? R.k : 0) + ':' + ar.w + ':' + ar.h) {
+        const c = document.createElement('canvas'), d = 1; c.width = Math.max(1, ar.w * d | 0); c.height = Math.max(1, ar.h * d | 0);
+        const x = c.getContext('2d'), rg = mkRng((R ? R.k * 977 : 3) + 11);
+        const hues = R && R.haz === 'neb' ? ['#5a2a8a', '#8a3a7a', '#3a2a7a'] : R && R.haz === 'stm' ? ['#1a3a6a', '#2a5a8a', '#1a2a4a'] : ['#2a1a4a', '#3a1a3a', '#1a2a4a'];
+        for (let k = 0; k < 6; k++) { const px = rg() * c.width, py = rg() * c.height, r = (0.3 + rg() * 0.5) * Math.max(c.width, c.height); const gg = x.createRadialGradient(px, py, 0, px, py, r); gg.addColorStop(0, hexA(hues[k % 3], R && R.haz === 'neb' ? 0.35 : 0.22)); gg.addColorStop(1, 'rgba(0,0,0,0)'); x.fillStyle = gg; x.fillRect(0, 0, c.width, c.height); }
+        bgCache = { k: (R ? R.k : 0) + ':' + ar.w + ':' + ar.h, c };
+      }
+      ctx.drawImage(bgCache.c, ar.x, ar.y, ar.w, ar.h);
+      ctx.fillStyle = '#fff';
+      for (const s of stars) {
+        const x = ar.x + ((((s.x - cam.x * s.z) % 900) + 900) % 900) / 900 * ar.w * 1.2 - ar.w * 0.1, y = ar.y + ((((s.y - cam.y * s.z) % 900) + 900) % 900) / 900 * ar.h * 1.2 - ar.h * 0.1;
+        ctx.globalAlpha = s.b * (0.35 + 0.65 * s.z) * (0.85 + 0.15 * Math.sin(t * 2 + s.x)); ctx.fillRect(x, y, 1 + s.z * 1.4, 1 + s.z * 1.4);
+      }
+      ctx.globalAlpha = 1;
+      // arena border
+      ctx.strokeStyle = 'rgba(227,174,69,.35)'; ctx.lineWidth = 2; ctx.setLineDash([10, 8]);
+      ctx.strokeRect(SX(0), SY(0), AW * g.s, AH * g.s); ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(0,0,0,.35)';
+      const x0 = SX(0), y0 = SY(0), x1 = SX(AW), y1 = SY(AH);
+      if (x0 > ar.x) ctx.fillRect(ar.x, ar.y, x0 - ar.x, ar.h);
+      if (x1 < ar.x + ar.w) ctx.fillRect(x1, ar.y, ar.x + ar.w - x1, ar.h);
+      if (y0 > ar.y) ctx.fillRect(Math.max(ar.x, x0), ar.y, Math.min(x1, ar.x + ar.w) - Math.max(ar.x, x0), y0 - ar.y);
+      if (y1 < ar.y + ar.h) ctx.fillRect(Math.max(ar.x, x0), y1, Math.min(x1, ar.x + ar.w) - Math.max(ar.x, x0), ar.y + ar.h - y1);
+    }
+    function drawShipAt(s, pg, col, accC, ours, t, hiPart, hiCol, myM, R) {
+      ctx.save(); ctx.translate(SX(s.x), SY(s.y)); ctx.rotate(s.a); ctx.scale(g.s, g.s);
+      // engine flames
+      const spd = hyp(s.vx || 0, s.vy || 0);
+      for (const p of s.pt) if (p.t === 'E' && !p.dis) {
+        const fl = (2 + spd * 0.09) * (0.8 + 0.2 * Math.sin(t * 40 + p.y)) * (p.r / 3.4);
+        const gg = ctx.createLinearGradient(p.x - p.r, 0, p.x - p.r - fl * 2, 0); gg.addColorStop(0, ours ? 'rgba(160,230,255,.95)' : 'rgba(255,190,110,.95)'); gg.addColorStop(1, 'rgba(255,120,60,0)');
+        ctx.fillStyle = gg; ctx.beginPath(); ctx.moveTo(p.x - p.r * 0.9, p.y - p.r * 0.45); ctx.lineTo(p.x - p.r - fl * 2, p.y); ctx.lineTo(p.x - p.r * 0.9, p.y + p.r * 0.45); ctx.fill();
+      }
+      drawHull(ctx, pg, col, t, ours);
+      const toUs = R && !ours ? Math.atan2(R.S.y - s.y, R.S.x - s.x) - s.a : 0;
+      s.pt.forEach((p, i) => {
+        let ang = 0;
+        if (p.t === 'T') ang = s.M[p.m] ? s.M[p.m].ang : 0;
+        else if (p.t === 'W') ang = toUs;
+        drawPart(ctx, p, col, accC, t, ang, ours, i === hiPart ? hiCol : p.t === 'T' && myM && s.M[p.m] === myM ? '#fff' : '');
+      });
+      ctx.restore();
+    }
+    function drawWorld(R, age, now) {
+      const t = now / 1000, S = R.S, D = SHIPS[R.sh];
+      const ex = (o) => [o.x + (o.vx || 0) * age, o.y + (o.vy || 0) * age];
+      // storm zones
+      for (const z of R.Z) {
+        const a = 0.35 + 0.35 * Math.sin(t * 16);
+        ctx.beginPath(); ctx.arc(SX(z.x), SY(z.y), z.r * g.s, 0, TAU); ctx.fillStyle = 'rgba(255,240,140,' + (0.06 + 0.12 * (1 - z.t / 1.6)) + ')'; ctx.fill();
+        ctx.setLineDash([5, 4]); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,240,140,' + a + ')'; ctx.stroke(); ctx.setLineDash([]);
+        ctx.beginPath(); ctx.arc(SX(z.x), SY(z.y), z.r * g.s * clamp(z.t / 1.6, 0, 1), 0, TAU); ctx.lineWidth = 1; ctx.stroke();
+      }
+      if (R.GW) { const gx = SX(R.GW.x), gy = SY(R.GW.y); for (let k = 0; k < 4; k++) { const rr = ((t * 30 + k * 12) % 48) * g.s; ctx.beginPath(); ctx.arc(gx, gy, Math.max(1, (48 * g.s - rr)), 0, TAU); ctx.strokeStyle = 'rgba(180,140,255,' + (0.15 + 0.1 * k) + ')'; ctx.lineWidth = 2; ctx.stroke(); } const gg = ctx.createRadialGradient(gx, gy, 0, gx, gy, 14 * g.s); gg.addColorStop(0, 'rgba(10,0,20,1)'); gg.addColorStop(1, 'rgba(120,80,200,0)'); ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(gx, gy, 14 * g.s, 0, TAU); ctx.fill(); }
+      // mines
+      for (const m of R.MN) {
+        const x = SX(m.x), y = SY(m.y), bl = 0.5 + 0.5 * Math.sin(t * 8 + m.x);
+        ctx.fillStyle = m.o ? '#5a2a2a' : '#2a4a44'; ctx.beginPath(); ctx.arc(x, y, 2.6 * g.s, 0, TAU); ctx.fill();
+        ctx.strokeStyle = m.o ? '#c05050' : '#5fd0b0'; ctx.lineWidth = 1; for (let k = 0; k < 6; k++) { const a = k / 6 * TAU; ctx.beginPath(); ctx.moveTo(x + Math.cos(a) * 2.6 * g.s, y + Math.sin(a) * 2.6 * g.s); ctx.lineTo(x + Math.cos(a) * 3.8 * g.s, y + Math.sin(a) * 3.8 * g.s); ctx.stroke(); }
+        if (!m.arm) { ctx.fillStyle = m.o ? 'rgba(255,80,80,' + bl + ')' : 'rgba(120,255,200,' + bl + ')'; ctx.beginPath(); ctx.arc(x, y, 1.1 * g.s, 0, TAU); ctx.fill(); }
+      }
+      // rocks
+      for (const rk of R.RK) {
+        const p = ex(rk), P2 = ROCKS[rk.s % 16];
+        ctx.save(); ctx.translate(SX(p[0]), SY(p[1])); ctx.rotate(t * 0.5 + rk.s); ctx.scale(rk.r * g.s, rk.r * g.s);
+        ctx.beginPath(); for (let j = 0; j < 8; j++) { if (j) ctx.lineTo(P2[j * 2], P2[j * 2 + 1]); else ctx.moveTo(P2[0], P2[1]); } ctx.closePath();
+        const rg = ctx.createLinearGradient(0, -1, 0, 1); rg.addColorStop(0, '#a08a6a'); rg.addColorStop(1, '#4a3a2a'); ctx.fillStyle = rg; ctx.fill(); ctx.lineWidth = 0.08; ctx.strokeStyle = '#c4a57a'; ctx.stroke();
+        ctx.restore();
+      }
+      // enemies
+      const mt = myRole() === 'G' ? myMount() : null;
+      for (const e of R.E) {
+        if (e.dead) continue;
+        const ES = ESTAT[e.k], DD = EN[e.k], p = ex(e);
+        const vis = R.haz === 'neb' ? clamp(1.4 - hyp(p[0] - S.x, p[1] - S.y) / 130, 0.15, 1) : 1;
+        ctx.globalAlpha = e.ck ? 0.12 : vis;
+        drawShipAt({ x: p[0], y: p[1], a: e.a, vx: e.vx, vy: e.vy, pt: e.pt }, ES.pg, DD.col, '#ffd36b', false, t, -1, '', null, R);
+        // shield bubble
+        if (e.sh > 0.5 && e.shm) { ctx.beginPath(); ctx.arc(SX(p[0]), SY(p[1]), (e.r + 3.5) * g.s, 0, TAU); ctx.fillStyle = 'rgba(120,200,255,' + (0.05 + 0.08 * e.sh / e.shm) + ')'; ctx.fill(); ctx.lineWidth = 1 + e.sh / e.shm; ctx.strokeStyle = 'rgba(150,220,255,' + (0.3 + 0.4 * e.sh / e.shm) + ')'; ctx.stroke(); }
+        if (e.emp) { ctx.strokeStyle = 'rgba(200,170,255,' + (0.4 + 0.4 * Math.sin(t * 20)) + ')'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(SX(p[0]), SY(p[1]), (e.r + 2) * g.s, 0, TAU); ctx.stroke(); }
+        ctx.globalAlpha = 1;
+        if (e.ck) continue;
+        // focus mark
+        const idx = R.guest ? e.id : R.E.indexOf(e);
+        const foc = (myRole() === 'C' ? loc.fo : R.fo == null ? -2 : R.fo) === idx;
+        if (foc) { ctx.strokeStyle = '#ff8a6a'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.arc(SX(p[0]), SY(p[1]), (e.r + 7) * g.s, 0, TAU); ctx.stroke(); ctx.setLineDash([]); }
+        // hp bar
+        if (!DD.boss) {
+          const bw = Math.max(20, e.r * 2.2 * g.s), bx = SX(p[0]) - bw / 2, by = SY(p[1] - e.r) - 10;
+          ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(bx - 1, by - 1, bw + 2, 5);
+          ctx.fillStyle = DD.el ? '#ff9a3d' : '#ee6a55'; ctx.fillRect(bx, by, bw * clamp(e.hp / e.hm, 0, 1), 3);
+          if (e.shm) { ctx.fillStyle = '#7fd4ff'; ctx.fillRect(bx, by - 3, bw * clamp(e.sh / e.shm, 0, 1), 2); }
+        }
+      }
+      // lead ghost for my turret
+      aimInfo = '';
+      if (mt && R.inj[me()] <= 0) {
+        const o = mountWorld(S, mt), T = TUR[mt.tt], sp = T.sp * (1 + 0.2 * R.up[8]), rng = sp * T.l;
+        const la = angN(loc.a - S.a), ok = inArc(mt, la);
+        // arc wedge
+        if (mt.w < 3.1) { ctx.strokeStyle = 'rgba(255,210,122,.3)'; ctx.lineWidth = 1; ctx.beginPath(); for (const sg of [-1, 1]) { const ea = S.a + mt.a + sg * mt.w; ctx.moveTo(SX(o[0] + Math.cos(ea) * 6), SY(o[1] + Math.sin(ea) * 6)); ctx.lineTo(SX(o[0] + Math.cos(ea) * 34), SY(o[1] + Math.sin(ea) * 34)); } ctx.stroke(); ctx.beginPath(); ctx.arc(SX(o[0]), SY(o[1]), 30 * g.s, S.a + mt.a - mt.w, S.a + mt.a + mt.w); ctx.setLineDash([2, 4]); ctx.stroke(); ctx.setLineDash([]); }
+        ctx.save(); ctx.setLineDash([5, 6]); ctx.lineWidth = 1.5; ctx.strokeStyle = ok ? 'rgba(255,210,122,.75)' : 'rgba(255,110,90,.75)';
+        ctx.beginPath(); ctx.moveTo(SX(o[0]), SY(o[1])); ctx.lineTo(SX(o[0] + Math.cos(loc.a) * rng), SY(o[1] + Math.sin(loc.a) * rng)); ctx.stroke(); ctx.restore();
+        if (!ok) aimInfo = '그쪽은 내 포탑이 못 돌아가요 (' + mountSide(SHIPS[R.sh].mt[S.M.indexOf(mt)]) + ' 포탑)';
+        let best = null, bd = 0.7;
+        for (const e of R.E) {
+          if (e.dead || e.ck) continue;
+          const lp = lead(o[0], o[1], e.x, e.y, e.vx, e.vy, sp);
+          if (lp[2] * sp > rng * 1.1) continue;
+          const d = Math.abs(angN(Math.atan2(lp[1] - o[1], lp[0] - o[0]) - loc.a)) * Math.max(1, hyp(lp[0] - o[0], lp[1] - o[1]) / 60);
+          if (d < bd) { bd = d; best = [e, lp]; }
+        }
+        if (best) {
+          const e = best[0], lp = best[1], ES = ESTAT[e.k];
+          ctx.save(); ctx.translate(SX(lp[0]), SY(lp[1])); ctx.rotate(e.a); ctx.scale(g.s, g.s);
+          polyPath(ctx, ES.pg); ctx.setLineDash([2, 2]); ctx.lineWidth = 0.6; ctx.strokeStyle = 'rgba(255,230,160,.8)'; ctx.stroke(); ctx.setLineDash([]);
+          // aimed part
+          const dist = hyp(lp[0] - o[0], lp[1] - o[1]), ax = o[0] + Math.cos(loc.a) * dist, ay = o[1] + Math.sin(loc.a) * dist;
+          const gl = toLocal({ x: lp[0], y: lp[1], a: e.a }, ax, ay);
+          let bp = null, bq = 1e9;
+          for (const q of e.pt) { if (q.ph > e.ph) continue; const dd = hyp(q.x - gl[0], q.y - gl[1]); if (dd < bq) { bq = dd; bp = q; } }
+          for (const q of e.pt) { if (q.ph > e.ph) continue; ctx.beginPath(); ctx.arc(q.x, q.y, q.r * 0.7, 0, TAU); ctx.fillStyle = q === bp && bq < e.r ? 'rgba(255,240,170,.85)' : q.dis ? 'rgba(80,60,60,.5)' : 'rgba(255,210,122,.3)'; ctx.fill(); }
+          ctx.restore();
+          const onT = bq < e.r * 1.1;
+          ctx.strokeStyle = onT ? '#ffe9a8' : 'rgba(255,230,160,.5)'; ctx.lineWidth = 1.5;
+          const cx = SX(lp[0]), cy = SY(lp[1]), rr = 5;
+          ctx.beginPath(); ctx.moveTo(cx - rr - 4, cy); ctx.lineTo(cx - rr, cy); ctx.moveTo(cx + rr, cy); ctx.lineTo(cx + rr + 4, cy); ctx.moveTo(cx, cy - rr - 4); ctx.lineTo(cx, cy - rr); ctx.moveTo(cx, cy + rr); ctx.lineTo(cx, cy + rr + 4); ctx.stroke();
+          if (onT && bp && ok) aimInfo = '조준: ' + EN[e.k].nm + ' · ' + (bp.t === 'W' || bp.t === 'C' && bp.w ? '무기' : PN[bp.t]) + (bp.dis ? '(부서짐→관통)' : '');
+          else if (ok) aimInfo = '점선 유령에 조준선을 맞춰요';
+        }
+      }
+      // our drones
+      for (const d of R.DR) { ctx.save(); ctx.translate(SX(d.x), SY(d.y)); ctx.rotate(t * 3); ctx.fillStyle = '#9fe0ff'; ctx.beginPath(); ctx.moveTo(3 * g.s, 0); ctx.lineTo(-2 * g.s, -2 * g.s); ctx.lineTo(-2 * g.s, 2 * g.s); ctx.fill(); ctx.restore(); }
+      // our ship
+      const rpHi = myRole() === 'C' ? (loc.rp >= 0 ? loc.rp : R.rpT) : -1;
+      const sp = ex(S);
+      if (S.inv > 0) ctx.globalAlpha = 0.5 + 0.3 * Math.sin(t * 30);
+      drawShipAt({ x: sp[0], y: sp[1], a: S.a, vx: S.vx, vy: S.vy, pt: S.pt, M: S.M }, D.pg, D.col, D.acc, true, t, rpHi, '#7cf0a0', mt, R);
+      ctx.globalAlpha = 1;
+      if (flashR > 0) { ctx.save(); ctx.translate(SX(sp[0]), SY(sp[1])); ctx.rotate(S.a); ctx.scale(g.s, g.s); polyPath(ctx, D.pg); ctx.fillStyle = 'rgba(255,80,60,' + (flashR * (L.fx ? L.fx() : 1)).toFixed(3) + ')'; ctx.fill(); ctx.restore(); }
+      if (S.sh > 0.5 || flashS > 0) {
+        const mx = Math.max(1, R.shMax || S.shm), f = clamp(S.sh / mx, 0, 1.6);
+        ctx.beginPath(); ctx.ellipse(SX(sp[0]), SY(sp[1]), (S.r + 4) * g.s, (S.r + 4) * g.s, 0, 0, TAU);
+        ctx.fillStyle = 'rgba(110,200,255,' + (0.04 + 0.06 * f + flashS * 0.25) + ')'; ctx.fill();
+        ctx.lineWidth = 1 + f * 1.2; ctx.strokeStyle = S.oc ? 'rgba(200,250,255,.9)' : 'rgba(150,225,255,' + (0.25 + 0.35 * f + flashS) + ')'; ctx.stroke();
+      }
+      // bullets
+      ctx.lineCap = 'round';
+      for (const b of R.B) {
+        const x = b.x + b.vx * age, y = b.y + b.vy * age, sp2 = hyp(b.vx, b.vy) || 1;
+        if (b.tt === TB_TORP) { ctx.fillStyle = '#fff1c8'; ctx.beginPath(); ctx.arc(SX(x), SY(y), 2 * g.s, 0, TAU); ctx.fill(); ctx.strokeStyle = 'rgba(255,150,60,.7)'; ctx.lineWidth = 2 * g.s; ctx.beginPath(); ctx.moveTo(SX(x), SY(y)); ctx.lineTo(SX(x - b.vx / sp2 * 8), SY(y - b.vy / sp2 * 8)); ctx.stroke(); continue; }
+        const T = TUR[b.tt], col = T ? T.c : '#9fe0ff', len = T && T.big ? 5 : T && (T.flak || b.tt === 8) ? 2.5 : 6;
+        ctx.strokeStyle = col; ctx.lineWidth = (T && (T.big || T.spl) ? 2.6 : T && T.pierce ? 1.4 : 2) * Math.max(1, g.s * 0.6);
+        ctx.beginPath(); ctx.moveTo(SX(x - b.vx / sp2 * len), SY(y - b.vy / sp2 * len)); ctx.lineTo(SX(x), SY(y)); ctx.stroke();
+        if (T && (T.big || T.spl || T.hom)) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(SX(x), SY(y), 1.4 * g.s, 0, TAU); ctx.fill(); }
+      }
+      // enemy shots
+      for (const x of R.X) {
+        if (x.k === 4) {
+          const x0 = SX(x.x), y0 = SY(x.y), x1 = SX(x.x + Math.cos(x.a) * x.len), y1 = SY(x.y + Math.sin(x.a) * x.len);
+          if (x.t > 0) { ctx.setLineDash([6, 5]); ctx.lineWidth = 1 + (1.1 - x.t) * 3; ctx.strokeStyle = 'rgba(255,80,80,' + (0.35 + 0.5 * (1 - x.t / 1.1)) + ')'; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.setLineDash([]); }
+          else { ctx.lineWidth = 4 * g.s; ctx.strokeStyle = 'rgba(255,90,90,.85)'; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.lineWidth = 1.5 * g.s; ctx.strokeStyle = '#fff'; ctx.stroke(); }
+          continue;
+        }
+        const px = x.x + x.vx * age, py = x.y + x.vy * age;
+        ctx.globalAlpha = R.haz === 'neb' ? clamp(1.5 - hyp(px - S.x, py - S.y) / 110, 0.25, 1) : 1;
+        if (x.k === 1) {
+          ctx.save(); ctx.translate(SX(px), SY(py)); ctx.rotate(Math.atan2(x.vy, x.vx)); ctx.scale(g.s, g.s);
+          ctx.fillStyle = 'rgba(255,160,60,.6)'; ctx.beginPath(); ctx.moveTo(-2, -0.8); ctx.lineTo(-5 - Math.random() * 2, 0); ctx.lineTo(-2, 0.8); ctx.fill();
+          ctx.fillStyle = '#ffb36b'; ctx.beginPath(); ctx.moveTo(3, 0); ctx.lineTo(-2, -1.3); ctx.lineTo(-2, 1.3); ctx.fill(); ctx.restore();
+        } else {
+          const r = x.k === 2 ? 3.4 : 1.6, col = x.k === 2 ? '#ff6ab0' : x.k === 3 ? '#7fe3ff' : '#ff5a46';
+          ctx.fillStyle = hexA(col, 0.3); ctx.beginPath(); ctx.arc(SX(px), SY(py), (r + 1.6) * g.s, 0, TAU); ctx.fill();
+          ctx.fillStyle = col; ctx.beginPath(); ctx.arc(SX(px), SY(py), r * g.s, 0, TAU); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(SX(px), SY(py), r * 0.45 * g.s, 0, TAU); ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+      // lance
+      if (R.LB) {
+        const B = R.LB, x0 = SX(B.x), y0 = SY(B.y), x1 = SX(B.x + Math.cos(B.a) * 270), y1 = SY(B.y + Math.sin(B.a) * 270);
+        if (B.t > 0) { ctx.setLineDash([8, 6]); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(160,230,255,.7)'; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.setLineDash([]); }
+        else { const a = clamp(B.l / 0.35, 0, 1); ctx.lineWidth = 9 * g.s * a; ctx.strokeStyle = 'rgba(120,220,255,' + a * 0.8 + ')'; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); ctx.lineWidth = 3 * g.s * a; ctx.strokeStyle = 'rgba(255,255,255,' + a + ')'; ctx.stroke(); }
+      }
+      // particles
+      for (const p of parts) {
+        const a = clamp(1 - p.t / p.life, 0, 1);
+        if (p.ty === 3) { ctx.globalAlpha = a; ctx.beginPath(); ctx.arc(SX(p.x), SY(p.y), Math.max(1, p.s * (1 - a * 0.85) * g.s), 0, TAU); ctx.lineWidth = 2 + 3 * a; ctx.strokeStyle = p.col; ctx.stroke(); continue; }
+        if (p.ty === 1) { ctx.globalAlpha = a * 0.7; ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(SX(p.x), SY(p.y), p.s * (1.6 - a) * g.s, 0, TAU); ctx.fill(); continue; }
+        if (p.ty === 2) { ctx.globalAlpha = Math.min(1, a * 2); ctx.save(); ctx.translate(SX(p.x), SY(p.y)); ctx.rotate(p.rot); ctx.fillStyle = p.col; ctx.fillRect(-p.s * g.s, -p.s * 0.5 * g.s, p.s * 2 * g.s, p.s * g.s); ctx.restore(); continue; }
+        ctx.globalAlpha = a; ctx.fillStyle = p.col; const sz = Math.max(1.2, p.s * g.s * 0.8); ctx.fillRect(SX(p.x) - sz / 2, SY(p.y) - sz / 2, sz, sz);
+      }
+      ctx.globalAlpha = 1;
+      if (zapF > 0) { ctx.fillStyle = 'rgba(230,240,255,' + zapF * 0.6 + ')'; ctx.fillRect(g.ar.x, g.ar.y, g.ar.w, g.ar.h); }
+      // floats
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      for (const f of floats) { ctx.globalAlpha = clamp(1 - f.t / f.life, 0, 1); ctx.fillStyle = '#0008'; ctx.fillText(f.text, SX(f.x) + 1, SY(f.y) - f.t * 18 + 1); ctx.fillStyle = f.col; ctx.fillText(f.text, SX(f.x), SY(f.y) - f.t * 18); }
+      ctx.globalAlpha = 1;
+    }
+    function drawOverlay(R, now) {
+      const ar = g.ar, S = R.S, t = now / 1000;
+      // off-screen arrows
+      for (const e of R.E) {
+        if (e.dead || e.ck) continue;
+        const x = SX(e.x), y = SY(e.y);
+        if (x > ar.x && x < ar.x + ar.w && y > ar.y && y < ar.y + ar.h) continue;
+        const cx = ar.x + ar.w / 2, cy = ar.y + ar.h / 2, a = Math.atan2(y - cy, x - cx);
+        const k = Math.min((ar.w / 2 - 14) / Math.abs(Math.cos(a) || 1e-6), (ar.h / 2 - 14) / Math.abs(Math.sin(a) || 1e-6));
+        const px = cx + Math.cos(a) * k, py = cy + Math.sin(a) * k, big = EN[e.k].boss ? 1.6 : EN[e.k].el ? 1.25 : 1;
+        ctx.save(); ctx.translate(px, py); ctx.rotate(a); ctx.fillStyle = EN[e.k].boss ? '#ff5a7a' : EN[e.k].el ? '#ff9a3d' : 'rgba(255,110,90,.85)';
+        ctx.beginPath(); ctx.moveTo(8 * big, 0); ctx.lineTo(-5 * big, -5 * big); ctx.lineTo(-5 * big, 5 * big); ctx.fill(); ctx.restore();
+      }
+      // minimap
+      const mm = 62, mx = ar.x + ar.w - mm - 6, my = ar.y + 6;
+      ctx.fillStyle = 'rgba(10,8,18,.7)'; ctx.fillRect(mx, my, mm, mm); ctx.strokeStyle = 'rgba(227,174,69,.45)'; ctx.lineWidth = 1; ctx.strokeRect(mx + 0.5, my + 0.5, mm - 1, mm - 1);
+      const k = mm / AW;
+      ctx.save(); ctx.beginPath(); ctx.rect(mx, my, mm, mm); ctx.clip(); ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.strokeRect(mx + (cam.x - ar.w / 2 / g.s) * k, my + (cam.y - ar.h / 2 / g.s) * k, ar.w / g.s * k, ar.h / g.s * k); ctx.restore();
+      for (const e of R.E) { if (e.dead || e.ck) continue; ctx.fillStyle = EN[e.k].boss ? '#ff5a7a' : EN[e.k].el ? '#ff9a3d' : '#ee6a55'; const r = EN[e.k].boss ? 3 : EN[e.k].drone ? 1 : 1.8; ctx.fillRect(mx + e.x * k - r, my + e.y * k - r, r * 2, r * 2); }
+      ctx.save(); ctx.translate(mx + S.x * k, my + S.y * k); ctx.rotate(S.a); ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-3, -2.6); ctx.lineTo(-3, 2.6); ctx.fill(); ctx.restore();
+      // crew list
+      ctx.font = '600 10.5px "IBM Plex Sans KR", sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      const m = me(), ac = acOf(R);
+      let y = ar.y + 12;
+      const bw = Math.min(150, ar.w * 0.4);
+      ctx.fillStyle = 'rgba(10,8,18,.55)'; ctx.fillRect(ar.x + 4, ar.y + 4, bw, R.NC * 14 + 4);
+      for (let s = 0; s < R.NC; s++) {
+        ctx.fillStyle = colOf(s); ctx.beginPath(); ctx.arc(ar.x + 12, y, 3.6, 0, TAU); ctx.fill();
+        if (s === m) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2; ctx.stroke(); }
+        const mi = R.gm[s];
+        let lab = s === R.cap ? '선장' : (s === R.vc ? '부선장 ' : '포수 ') + (mi + 1);
+        if (s === ac && s !== R.cap) lab = '부선장(지휘)';
+        let stt = '', col = '#d9cee8';
+        if (R.inj[s] > 0) { stt = '부상 ' + Math.ceil(R.inj[s]); col = '#ff8a7a'; }
+        else if (mi >= 0 && R.S.M[mi] && R.S.M[mi].p.dis && s !== ac) { stt = '포탑 파손'; col = '#ffb36b'; }
+        ctx.fillStyle = col; ctx.fillText(lab + (s === m ? ' (나)' : '') + (stt ? ' · ' + stt : ''), ar.x + 20, y);
+        y += 14;
+      }
+      // boss bar
+      const boss = R.E.find((e) => !e.dead && EN[e.k].boss);
+      if (boss) {
+        const bw2 = Math.min(ar.w - 150 - 80, 260), bx = ar.x + (ar.w - bw2) / 2 + 20, by = ar.y + ar.h - 20;
+        ctx.fillStyle = 'rgba(10,8,18,.75)'; ctx.fillRect(bx - 4, by - 14, bw2 + 8, 26);
+        ctx.fillStyle = '#3a1a24'; ctx.fillRect(bx, by, bw2, 7); ctx.fillStyle = '#e0405e'; ctx.fillRect(bx, by, bw2 * clamp(boss.hp / boss.hm, 0, 1), 7);
+        if (boss.shm) { ctx.fillStyle = '#7fd4ff'; ctx.fillRect(bx, by + 7, bw2 * clamp(boss.sh / boss.shm, 0, 1), 2); }
+        ctx.fillStyle = '#ffd0d8'; ctx.textAlign = 'center'; ctx.font = '700 11px "IBM Plex Sans KR", sans-serif'; ctx.fillText(EN[boss.k].nm + ' · ' + (boss.ph + 1) + '단계', bx + bw2 / 2, by - 6);
+      }
+      // countdown / banners
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if ((cd > 0 && host()) || (!host() && !G.got)) {
+        ctx.fillStyle = 'rgba(10,6,16,.4)'; ctx.fillRect(ar.x, ar.y, ar.w, ar.h);
+        ctx.fillStyle = '#ffe6b0'; ctx.font = '400 34px "Black Han Sans", sans-serif';
+        ctx.fillText(host() ? String(Math.ceil(cd)) : '…', ar.x + ar.w / 2, ar.y + ar.h * 0.6);
+      }
+      for (let i = 0; i < banners.length; i++) {
+        const b = banners[i], a = clamp(Math.min(b.t * 5, (b.life - b.t) * 2.5), 0, 1);
+        ctx.globalAlpha = a * 0.9; ctx.font = '400 16px "Black Han Sans", sans-serif';
+        const tw = Math.min(ar.w - 20, ctx.measureText(b.text).width + 24), by = ar.y + R.NC * 14 + 30 + i * 30;
+        ctx.fillStyle = 'rgba(16,10,24,.5)'; ctx.fillRect(ar.x + ar.w / 2 - tw / 2, by - 13, tw, 26);
+        ctx.fillStyle = b.col; ctx.fillText(b.text, ar.x + ar.w / 2, by + 1, ar.w - 30);
+      }
+      ctx.globalAlpha = 1;
+      if (R.over) {
+        const txt = R.over === 3 ? '배가 부서졌어요…' : R.over === 2 ? '적이 물러갔어요' : '승리!';
+        ctx.font = '400 30px "Black Han Sans", sans-serif'; ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillText(txt, ar.x + ar.w / 2 + 2, ar.y + ar.h * 0.45 + 2);
+        ctx.fillStyle = R.over === 3 ? '#ff8a7a' : '#ffe6b0'; ctx.fillText(txt, ar.x + ar.w / 2, ar.y + ar.h * 0.45);
+      }
+      // help hint for empty-captain
+      if (ac < 0 && !R.over) { ctx.font = '700 12px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#ff8a7a'; ctx.fillText('선장·부선장 모두 부상 — 자동 조종 중', ar.x + ar.w / 2, ar.y + ar.h - 40); }
+    }
+    function drawHud(R) {
+      const w = g.w, S = R.S;
+      ctx.fillStyle = '#16111e'; ctx.fillRect(0, 0, w, g.hud);
+      ctx.fillStyle = 'rgba(227,174,69,.35)'; ctx.fillRect(0, g.hud - 1, w, 1);
+      ctx.font = '600 11px "IBM Plex Sans KR", sans-serif'; ctx.textBaseline = 'middle';
+      const y = g.hud / 2;
+      ctx.fillStyle = '#cbbfdb'; ctx.textAlign = 'left'; ctx.fillText('선체', 6, y);
+      const bw = Math.min(110, w * 0.25), bx = 32, hpF = clamp(S.hp / S.hm, 0, 1);
+      ctx.fillStyle = '#2b2238'; ctx.fillRect(bx, y - 6, bw, 12);
+      ctx.fillStyle = hpF > 0.5 ? '#7cc66a' : hpF > 0.25 ? '#e3ae45' : '#ee6a55'; ctx.fillRect(bx, y - 6, bw * hpF, 12);
+      ctx.fillStyle = '#fff'; ctx.font = '600 10.5px "IBM Plex Mono", monospace'; ctx.textAlign = 'center'; ctx.fillText(Math.ceil(S.hp) + '/' + S.hm, bx + bw / 2, y + 0.5);
+      let x = bx + bw + 8;
+      ctx.textAlign = 'left'; ctx.font = '600 11px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#9fe0ff'; ctx.fillText('막', x, y); x += 14;
+      const sw = Math.min(56, w * 0.13), mx = Math.max(1, R.shMax || S.shm);
+      ctx.fillStyle = '#1e2a36'; ctx.fillRect(x, y - 5, sw, 10); ctx.fillStyle = R.sys && R.sys.S.dis ? '#555' : '#7fd4ff'; ctx.fillRect(x, y - 5, sw * clamp(S.sh / mx, 0, 1), 10);
+      x += sw + 8;
+      ctx.fillStyle = '#e3ae45'; ctx.fillText('⚡' + PREN[S.pre], x, y);
+      ctx.textAlign = 'right'; ctx.fillStyle = '#e3ae45';
+      ctx.fillText('고철 ' + (host() ? money(R) : (R.m0 || 0) + (R.earn || 0)), w - 6, y);
+    }
+    function tick(dt) {
+      for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; const dr = p.ty === 1 ? 0.97 : 0.95; p.vx *= dr; p.vy *= dr; p.rot += p.vr * dt; if (p.t >= p.life) parts.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t += dt; if (floats[i].t >= floats[i].life) floats.splice(i, 1); }
+      for (let i = banners.length - 1; i >= 0; i--) { banners[i].t += dt; if (banners[i].t >= banners[i].life) banners.splice(i, 1); }
+      shake = Math.max(0, shake - dt * 1.8); flashS = Math.max(0, flashS - dt * 2); flashR = Math.max(0, flashR - dt * 2); zapF = Math.max(0, zapF - dt * 2.5);
+    }
+    let smokeT = 0;
+    function smoke(R, dt) {
+      smokeT -= dt; if (smokeT > 0) return; smokeT = 0.12;
+      const emit = (s) => { for (const p of s.pt) { const f = p.hp / p.hm; if (p.dis ? Math.random() < 0.7 : f < 0.5 && Math.random() < 0.25) { const w = toWorld(s, p.x, p.y); part(w[0], w[1], (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6 - 3, 1.2, 1.4 + Math.random(), p.dis ? 'rgba(40,34,44,.8)' : 'rgba(80,74,84,.6)', 1); if (p.dis && Math.random() < 0.4) part(w[0], w[1], (Math.random() - 0.5) * 20, (Math.random() - 0.5) * 20, 0.3, 0.8, '#ffb35c'); } } };
+      emit(R.S); for (const e of R.E) if (!e.dead && !e.ck) emit(e);
+    }
+
+    /* ---------- main loop ---------- */
+    function syncHu() {
+      if (!st || !host()) return;
+      const hu = humanFlags();
+      if (hu.join() !== st.hu.join()) {
+        let ns = Object.assign(U.clone(st), { hu });
+        if (['map', 'ev', 'shop'].includes(ns.ph) && hu.some((v) => v)) ns = tryResolve(ns, false);
+        if (W) W.hu = hu;
+        api.setState(ns);
+      }
+    }
+    function frame(rdt, now) {
+      if (!st) return;
+      const dt = rdt * SPD();
+      tick(rdt);
+      if (host()) syncHu();
+      if (!st) return;
+      if (st.ph === 'fight') {
+        if (fkey !== st.fi.k) startFightView();
+        const R = RW();
+        updateAim();
+        if (host()) {
+          if (cd > 0) { if (!(tipShown && soloLocal())) cd -= dt; }
+          else if (W && !W.done && !(tipShown && soloLocal())) {
+            pollHost(); controls();
+            acc += dt; let n = 0;
+            while (acc >= H && n < 16) {
+              const ac = actCap(W), capC = ac >= 0 ? C[ac] : W.autoCap;
+              for (let i = 0; i < st.NC; i++) if (isAI(i)) aiCrew(W, i, aiC[i], mem[i], lvOf(i), H, capC);
+              stepFight(W, C, H); acc -= H; n++;
+            }
+            if (n >= 16) acc = 0;
+            for (const e of W.fx) if (e[0] > lastFx) { lastFx = e[0]; onFx(e); }
+          }
+          if (W && W.done && !sentEnd) { sentEnd = true; api.setState(endFight(U.clone(st), summary(W))); return; }
+        } else pollGuest(now);
+        readKeys(rdt);
+        publish(rdt);
+        if (R) {
+          const age = host() ? 0 : Math.min(0.2, (now - (G.tS || now)) / 1000);
+          const S = R.S, tx = S.x + S.vx * 0.35, ty = S.y + S.vy * 0.35;
+          const k = Math.min(1, rdt * 4); cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k;
+          smoke(R, rdt);
+          ctx.clearRect(0, 0, g.w, g.h);
+          ctx.save(); ctx.beginPath(); ctx.rect(g.ar.x, g.ar.y, g.ar.w, g.ar.h); ctx.clip();
+          if (shake > 0) { const fxk = L.fx ? L.fx() : 1; ctx.translate((Math.random() - 0.5) * shake * 9 * fxk, (Math.random() - 0.5) * shake * 7 * fxk); }
+          drawSpace(R, now); drawWorld(R, age, now);
+          ctx.restore();
+          ctx.save(); ctx.beginPath(); ctx.rect(g.ar.x, g.ar.y, g.ar.w, g.ar.h); ctx.clip(); drawOverlay(R, now); ctx.restore();
+          drawHud(R);
+          updatePanel(R);
+        }
+        return;
+      }
+      drawBg(now);
+      if (!host()) return;
+      const ph = st.ph;
+      if (['hangar', 'map', 'ev', 'shop'].includes(ph)) {
+        const hh = humans(st);
+        if (!hh.length) {
+          aiT += dt;
+          if (aiT > 1.1) { aiT = 0; api.setState(aiCoarse(U.clone(st), ph === 'hangar' ? (Math.random() * SHIPS.length) | 0 : null)); }
+        } else if (hh.length > 1 && ph !== 'hangar' && hh.some((i) => st.vt[i] >= 0)) {
+          voteT += rdt;
+          if (voteT > 30) { voteT = 0; api.toast('시간이 지나 투표로 정했어요'); api.setState(tryResolve(U.clone(st), true)); }
+        } else voteT = 0;
+      }
+    }
+    function drawBg(now) {
+      ctx.fillStyle = '#0f0b17'; ctx.fillRect(0, 0, g.w, g.h);
+      ctx.fillStyle = '#fff';
+      for (const s of stars) { ctx.globalAlpha = s.b * 0.6; ctx.fillRect((((s.x - now * 0.01 * s.z) % 900) + 900) % 900 / 900 * g.w, s.y / 900 * g.h, 1 + s.z, 1 + s.z); }
+      ctx.globalAlpha = 1;
+      if (st) {
+        const D = SHIPS[st.sh];
+        ctx.save(); ctx.translate(g.w * 0.5, g.h * 0.5 + Math.sin(now / 900) * 6); ctx.rotate(-PI / 2); ctx.scale(5, 5); ctx.globalAlpha = 0.22;
+        drawHull(ctx, D.pg, D.col, 0, 1); ctx.restore(); ctx.globalAlpha = 1;
+      }
+    }
+    const stopLoop = U.loop(frame);
+    layout();
+
+    return {
+      update(next, prev) {
+        if (!next) return;
+        const old = st; st = next;
+        if (!old || old.rid !== next.rid) { W = null; G = null; fkey = -1; scrKey = ''; selNode = -1; mapScroll = null; tipShown = ''; tipEl.hidden = true; showEq = false; selCg = -1; }
+        if (next.ph === 'fight') { if (fkey !== next.fi.k) startFightView(); }
+        else { W = null; G = null; fkey = -1; aimDrag = null; fireHeld = false; }
+        if (old && old.ph !== next.ph) {
+          selNode = -1; aiT = 0; voteT = 0; selCg = -1;
+          if (old.ph === 'fight' && next.ph === 'map' && next.msg) api.toast(next.msg);
+          if (next.ph === 'shop' || next.ph === 'ev') api.sfx('card');
+          if (tipShown && next.ph !== 'fight') { tipEl.hidden = true; tipShown = ''; }
+          if (next.ph !== 'map') showEq = false;
+        }
+        if (old && next.ph === 'map' && old.ph === 'map' && old.col !== next.col) selNode = -1;
+        if (selCg >= 0 && selCg >= next.cg.length) selCg = -1;
+        pn.hidden = !(next.ph === 'fight' && me() >= 0);
+        if (next.ph === 'fight') pnKey = '';
+        layout();
+        renderScreen();
+      },
+      destroy() {
+        stopLoop();
+        if (offIn) offIn();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        pn.remove(); scr.remove(); tipEl.remove(); styleEl.remove();
+        cv.destroy();
+      },
+      _dbg: () => ({ W, G, st, loc }),
+    };
+  }
+
+  function result(st) {
+    if (!st || st.ph !== 'done') return null;
+    const D = SHIPS[st.sh] || SHIPS[0];
+    const text = D.nm + ' · ' + st.col + '/' + st.len + ' 성계 · 격추 ' + st.k + (st.cp ? ' (나포 ' + st.cp + ')' : '') + ' · 모은 고철 ' + st.ga;
+    const all = []; for (let i = 0; i < st.np; i++) all.push(i);
+    const stats = [{ label: '도달 성계', value: st.col + '/' + st.len }, { label: '격추', value: (st.k | 0) + '척' }, { label: '나포', value: (st.cp | 0) + '척' }, { label: '모은 고철', value: String(st.ga | 0) }];
+    if (st.win) return { stats, winners: all, title: ((n) => { const c = n.charCodeAt(n.length - 1) - 0xac00; return n + (c >= 0 && c < 11172 && c % 28 ? '을' : '를'); })(EN[finalBoss(st)].nm) + ' 물리쳤어요!', text };
+    return { stats, winners: [], title: '배가 부서졌어요… (' + st.col + '/' + st.len + ' 성계)', text };
+  }
+
+  /* ======================= 도감 (위 데이터 표에서 자동으로 만듦) ======================= */
+  function crewCodex() {
+    const n1 = (v) => String(Math.round(v * 10) / 10);
+    const PCOL = { B: '#e8fbff', R: '#ffa040', S: '#8fdcff', E: '#ff9a4a', H: 'rgba(255,255,255,.25)', T: '#e3ae45', W: '#ff8a6a', G: '#b48cf0', C: '#ff4a6a' };
+    const shipSvg = (pg, pts, col, sz) => {
+      let mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9;
+      for (let i = 0; i < pg.length; i += 2) { mnx = Math.min(mnx, pg[i]); mxx = Math.max(mxx, pg[i]); mny = Math.min(mny, pg[i + 1]); mxy = Math.max(mxy, pg[i + 1]); }
+      const w = Math.max(mxx - mnx, mxy - mny) + 2, cx = (mnx + mxx) / 2, cy = (mny + mxy) / 2;
+      let s = '<svg viewBox="' + n1(cx - w / 2) + ' ' + n1(cy - w / 2) + ' ' + n1(w) + ' ' + n1(w) + '" xmlns="http://www.w3.org/2000/svg">';
+      s += '<polygon points="' + pg.map(n1).join(',') + '" fill="' + col + '" stroke="rgba(0,0,0,.55)" stroke-width="' + n1(w / 40) + '"/>';
+      for (const p of pts) s += '<circle cx="' + n1(p[1]) + '" cy="' + n1(p[2]) + '" r="' + n1(sz(p[0])) + '" fill="' + (PCOL[p[0]] || '#fff') + '" stroke="rgba(0,0,0,.5)" stroke-width="' + n1(w / 60) + '"/>';
+      return s + '</svg>';
+    };
+    const dotSvg = (c) => '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="7" fill="' + c + '"/><circle cx="12" cy="12" r="10" fill="none" stroke="' + c + '" stroke-opacity=".45" stroke-width="2"/></svg>';
+    const nodeSvg = (k) => '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" style="color:' + NT[k].c + '">' + NI[k] + '</svg>';
+    const cnt = (arr) => { const o = {}, ord = []; for (const t of arr) { if (!o[t]) { o[t] = 0; ord.push(t); } o[t]++; } return ord.map((t) => PN[t] + (o[t] > 1 ? ' ' + o[t] : '')).join(' · '); };
+    const WKN = { las: '레이저', brs: '3연발', spr: '산탄 5발', msl: '유도 미사일·요격 가능', hvy: '중포탄', bem: '조준 광선(잠깐 뒤 일직선 발사)', ion: '이온탄(방어막 4배)', min: '기뢰 투하', rng: '사방 14발 고리탄', spi: '회전 3갈래 연사' };
+    const BEH = { fln: '뒤·옆으로 돌아 들어와요', orb: '일정 거리에서 빙빙 돌아요', swm: '떼로 둘러싸요', kam: '곧장 날아와 들이받고 터져요', kit: '거리를 벌리며 쏴요', snp: '아주 멀리서 쏴요', ram: '빙 돌다가 빠르게 들이받아요', sta: '거의 움직이지 않는 요새', eat: '빙빙 돌다가 2단계부터 삼키려고 돌진해요' };
+    const WAVE = { 13: '해적 쾌속정 2척', 14: ['공격 드론 2 + 자폭 드론 1', '해적 포함 + 자폭 드론 2'], 15: '자폭 드론 3' };
+    const ships = SHIPS.map((D) => {
+      const feat = [D.esc ? '호위 드론 2대가 늘 따라다님' : '', D.mine ? '움직이면 뒤로 기뢰를 흘림' : '', D.main ? '뱃머리 주포 피해 ×1.4' : ''].filter(Boolean);
+      return { icon: shipSvg(D.pg, D.pt.concat(D.mt.map((m) => ['T', m[0], m[1]])), D.col, (t) => (t === 'T' ? 1.7 : 1.9)), name: D.nm, tag: '선체 ' + D.hm + ' · 포탑 ' + D.mt.length,
+        desc: D.d + '. 속도 ' + D.v + ' · 선회 ' + D.tr + ' · 방어막 ' + D.shm + ' · 동력 ' + D.P + ' · 특수 무기 칸 1 (기본: ' + SPC[D.sp].nm + ')' +
+          ' · 포탑 방향: ' + D.mt.map(mountSide).join('/') + ' · 시작 포탑: ' + D.tt.map((t) => TUR[t].nm).join(', ') + ' · 부위: ' + cnt(D.pt.map((p) => p[0]).concat(D.mt.map(() => 'T'))) + (feat.length ? ' · 특징: ' + feat.join(', ') : '') };
+    });
+    const turs = TUR.map((T) => {
+      const n = T.n || 1, lv = [1, 2, 3].map((l) => { const d = T.dmg * (1 + 0.25 * (l - 1)), cd = T.cd * (1 - 0.1 * (l - 1)); return 'Lv' + l + ' 피해 ' + n1(d) + (n > 1 ? '×' + n : '') + ' · ' + r2(cd) + '초마다 (초당 ' + n1(d * n / cd) + ')'; });
+      return { icon: dotSvg(T.c), name: T.nm, tag: '고철 ' + T.pr, desc: T.d + '. 탄속 ' + T.sp + (T.pd && T.pd !== 1 ? ' · 부위 피해 ×' + T.pd : '') + ' / ' + lv.join(' / ') };
+    });
+    const ens = EN.map((D, k) => {
+      const kind = D.boss ? '보스' : D.el ? '정예' : D.drone ? '드론' : '일반';
+      const hm0 = D.hp * (D.boss ? EHPB : D.drone ? EHPD : EHP), hpS = Math.round(hm0) + '~' + Math.round(hm0 * (D.boss ? 1.3 : 1.7));
+      const wc = {}, wo = [];
+      for (const p of D.pt) if (p[3]) { const key = p[3] + (p[4] || 0); if (!wc[key]) { wc[key] = 0; wo.push(p); } wc[key]++; }
+      const ws = wo.map((p) => { const c = wc[p[3] + (p[4] || 0)]; return WKN[p[3]] + (c > 1 ? ' ×' + c : '') + '(피해 ' + WK[p[3]].d + ', ' + WK[p[3]].cd + '초' + (p[4] ? ', ' + (p[4] + 1) + '단계부터' : '') + ')'; });
+      const gs = D.pt.filter((p) => p[0] === 'G').length;
+      let ph = '';
+      if (D.phs) ph = ' · 단계: 체력 ' + D.phs.map((f, i) => Math.round(f * 100) + '% 아래 → ' + (i + 2) + '단계(' + (Array.isArray(WAVE[k]) ? WAVE[k][i] : WAVE[k]) + ' 부름)').join(', ') + ' · 3분·5분이 지나면 공격이 점점 빨라져요';
+      return { icon: shipSvg(ESTAT[k].pg, D.pt.map((p) => [p[0], p[1] * D.r / 10, p[2] * D.r / 10]), D.col, (t) => PRAD[t] * Math.max(0.8, Math.min(2.2, D.r / 10 * 0.9)) * 0.55), name: D.nm, tag: kind,
+        desc: '체력 ' + hpS + (D.sh ? ' · 방어막 ' + Math.round(D.sh * ESH) : '') + ' · 속도 ' + D.v + ' · ' + BEH[D.beh] + (D.cloak ? ' · 가끔 모습을 감춰요' : '') +
+          ' · 부위: ' + cnt(D.pt.map((p) => p[0])) + ' · 공격: ' + (ws.length ? ws.join(', ') : '몸통 박치기') + (gs ? ' · 격납고에서 드론을 내보내요' : '') + ph };
+    });
+    return [
+      { h: '함선', p: ['처음부터 7종 모두 고를 수 있어요. 그림의 색 점은 부위(함교·동력실·방어막·엔진·포탑…)예요.'], rows: ships },
+      { h: '포탑', p: ['포탑은 Lv3까지 강화해요: 한 단계마다 피해 +25%, 재장전 −10%. 동력 「공격」이면 더 빨리 쏴요.'], rows: turs },
+      { h: '특수 무기', p: ['선장이 쏴요. 충전이 다 차면 「특수」 버튼이 켜져요. 배마다 칸이 1개라 새로 사면 헌 것은 창고로 가요.'], rows: SPC.map((x) => ({ icon: '✦', name: x.nm, tag: '충전 ' + x.ch + '초 · 고철 ' + x.pr, desc: x.d })) },
+      { h: '함선 개조', p: ['정거장(상점)에서 고철로 사요. 한 개조를 여러 단계까지 쌓을 수 있어요.'], rows: UPG.map((x) => ({ icon: '🔧', name: x.nm, tag: '최대 ' + x.mx + '단계 · 고철 ' + x.pr, desc: x.d + (x.mx > 1 ? ' (단계마다)' : '') })) },
+      { h: '적', p: ['체력은 항로 뒤쪽일수록 커져요(표의 범위). 적 무기·엔진·함교를 부수면 덜 쏘고 느려지고 빗나가요.'], rows: ens },
+      { h: '장소·사건', p: ['지도의 칸 종류예요. 신호에서는 사건 ' + EVS.length + '가지 중 하나가 생겨요: ' + EVS.map((e) => e.t).join(' · ') + '.', '상점: 포탑 2 · 개조 3 · 포탑 강화 2 · 특수 무기 1 · 선체 수리(고철 10)가 나와요. 창고는 4칸.'],
+        rows: NT.map((x, k) => ({ icon: nodeSvg(k), name: x.nm, desc: x.d })) },
+      { h: '역할', p: [
+        '선장(1명): 배를 몰고, 특수 무기를 쏘고, 동력을 나눠요(' + PREN.map((nm, i) => nm + ' ' + PRE[i].map((v) => Math.round(v * 100)).join('/')).join(' · ') + ' — 무기/방어막/엔진 %). 먼저 고칠 부위와 수리 호출도 정해요.',
+        '부선장: 포수 중 한 명이 겸해요. 선장이 다치면 대신 지휘해요.',
+        '포수(3~5명): 포탑 하나씩 조준·발사. 수리 호출이 켜지면 「수리 돕기」로 거들 수 있어요(그동안 그 포탑은 못 쏴요).',
+        '빈 자리는 AI 승무원. 포수보다 포탑이 많으면 남는 포탑은 혼자 느리게 쏴요.',
+        '부위가 부서지면: 엔진 → 느려짐 · 함교 → 잘 못 돌고 특수 충전 느림 · 동력실 → 모든 장치 약해짐 · 방어막 발생기 → 방어막 꺼짐 · 포탑 → 못 쏨. 부서진 부위를 또 맞으면 그 자리 승무원이 다쳐요.',
+      ] },
+    ];
+  }
+
+  L.register({
+    id: 'crew', name: '우주선 승무원', tag: '협동 우주선 로그라이크', cat: '아케이드',
+    blurb: '4~6명이 한 우주선에 타요. 선장은 배를 몰고 동력·수리·특수 무기를 맡고, 포수들은 각자 포탑으로 적의 부위(포탑·엔진·함교)를 노려요. 판마다 새로 생기는 항로를 건너 최종 보스를 물리치는 협동 로그라이크.',
+    tint: '#1f3550',
+    icon: '<path d="M6 28c6-8 20-12 34-8l10 8-10 8c-14 4-28 0-34-8z" fill="currentColor"/><path d="M18 21l-6-9h5l9 8zM18 35l-6 9h5l9-8z" fill="currentColor"/><circle cx="20" cy="28" r="2.6" fill="#000" fill-opacity=".45"/><circle cx="29" cy="28" r="2.6" fill="#000" fill-opacity=".45"/><circle cx="38" cy="28" r="2.6" fill="#000" fill-opacity=".45"/><path d="M2 25l4 3-4 3z" fill="currentColor" fill-opacity=".6"/><circle cx="48" cy="12" r="2" fill="currentColor"/><circle cx="52" cy="46" r="1.6" fill="currentColor"/>',
+    minPlayers: 1, maxPlayers: 6, defaultPlayers: 4, hidden: false, realtime: true, coop: true, aiDelay: 0,
+    codex: crewCodex(),
+    options: [
+      { id: 'len', label: '항로 길이', tip: '목적지까지 거치는 구역 수.', choices: [{ v: 6, label: '짧게 (약 10분)' }, { v: 10, label: '보통 (약 20분)' }, { v: 14, label: '길게 (약 30분)' }], def: 10 },
+      { id: 'crew', label: '승무원 수', tip: '배에 탈 인원. 사람이 모자라면 AI 승무원이 채워요.', choices: [{ v: 0, label: '자동 (4명 이상)' }, { v: 4, label: '4명' }, { v: 5, label: '5명' }, { v: 6, label: '6명' }], def: 0 },
+    ],
+    controls: [
+      { id: 'up', label: '위 (선장: 이동 / 포수: 조준 돌리기)', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '아래', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'left', label: '왼쪽', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '오른쪽', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'fire', label: '포수: 발사 / 선장: 특수 무기', keys: ['Space'], pad: ['a', 'rt'] },
+      { id: 'alt', label: '포수: 수리 돕기 / 선장: 수리 호출', keys: ['KeyF'], pad: ['b', 'lt'] },
+      { id: 'rep', label: '선장: 수리 우선 부위 바꾸기', keys: ['KeyR'], pad: ['y'] },
+      { id: 'pre', label: '선장: 동력 배분 바꾸기', keys: ['KeyQ'], pad: ['x'] },
+      { id: 'p1', label: '선장: 동력 균형', keys: ['Digit1'], pad: [] },
+      { id: 'p2', label: '선장: 동력 공격', keys: ['Digit2'], pad: [] },
+      { id: 'p3', label: '선장: 동력 방어', keys: ['Digit3'], pad: [] },
+      { id: 'p4', label: '선장: 동력 기동', keys: ['Digit4'], pad: [] },
+    ],
+    quick: [
+      '모두 한 배의 승무원! 선장 1명이 배를 몰고, 나머지는 포수가 되어 포탑을 하나씩 맡아요.',
+      '전투는 실시간: 선장은 피하고 돌아 들어가며 동력·수리·특수 무기를 쓰고, 포수는 조준해서 적의 부위를 부숴요.',
+      '항로를 골라 성계를 건너 마지막 보스를 부수면 모두 승리! 선체가 0이 되면 모두 패배.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '모두 한 편이에요. 판마다 새로 만들어지는 항로를 따라 성계를 건너요. 가운데쯤 「강철 기함」, 맨 끝에 최종 보스(「검은 별 요새」 또는 「공허 포식자」)가 있어요.',
+        '최종 보스를 부수면 승리, 선체(배의 체력)가 0이 되면 패배예요.',
+      ] },
+      { h: '역할', p: [
+        '선장(1명): 왼쪽 동그라미를 끌어 배를 아무 방향으로나 몰아요. 「특수」 무기를 쏘고, 동력을 나누고(균형·공격·방어·기동), 먼저 고칠 부위(🔧 우선)와 수리 호출(📢)을 정해요. 적을 누르면 집중 공격 목표가 돼요.',
+        '포수(3~5명): 포탑을 하나씩 맡아요. 위 화면을 끌면 그쪽으로 조준하며 쏘고, 「발사」를 눌러도 쏴요. 포탑마다 돌 수 있는 방향(앞·옆·뒤·사방)이 달라요.',
+        '부선장: 포수 중 한 명이 겸해요. 선장이 다치면 부선장 화면이 선장 화면으로 바뀌어 지휘해요. 둘 다 다치면 잠깐 자동 조종돼요.',
+        '빈 자리는 AI 승무원이 맡고, 포수보다 포탑이 많으면 남는 포탑은 혼자 느리게 쏴요.',
+      ] },
+      { h: '부위와 관통', p: [
+        '배(우리·적 모두)는 부위로 나뉘어요: 함교 · 엔진 · 동력실 · 방어막 발생기 · 포탑(무기) · 격납고 · 선체 구역.',
+        '맞은 부위가 많이 상하면 기능을 잃어요: 엔진 → 느려짐, 함교 → 잘 못 돌고 특수 무기 충전이 느려짐, 동력실 → 모든 장치가 약해짐, 방어막 발생기 → 방어막 꺼짐, 포탑 → 못 쏨.',
+        '부서진 부위를 또 맞으면 관통해서 선체가 크게 깎이고, 그 자리 승무원이 다쳐요(함교 = 선장, 포탑 = 그 포수). 다친 사람은 몇 초 쉬었다 돌아오고, 잠깐 느려요.',
+        '적도 똑같아요: 적 포탑을 부수면 덜 맞고, 엔진을 부수면 느려지고, 부서진 함교를 계속 맞히면 적 승무원이 쓰러져 「나포」(보상 1.5배)할 수 있어요.',
+        '예시: 미사일 순양함이 미사일을 쏘면, 포수 한 명은 미사일을 떨어뜨리고, 나머지는 그 배의 미사일 발사대를 노려 부숴요.',
+      ] },
+      { h: '수리·동력·방어막', p: [
+        '배는 전투 중에 저절로 조금씩 고쳐져요. 「🔧 우선」으로 고를 부위를 정하고(위 화면의 우리 배 부위를 눌러도 돼요), 「📢 호출」을 켜면 포수들이 「🔧 수리 돕기」로 거들 수 있어요(돕는 동안 그 포탑은 못 쏴요).',
+        '방어막은 탄을 대신 막고 조금 뒤 다시 차요. 이온 탄은 방어막을 4배로 깎고, 미사일·충돌은 방어막에 막혀요.',
+        '동력 배분: 공격 = 포탑 재장전 빨라짐, 방어 = 방어막 크고 빨리 참, 기동 = 빨라짐. 동력실이 상하면 전체 동력이 줄어요.',
+      ] },
+      { h: '배 7종', p: [
+        SHIPS.map((D) => D.nm + '(' + D.d + ', 포탑 ' + D.mt.length + ', 특수: ' + SPC[D.sp].nm + ')').join(' / '),
+        '모든 배를 처음부터 고를 수 있어요.',
+      ] },
+      { h: '적', p: [
+        EN.map((D) => D.nm + (D.el ? '(정예)' : D.boss ? '(보스)' : '')).join(' · '),
+        '보스는 체력이 줄면 단계가 바뀌며 새 공격과 졸개를 불러요. 전투가 너무 길어지면 보스가 점점 사나워져요.',
+      ] },
+      { h: '항로·상점·장비', p: [
+        '전투 사이에는 지도에서 다음 갈 곳을 골라요(사람이 여럿이면 투표). ' + NT.map((x) => x.nm).join(' · ') + '.',
+        '신호에서는 사건(' + EVS.length + '가지)이 생기고 선택지를 골라요. 결과는 운도 따라요.',
+        '고철은 모두 함께 써요. 상점에서 포탑(' + TUR.length + '종: ' + TUR.map((x) => x.nm).join(', ') + '), 특수 무기(' + SPC.length + '종: ' + SPC.map((x) => x.nm).join(', ') + '), 포탑 강화(Lv3까지), 배 개조(' + UPG.map((x) => x.nm).join(', ') + '), 선체 수리를 사요.',
+        '새 포탑이 가장 약한 포탑보다 좋으면 바로 달고, 아니면 창고에 넣어요. 지도의 「🔧 정비」에서 창고의 포탑을 원하는 자리로 바꿔 달 수 있어요.',
+      ] },
+      { h: '함께 하기', p: [
+        '한 폰에는 한 명만(실시간). 혼자 하면 나머지 승무원은 AI예요. 친구와는 온라인·LAN 방에서 각자 폰으로(1~6명).',
+        'AI 승무원 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 늦게 피하고 대충 쏘며 수리 호출을 잘 안 들어요. 어려움은 탄을 미리 피해 돌아 들어가고, 앞을 내다보고 쏘며, 적의 무기·방어막 발생기를 골라 부수고, 미사일을 요격해요.',
+        'PC: 선장 = WASD/방향키 이동, 스페이스 특수, 1~4 동력, R 수리 우선, F 수리 호출. 포수 = 마우스로 조준, 왼쪽 버튼/스페이스 발사, F 수리 돕기. 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+    ],
+    init, actor, apply,
+    ai: () => null,
+    result, mount: (root, api) => mount(root, api),
+    _t: { init, genMap, getMap, nextRows, newFight, stepFight, aiCrew, aiCoarse, endFight, summary, encode, apply, newCtl, actCap, compose, guestWorld, applySnap, EVS, UPG, TUR, SPC, EN, SHIPS, NT, humans },
+  });
+})();

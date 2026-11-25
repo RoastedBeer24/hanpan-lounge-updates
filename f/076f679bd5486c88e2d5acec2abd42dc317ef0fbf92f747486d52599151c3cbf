@@ -1,0 +1,184 @@
+/* 흐물 협동 (floppy) — 흐느적거리는 몸으로 붙잡고, 매달리고, 끌고, 쌓아서 푸는 1~4인 3D 물리 협동 퍼즐.
+   구조만 참고(물렁한 몸 · 두 손으로 잡기 · 물리 퍼즐 마당). 이름 · 캐릭터 · 마당 · 글은 모두 독자.
+
+   파일 구성
+   - 이 파일: 판 상태(구역 순서 · 진행 · 기록) · 옵션 · 결과 · 규칙 · 도감 · 표지 · L.register 와 가벼운 입구 화면(3D 파일 불러오기).
+   - assets/floppy/sim.js: 물리(고정 걸음 60/초) · 잡기 · 장치 · 봇 · 온라인 묶기. node에서도 돎.
+   - assets/floppy/yards.js: 구역 5 × 마당 4의 지형 · 장치 · 봇 풀이 단계.
+   - assets/floppy/view.js: 3D 화면(three.js — assets/hyperrace/lib/three.min.js 공용) · 캐릭터 · 조작 · HUD · 온라인.
+   온라인: 세계는 방장이 돌려 hostSend(20Hz, 움직이는 것만). 손님은 입력을 publish하고 받은 위치를 부드럽게 따라 그림. 잡기 판정은 방장. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'floppy', TITLE = '흐물 협동';
+  /* 구역 표(yards.js의 ZONES와 같은 순서). 화면 밖(설정 · 규칙 · 도감)에서도 쓰려고 이름만 여기에 둠 */
+  const ZN = [
+    { nm: '야적장', d: '잡기 · 오르기 · 상자', y: ['낮은 턱', '상자 하나', '무거운 상자', '쌓기'] },
+    { nm: '창고', d: '미닫이문 · 발판 · 손잡이 · 승강대', y: ['미닫이문', '무게 발판', '손잡이 둘', '승강대'] },
+    { nm: '부두', d: '밧줄 · 수레 · 들보', y: ['밧줄', '수레', '나룻수레', '들보'] },
+    { nm: '채석장', d: '시소 · 돌덩이 · 투석기', y: ['시소', '돌 디딤', '투석기', '높은 벽'] },
+    { nm: '공장', d: '벨트 · 오가는 발판 · 종합', y: ['거꾸로 벨트', '벨트 배달', '오가는 발판', '마지막 작업'] },
+  ];
+  const LENS = { one: { nm: '구역 하나', n: 1, tip: '마당 넷. 5분 안팎.' }, three: { nm: '구역 셋', n: 3, tip: '마당 열둘. 15분 안팎.' }, all: { nm: '전체', n: 5, tip: '다섯 구역, 마당 스물. 30분 안팎.' } };
+  const fmtT = (s) => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+
+  function init(players, opts) {
+    opts = opts || {};
+    const len = LENS[opts.len] ? opts.len : 'one', n = LENS[len].n;
+    let zones;
+    if (n >= 5) zones = [0, 1, 2, 3, 4];
+    else {
+      const first = opts.zone != null && opts.zone !== 'rnd' && ZN[+opts.zone] ? +opts.zone : Math.floor(Math.random() * 5);
+      const rest = [0, 1, 2, 3, 4].filter((z) => z !== first).sort(() => Math.random() - 0.5).slice(0, n - 1);
+      zones = [first].concat(rest).sort((a, b) => a - b);   // 쉬운 구역부터
+    }
+    return { rid: Math.random().toString(36).slice(2, 8), seed: 1 + Math.floor(Math.random() * 1e6), n: players.length, len, zones, zi: 0, yd: 0, ph: 'run', seq: 0, tt: 0, zt: [], falls: players.map(() => 0), mv: players.map(() => 0), hints: 0 };
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done') return null;
+    const all = s.falls.map((_, i) => i), tf = s.falls.reduce((a, b) => a + b, 0);
+    const hl = [s.zones.map((z) => ZN[z].nm).join(' · ') + ' 통과', '걸린 시간 ' + fmtT(s.tt) + (tf ? ' · 떨어진 횟수 ' + tf : ' · 한 번도 떨어지지 않음')];
+    return { winners: all, title: s.zones.length >= 5 ? '모든 구역 통과' : '구역 ' + s.zones.length + '곳 통과', text: '마당 ' + s.zones.length * 4 + '곳 · ' + fmtT(s.tt), highlights: hl,
+      stats: [{ label: '걸린 시간', value: fmtT(s.tt) }].concat(s.zones.map((z, i) => ({ label: ZN[z].nm, value: fmtT(s.zt[i] || 0) })).slice(0, 5), [{ label: '떨어진 횟수', values: s.falls.map(String), low: true }, { label: '걸은 거리', values: s.mv.map((v) => Math.round(v) + 'm') }]) };
+  }
+  function hint(s) {
+    if (!s || s.ph !== 'run') return null;
+    const Z = ZN[s.zones[s.zi]], S = G.FLOPPY_SIM, y = Math.min(s.yd || 0, 3);
+    const out = [Z.nm + ' ' + (y + 1) + '/4 — ' + Z.y[y]];
+    if (S && S.HINTS && S.HINTS[s.zones[s.zi]]) { const h = S.HINTS[s.zones[s.zi]][y]; if (h) out.push('목표: ' + h[0], h[1]); }
+    out.push('잡기를 누른 채 다가가면 손이 닿는 것을 붙잡음. 턱을 잡았으면 앞으로(또는 점프)로 올라섬.', '막히면 R을 길게 눌러 기점으로, T를 길게 눌러 마당의 물건을 처음 자리로.');
+    return out;
+  }
+
+  const RULES = [
+    { h: '목표', p: ['마당마다 길이 막혀 있습니다. 물건을 옮기고 장치를 움직여 다음 마당으로 넘어갑니다.', '구역의 마지막 표시 위에 사람 자리 모두가 서면 그 구역을 통과합니다. 시간 제한은 없습니다.'] },
+    { h: '몸', p: ['몸은 흐느적거리지만 걷기 · 잡기 · 오르기는 누른 대로 됩니다.', '높은 곳에서 떨어지거나 투석기로 날아가 세게 닿으면 잠깐 쓰러졌다가 일어납니다.', '판 밖으로 떨어지면 가장 가까운 기점에서 다시 시작합니다.'] },
+    { h: '잡기', p: ['잡기를 누르고 있으면 두 손이 보는 쪽으로 뻗고, 닿는 것을 붙잡습니다. 잡을 수 있는 곳에는 고리 표시가 뜹니다.', '턱 · 들보: 붙잡은 채 앞으로(또는 점프)를 누르면 몸을 끌어올립니다. 매달린 채 옆으로 누르면 옮겨 갑니다.', '나무 상자: 들어서 옮깁니다. 시선을 올리면 높이, 내리면 낮게 듭니다.', '큰 상자 · 돌덩이 · 수레 · 미닫이문: 붙잡고 가려는 쪽으로 끕니다. 여럿이 함께 하면 빨라집니다.', '손잡이: 잡고 있는 동안 켜집니다. 놓아도 얼마간 켜져 있는 것이 있습니다.', '밧줄: 뛰면서 잡아 매달리고, 앞으로 흔들릴 때 놓습니다.', '동료: 붙잡아 끌어 주거나, 매달려서 타고 오를 수 있습니다. 머리를 딛고 올라서도 됩니다.'] },
+    { h: '장치', p: ['무게 발판: 적힌 무게만큼 올라가면 켜집니다. 사람 1 · 나무 상자 1 · 큰 상자 3 · 돌덩이 5.', '시소: 무거운 쪽이 내려갑니다. 한쪽을 눌러 두면 반대쪽이 높게 남습니다.', '투석기: 손잡이를 당기면 2.5초 뒤 낮은 쪽 끝에 있는 것을 날려 보냅니다.', '벨트: 올라선 것을 실어 나릅니다.'] },
+    { h: '함께 할 때', p: ['마당은 혼자서도 풀 수 있고, 여럿이면 더 빠른 길이 생깁니다(문을 잡아 주기, 발판에 같이 서기, 같이 밀기).', '빈자리는 AI 동료가 채웁니다. 사람이 미는 상자를 같이 밀고, 발판과 손잡이를 맡아 줍니다. 한 마당에서 오래 막히면 동료가 먼저 나섭니다.', 'AI 난이도는 자리마다 쉬움 · 보통 · 어려움으로 고릅니다(반응 · 정확도 · 실수).'] },
+    { h: '조작', p: ['PC: WASD 이동 · 마우스 시점 · 마우스 왼쪽(또는 E) 잡기 · Space 점프 · R 길게 기점으로 · T 길게 마당 물건 되돌리기 · H 힌트.', '폰(가로): 왼쪽 막대 이동 · 화면 끌기 시점 · 잡기 단추(눌러서 잡고, 다시 눌러 놓기) · 점프 단추.', '예: 높은 벽 앞 — 나무 상자를 들어 벽에 붙여 놓고, 상자에 올라 잡기를 누른 채 점프하면 벽 위를 붙잡습니다. 그대로 앞으로 누르면 올라섭니다.'] },
+  ];
+  function codexData() {
+    const S = G.FLOPPY_SIM;
+    const row = (name, tag, desc) => ({ icon: '', name, tag, desc });
+    return [
+      { h: '물건', p: ['잡으면 종류에 따라 들거나 끕니다.'], rows: [row('나무 상자', '무게 1 · 들기', '한 변 0.9m. 들어서 옮기고 쌓음. 딛고 올라서는 디딤.'), row('큰 상자', '무게 3 · 끌기', '1.6 × 1.2m. 혼자 밀면 느리고 여럿이면 빨라짐. 붙잡고 점프하면 위로 올라섬.'), row('돌덩이', '무게 5 · 끌기', '1.4 × 1.2m. 가장 무거움. 시소를 눌러 두거나 틈을 메우는 디딤돌.')] },
+      { h: '장치', p: ['마당의 길을 여는 것들.'], rows: [row('무게 발판', '무게로 켜짐', '적힌 무게 이상이 올라가면 켜짐. 한번 켜지면 열린 채인 것과, 올라가 있는 동안만 켜지는 것이 있음.'), row('손잡이', '잡으면 켜짐', '잡고 있는 동안 켜짐. 놓은 뒤 몇 초 동안 켜져 있는 것도 있음.'), row('미닫이문', '끌어서 엶', '손잡이를 잡고 옆으로 끌면 열리고, 놓으면 천천히 닫힘. 물건이 끼면 더 닫히지 않음.'), row('수레', '레일 위', '레일을 따라서만 움직임. 가장자리 너머로 밀면 굴러가 멈춤.'), row('나룻수레', '손잡이로 감', '위에 올라 손잡이를 잡고 있으면 건너편으로 감. 아무도 없으면 돌아옴.'), row('시소', '기울어짐', '무거운 쪽이 내려감.'), row('투석기', '날려 보냄', '손잡이를 당기고 2.5초 뒤 발사. 낮은 쪽 끝에 올라가 있으면 벽 너머로 날아감.'), row('밧줄', '매달림', '뛰면서 잡고, 앞으로 흔들릴 때 놓음.'), row('벨트', '실어 나름', '올라선 것을 한쪽으로 옮김. 손잡이로 방향이 바뀌는 것도 있음.'), row('승강대 · 오가는 발판', '오르내림', '발판이나 손잡이로 움직이거나, 스스로 오감.')] },
+      { h: '구역', p: ['길이 옵션에 따라 한 곳 · 세 곳 · 전부를 돕니다. 구역을 고르지 않으면 무작위.'], rows: ZN.map((z, i) => row((i + 1) + '. ' + z.nm, z.d, z.y.join(' → ') + (S && S.HINTS ? '' : ''))) },
+    ];
+  }
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#cfd9e2'); sky.addColorStop(1, '#eef1f0'); g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#b9c0c4'; g.fillRect(0, h * 0.72, w * 0.56, h * 0.28); g.fillStyle = '#a7aeb3'; g.fillRect(w * 0.56, h * 0.34, w * 0.44, h * 0.66);
+    g.fillStyle = '#8d949a'; g.fillRect(w * 0.56, h * 0.34, w * 0.44, 6); g.fillRect(0, h * 0.72, w * 0.56, 5);
+    const crate = (x, y, s, c) => { g.fillStyle = c; g.fillRect(x, y, s, s); g.strokeStyle = 'rgba(60,40,20,.55)'; g.lineWidth = 3; g.strokeRect(x + 1.5, y + 1.5, s - 3, s - 3); g.beginPath(); g.moveTo(x, y); g.lineTo(x + s, y + s); g.stroke(); };
+    crate(w * 0.42, h * 0.72 - 78, 78, '#c79a5e'); crate(w * 0.445, h * 0.72 - 78 - 52, 52, '#d6ad74');
+    const fig = (x, y, c, up) => { g.strokeStyle = c; g.lineCap = 'round'; g.lineWidth = 13; g.beginPath(); g.moveTo(x, y); g.lineTo(x + 4, y - 42); g.stroke(); g.lineWidth = 9; g.beginPath(); g.moveTo(x + 3, y - 38); g.lineTo(x + (up ? 30 : 26), y - (up ? 76 : 30)); g.moveTo(x - 4, y); g.lineTo(x - 12, y + 34); g.moveTo(x + 4, y); g.lineTo(x + 14, y + 34); g.stroke(); g.fillStyle = c; g.beginPath(); g.arc(x + 6, y - 56, 13, 0, 7); g.fill(); };
+    fig(w * 0.5 + 12, h * 0.72 - 78 - 52 - 34, '#d98a4e', true); fig(w * 0.3, h * 0.72 - 36, '#5d8fb5', false);
+    g.fillStyle = 'rgba(28,32,36,.62)'; g.fillRect(0, h - 56, w, 56);
+    g.fillStyle = '#f2ede2'; g.font = '30px "Black Han Sans","IBM Plex Sans KR",sans-serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 22, h - 28);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(242,237,226,.78)'; g.fillText('붙잡고 · 매달리고 · 쌓아서 넘는 1~4인 협동', 232, h - 27);
+  }
+
+  /* ======================= 입구 화면 (3D 불러오기) ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '그림자 없음 · 배율 낮게 — 끊길 때', pr: 1, shadow: 0, aa: false },
+    { id: 'mid', nm: '보통', tip: '그림자 · 보통 배율', pr: 1.5, shadow: 2048, aa: true },
+    { id: 'high', nm: '높음', tip: '고운 그림자 · 고해상도', pr: 2, shadow: 4096, aa: true },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem('floppy.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('floppy.' + k, v); } catch (e) {} } };
+  function gfxTier() { const v = store.get('gfx', ''); return TIERS.some((t) => t.id === v) ? v : 'mid'; }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => { const el = document.createElement('script'); el.src = src; el.async = true; el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); }; document.head.appendChild(el); });
+    return scripts[src];
+  }
+  function loadCore() {
+    return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js'))
+      .then(() => (G.FLOPPY_SIM ? null : loadScript('assets/floppy/sim.js')))
+      .then(() => (G.FLOPPY_SIM.ZONES ? null : loadScript('assets/floppy/yards.js')))
+      .then(() => (G.FLOPPY_VIEW ? null : loadScript('assets/floppy/view.js')));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+  const CONTROLS = [
+    { id: 'up', label: '앞으로', keys: ['KeyW'], pad: ['ly-'] },
+    { id: 'down', label: '뒤로', keys: ['KeyS'], pad: ['ly+'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA'], pad: ['lx-'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD'], pad: ['lx+'] },
+    { id: 'grab', label: '잡기 (마우스 왼쪽)', keys: ['KeyE', 'ShiftLeft'], pad: ['rt', 'rb'] },
+    { id: 'jump', label: '점프 · 매달려 오르기', keys: ['Space'], pad: ['a'] },
+    { id: 'camL', label: '시점 왼쪽(마우스 대신)', keys: ['ArrowLeft'], pad: ['rx-'] },
+    { id: 'camR', label: '시점 오른쪽', keys: ['ArrowRight'], pad: ['rx+'] },
+    { id: 'camU', label: '시점 위', keys: ['ArrowUp'], pad: ['ry-'] },
+    { id: 'camD', label: '시점 아래', keys: ['ArrowDown'], pad: ['ry+'] },
+    { id: 'back', label: '기점으로(길게)', keys: ['KeyR'], pad: ['y'] },
+    { id: 'reset', label: '마당 물건 되돌리기(길게)', keys: ['KeyT'], pad: ['back'] },
+    { id: 'hint', label: '힌트 보기', keys: ['KeyH'], pad: ['x'] },
+  ];
+  const API = { ID, TITLE, ZN, LENS, TIERS, store, gfxTier, fmtT, init, result, hint };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'linear-gradient(#cfd9e2,#eef1f0)', color: '#2b3238', zIndex: '5' } });
+    const t1 = h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '30px', letterSpacing: '1px' }, text: TITLE });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '작업장을 여는 중' });
+    const bar = h('div', { style: { width: '220px', height: '4px', borderRadius: '2px', background: 'rgba(40,50,60,.14)', overflow: 'hidden' } }, h('div', { style: { width: '8%', height: '100%', background: '#c98a3c', transition: 'width .2s' } }));
+    box.append(t1, t2, bar); root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(Math.min(1, Math.max(0.05, f)) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기(브라우저)에서는 3D 그래픽(WebGL)을 켤 수 없습니다.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.5, '마당을 놓는 중');
+      view = G.FLOPPY_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'); });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<rect x="30" y="30" width="20" height="20" rx="2" fill="currentColor" opacity=".55"/><rect x="34" y="16" width="14" height="14" rx="2" fill="currentColor" opacity=".8"/><circle cx="17" cy="15" r="6" fill="currentColor"/><path d="M17 22c-2 8-3 12-2 17" stroke="currentColor" stroke-width="6" stroke-linecap="round" fill="none"/><path d="M17 25c7 0 11-2 16-6" stroke="currentColor" stroke-width="4" stroke-linecap="round" fill="none"/><path d="M15 38l-5 12M16 38l6 12" stroke="currentColor" stroke-width="4" stroke-linecap="round" fill="none"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '3D 물리 협동 퍼즐', cat: '협동', icon: ICON, tint: '#2f4350', coop: true,
+    blurb: '흐느적거리는 몸으로 턱을 붙잡아 오르고, 상자를 쌓고, 문을 잡아 주고, 시소와 투석기로 벽을 넘습니다. 다섯 구역 · 마당 스물. 혼자서도 풀 수 있고, 여럿이면 더 빠른 길이 생기는 1~4인 협동.',
+    time: '5–30분', landscape: true, realtime: true, aiDelay: 0, mood: 'calm', ambient: 'wind', sidePanel: false, contextMenu: true, menuCorner: 'tr',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2,
+    options: [
+      { id: 'len', label: '길이', tip: '도는 구역 수. 구역 하나에 마당이 넷.', choices: Object.keys(LENS).map((k) => ({ v: k, label: LENS[k].nm, tip: LENS[k].tip })), def: 'one' },
+      { id: 'zone', label: '구역', tip: '시작 구역. 무작위면 판마다 바뀜. 「전체」에서는 다섯 구역을 차례로 돎.', showIf: (o) => o.len !== 'all', choices: [{ v: 'rnd', label: '무작위' }].concat(ZN.map((z, i) => ({ v: String(i), label: z.nm, tip: z.d }))), def: 'rnd' },
+    ],
+    setupExtra(opts, ctx) {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        const grp = (label, key, def, items) => { wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 8px' }, text: label })); const cur = store.get(key, def); for (const [v, nm, tip] of items) wrap.append(h('button', { class: 'btn sm' + (String(cur) === String(v) ? ' primary' : ''), title: tip || '', style: { minHeight: '44px' }, text: nm, onclick() { store.set(key, v); draw(); } })); };
+        grp('그래픽(이 기기)', 'gfx', 'mid', TIERS.map((t) => [t.id, t.nm, t.tip]));
+        grp('잡기 방식', 'grab', L.touchOnly && L.touchOnly() ? 'toggle' : 'hold', [['hold', '누르고 있기', '누르는 동안 잡음'], ['toggle', '눌러서 전환', '한 번 눌러 잡고, 다시 눌러 놓음']]);
+        if (!(L.touchOnly && L.touchOnly())) grp('마우스 감도', 'sens', '1', [['0.6', '낮게'], ['1', '보통'], ['1.5', '높게'], ['2.2', '아주 높게']]);
+      };
+      draw(); void ctx; void opts;
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['잡기를 누른 채 다가가면 손이 닿는 것을 붙잡음 — 턱은 올라서고, 상자는 들거나 끌고, 손잡이는 당김', '마당마다 막힌 길을 물건과 장치로 열고 다음 마당으로', '구역의 끝 표시 위에 모두 서면 통과 — 떨어지면 가까운 기점에서 다시'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.FLOPPY = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

@@ -1,0 +1,1331 @@
+/* 순발력 대결 — 반응속도 미니게임 모음 (신호등 · 과일 종 · 색과 글자 · 쌍둥이 그림 · 화살표 · 점 세기 · 속임수 신호).
+   Timing model: every round is a short "stream" of frames. Frame i appears at pre + i*iv ms after the device
+   received the round (local clock); frame k is the target (the moment it is right to tap). The host stores only the
+   schedule; each device plays it back and measures reaction time from when IT painted frame k, then submits
+   {type:'tap', q, ms, e}. The host resolves when every seat tapped, or on a deadline action ('to') sent by the host's
+   own seat (or by the first AI seat when nobody human plays). */
+(function () {
+  const L = window.Lounge, U = L.util;
+
+  const MODES = ['신호등', '과일 종', '색과 글자', '쌍둥이 그림', '화살표', '점 세기', '속임수 신호',
+    '소리 반응', '움직이는 표적', '숫자 순서', '같은 모양 찾기', '다른 색 찾기', '방향 밀기', '박자 맞추기', '색 이름 함정', '큰 수 고르기',
+    '딱 멈춰', '번쩍 기억', '두 점 동시', '점 많은 쪽', '빠른 계산', '깜빡임 세기', '황금 두더지', '구석 불빛'];
+  const HOW = [
+    '초록불이 켜지면 탭! 빨간불에 누르면 부정 출발',
+    '네 장 중 같은 과일이 딱 5개면 종을 탭!',
+    '글자 뜻과 글자색이 같을 때만 탭!',
+    '두 카드 그림이 위치까지 똑같으면 탭!',
+    '화살표가 가리키는 쪽 절반을 탭!',
+    '점이 딱 #개일 때만 탭!',
+    '초록 원이 뜰 때만 탭! 다른 색은 참기',
+    '높은 「삐—」 소리가 날 때만 탭! 낮은 소리는 참기',
+    '표적이 나타나면 움직이는 표적을 정확히 탭! 빗나가면 탈락',
+    '숫자가 뜨면 1부터 9까지 순서대로 탭!',
+    '위의 모양과 모양·색이 똑같은 칸을 탭!',
+    '색이 살짝 다른 칸 하나를 찾아 탭!',
+    '파란 화살표는 그 방향, 주황 화살표는 반대로 밀기!',
+    '박자 4번을 잘 듣고, 다섯 번째 박자에 맞춰 탭!',
+    '글자의 「색」 이름이 적힌 버튼을 탭!',
+    '두 수 중 더 큰 수 쪽 절반을 탭!',
+    '움직이는 바늘이 초록 선에 딱 닿는 순간 탭! (오차 작을수록 승)',
+    '번쩍인 칸을 기억했다가 「지금!」에 그 칸을 탭!',
+    '빛나는 두 칸을 모두 탭! 두 손가락으로 동시에 눌러도 돼요',
+    '점이 더 많은 쪽 절반을 탭!',
+    '식의 답이 적힌 쪽 절반을 탭!',
+    '불빛이 #번째 깜빡일 때 탭! 그 전엔 참기',
+    '갈색 두더지는 참고, 황금 두더지가 나온 구멍을 탭!',
+    '가운데를 보다가, 구석에 불빛이 켜진 쪽(4칸 중)을 탭!',
+  ];
+  const howOf = (s) => HOW[s.m].replace('#', s.d ? s.d[0] : '?');
+  const MCOL = ['#5fd38a', '#f0b440', '#b48cf0', '#5bb3e6', '#ee6a55', '#e8d27a', '#4fd1c5',
+    '#7fb8ff', '#ff7a5c', '#e3ae45', '#c79bff', '#6fd6b0', '#5aa8ff', '#f2c66a', '#ff8fb1', '#9fd86a',
+    '#ffb35c', '#7ee0e0', '#e88cff', '#c6e36a', '#8fb0ff', '#ffe066', '#f0c040', '#ff9aa8'];
+  /* mode ids are one base-36 character each in a set string ('0'…'9', 'a' = 10 … 'n' = 23) */
+  const SETS = { all: '0123456789abcdefghijklmn', classic: '01234', quick: '0467cd', eye: '1235ab', hand: '89ef', fresh: '789abcdef' };
+  for (let i = 0; i < MODES.length; i++) SETS[i.toString(36)] = i.toString(36);
+  const DECOY = ['#ff4d5a', '#f5cf3a', '#3e8ef7', '#b77cff', '#ff8a3d'], GO = '#3dff8a';
+  /* 연속 콤보: 라운드를 연달아 이기면 배수 (2연승 ×1.5, 3연승 ×2, 4연승 ×2.5, 5연승부터 ×3). 서든데스 라운드는 배수 없이 1점 */
+  const comboMul = (c) => Math.min(3, 1 + 0.5 * Math.max(0, c - 1));
+  const fmtPt = (v) => String(Math.round(v * 10) / 10);
+  const INTRO = 1400, WIN = 2400, SLACK = 700;
+  const STREAM = [false, true, true, true, false, true, true, true, false, false, false, false, false, true, false, false,
+    true, true, false, false, false, true, true, false];
+  /* timing modes: the record is the |error| against the target moment; a tap more than half a step early is 너무 빠름 */
+  const TIM = { 13: 1, 16: 1 };
+  /* location-tap modes: a tap on the wrong thing is e = 2 (탈락) */
+  const LOC = { 4: 1, 8: 1, 9: 1, 10: 1, 11: 1, 12: 1, 14: 1, 15: 1, 17: 1, 18: 1, 19: 1, 20: 1, 22: 1, 23: 1 };
+  const winOf = (m) => (m === 9 ? 7000 : m === 10 || m === 11 || m === 14 || m === 18 || m === 19 || m === 20 ? 4200 : WIN);
+  const COL4 = ['#ff5a5f', '#3e8ef7', '#f5cf3a', '#36c46e'];
+  const OPP = { U: 'D', D: 'U', L: 'R', R: 'L' };
+
+  /* ---------- deterministic helpers (AI plans are a pure function of the state) ---------- */
+  function hash() {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < arguments.length; i++) { h = Math.imul(h ^ (arguments[i] | 0), 16777619); h ^= h >>> 13; }
+    return h >>> 0;
+  }
+  function prng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const rnd = (n) => Math.floor(Math.random() * n);
+  /* derived round content for the new modes (pure functions of g and q, so every device draws the same thing) */
+  function shuf(a, r) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+  function genOrder(s) { return shuf([1, 2, 3, 4, 5, 6, 7, 8, 9], prng(hash(s.g, s.q, 9))); }
+  function genShape(s) {
+    const r = prng(hash(s.g, s.q, 10)), ts = Math.floor(r() * 6), tc = Math.floor(r() * 4), mi = Math.floor(r() * 9), cells = [];
+    for (let i = 0; i < 9; i++) {
+      if (i === mi) { cells.push([ts, tc]); continue; }
+      let a, b, g = 0;
+      do { const x = r(); a = x < 0.42 ? ts : Math.floor(r() * 6); b = x >= 0.42 && x < 0.84 ? tc : Math.floor(r() * 4); } while (a === ts && b === tc && g++ < 50);
+      if (a === ts && b === tc) b = (tc + 1) % 4;
+      cells.push([a, b]);
+    }
+    return { ts, tc, mi, cells };
+  }
+  function genOdd(s, n) { const r = prng(hash(s.g, s.q, 11)); return { odd: Math.floor(r() * n * n), hue: Math.floor(r() * 360), dl: r() < 0.5 ? -10 : 10 }; }
+  function genInk(s) {
+    const r = prng(hash(s.g, s.q, 14)), w = Math.floor(r() * 5); let c = Math.floor(r() * 4); if (c >= w) c++;
+    const rest = [0, 1, 2, 3, 4].filter((x) => x !== w && x !== c);
+    shuf(rest, r);
+    return { w, c, names: shuf([c, w, rest[0], rest[1]], r) };
+  }
+  function genBig(s) {
+    const r = prng(hash(s.g, s.q, 15)), a = 12 + Math.floor(r() * 87);
+    let b = a, g = 0;
+    while ((b === a || b < 10 || b > 99) && g++ < 50) b = r() < 0.4 && a % 10 ? (a % 10) * 10 + Math.floor(a / 10) : a + (r() < 0.5 ? -1 : 1) * (1 + Math.floor(r() * 8));
+    if (b === a || b < 10 || b > 99) b = a > 50 ? a - 3 : a + 3;
+    return { a, b };
+  }
+  /* 점 많은 쪽: dot counts of the two halves */
+  function genMore(s) {
+    const r = prng(hash(s.g, s.q, 19)), a = 6 + Math.floor(r() * 9), d = 1 + Math.floor(r() * 3);
+    let b = r() < 0.5 ? a + d : a - d;
+    if (b > 17) b = a - d;
+    return r() < 0.5 ? { a, b } : { a: b, b: a };
+  }
+  /* 빠른 계산: question text, left / right answers, L = the left one is right */
+  function genCalc(s) {
+    const r = prng(hash(s.g, s.q, 20)), add = r() < 0.55;
+    let a, b, ans;
+    if (add) { a = 2 + Math.floor(r() * 8); b = 2 + Math.floor(r() * 8); ans = a + b; } else { a = 11 + Math.floor(r() * 9); b = 2 + Math.floor(r() * 8); ans = a - b; }
+    const offs = [1, -1, 2, -2, 10, -10].filter((o) => ans + o >= 0);
+    const wr = ans + offs[Math.floor(r() * offs.length)], L = r() < 0.5;
+    return { q: a + (add ? ' + ' : ' − ') + b, l: L ? ans : wr, rt: L ? wr : ans, L };
+  }
+  /* 움직이는 표적: normalised position t seconds after it appeared (Lissajous path) */
+  function movePos(s, t) {
+    const r = prng(hash(s.g, s.q, 8)), fa = 1.1 + r() * 0.8, fb = 0.8 + r() * 0.8, pa = r() * 6.28, pb = r() * 6.28;
+    return { x: 0.5 + 0.36 * Math.sin(fa * t * 1.5 + pa), y: 0.5 + 0.34 * Math.sin(fb * t * 1.5 + pb) };
+  }
+
+  /* ---------- schedule ---------- */
+  const tgt = (s) => s.pre + s.k * s.iv;            // target frame time (ms after the round arrived)
+  const dline = (s) => tgt(s) + winOf(s.m) + SLACK;  // host-side deadline
+  const revealMs = (s) => 1500 + s.n * 260;
+  function frameAt(s, el) {                          // index of the frame visible at elapsed el (−1 = none yet), frozen at k
+    if (el < s.pre) return -1;
+    if (!STREAM[s.m]) return 0;
+    return Math.min(s.k, Math.floor((el - s.pre) / s.iv));
+  }
+  /* mode data decoders (shared by logic tests and view) */
+  function fruitSlots(d, i) {
+    const sl = [null, null, null, null];
+    for (let j = 0; j <= i; j++) sl[j % 4] = { f: +d[2 * j], c: +d[2 * j + 1] };
+    return sl;
+  }
+  function fruitTotals(sl) { const t = [0, 0, 0, 0]; sl.forEach((c) => { if (c) t[c.f] += c.c; }); return t; }
+  const fruitHit = (d, i) => fruitTotals(fruitSlots(d, i)).includes(5);
+  const stroopAt = (d, i) => ({ w: +d[2 * i], c: +d[2 * i + 1] });
+  const twinAt = (d, i) => ({ a: d.substr(8 * i, 4), b: d.substr(8 * i + 4, 4) });
+
+  function genFruit() {
+    const W = [1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
+    for (let tries = 0; tries < 400; tries++) {
+      let d = '';
+      for (let i = 0; i < 13; i++) {
+        d += rnd(4) + '' + W[rnd(W.length)];
+        if (fruitHit(d, i)) { if (i >= 4) return { d, k: i }; break; }
+      }
+    }
+    // fallback (practically unreachable): build a hit by hand
+    return { d: '11221331' + '04' + '22' + '33' + '01', k: 7 };
+  }
+  function genStroop() {
+    const k = 2 + rnd(6);
+    let d = '';
+    for (let i = 0; i < k; i++) { const w = rnd(5); let c = rnd(4); if (c >= w) c++; d += w + '' + c; }
+    const w = rnd(5);
+    return { d: d + w + w, k };
+  }
+  function genTwins() {
+    const k = 1 + rnd(5);
+    let d = '';
+    for (let i = 0; i <= k; i++) {
+      const all = U.shuffle([0, 1, 2, 3, 4, 5]);
+      const a = all.slice(0, 4), b = a.slice();
+      if (i < k) {
+        if (Math.random() < 0.55) b[rnd(4)] = all[4 + rnd(2)];
+        else { const x = rnd(4); let y = rnd(3); if (y >= x) y++; [b[x], b[y]] = [b[y], b[x]]; }
+      }
+      d += a.join('') + b.join('');
+    }
+    return { d, k };
+  }
+  /* 점 세기: d[0] = target count, then one digit per frame (3–9 dots); positions come from hash(g,q,frame) */
+  function genDots() {
+    const T = 4 + rnd(5), k = 2 + rnd(5);
+    let d = '' + T;
+    for (let i = 0; i < k; i++) { let c = 3 + rnd(6); if (c >= T) c++; d += c; }
+    return { d: d + T, k };
+  }
+  const dotsAt = (d, i) => +d[1 + i];
+  /* 속임수 신호: one decoy colour index per frame (0–4), the target frame is 'g' */
+  function genDecoy() {
+    const k = 2 + rnd(6);
+    let d = '';
+    for (let i = 0; i < k; i++) d += rnd(DECOY.length);
+    return { d: d + 'g', k };
+  }
+
+  function newRound(s) {
+    s.rn++; s.q++;
+    const pool = s.set.split('').map((c) => parseInt(c, 36)).filter((x) => x >= 0 && x < MODES.length);
+    let m = s.ord && s.rn <= s.ord.length ? parseInt(s.ord[s.rn - 1], 36) : pool[rnd(pool.length)];
+    if (!(s.ord && s.rn <= s.ord.length) && pool.length > 1 && m === s.lm) m = pool.filter((x) => x !== s.lm)[rnd(pool.length - 1)];
+    s.m = m;
+    s.k = 0; s.iv = 0; s.d = '';
+    if (m === 7) { // 소리 반응: low decoy tones, then the high one
+      s.k = 1 + rnd(5); s.d = 'l'.repeat(s.k) + 'h';
+      s.pre = INTRO + 700 + rnd(600); s.iv = 850 + rnd(500);
+    } else if (m === 13) { // 박자 맞추기: 4 audible beats, the 5th (silent) beat is the target
+      s.k = 4; s.pre = INTRO + 700 + rnd(400); s.iv = 520 + rnd(200);
+    } else if (m === 16) { // 딱 멈춰: the needle starts at pre and reaches the line one step (iv) later
+      s.k = 1; s.pre = INTRO + 600 + rnd(500); s.iv = 1300 + rnd(900);
+    } else if (m === 17) { // 번쩍 기억: frame 0 = flash of one cell, frame 1 = 「지금!」
+      s.k = 1; s.pre = INTRO + 700 + rnd(500); s.iv = 1000 + rnd(700); s.d = '' + rnd(9);
+    } else if (m === 21) { // 깜빡임 세기: tap on the T-th blink
+      const T = 2 + rnd(4); s.k = T - 1; s.d = '' + T; s.pre = INTRO + 700 + rnd(500); s.iv = 620 + rnd(300);
+    } else if (m === 22) { // 황금 두더지: brown moles in random holes (never the same twice in a row), then the golden one
+      s.k = 2 + rnd(5); let d = '', last = -1;
+      for (let i = 0; i <= s.k; i++) { let c = last < 0 ? rnd(9) : rnd(8); if (last >= 0 && c >= last) c++; d += c; last = c; }
+      s.d = d; s.pre = INTRO + 700 + rnd(500); s.iv = 560 + rnd(260);
+    } else if (m === 0 || m === 4 || !STREAM[m]) {
+      s.pre = INTRO + 700 + rnd(m === 0 || m === 4 || m === 23 ? 3000 : 2200);
+      if (m === 18) { const a = rnd(9); let b = rnd(8); if (b >= a) b++; s.d = '' + a + b; }
+      if (m === 23) s.d = '' + rnd(4);
+      if (m === 4) s.d = (Math.random() < 0.5 ? 'L' : 'R') + (Math.random() < 0.5 ? 'L' : 'R');
+      if (m === 12) s.d = 'UDLR'[rnd(4)] + (Math.random() < 0.5 ? 's' : 'o');
+    } else {
+      s.pre = INTRO + 800 + rnd(500);
+      const g = m === 1 ? genFruit() : m === 2 ? genStroop() : m === 3 ? genTwins() : m === 5 ? genDots() : genDecoy();
+      s.d = g.d; s.k = g.k;
+      s.iv = m === 1 ? 900 + rnd(250) : m === 2 ? 850 + rnd(250) : m === 3 ? 1300 + rnd(300) : m === 5 ? 1150 + rnd(250) : 620 + rnd(260);
+    }
+    s.tp = Array(s.n).fill(null);
+    if (s.sd) for (let i = 0; i < s.n; i++) if (!s.sd.includes(i)) s.tp[i] = -9; // 서든데스: 동점자만, 나머지는 관전(-9)
+    s.w = [];
+    s.ph = 'p';
+    s.t0 = Date.now();
+    s.lm = m;
+  }
+
+  /* 라운드 순서: 고른 종류를 섞어 겹치지 않게 → 모자라면 안 고른 종류로(역시 겹치지 않게) → 그래도 모자라면 고른 것에서 반복(연속만 피함) */
+  function planOrder(set, R) {
+    const picked = U.shuffle(set.split('')), rest = U.shuffle(SETS.all.split('').filter((c) => !set.includes(c)));
+    const ord = picked.concat(rest).slice(0, R);
+    while (ord.length < R) { let c = picked[rnd(picked.length)]; if (picked.length > 1 && c === ord[ord.length - 1]) c = picked.filter((x) => x !== c)[rnd(picked.length - 1)]; ord.push(c); }
+    return ord.join('');
+  }
+  function setOf(opts) {
+    if (Array.isArray(opts.modes)) { const c = SETS.all.split('').filter((x) => opts.modes.includes(x)); if (c.length) return c.join(''); }
+    return SETS[String(opts.set)] || SETS.all; // 예전 저장값(묶음 고르기) 호환
+  }
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length;
+    const s = {
+      n, hu: players.some((p) => !p.ai), nm: players.map((p) => String(p.name || '').slice(0, 10)), g: Math.floor(Math.random() * 1e9),
+      R: [5, 7, 10].includes(+opts.rounds) ? +opts.rounds : 7,
+      pen: opts.pen === 0 ? 0 : 1,
+      set: setOf(opts),
+      rn: 0, q: 0, ph: 'p', t0: 0, m: 0, pre: 0, iv: 0, k: 0, d: '', lm: -1,
+      tp: [], w: [], sc: Array(n).fill(0), bt: Array(n).fill(-1), sm: Array(n).fill(0), cn: Array(n).fill(0), mi: Array(n).fill(0),
+      cb: Array(n).fill(0), mc: Array(n).fill(0), gn: Array(n).fill(0), cx: [],
+    };
+    s.ord = planOrder(s.set, s.R);
+    newRound(s);
+    return s;
+  }
+
+  function actor(s) {
+    if (s.ph === 'e') return null;
+    return Array.from({ length: s.n }, (_, i) => i);
+  }
+
+  function resolve(s) {
+    let best = Infinity;
+    s.tp.forEach((v) => { if (v != null && v >= 0 && v < best) best = v; });
+    s.w = [];
+    if (!s.cb) { s.cb = Array(s.n).fill(0); s.mc = Array(s.n).fill(0); }
+    s.gn = Array(s.n).fill(0); s.cx = [];
+    s.tp.forEach((v, i) => { if (v != null && v >= 0 && v === best) s.w.push(i); });
+    s.tp.forEach((v, i) => {
+      if (v === -9) return; // 서든데스 관전: 콤보 그대로
+      if (s.w.includes(i)) {
+        s.cb[i]++; if (s.cb[i] > s.mc[i]) s.mc[i] = s.cb[i];
+        s.gn[i] = s.sd ? 1 : comboMul(s.cb[i]);
+      } else { if (s.cb[i] >= 2) s.cx.push(i); s.cb[i] = 0; }
+    });
+    s.tp.forEach((v, i) => {
+      if (v != null && v >= 0) {
+        if (v === best) s.sc[i] = Math.round((s.sc[i] + s.gn[i]) * 10) / 10;
+        if (!TIM[s.m] && s.m !== 9) { // 박자·딱 멈춰 = timing error, 숫자 순서 = completion time: not reaction times
+          if (s.bt[i] < 0 || v < s.bt[i]) s.bt[i] = v;
+          s.sm[i] += v; s.cn[i]++;
+        }
+      } else if (v != null && v < 0 && v !== -9) { s.sc[i] -= s.pen; s.gn[i] = -s.pen; s.mi[i]++; }
+    });
+    s.ph = 'r';
+    s.t0 = Date.now();
+  }
+
+  function apply(s, seat, a) {
+    if (!a || typeof a !== 'object') throw new Error('bad action');
+    if (a.q !== s.q) throw new Error('stale round');
+    if (a.type === 'tap') {
+      if (s.ph !== 'p') throw new Error('not tapping now');
+      if (s.tp[seat] != null) throw new Error('already tapped');
+      const e = a.e | 0;
+      if (e < 0 || e > 2 || (e === 2 && !LOC[s.m])) throw new Error('bad tap');
+      if (e === 0) {
+        if (typeof a.ms !== 'number' || !isFinite(a.ms)) throw new Error('bad ms');
+        s.tp[seat] = U.clamp(Math.round(a.ms), 0, 9999);
+      } else s.tp[seat] = -e;
+      if (s.tp.every((v) => v != null)) resolve(s);
+      return s;
+    }
+    if (a.type === 'to') { if (s.ph !== 'p') throw new Error('not running'); resolve(s); return s; }
+    if (a.type === 'next') {
+      if (s.ph !== 'r') throw new Error('not revealing');
+      if (s.rn >= s.R) {
+        // 서든데스: 1위 동점이면 동점자끼리 한 문제 더 — 결정될 때까지(최대 12번, 그래도 같으면 공동 1위)
+        const pool = s.sd || s.sc.map((_, i) => i), top = Math.max(...pool.map((i) => s.sc[i]));
+        const tied = pool.filter((i) => s.sc[i] === top);
+        if (tied.length > 1 && (s.sdn | 0) < 12) { s.sd = tied; s.sdn = (s.sdn | 0) + 1; newRound(s); return s; }
+        s.ph = 'e'; s.tp = []; return s;
+      }
+      newRound(s);
+      return s;
+    }
+    throw new Error('bad action');
+  }
+
+  function result(s) {
+    if (s.ph !== 'e') return null;
+    const top = Math.max(...s.sc);
+    const winners = s.sc.map((v, i) => (v === top ? i : -1)).filter((i) => i >= 0);
+    const ord = s.sc.map((v, i) => i).sort((a, b) => s.sc[b] - s.sc[a]);
+    let fast = -1;
+    s.bt.forEach((v, i) => { if (v >= 0 && (fast < 0 || v < s.bt[fast])) fast = i; });
+    const col = (fm) => s.sc.map((_, i) => fm(i));
+    return {
+      winners,
+      stats: [{ label: '점수', values: col((i) => fmtPt(s.sc[i]) + '점') }, { label: '최고 콤보', values: col((i) => ((s.mc && s.mc[i]) | 0) + '연승') }, { label: '최고 반응', values: col((i) => (s.bt[i] >= 0 ? s.bt[i] + 'ms' : '-')) },
+        { label: '평균 반응', values: col((i) => (s.cn[i] ? Math.round(s.sm[i] / s.cn[i]) + 'ms' : '-')) }, { label: '실수', values: col((i) => (s.mi[i] | 0) + '번') }],
+      text: ord.map((i) => s.nm[i] + ' ' + fmtPt(s.sc[i]) + '점').join(' · ') + (fast >= 0 ? '\n가장 빠른 반응: ' + s.nm[fast] + ' ' + s.bt[fast] + 'ms' : '') +
+        '\n' + ord.map((i) => s.nm[i] + ' 평균 ' + (s.cn[i] ? Math.round(s.sm[i] / s.cn[i]) + 'ms' : '–') + (s.mi[i] ? ' · 실수 ' + s.mi[i] : '')).join(' / '),
+    };
+  }
+
+  /* ---------- AI ---------- */
+  /* per-seat level (1 쉬움 / 2 보통 / 3 어려움): base reaction (ms), its spread, recognition-time factor for the
+     "eye" games, chance to zone out, false-start/wrong-tap factor, fastest possible tap */
+  const RLV = {
+    1: { b: 265, sk: 150, sp: 150, rec: 1.25, zo: 0.06, fs: 1.7, min: 200 },
+    2: { b: 230, sk: 130, sp: 90, rec: 1, zo: 0.03, fs: 1, min: 170 },
+    3: { b: 205, sk: 90, sp: 90, rec: 0.8, zo: 0.015, fs: 0.5, min: 160 },
+  };
+  /* per-challenge AI profile: extra recognition / search time (ms, × level factor) and mistake chance (× level factor) */
+  const AREC = [0, 170, 140, 260, 45, 230, 60, 90, 230, 2300, 700, 650, 210, 0, 480, 300, 0, 260, 330, 420, 620, 40, 160, 140];
+  const AERR = [0.08, 0.07, 0.07, 0.06, 0.07, 0.07, 0.08, 0.08, 0.1, 0.06, 0.06, 0.07, 0.09, 0.06, 0.08, 0.06, 0.06, 0.09, 0.07, 0.1, 0.07, 0.07, 0.07, 0.07];
+  const RHY = [0, 120, 75, 40]; // 박자 맞추기: timing spread (ms) per level
+  function aiPlan(s, seat, lv) {
+    const K = RLV[lv] || RLV[2];
+    const sk = prng(hash(s.g, seat, 77))();
+    const r = prng(hash(s.g, s.q, seat, 5));
+    let rt = K.b + (1 - sk) * K.sk + r() * K.sp;              // lv2: 230–450 ms base
+    rt += AREC[s.m] * K.rec * (s.m === 9 ? 0.75 + r() * 0.5 : 1) + (r() - 0.5) * 80; // harder recognition in the "eye" games
+    rt = Math.round(Math.max(K.min, rt));
+    const T = tgt(s), x = r(), y = r(), z = r();
+    if (x < K.zo) return { at: Infinity };                   // zoned out — no tap
+    if (TIM[s.m]) {
+      const sp = (RHY[lv] || RHY[2]) * (s.m === 16 ? 1.25 : 1), err = Math.round(((r() + r() + r() - 1.5) * 2) * sp * (0.7 + (1 - sk) * 0.6));
+      if (err < -s.iv / 2) return { at: T + err, e: 1 };
+      return { at: T + Math.max(0, err), e: 0, ms: Math.abs(err) };
+    }
+    if (y < AERR[s.m] * K.fs) {
+      if (LOC[s.m] && (s.m !== 4 || z < 0.5)) return { at: T + rt * (s.m === 9 ? z : 0.8), e: 2 };
+      if (!STREAM[s.m]) return { at: Math.max(INTRO + 80, T - 60 - z * Math.min(800, T - INTRO - 200)), e: 1 };
+      if (s.k >= 1) return { at: s.pre + Math.floor(z * s.k) * s.iv + rt * 0.7, e: 1 };
+    }
+    return { at: T + rt, e: 0, ms: rt };
+  }
+  const driverSeat = (s) => (s.hu ? -1 : 0);   // with no human in the match the first AI keeps the clock
+  function elapsed(s) { return (Date.now() - s.t0) * ((L.debug && L.debug.speed) || 1); }
+  function aiDelayFor(s, seat, lv) {
+    if (s.ph === 'e') return -1;
+    const el = elapsed(s);
+    if (s.ph === 'p') {
+      if (s.tp[seat] == null) {
+        const p = aiPlan(s, seat, lv);
+        if (isFinite(p.at)) return Math.max(0, p.at - el);
+      }
+      return seat === driverSeat(s) ? Math.max(0, dline(s) - el) : -1;
+    }
+    return seat === driverSeat(s) ? Math.max(0, revealMs(s) - el) : -1;
+  }
+  function ai(s, seat, lv) {
+    if (s.ph === 'p') {
+      if (s.tp[seat] == null) {
+        const p = aiPlan(s, seat, lv);
+        if (isFinite(p.at) && (seat !== driverSeat(s) || elapsed(s) < dline(s))) return { type: 'tap', q: s.q, e: p.e, ms: p.e === 0 ? p.ms : 0 };
+      }
+      return seat === driverSeat(s) ? { type: 'to', q: s.q } : null;
+    }
+    if (s.ph === 'r' && seat === driverSeat(s)) return { type: 'next', q: s.q };
+    return null;
+  }
+
+  /* ---------- view ---------- */
+  const FD = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const FB = '"IBM Plex Sans KR","Apple SD Gothic Neo",sans-serif';
+  const FM = '"IBM Plex Mono",ui-monospace,monospace';
+  const INK = ['#ff4d5a', '#3e8ef7', '#f5cf3a', '#36c46e', '#b77cff'];
+  const INKN = ['빨강', '파랑', '노랑', '초록', '보라'];
+
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const hud = L.h('div', { class: 'hud top', style: { gap: '5px', padding: '8px 8px 0' } });
+    root.append(hud);
+    const sp = () => L.debug.speed || 1;
+    let st = null, key = '', localStart = performance.now(), shownAt = null, lastFrame = -2, revealAt = 0;
+    let myTap = {}, zones = [], hudH = 0, drv = 0, introStep = 0, rowsPlayed = 0, winPlayed = false, prog = {}, swipes = {};
+    const ring = {}; // seat -> time of the last tap (bell / ripple anim)
+    let actx = null;
+
+    /* own tiny sounds for the bell and the "go" cue (respects the app's sound toggle) */
+    function tone(parts, dur, vol) {
+      if (!U.store.get('sound', true)) return;
+      vol *= L.audio ? L.audio.sfx() : 1; // app volume, read live so 'lounge-volume' changes apply to the next sound
+      if (vol <= 0) return;
+      try {
+        if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+        const t = actx.currentTime;
+        parts.forEach(([f, v], i) => {
+          const o = actx.createOscillator(), g = actx.createGain();
+          o.type = i ? 'sine' : 'triangle'; o.frequency.setValueAtTime(f, t);
+          g.gain.setValueAtTime(vol * v, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+          o.connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+        });
+      } catch (e) {}
+    }
+    const ding = () => tone([[1568, 1], [2349, 0.5], [3136, 0.25]], 0.7, 0.16);
+    const goBeep = () => tone([[988, 1], [1976, 0.3]], 0.18, 0.2);
+    const lowBeep = () => tone([[392, 1], [784, 0.2]], 0.32, 0.22);
+    const highBeep = () => tone([[1568, 1], [3136, 0.25]], 0.32, 0.22);
+    const click = () => tone([[1200, 1], [2400, 0.4]], 0.06, 0.25);
+    const soundOn = () => U.store.get('sound', true) && (!L.audio || L.audio.sfx() > 0);
+
+    const locals = () => api.mySeats();
+    const isMulti = () => !api.online && locals().length >= 2;
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      if (!isMulti()) {
+        hud.hidden = false;
+        hudH = hud.offsetHeight + 4;
+        const me = locals();
+        zones = [{ seat: me.length ? me[0] : -1, x: 0, y: hudH, w: W, h: H - hudH, rot: 0 }];
+        return;
+      }
+      hud.hidden = true; hudH = 0;
+      const hs = locals(), P = Math.PI, n = hs.length;
+      const z = [];
+      const add = (i, x, y, w, h, rot) => z.push({ seat: hs[i], x: x + 2, y: y + 2, w: w - 4, h: h - 4, rot });
+      if (n === 2) { add(0, 0, H / 2, W, H / 2, 0); add(1, 0, 0, W, H / 2, P); }
+      else if (n === 3) { add(0, 0, H / 2, W / 2, H / 2, 0); add(1, W / 2, H / 2, W / 2, H / 2, 0); add(2, 0, 0, W, H / 2, P); }
+      else if (n === 4) { add(0, 0, H / 2, W / 2, H / 2, 0); add(1, W / 2, H / 2, W / 2, H / 2, 0); add(2, W / 2, 0, W / 2, H / 2, P); add(3, 0, 0, W / 2, H / 2, P); }
+      else {
+        const a = H * 0.3, b = H * 0.4;
+        if (n === 5) add(0, 0, a + b, W, a, 0);
+        else { add(0, 0, a + b, W / 2, a, 0); add(1, W / 2, a + b, W / 2, a, 0); }
+        const o = n === 5 ? 1 : 2;
+        add(o, W / 2, a, W / 2, b, -P / 2); add(o + 1, W / 2, 0, W / 2, a, P); add(o + 2, 0, 0, W / 2, a, P); add(o + 3, 0, a, W / 2, b, P / 2);
+      }
+      zones = z;
+    }
+    cv.onresize = () => layout();
+
+    function zoneDims(z) { const side = Math.abs(Math.abs(z.rot) - Math.PI / 2) < 0.01; return side ? { w: z.h, h: z.w } : { w: z.w, h: z.h }; }
+    function toLocal(z, px, py) {
+      const d = zoneDims(z);
+      const dx = px - (z.x + z.w / 2), dy = py - (z.y + z.h / 2);
+      const c = Math.cos(-z.rot), s = Math.sin(-z.rot);
+      return { x: dx * c - dy * s + d.w / 2, y: dx * s + dy * c + d.h / 2, w: d.w, h: d.h };
+    }
+
+    /* ---------- HUD (single-screen scoreboard) ---------- */
+    function renderHud() {
+      hud.innerHTML = '';
+      if (!st || isMulti()) return;
+      const top = Math.max(...st.sc);
+      api.players.forEach((p, i) => {
+        hud.append(L.h('span', { class: 'turn', style: { padding: '3px 9px 3px 7px', fontSize: '12px', borderColor: st.sc[i] === top && top > 0 ? 'var(--brass)' : '' } },
+          L.h('span', { class: 'dot', style: { '--c': p.color } }), L.h('span', { style: { maxWidth: '64px', overflow: 'hidden', textOverflow: 'ellipsis' }, text: p.name }),
+          L.h('b', { class: 'mono', text: fmtPt(st.sc[i]) }),
+          st.cb && st.cb[i] >= 2 ? L.h('span', { style: { color: '#ff9f43', fontWeight: '700' }, text: '🔥' + st.cb[i] }) : null));
+      });
+      const h0 = hudH;
+      hudH = hud.offsetHeight + 4;
+      if (Math.abs(h0 - hudH) > 1) layout();
+    }
+
+    /* ---------- input ---------- */
+    function submit(seat, e, ms) {
+      myTap[seat] = { e, ms, at: performance.now() };
+      ring[seat] = performance.now();
+      if (e === 0) { if (st.m === 1) ding(); else api.sfx('hit'); api.buzz(25); }
+      else { api.sfx('lose'); api.buzz(90); }
+      api.actAs(seat, { type: 'tap', q: st.q, e, ms });
+    }
+    const evPos = (ev) => { const r = cv.cv.getBoundingClientRect(); return { px: ev.clientX - r.left, py: ev.clientY - r.top }; };
+    function onDown(ev) {
+      ev.preventDefault();
+      if (!st || st.ph !== 'p') return;
+      const { px, py } = evPos(ev);
+      const z = zones.find((q) => px >= q.x && px <= q.x + q.w && py >= q.y && py <= q.y + q.h);
+      if (!z || z.seat < 0 || !api.canAct(z.seat)) return;
+      const seat = z.seat;
+      if (myTap[seat] || st.tp[seat] != null) return;
+      const t = ev.timeStamp || performance.now();
+      const el = (t - localStart) * sp();
+      if (el < INTRO) return; // title card: accidental taps from the last round are ignored
+      const m = st.m, lp = toLocal(z, px, py);
+      if (TIM[m]) { // 박자·딱 멈춰: measured against where the 5th beat falls on this device's clock
+        const half = localStart + (st.pre + (st.k - 0.5) * st.iv) / sp(), b5 = localStart + tgt(st) / sp();
+        if (t < half) submit(seat, 1, 0); else submit(seat, 0, Math.round(Math.abs(t - b5) * sp()));
+        return;
+      }
+      if (shownAt == null || t < shownAt) { submit(seat, 1, 0); return; }
+      const ms = Math.max(0, Math.round((t - shownAt) * sp()));
+      if (m === 4) { submit(seat, (lp.x < lp.w / 2 ? 'L' : 'R') !== st.d[0] ? 2 : 0, ms); return; }
+      if (m === 12) { swipes[ev.pointerId] = { seat, t, x: lp.x, y: lp.y, z }; return; }
+      if (LOC[m]) {
+        const h = locHit(m, seat, lp, t);
+        if (h === 'skip') return;
+        if (h === 'more') { ring[seat] = performance.now(); click(); api.buzz(8); return; }
+        submit(seat, h === 'ok' ? 0 : 2, ms);
+        return;
+      }
+      submit(seat, 0, ms);
+    }
+    /* 방향 밀기: the swipe counts from the moment the finger went down */
+    function onMove(ev) {
+      const sw = swipes[ev.pointerId];
+      if (!sw || !st || st.ph !== 'p' || st.m !== 12 || myTap[sw.seat] || st.tp[sw.seat] != null) return;
+      const { px, py } = evPos(ev), lp = toLocal(sw.z, px, py), dx = lp.x - sw.x, dy = lp.y - sw.y;
+      if (Math.hypot(dx, dy) < 26) return;
+      delete swipes[ev.pointerId];
+      const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'R' : 'L') : (dy > 0 ? 'D' : 'U'), want = st.d[1] === 's' ? st.d[0] : OPP[st.d[0]];
+      submit(sw.seat, dir === want ? 0 : 2, Math.max(0, Math.round((sw.t - shownAt) * sp())));
+    }
+    function onUp(ev) { delete swipes[ev.pointerId]; }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+
+    /* ---------- layouts of the location-tap modes (zone-local coords; drawing and hit tests share them) ---------- */
+    function boxOf(h) { const multi = isMulti(), hh = multi ? 30 : 26, by = hh + 4; return { by, bh: h - by - (multi ? 10 : 34) }; }
+    function gridL(m, w, by, bh) {
+      if (m === 9 || m === 17 || m === 18 || m === 22) { const cs = Math.min((w - 24) / 3, (bh - 16) / 3, 104); return { n: 3, cs, ox: (w - 3 * cs) / 2, oy: by + (bh - 3 * cs) / 2 }; }
+      if (m === 10) { const ts = Math.min(70, bh * 0.2), av = bh - ts - 30, cs = Math.min((w - 24) / 3, av / 3, 100); return { n: 3, cs, ts, ox: (w - 3 * cs) / 2, oy: by + ts + 26 + (av - 3 * cs) / 2 }; }
+      if (m === 11) { const n = Math.min(w, bh) >= 300 ? 5 : 4, cs = Math.min((w - 20) / n, (bh - 10) / n, 84); return { n, cs, ox: (w - n * cs) / 2, oy: by + (bh - n * cs) / 2 }; }
+      if (m === 14) { const bw = (w - 36) / 2, bhh = Math.min(70, (bh * 0.52 - 12) / 2); return { bw, bhh, ox: 12, oy: by + bh * 0.46 }; }
+      return null;
+    }
+    function cellAt(G, lp) {
+      const c = Math.floor((lp.x - G.ox) / G.cs), r = Math.floor((lp.y - G.oy) / G.cs);
+      if (c < 0 || r < 0 || c >= G.n || r >= G.n) return -1;
+      const fx = (lp.x - G.ox) / G.cs - c, fy = (lp.y - G.oy) / G.cs - r;
+      return fx < 0.04 || fx > 0.96 || fy < 0.04 || fy > 0.96 ? -1 : r * G.n + c;
+    }
+    function locHit(m, seat, lp, t) {
+      const { by, bh } = boxOf(lp.h), w = lp.w;
+      if (m === 15) { const B = genBig(st); return (lp.x < w / 2) === (B.a > B.b) ? 'ok' : 'wrong'; }
+      if (m === 19) { const M = genMore(st); return (lp.x < w / 2) === (M.a > M.b) ? 'ok' : 'wrong'; }
+      if (m === 20) return (lp.x < w / 2) === genCalc(st).L ? 'ok' : 'wrong';
+      if (m === 23) { if (lp.y < by) return 'skip'; return (lp.y >= by + bh / 2 ? 2 : 0) + (lp.x >= w / 2 ? 1 : 0) === +st.d[0] ? 'ok' : 'wrong'; }
+      if (m === 8) {
+        const P = movePos(st, Math.max(0, (t - shownAt) * sp() / 1000)), R0 = tgtR(w, bh);
+        return Math.hypot(lp.x - (12 + P.x * (w - 24)), lp.y - (by + 8 + P.y * (bh - 16))) <= R0 + 14 ? 'ok' : 'wrong';
+      }
+      if (m === 14) {
+        const G = gridL(m, w, by, bh), I = genInk(st);
+        for (let i = 0; i < 4; i++) { const x = G.ox + (i % 2) * (G.bw + 12), y = G.oy + Math.floor(i / 2) * (G.bhh + 12); if (lp.x >= x && lp.x <= x + G.bw && lp.y >= y && lp.y <= y + G.bhh) return I.names[i] === I.c ? 'ok' : 'wrong'; }
+        return 'skip';
+      }
+      const G = gridL(m, w, by, bh), c = cellAt(G, lp);
+      if (c < 0) return 'skip';
+      if (m === 9) {
+        const O = genOrder(st), want = (prog[seat] | 0) + 1;
+        if (O[c] !== want) return O[c] < want ? 'skip' : 'wrong';
+        prog[seat] = want;
+        return want === 9 ? 'ok' : 'more';
+      }
+      if (m === 10) return c === genShape(st).mi ? 'ok' : 'wrong';
+      if (m === 17) return c === +st.d[0] ? 'ok' : 'wrong';
+      if (m === 22) return c === +st.d[st.k] ? 'ok' : 'wrong';
+      if (m === 18) {
+        const j = st.d.indexOf(String(c)), done = prog[seat] | 0;
+        if (j < 0) return 'wrong';
+        if (done & (1 << j)) return 'skip';
+        prog[seat] = done | (1 << j);
+        return prog[seat] === 3 ? 'ok' : 'more';
+      }
+      if (m === 11) return c === genOdd(st, G.n).odd ? 'ok' : 'wrong';
+      return 'skip';
+    }
+    const tgtR = (w, bh) => Math.max(24, Math.min(w, bh) * 0.085);
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('contextmenu', noCtx);
+
+    /* ---------- host clock (deadline / next round) ---------- */
+    function setDriver() {
+      clearTimeout(drv); drv = 0;
+      if (!st || !api.isHost || !st.hu || st.ph === 'e') return;
+      const seat = locals()[0];
+      if (seat == null) return;
+      const q = st.q, ph = st.ph;
+      const wait = ph === 'p' ? dline(st) / sp() - (performance.now() - localStart) : revealMs(st) / sp();
+      drv = setTimeout(function fire() {
+        if (!st || st.q !== q || st.ph !== ph) return;
+        if (document.querySelector('.overlay.rules-ov') && !api.online) { drv = setTimeout(fire, 300); return; }
+        api.actAs(seat, ph === 'p' ? { type: 'to', q } : { type: 'next', q });
+      }, Math.max(0, wait));
+    }
+
+    /* ---------- drawing helpers ---------- */
+    function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+    function fnt(size, font) { const m = /^(\d{3}) (.*)$/.exec(font || FD); return m ? m[1] + ' ' + size + 'px ' + m[2] : size + 'px ' + (font || FD); }
+    function txt(t, x, y, size, col, font, align, base) {
+      ctx.font = fnt(size, font); ctx.fillStyle = col; ctx.textAlign = align || 'center'; ctx.textBaseline = base || 'middle'; ctx.fillText(t, x, y);
+    }
+    function fitSize(t, maxW, size, font) { ctx.font = fnt(size, font); const w = ctx.measureText(t).width; return w > maxW ? Math.max(8, size * maxW / w) : size; }
+    function wrap(t, maxW, size, font) {
+      ctx.font = fnt(size, font);
+      const words = t.split(' '), lines = [];
+      let cur = '';
+      words.forEach((w) => { const tr = cur ? cur + ' ' + w : w; if (ctx.measureText(tr).width > maxW && cur) { lines.push(cur); cur = w; } else cur = tr; });
+      if (cur) lines.push(cur);
+      return lines;
+    }
+    function alpha(hex, a) { const n = parseInt(hex.slice(1), 16); return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')'; }
+
+    function drawFruit(f, x, y, r) {
+      ctx.save(); ctx.translate(x, y);
+      if (f === 0) { // apple
+        ctx.fillStyle = '#d93a3a';
+        ctx.beginPath(); ctx.arc(-r * 0.32, r * 0.05, r * 0.68, 0, 7); ctx.arc(r * 0.32, r * 0.05, r * 0.68, 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.beginPath(); ctx.ellipse(-r * 0.45, -r * 0.2, r * 0.18, r * 0.28, -0.4, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#5a3a1a'; ctx.lineWidth = Math.max(1.5, r * 0.12); ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(0, -r * 0.45); ctx.lineTo(r * 0.08, -r * 0.85); ctx.stroke();
+        ctx.fillStyle = '#4caf50'; ctx.beginPath(); ctx.ellipse(r * 0.35, -r * 0.78, r * 0.3, r * 0.14, -0.5, 0, 7); ctx.fill();
+      } else if (f === 1) { // lemon
+        ctx.rotate(-0.35);
+        ctx.fillStyle = '#f6d23a';
+        ctx.beginPath(); ctx.ellipse(0, 0, r * 0.85, r * 0.62, 0, 0, 7); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(r * 0.85, 0, r * 0.18, r * 0.12, 0, 0, 7); ctx.ellipse(-r * 0.85, 0, r * 0.18, r * 0.12, 0, 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.4)'; ctx.beginPath(); ctx.ellipse(-r * 0.25, -r * 0.28, r * 0.3, r * 0.12, -0.2, 0, 7); ctx.fill();
+      } else if (f === 2) { // grapes
+        ctx.fillStyle = '#7d3fb8';
+        const g = [[-0.42, -0.35], [0, -0.35], [0.42, -0.35], [-0.21, 0.02], [0.21, 0.02], [0, 0.38]];
+        g.forEach(([a, b]) => { ctx.beginPath(); ctx.arc(a * r * 1.05, b * r * 1.05 + r * 0.1, r * 0.27, 0, 7); ctx.fill(); });
+        ctx.fillStyle = 'rgba(255,255,255,.35)';
+        g.forEach(([a, b]) => { ctx.beginPath(); ctx.arc(a * r * 1.05 - r * 0.08, b * r * 1.05 + r * 0.02, r * 0.07, 0, 7); ctx.fill(); });
+        ctx.strokeStyle = '#4a7a2a'; ctx.lineWidth = Math.max(1.5, r * 0.1); ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(0, -r * 0.55); ctx.quadraticCurveTo(r * 0.1, -r * 0.85, r * 0.3, -r * 0.9); ctx.stroke();
+      } else { // kiwi slice
+        ctx.fillStyle = '#7a5a32'; ctx.beginPath(); ctx.arc(0, 0, r * 0.8, 0, 7); ctx.fill();
+        ctx.fillStyle = '#7cc242'; ctx.beginPath(); ctx.arc(0, 0, r * 0.68, 0, 7); ctx.fill();
+        ctx.fillStyle = '#e8f3c8'; ctx.beginPath(); ctx.arc(0, 0, r * 0.22, 0, 7); ctx.fill();
+        ctx.fillStyle = '#1d1a12';
+        for (let i = 0; i < 10; i++) { const a = (i / 10) * Math.PI * 2; ctx.beginPath(); ctx.ellipse(Math.cos(a) * r * 0.38, Math.sin(a) * r * 0.38, r * 0.06, r * 0.035, a, 0, 7); ctx.fill(); }
+      }
+      ctx.restore();
+    }
+    const PIPS = [[[0, 0]], [[-1, -1], [1, 1]], [[-1, -1], [0, 0], [1, 1]], [[-1, -1], [1, -1], [-1, 1], [1, 1]], [[-1, -1], [1, -1], [0, 0], [-1, 1], [1, 1]]];
+    function drawCard(card, x, y, w, h, flip) {
+      ctx.save(); ctx.translate(x + w / 2, y + h / 2);
+      if (flip != null && flip < 1) ctx.scale(Math.max(0.05, Math.abs(Math.cos((1 - flip) * Math.PI / 2))), 1);
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(-w / 2 + 2, -h / 2 + 4, w, h, w * 0.1); ctx.fill();
+      if (!card) {
+        ctx.strokeStyle = 'rgba(242,233,216,.18)'; ctx.setLineDash([5, 5]); ctx.lineWidth = 2; rr(-w / 2, -h / 2, w, h, w * 0.1); ctx.stroke(); ctx.setLineDash([]);
+        ctx.restore(); return;
+      }
+      ctx.fillStyle = '#f7efdf'; rr(-w / 2, -h / 2, w, h, w * 0.1); ctx.fill();
+      ctx.strokeStyle = '#d8c7a3'; ctx.lineWidth = 2; rr(-w / 2 + 4, -h / 2 + 4, w - 8, h - 8, w * 0.07); ctx.stroke();
+      const r = Math.min(w, h * 0.72) * 0.17;
+      PIPS[card.c - 1].forEach(([a, b]) => drawFruit(card.f, a * w * 0.25, b * h * 0.28, r));
+      ctx.restore();
+    }
+    function drawSym(k, x, y, r, colOver) {
+      ctx.save(); ctx.translate(x, y);
+      const col = colOver || ['#f0b440', '#ee5a6e', '#9fc4ff', '#55c27a', '#3e8ef7', '#ff8a3d'][k];
+      ctx.fillStyle = col; ctx.beginPath();
+      if (k === 0) { for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr2 = i % 2 ? r * 0.42 : r; ctx.lineTo(Math.cos(a) * rr2, Math.sin(a) * rr2); } ctx.closePath(); ctx.fill(); }
+      else if (k === 1) { ctx.moveTo(0, r * 0.85); ctx.bezierCurveTo(-r * 1.3, -r * 0.1, -r * 0.55, -r * 1.05, 0, -r * 0.35); ctx.bezierCurveTo(r * 0.55, -r * 1.05, r * 1.3, -r * 0.1, 0, r * 0.85); ctx.fill(); }
+      else if (k === 2) { ctx.arc(0, 0, r * 0.9, 0, 7); ctx.fill(); ctx.globalCompositeOperation = 'destination-out'; ctx.beginPath(); ctx.arc(r * 0.42, -r * 0.25, r * 0.75, 0, 7); ctx.fill(); ctx.globalCompositeOperation = 'source-over'; }
+      else if (k === 3) { ctx.moveTo(0, -r * 0.9); ctx.lineTo(r * 0.95, r * 0.75); ctx.lineTo(-r * 0.95, r * 0.75); ctx.closePath(); ctx.fill(); }
+      else if (k === 4) { ctx.moveTo(0, -r); ctx.bezierCurveTo(r * 0.3, -r * 0.4, r * 0.8, 0, r * 0.8, r * 0.3); ctx.arc(0, r * 0.3, r * 0.8, 0, Math.PI); ctx.bezierCurveTo(-r * 0.8, 0, -r * 0.3, -r * 0.4, 0, -r); ctx.fill(); }
+      else { ctx.moveTo(r * 0.25, -r); ctx.lineTo(-r * 0.6, r * 0.15); ctx.lineTo(-r * 0.02, r * 0.15); ctx.lineTo(-r * 0.3, r); ctx.lineTo(r * 0.65, -r * 0.2); ctx.lineTo(r * 0.06, -r * 0.2); ctx.closePath(); ctx.fill(); }
+      ctx.restore();
+    }
+    function drawTwinCard(code, x, y, s) {
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(x + 2, y + 4, s, s, s * 0.1); ctx.fill();
+      ctx.fillStyle = '#2a2238'; rr(x, y, s, s, s * 0.1); ctx.fill();
+      ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 2; rr(x + 3, y + 3, s - 6, s - 6, s * 0.08); ctx.stroke();
+      for (let i = 0; i < 4; i++) drawSym(+code[i], x + s * (i % 2 ? 0.72 : 0.28), y + s * (i < 2 ? 0.28 : 0.72), s * 0.16);
+    }
+    function drawBell(x, y, r, shake) {
+      ctx.save(); ctx.translate(x, y); ctx.rotate(Math.sin(shake * 40) * 0.25 * Math.max(0, 1 - shake * 3));
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(2, r * 0.62, r * 1.05, r * 0.25, 0, 0, 7); ctx.fill();
+      const g = ctx.createLinearGradient(-r, 0, r, 0); g.addColorStop(0, '#9c6b1c'); g.addColorStop(0.45, '#f4d27a'); g.addColorStop(1, '#a8741f');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.moveTo(-r, r * 0.5); ctx.quadraticCurveTo(-r * 0.92, -r * 0.75, 0, -r * 0.78); ctx.quadraticCurveTo(r * 0.92, -r * 0.75, r, r * 0.5); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#5b3d10'; rr(-r * 1.05, r * 0.42, r * 2.1, r * 0.2, r * 0.1); ctx.fill();
+      ctx.fillStyle = '#f4d27a'; ctx.beginPath(); ctx.arc(0, -r * 0.86, r * 0.16, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+    function drawArrow(x, y, s, dir, col) {
+      ctx.save(); ctx.translate(x, y); if (dir === 'L') ctx.scale(-1, 1);
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.translate(3, 5);
+      const path = () => { ctx.beginPath(); ctx.moveTo(-s, -s * 0.28); ctx.lineTo(s * 0.15, -s * 0.28); ctx.lineTo(s * 0.15, -s * 0.7); ctx.lineTo(s, 0); ctx.lineTo(s * 0.15, s * 0.7); ctx.lineTo(s * 0.15, s * 0.28); ctx.lineTo(-s, s * 0.28); ctx.closePath(); };
+      path(); ctx.fill(); ctx.translate(-3, -5);
+      ctx.fillStyle = col; path(); ctx.fill();
+      ctx.restore();
+    }
+
+    /* ---------- per-zone rendering ---------- */
+    function tapOf(seat) {
+      if (seat < 0 || !st) return null;
+      const v = st.tp && st.tp[seat];
+      if (v != null) return v;
+      const m = myTap[seat];
+      return m ? (m.e ? -m.e : m.ms) : null;
+    }
+    function badLabel(v, m) {
+      if (v === -9) return '관전';
+      if (v === -2) return m === 4 ? '반대쪽!' : m === 8 ? '빗나감' : m === 9 ? '순서 틀림' : m === 12 ? '방향 틀림' : '틀림';
+      return TIM[m] ? '너무 빠름' : STREAM[m] ? '잘못 누름' : '부정 출발';
+    }
+
+    function drawZone(z, w, h, now) {
+      const seat = z.seat, multi = isMulti();
+      const p = seat >= 0 ? api.players[seat] : null;
+      // table
+      const bg = ctx.createRadialGradient(w / 2, h * 0.45, 10, w / 2, h * 0.45, Math.max(w, h) * 0.75);
+      bg.addColorStop(0, '#2c2240'); bg.addColorStop(1, '#17121f');
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
+      if (multi && p) { ctx.fillStyle = alpha(p.color, 0.1); ctx.fillRect(0, 0, w, h); ctx.fillStyle = p.color; ctx.fillRect(0, h - 5, w, 5); }
+      const el = (now - localStart) * sp();
+      // header
+      const hh = multi ? 30 : 26;
+      if (multi && p) {
+        ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(14, hh / 2 + 2, 6, 0, 7); ctx.fill();
+        const ns = fitSize(p.name, w * 0.42, 15, FB);
+        ctx.font = '700 ' + ns + 'px ' + FB; ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(p.name, 26, hh / 2 + 2);
+        txt(fmtPt(st.sc[seat]) + (st.cb && st.cb[seat] >= 2 ? ' 🔥' + st.cb[seat] : ''), 26 + ctx.measureText(p.name).width + 10, hh / 2 + 2, 16, '#e3ae45', FM, 'left');
+        if (st.ph !== 'e') txt((st.sd ? '서든데스' : st.rn + '/' + st.R) + ' · ' + MODES[st.m], w - 10, hh / 2 + 2, fitSize(MODES[st.m] + ' 10/10', w * 0.4, 12, FB), '#ab9fb8', FB, 'right');
+      } else if (st.ph !== 'e') {
+        txt(MODES[st.m], 12, hh / 2 + 2, 15, MCOL[st.m], FD, 'left');
+        txt(st.sd ? '서든데스!' : '라운드 ' + st.rn + '/' + st.R, w - 12, hh / 2 + 2, 12, '#ab9fb8', FM, 'right');
+      }
+      const { by, bh } = boxOf(h);
+      if (st.ph === 'e') { drawFinal(w, by, bh, seat); return; }
+      if (st.ph === 'r') { drawReveal(w, by, bh, seat, now); return; }
+      if (el < INTRO) drawIntro(w, by, bh, el);
+      else drawStim(z, w, by, bh, now, el, seat);
+      // own feedback
+      const v = tapOf(seat);
+      if (v != null) {
+        const t0 = myTap[seat] ? myTap[seat].at : now - 1000;
+        const k = Math.min(1, (now - t0) / 160);
+        const cy = by + bh * 0.5, s = Math.min(w, bh);
+        if (v >= 0) {
+          ctx.fillStyle = 'rgba(16,12,22,' + (0.72 * k) + ')'; ctx.fillRect(0, by, w, bh);
+          const sz = Math.min(w * 0.26, s * 0.3) * (1.25 - 0.25 * k);
+          txt(String(v), w / 2 - sz * 0.05, cy, sz, p ? p.color : '#f2e9d8', '700 ' + FM, 'right');
+          txt('ms', w / 2 + 4, cy + sz * 0.18, sz * 0.4, '#f2e9d8', '600 ' + FM, 'left');
+          txt('기록 완료 · 다른 사람 기다리는 중', w / 2, cy + sz * 0.85, fitSize('기록 완료 · 다른 사람 기다리는 중', w - 24, 13, FB), '#ab9fb8', FB);
+        } else {
+          ctx.fillStyle = v === -9 ? 'rgba(16,12,22,' + (0.7 * k) + ')' : 'rgba(120,20,30,' + (0.6 * k) + ')'; ctx.fillRect(0, by, w, bh);
+          const sh = k < 1 ? Math.sin(now / 18) * 8 * (1 - k) : 0;
+          const lab = v === -9 ? '관전 중' : badLabel(v, st.m);
+          txt(lab, w / 2 + sh, cy, fitSize(lab, w - 30, Math.min(w * 0.16, s * 0.18), FD), '#ffd9d4', FD);
+          txt(v === -9 ? '서든데스 — 동점자끼리 대결 중' : st.pen ? '이번 라운드 탈락 · −1점' : '이번 라운드 탈락', w / 2, cy + Math.min(w * 0.16, s * 0.18) * 0.9, 13, '#f2e9d8', FB);
+        }
+      } else if (!multi && seat >= 0 && el >= INTRO) {
+        txt(howOf(st), w / 2, h - 18, fitSize(howOf(st), w - 24, 13, FB), '#ab9fb8', FB);
+      } else if (!multi && seat < 0) {
+        txt('관전 중', w / 2, h - 18, 13, '#ab9fb8', FB);
+      }
+    }
+
+    function drawIntro(w, by, bh, el) {
+      const k = Math.min(1, el / 220);
+      const cy = by + bh * 0.42;
+      const big = fitSize(MODES[st.m], w - 40, Math.min(w * 0.2, bh * 0.2), FD) * (0.85 + 0.15 * k);
+      ctx.globalAlpha = k;
+      if (st.sd) { // 서든데스 배너
+        const bs = fitSize('서든데스!', w - 40, Math.min(34, w * 0.1), FD), byy = cy - big * 0.95 - bs * 1.3, pul = 1 + 0.06 * Math.sin(el / 90);
+        ctx.fillStyle = 'rgba(200,30,45,.85)'; rr(w * 0.08, byy - bs * 0.75, w * 0.84, bs * 1.5, 10); ctx.fill();
+        txt('서든데스!', w / 2, byy, bs * pul, '#fff3e0', FD);
+        const nm = st.sd.map((i) => st.nm[i]).join(' vs ');
+        txt(nm, w / 2, byy + bs * 1.15, fitSize(nm, w - 40, 13, FB), '#ffd9d4', '700 ' + FB);
+      } else txt('ROUND ' + st.rn + ' / ' + st.R, w / 2, cy - big * 0.95, Math.min(14, w * 0.05), '#ab9fb8', '600 ' + FM);
+      txt(MODES[st.m], w / 2, cy, big, MCOL[st.m], FD);
+      const fs = Math.min(16, w * 0.05);
+      const lines = wrap(howOf(st), w - 40, fs, FB);
+      lines.forEach((l, i) => txt(l, w / 2, cy + big * 0.85 + i * fs * 1.35, fs, '#f2e9d8', FB));
+      ctx.fillStyle = 'rgba(242,233,216,.12)'; rr(w * 0.3, cy + big * 0.85 + lines.length * fs * 1.35 + 8, w * 0.4, 4, 2); ctx.fill();
+      ctx.fillStyle = MCOL[st.m]; rr(w * 0.3, cy + big * 0.85 + lines.length * fs * 1.35 + 8, w * 0.4 * Math.min(1, el / INTRO), 4, 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    function readyText(w, y, now, size) {
+      const a = 0.55 + 0.45 * Math.sin(now / 180);
+      ctx.globalAlpha = a; txt('준비…', w / 2, y, size, '#f2e9d8', FD); ctx.globalAlpha = 1;
+    }
+
+    function drawStim(z, w, by, bh, now, el, seat) {
+      const fi = frameAt(st, el);
+      const cx = w / 2, cy = by + bh / 2, m = st.m;
+      const hit = fi === st.k;
+      if (m === 0) {
+        const vert = bh > w * 0.9;
+        const lr = Math.min(vert ? Math.min(w * 0.26, bh * 0.14) : Math.min(bh * 0.25, w * 0.15), 110);
+        const hw = vert ? lr * 2.7 : lr * 5, hhh = vert ? lr * 5 : lr * 2.7;
+        const hx = cx - hw / 2, hy = cy - hhh / 2 - (vert ? lr * 0.3 : 0);
+        if (hit) { const f = Math.max(0, 1 - (now - (shownAt || now)) / 400); ctx.fillStyle = 'rgba(95,211,138,' + (0.12 + 0.35 * f) + ')'; ctx.fillRect(0, by, w, bh); }
+        ctx.fillStyle = 'rgba(0,0,0,.4)'; rr(hx + 4, hy + 6, hw, hhh, lr * 0.6); ctx.fill();
+        ctx.fillStyle = '#1b1622'; rr(hx, hy, hw, hhh, lr * 0.6); ctx.fill();
+        ctx.strokeStyle = '#8a6a2a'; ctx.lineWidth = 3; rr(hx + 2, hy + 2, hw - 4, hhh - 4, lr * 0.55); ctx.stroke();
+        const p1 = vert ? [cx, hy + hhh * 0.28] : [hx + hw * 0.28, cy];
+        const p2 = vert ? [cx, hy + hhh * 0.72] : [hx + hw * 0.72, cy];
+        const lamp = (pt, on, col, dim) => {
+          if (on) { const g = ctx.createRadialGradient(pt[0], pt[1], lr * 0.2, pt[0], pt[1], lr * 1.6); g.addColorStop(0, alpha(col, 0.55)); g.addColorStop(1, alpha(col, 0)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(pt[0], pt[1], lr * 1.6, 0, 7); ctx.fill(); }
+          ctx.fillStyle = on ? col : dim; ctx.beginPath(); ctx.arc(pt[0], pt[1], lr, 0, 7); ctx.fill();
+          ctx.fillStyle = on ? 'rgba(255,255,255,.35)' : 'rgba(255,255,255,.05)'; ctx.beginPath(); ctx.arc(pt[0] - lr * 0.3, pt[1] - lr * 0.3, lr * 0.3, 0, 7); ctx.fill();
+        };
+        lamp(p1, !hit, '#ff3b3b', '#3a1a1e'); lamp(p2, hit, '#3dff8a', '#16301f');
+        const ty = vert ? hy + hhh + Math.min(36, (by + bh - hy - hhh) / 2) : hy + hhh + 26;
+        if (hit) txt('지금!', cx, Math.min(ty, by + bh - 14), Math.min(34, w * 0.1), '#3dff8a', FD);
+        else readyText(w, Math.min(ty, by + bh - 14), now, Math.min(30, w * 0.09));
+      } else if (m === 4) {
+        const s = Math.min(w * 0.3, bh * 0.32);
+        ctx.strokeStyle = 'rgba(242,233,216,.12)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(cx, by + 6); ctx.lineTo(cx, by + bh - 6); ctx.stroke(); ctx.setLineDash([]);
+        txt('◀ 왼쪽', 14, by + bh - 14, 13, 'rgba(242,233,216,.45)', FB, 'left');
+        txt('오른쪽 ▶', w - 14, by + bh - 14, 13, 'rgba(242,233,216,.45)', FB, 'right');
+        if (hit) {
+          const k = Math.min(1, (now - (shownAt || now)) / 90);
+          const ox = (st.d[1] === 'L' ? -1 : 1) * w * 0.16;
+          drawArrow(cx + ox, cy, s * (0.7 + 0.3 * k), st.d[0], '#ee6a55');
+        } else {
+          const a = 0.5 + 0.5 * Math.sin(now / 150);
+          ctx.strokeStyle = 'rgba(238,106,85,' + (0.3 + 0.4 * a) + ')'; ctx.lineWidth = 4;
+          ctx.beginPath(); ctx.arc(cx, cy, s * 0.55, 0, 7); ctx.stroke();
+          readyText(w, cy, now, Math.min(30, w * 0.09));
+        }
+      } else if (m === 1) {
+        const bellH = Math.min(bh * 0.26, 90);
+        const gh = bh - bellH - 6, gw = w - 20;
+        const wide = gw > gh * 1.6;
+        const cols = wide ? 4 : 2, rows = wide ? 1 : 2;
+        let cw = Math.min((gw - (cols - 1) * 10) / cols, ((gh - (rows - 1) * 10) / rows) * 0.72);
+        const ch = cw / 0.72;
+        const ox = cx - (cols * cw + (cols - 1) * 10) / 2, oy = by + (gh - (rows * ch + (rows - 1) * 10)) / 2;
+        const sl = fi >= 0 ? fruitSlots(st.d, fi) : [null, null, null, null];
+        for (let i = 0; i < 4; i++) {
+          const x = ox + (i % cols) * (cw + 10), y = oy + Math.floor(i / cols) * (ch + 10);
+          let flip = null;
+          if (fi >= 0 && fi % 4 === i) { const tf = localStart + (st.pre + fi * st.iv) / sp(); flip = Math.min(1, (now - tf) * sp() / 130); }
+          if (fi >= 4 && fi % 4 === i && flip < 1) drawCard(fruitSlots(st.d, fi - 4)[i], x, y, cw, ch, null);
+          drawCard(sl[i], x, y, cw, ch, flip);
+        }
+        const rt = seat >= 0 && ring[seat] ? (now - ring[seat]) / 1000 : 9;
+        const br = bellH * 0.42;
+        drawBell(cx, by + bh - bellH / 2 - 2, br, rt);
+        if (fi < 0) readyText(w, oy + rows * ch / 2 + (rows - 1) * 5, now, Math.min(28, w * 0.09));
+      } else if (m === 2) {
+        if (fi < 0) { readyText(w, cy, now, Math.min(30, w * 0.09)); return; }
+        const f = stroopAt(st.d, fi);
+        const tf = localStart + (st.pre + fi * st.iv) / sp();
+        const k = Math.min(1, (now - tf) * sp() / 90);
+        const cwid = Math.min(w - 30, bh * 1.3), chgt = Math.min(bh * 0.62, cwid * 0.62);
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(cx - cwid / 2 + 3, cy - chgt / 2 + 5, cwid, chgt, 18); ctx.fill();
+        ctx.fillStyle = '#ece3d0'; rr(cx - cwid / 2, cy - chgt / 2, cwid, chgt, 18); ctx.fill();
+        const size = fitSize(INKN[f.w], cwid * 0.8, chgt * 0.6, FD) * (0.8 + 0.2 * k);
+        ctx.globalAlpha = k; txt(INKN[f.w], cx, cy + 2, size, INK[f.c], FD); ctx.globalAlpha = 1;
+      } else if (m === 5) {
+        const T = +st.d[0];
+        const bs = Math.min(w - 24, bh - 50), bx = cx - bs / 2, byy = by + 34 + (bh - 40 - bs) / 2;
+        txt('목표 ' + T + '개', cx, by + 16, Math.min(22, w * 0.07), MCOL[5], FD);
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(bx + 3, byy + 5, bs, bs, 18); ctx.fill();
+        ctx.fillStyle = '#211a2c'; rr(bx, byy, bs, bs, 18); ctx.fill();
+        ctx.strokeStyle = 'rgba(232,210,122,.35)'; ctx.lineWidth = 2; rr(bx + 3, byy + 3, bs - 6, bs - 6, 15); ctx.stroke();
+        if (fi < 0) { readyText(w, byy + bs / 2, now, Math.min(30, w * 0.09)); return; }
+        const c = dotsAt(st.d, fi), r = prng(hash(st.g, st.q, fi, 31));
+        const tf = localStart + (st.pre + fi * st.iv) / sp(), k = Math.min(1, (now - tf) * sp() / 110);
+        // positions: 4x4 jittered grid, first c cells of a seeded order
+        const ordc = Array.from({ length: 16 }, (_, i) => i);
+        for (let i = 15; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [ordc[i], ordc[j]] = [ordc[j], ordc[i]]; }
+        const cs = bs / 4, dr = cs * 0.26 * (0.7 + 0.3 * k);
+        for (let i = 0; i < c; i++) {
+          const q = ordc[i], x = bx + (q % 4 + 0.5) * cs + (r() - 0.5) * cs * 0.35, y = byy + (Math.floor(q / 4) + 0.5) * cs + (r() - 0.5) * cs * 0.35;
+          const g = ctx.createRadialGradient(x - dr * 0.3, y - dr * 0.3, dr * 0.1, x, y, dr);
+          g.addColorStop(0, '#fff3c4'); g.addColorStop(1, '#d9a93a');
+          ctx.globalAlpha = k; ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, dr, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+        }
+      } else if (m === 6) {
+        const R0 = Math.min(w * 0.3, bh * 0.3);
+        if (fi < 0) { readyText(w, cy, now, Math.min(30, w * 0.09)); return; }
+        const col = st.d[fi] === 'g' ? GO : DECOY[+st.d[fi]];
+        const tf = localStart + (st.pre + fi * st.iv) / sp(), k = Math.min(1, (now - tf) * sp() / 80);
+        const g = ctx.createRadialGradient(cx, cy, R0 * 0.2, cx, cy, R0 * 1.8);
+        g.addColorStop(0, alpha(col, 0.45)); g.addColorStop(1, alpha(col, 0));
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R0 * 1.8, 0, 7); ctx.fill();
+        ctx.fillStyle = col; ctx.beginPath(); ctx.arc(cx, cy, R0 * (0.75 + 0.25 * k), 0, 7); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.beginPath(); ctx.arc(cx - R0 * 0.3, cy - R0 * 0.3, R0 * 0.25, 0, 7); ctx.fill();
+        if (hit) txt('지금!', cx, Math.min(cy + R0 + 34, by + bh - 14), Math.min(34, w * 0.1), GO, FD);
+      } else if (m >= 7) {
+        drawNew(m, w, by, bh, now, el, fi, hit, seat);
+      } else if (m === 3) {
+        if (fi < 0) { readyText(w, cy, now, Math.min(30, w * 0.09)); return; }
+        const f = twinAt(st.d, fi);
+        const side = w >= bh * 0.95;
+        const s = side ? Math.min((w - 36) / 2, bh * 0.82) : Math.min(w * 0.6, (bh - 18) / 2);
+        const tf = localStart + (st.pre + fi * st.iv) / sp();
+        const k = Math.min(1, (now - tf) * sp() / 100);
+        ctx.globalAlpha = k;
+        if (side) { drawTwinCard(f.a, cx - s - 6, cy - s / 2, s); drawTwinCard(f.b, cx + 6, cy - s / 2, s); }
+        else { drawTwinCard(f.a, cx - s / 2, cy - s - 6, s); drawTwinCard(f.b, cx - s / 2, cy + 6, s); }
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    /* ---------- the nine newer challenges ---------- */
+    function tile(x, y, s, fill, line) {
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(x + 2, y + 4, s, s, s * 0.14); ctx.fill();
+      ctx.fillStyle = fill; rr(x, y, s, s, s * 0.14); ctx.fill();
+      if (line) { ctx.strokeStyle = line; ctx.lineWidth = 2; rr(x + 2, y + 2, s - 4, s - 4, s * 0.12); ctx.stroke(); }
+    }
+    function drawNew(m, w, by, bh, now, el, fi, hit, seat) {
+      const cx = w / 2, cy = by + bh / 2, ready = () => readyText(w, cy, now, Math.min(30, w * 0.09));
+      const tf = (i) => localStart + (st.pre + i * st.iv) / sp();
+      if (m === 7) { // speaker: identical pulse for every tone (listen!), labels only when sound is off
+        const R0 = Math.min(w * 0.2, bh * 0.2), age = fi >= 0 ? (now - tf(fi)) * sp() : 9999, k = Math.max(0, 1 - age / 420);
+        for (let j = 0; j < 3; j++) { const rr2 = R0 * (1.3 + j * 0.45 + (1 - k) * 0.4); ctx.strokeStyle = 'rgba(127,184,255,' + (0.5 * k / (j + 1)).toFixed(3) + ')'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(cx + R0 * 0.3, cy, rr2, -0.8, 0.8); ctx.stroke(); }
+        ctx.fillStyle = '#d8e4f4'; ctx.beginPath(); ctx.moveTo(cx - R0 * 0.9, cy - R0 * 0.35); ctx.lineTo(cx - R0 * 0.4, cy - R0 * 0.35); ctx.lineTo(cx + R0 * 0.25, cy - R0 * 0.9); ctx.lineTo(cx + R0 * 0.25, cy + R0 * 0.9); ctx.lineTo(cx - R0 * 0.4, cy + R0 * 0.35); ctx.lineTo(cx - R0 * 0.9, cy + R0 * 0.35); ctx.closePath(); ctx.fill();
+        if (fi < 0) { txt('귀를 기울여요…', cx, cy + R0 * 1.6, Math.min(22, w * 0.07), '#ab9fb8', FB); return; }
+        if (!soundOn()) { const hi = st.d[fi] === 'h'; txt(hi ? '♪ 높은 음' : '♪ 낮은 음', cx, cy + R0 * 1.6, Math.min(24, w * 0.08), hi ? '#ffd34d' : '#8a8fa8', FD); txt('소리가 꺼져 있어 글자로 보여요', cx, by + bh - 10, 11, '#ab9fb8', FB); }
+        return;
+      }
+      if (m === 16 || m === 17 || m === 21 || m === 22) { drawNew2(m, w, by, bh, now, el, fi, hit, seat); return; }
+      if (m === 13) { // metronome: 4 lit beats, then the silent 5th
+        const b = fi < 0 ? -1 : Math.min(st.k - 1, Math.floor((el - st.pre) / st.iv)), s = Math.min(w / 7, 46);
+        for (let i = 0; i < 5; i++) {
+          const x = cx + (i - 2) * s * 1.3, on = i <= b, last = i === 4;
+          ctx.fillStyle = last ? 'rgba(242,198,106,.12)' : on ? '#f2c66a' : 'rgba(242,233,216,.12)';
+          ctx.beginPath(); ctx.arc(x, cy, s * 0.42, 0, 7); ctx.fill();
+          if (last) { ctx.strokeStyle = 'rgba(242,198,106,.7)'; ctx.setLineDash([4, 4]); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, cy, s * 0.42, 0, 7); ctx.stroke(); ctx.setLineDash([]); txt('5', x, cy + 1, s * 0.4, '#f2c66a', FD); }
+        }
+        if (b >= 0) { const ph = ((el - st.pre) % st.iv) / st.iv, a = Math.sin(ph * Math.PI) * (b % 2 ? 1 : -1) * 0.5; ctx.strokeStyle = '#d9cbb0'; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(cx, cy - s * 2.4); ctx.lineTo(cx + Math.sin(a) * s * 1.4, cy - s * 2.4 + Math.cos(a) * s * 1.4); ctx.stroke(); ctx.lineCap = 'butt'; }
+        txt(b < 0 ? '박자를 세요…' : b < 3 ? (b + 1) + '…' : '다섯 번째 박자에 탭!', cx, cy + s * 1.4, Math.min(22, w * 0.07), '#f2e9d8', FD);
+        return;
+      }
+      if (m === 23) { // quadrant guides + a spinning ring in the centre to keep the eyes busy
+        ctx.strokeStyle = 'rgba(242,233,216,.1)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, by + 6); ctx.lineTo(cx, by + bh - 6); ctx.moveTo(6, cy); ctx.lineTo(w - 6, cy); ctx.stroke(); ctx.setLineDash([]);
+        const R1 = Math.min(w, bh) * 0.12, a = el / 300;
+        ctx.strokeStyle = '#ff9aa8'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(cx, cy, R1, a, a + 4.2); ctx.stroke();
+        if (fi < 0) { txt('가운데를 보세요', cx, cy + R1 + 22, Math.min(16, w * 0.05), '#ab9fb8', FB); return; }
+      }
+      if (fi < 0) { ready(); return; }
+      const k = Math.min(1, (now - (shownAt || now)) / 110);
+      ctx.globalAlpha = k;
+      if (m === 8) {
+        const P = movePos(st, Math.max(0, (now - (shownAt || now)) * sp() / 1000)), R0 = tgtR(w, bh), x = 12 + P.x * (w - 24), y = by + 8 + P.y * (bh - 16);
+        ctx.fillStyle = 'rgba(255,122,92,.15)'; ctx.beginPath(); ctx.arc(x, y, R0 * 1.5, 0, 7); ctx.fill();
+        [1, 0.68, 0.36].forEach((f, j) => { ctx.fillStyle = j % 2 ? '#f2e9d8' : '#ff7a5c'; ctx.beginPath(); ctx.arc(x, y, R0 * f, 0, 7); ctx.fill(); });
+        ctx.strokeStyle = 'rgba(242,233,216,.5)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x - R0 * 1.4, y); ctx.lineTo(x + R0 * 1.4, y); ctx.moveTo(x, y - R0 * 1.4); ctx.lineTo(x, y + R0 * 1.4); ctx.stroke();
+      } else if (m === 9) {
+        const G = gridL(9, w, by, bh), O = genOrder(st), done = prog[seat] | 0;
+        for (let i = 0; i < 9; i++) {
+          const x = G.ox + (i % 3) * G.cs + 3, y = G.oy + Math.floor(i / 3) * G.cs + 3, s = G.cs - 6, ok = O[i] <= done;
+          tile(x, y, s, ok ? 'rgba(227,174,69,.25)' : '#2a2238', ok ? 'rgba(227,174,69,.7)' : 'rgba(242,233,216,.18)');
+          txt(String(O[i]), x + s / 2, y + s / 2 + 2, s * 0.5, ok ? 'rgba(242,233,216,.35)' : '#f2e9d8', '700 ' + FM);
+        }
+      } else if (m === 10) {
+        const G = gridL(10, w, by, bh), S = genShape(st);
+        tile(cx - G.ts / 2, by + 4, G.ts, '#2a2238', 'rgba(199,155,255,.8)');
+        drawSym(S.ts, cx, by + 4 + G.ts / 2, G.ts * 0.3, COL4[S.tc]);
+        for (let i = 0; i < 9; i++) { const x = G.ox + (i % 3) * G.cs + 3, y = G.oy + Math.floor(i / 3) * G.cs + 3, s = G.cs - 6; tile(x, y, s, '#211a2c', 'rgba(242,233,216,.12)'); drawSym(S.cells[i][0], x + s / 2, y + s / 2, s * 0.3, COL4[S.cells[i][1]]); }
+      } else if (m === 11) {
+        const G = gridL(11, w, by, bh), O = genOdd(st, G.n);
+        for (let i = 0; i < G.n * G.n; i++) { const x = G.ox + (i % G.n) * G.cs + 2, y = G.oy + Math.floor(i / G.n) * G.cs + 2, s = G.cs - 4; ctx.fillStyle = 'hsl(' + O.hue + ',55%,' + (50 + (i === O.odd ? O.dl : 0)) + '%)'; rr(x, y, s, s, s * 0.14); ctx.fill(); }
+      } else if (m === 12) {
+        const dir = st.d[0], same = st.d[1] === 's', s = Math.min(w * 0.3, bh * 0.3), a = { R: 0, D: Math.PI / 2, L: Math.PI, U: -Math.PI / 2 }[dir];
+        ctx.save(); ctx.translate(cx, cy); ctx.rotate(a); drawArrow(0, 0, s, 'R', same ? '#5aa8ff' : '#ff9a3d'); ctx.restore();
+        txt(same ? '그 방향으로' : '반대로!', cx, Math.min(cy + s + 30, by + bh - 12), Math.min(20, w * 0.065), same ? '#5aa8ff' : '#ff9a3d', FD);
+      } else if (m === 14) {
+        const G = gridL(14, w, by, bh), I = genInk(st);
+        const fs = fitSize(INKN[I.w], w - 40, Math.min(bh * 0.24, 84), FD);
+        txt(INKN[I.w], cx, by + bh * 0.22, fs, INK[I.c], FD);
+        for (let i = 0; i < 4; i++) { const x = G.ox + (i % 2) * (G.bw + 12), y = G.oy + Math.floor(i / 2) * (G.bhh + 12); ctx.fillStyle = '#ece3d0'; rr(x, y, G.bw, G.bhh, 12); ctx.fill(); txt(INKN[I.names[i]], x + G.bw / 2, y + G.bhh / 2 + 1, fitSize(INKN[I.names[i]], G.bw - 16, Math.min(26, G.bhh * 0.45), FD), '#2a2238', FD); }
+      } else if (m === 18) {
+        const G = gridL(18, w, by, bh), done = prog[seat] | 0;
+        for (let i = 0; i < 9; i++) {
+          const x = G.ox + (i % 3) * G.cs + 3, y = G.oy + Math.floor(i / 3) * G.cs + 3, s = G.cs - 6, j = st.d.indexOf(String(i));
+          if (j < 0) tile(x, y, s, '#211a2c', 'rgba(242,233,216,.12)');
+          else if (done & (1 << j)) tile(x, y, s, 'rgba(232,140,255,.2)', 'rgba(232,140,255,.4)');
+          else { tile(x, y, s, '#e88cff', '#fff'); txt('●', x + s / 2, y + s / 2 + 1, s * 0.3, '#2a2238', FB); }
+        }
+      } else if (m === 19) {
+        const M = genMore(st), r = prng(hash(st.g, st.q, 19, 7));
+        ctx.strokeStyle = 'rgba(242,233,216,.12)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, by + 6); ctx.lineTo(cx, by + bh - 6); ctx.stroke(); ctx.setLineDash([]);
+        [M.a, M.b].forEach((c, side) => {
+          const hw = w / 2, cols = 4, rows = 6, cw = (hw - 16) / cols, ch = (bh - 16) / rows, dr = Math.max(4, Math.min(cw, ch) * 0.26);
+          const cells = shuf(Array.from({ length: cols * rows }, (_, i) => i), r);
+          for (let i = 0; i < c; i++) { const q = cells[i], x = side * hw + 8 + (q % cols + 0.5) * cw + (r() - 0.5) * cw * 0.3, y = by + 8 + (Math.floor(q / cols) + 0.5) * ch + (r() - 0.5) * ch * 0.3; ctx.fillStyle = '#c6e36a'; ctx.beginPath(); ctx.arc(x, y, dr, 0, 7); ctx.fill(); }
+        });
+      } else if (m === 20) {
+        const C = genCalc(st);
+        ctx.strokeStyle = 'rgba(242,233,216,.12)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, by + bh * 0.34); ctx.lineTo(cx, by + bh - 6); ctx.stroke(); ctx.setLineDash([]);
+        txt(C.q + ' = ?', cx, by + bh * 0.18, fitSize(C.q + ' = ?', w - 30, Math.min(bh * 0.16, 56), '700 ' + FM), '#8fb0ff', '700 ' + FM);
+        const fs = Math.min(w * 0.18, bh * 0.26);
+        txt(String(C.l), w * 0.25, by + bh * 0.64, fs, '#f2e9d8', '700 ' + FM); txt(String(C.rt), w * 0.75, by + bh * 0.64, fs, '#f2e9d8', '700 ' + FM);
+      } else if (m === 23) {
+        const q = +st.d[0], x = q % 2 ? w * 0.84 : w * 0.16, y = q >= 2 ? by + bh * 0.84 : by + bh * 0.16, R0 = Math.max(14, Math.min(w, bh) * 0.06);
+        const g = ctx.createRadialGradient(x, y, 2, x, y, R0 * 3); g.addColorStop(0, 'rgba(255,154,168,.7)'); g.addColorStop(1, 'rgba(255,154,168,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, R0 * 3, 0, 7); ctx.fill();
+        ctx.fillStyle = '#ff9aa8'; ctx.beginPath(); ctx.arc(x, y, R0, 0, 7); ctx.fill();
+      } else if (m === 15) {
+        const B = genBig(st);
+        ctx.strokeStyle = 'rgba(242,233,216,.12)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx, by + 6); ctx.lineTo(cx, by + bh - 6); ctx.stroke(); ctx.setLineDash([]);
+        const fs = Math.min(w * 0.2, bh * 0.3);
+        txt(String(B.a), w * 0.25, cy, fs, '#f2e9d8', '700 ' + FM); txt(String(B.b), w * 0.75, cy, fs, '#f2e9d8', '700 ' + FM);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    /* stream / timing newcomers (drawn from the device clock; the target frame has no fade-in) */
+    function drawNew2(m, w, by, bh, now, el, fi, hit, seat) {
+      const cx = w / 2, cy = by + bh / 2;
+      if (m === 16) {
+        const x0 = 24, x1 = w - 24, lx = x0 + (x1 - x0) * 0.75, p = el < st.pre ? 0 : Math.min(1 / 0.75, (el - st.pre) / st.iv), nx = x0 + (x1 - x0) * 0.75 * p;
+        ctx.fillStyle = 'rgba(242,233,216,.1)'; rr(x0, cy - 10, x1 - x0, 20, 10); ctx.fill();
+        ctx.fillStyle = 'rgba(255,179,92,.35)'; rr(x0, cy - 10, Math.max(0, nx - x0), 20, 10); ctx.fill();
+        ctx.strokeStyle = '#3dff8a'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(lx, cy - 34); ctx.lineTo(lx, cy + 34); ctx.stroke();
+        ctx.fillStyle = '#ffb35c'; ctx.beginPath(); ctx.moveTo(nx, cy - 18); ctx.lineTo(nx - 9, cy - 36); ctx.lineTo(nx + 9, cy - 36); ctx.closePath(); ctx.fill(); ctx.fillRect(nx - 2, cy - 20, 4, 40);
+        txt(el < st.pre ? '준비…' : '선에서 딱!', cx, Math.min(cy + 70, by + bh - 14), Math.min(24, w * 0.075), '#f2e9d8', FD);
+        return;
+      }
+      if (m === 21) {
+        const T = +st.d[0], R0 = Math.min(w * 0.2, bh * 0.22);
+        txt('목표: ' + T + '번째 깜빡임', cx, by + 18, Math.min(22, w * 0.07), '#ffe066', FD);
+        const on = fi >= 0 && (fi === st.k || (el - st.pre - fi * st.iv) < 240);
+        if (on) { const g = ctx.createRadialGradient(cx, cy, R0 * 0.2, cx, cy, R0 * 1.9); g.addColorStop(0, 'rgba(255,224,102,.55)'); g.addColorStop(1, 'rgba(255,224,102,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, R0 * 1.9, 0, 7); ctx.fill(); }
+        ctx.fillStyle = on ? '#ffe066' : '#3a3320'; ctx.beginPath(); ctx.arc(cx, cy, R0, 0, 7); ctx.fill();
+        if (fi < 0) readyText(w, Math.min(cy + R0 + 30, by + bh - 14), now, Math.min(26, w * 0.08));
+        return;
+      }
+      const G = gridL(m, w, by, bh);
+      for (let i = 0; i < 9; i++) {
+        const x = G.ox + (i % 3) * G.cs + 3, y = G.oy + Math.floor(i / 3) * G.cs + 3, s = G.cs - 6;
+        if (m === 17) {
+          const flash = fi === 0 && i === +st.d[0] && el - st.pre < 450;
+          tile(x, y, s, flash ? '#7ee0e0' : hit ? '#24414a' : '#211a2c', hit ? 'rgba(126,224,224,.8)' : 'rgba(242,233,216,.12)');
+        } else {
+          tile(x, y, s, '#1c1610', 'rgba(242,233,216,.08)');
+          ctx.fillStyle = '#0a0806'; ctx.beginPath(); ctx.ellipse(x + s / 2, y + s * 0.7, s * 0.36, s * 0.13, 0, 0, 7); ctx.fill();
+          if (fi >= 0 && +st.d[fi] === i) {
+            const gold = fi === st.k, r = s * 0.27;
+            ctx.fillStyle = gold ? '#f0c040' : '#8a5a34'; ctx.beginPath(); ctx.arc(x + s / 2, y + s * 0.55, r, Math.PI, 0); ctx.lineTo(x + s / 2 + r, y + s * 0.7); ctx.lineTo(x + s / 2 - r, y + s * 0.7); ctx.closePath(); ctx.fill();
+            if (gold) { ctx.strokeStyle = '#fff3b0'; ctx.lineWidth = 2; ctx.stroke(); }
+            ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(x + s / 2 - r * 0.35, y + s * 0.5, r * 0.1, 0, 7); ctx.arc(x + s / 2 + r * 0.35, y + s * 0.5, r * 0.1, 0, 7); ctx.fill();
+          }
+        }
+      }
+      if (fi < 0) readyText(w, cy, now, Math.min(30, w * 0.09));
+      else if (m === 17 && hit) txt('지금!', cx, cy, Math.min(30, w * 0.09), '#7ee0e0', FD);
+      else if (m === 17 && el - st.pre >= 450) txt('기억하세요…', cx, cy, Math.min(26, w * 0.08), '#f2e9d8', FD);
+    }
+
+    function revealRows() {
+      const ord = Array.from({ length: st.n }, (_, i) => i);
+      const rank = (i) => { const v = st.tp[i]; return v == null ? 1e5 : v < 0 ? 2e5 - v : v; };
+      ord.sort((a, b) => rank(a) - rank(b) || a - b);
+      return ord;
+    }
+    function drawReveal(w, by, bh, seat, now) {
+      const ord = revealRows();
+      const t = (now - revealAt) * sp();
+      const step = 150, n = ord.length;
+      const title = st.w.length ? (st.w.length > 1 ? '공동 1등!' : api.players[st.w[0]].name + ' 승!') : '이번 라운드 승자 없음';
+      const allIn = t > n * step + 100;
+      const tsize = fitSize(title, w - 30, Math.min(30, w * 0.09), FD);
+      ctx.globalAlpha = Math.min(1, t / 150);
+      txt(title, w / 2, by + tsize * 0.75, tsize, st.w.length ? '#e3ae45' : '#ab9fb8', FD);
+      ctx.globalAlpha = 1;
+      const top = by + tsize * 1.6;
+      const rh = Math.min(40, (bh - (top - by) - 6) / n);
+      if (rh < 21 && seat >= 0) { // small zone: just my own result, big
+        const v = st.tp[seat], cy = top + (by + bh - top) * 0.42, k = Math.min(1, t / 200);
+        const lab = v == null ? '미응답' : v < 0 ? badLabel(v, st.m) : (TIM[st.m] ? '±' : '') + v + 'ms';
+        const sz = fitSize(lab, w * 0.8, Math.min(w * 0.14, (by + bh - top) * 0.36), '700 ' + FM);
+        ctx.globalAlpha = k;
+        txt(lab, w / 2, cy, sz, v != null && v < 0 ? '#ff8a7a' : '#f2e9d8', '700 ' + (v != null && v >= 0 ? FM : FB));
+        const rank = v != null && v >= 0 ? ord.indexOf(seat) + 1 : 0;
+        const sub = (st.w.includes(seat) ? gainLab(seat) : v != null && v < 0 && v !== -9 && st.pen ? '−1점' : '') + (rank ? (st.w.includes(seat) ? ' · ' : '') + rank + '위' : '');
+        if (sub) txt(sub, w / 2, cy + sz * 0.85, Math.min(15, sz * 0.5), st.w.includes(seat) ? '#e3ae45' : '#ab9fb8', '700 ' + FB);
+        ctx.globalAlpha = 1;
+        return;
+      }
+      const maxMs = Math.max(500, ...st.tp.filter((v) => v != null && v >= 0));
+      const fs = Math.max(10, Math.min(16, rh * 0.48, w / 21));
+      ord.forEach((i, r) => {
+        const appear = (n - 1 - r) * step;
+        if (t < appear) return;
+        const k = Math.min(1, (t - appear) / 140);
+        const y = top + r * rh, x = 10 + (1 - k) * 40;
+        const v = st.tp[i], win = st.w.includes(i), p = api.players[i];
+        ctx.globalAlpha = k;
+        ctx.fillStyle = win ? 'rgba(227,174,69,.22)' : i === seat ? 'rgba(242,233,216,.1)' : 'rgba(255,255,255,.04)';
+        rr(x, y + 2, w - 20, rh - 4, 8); ctx.fill();
+        if (win && allIn) { ctx.strokeStyle = 'rgba(227,174,69,' + (0.5 + 0.5 * Math.sin(now / 120)) + ')'; ctx.lineWidth = 2; rr(x, y + 2, w - 20, rh - 4, 8); ctx.stroke(); }
+        const mid = y + rh / 2, W2 = w - 20, xr = x + W2 - 8;
+        txt(v != null && v >= 0 ? String(r + 1) : '–', x + 12, mid, fs * 0.9, '#ab9fb8', '600 ' + FM);
+        ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(x + 26, mid, Math.min(5, fs * 0.35), 0, 7); ctx.fill();
+        const lab = v == null ? '미응답' : v < 0 ? badLabel(v, st.m) : (TIM[st.m] ? '±' : '') + v + 'ms';
+        const lc = v == null ? '#ab9fb8' : v < 0 ? '#ff8a7a' : '#f2e9d8';
+        const valR = xr - fs * 2, valW = fs * 3.9;
+        const avail = valR - valW - (x + 34) - 6;
+        const nameW = avail > 170 ? avail * 0.42 : avail;
+        txt(p.name, x + 34, mid, fitSize(p.name, nameW, fs, '700 ' + FB), '#f2e9d8', '700 ' + FB, 'left');
+        const bx = x + 34 + nameW + 8, bw = avail - nameW - 8;
+        if (avail > 170 && v != null && v >= 0) {
+          ctx.fillStyle = alpha(p.color, 0.8); rr(bx, mid - 4, Math.max(4, bw * Math.min(1, v / maxMs) * k), 8, 4); ctx.fill();
+        }
+        if (v != null && v >= 0) txt(lab, valR, mid, fitSize(lab, valW, fs, '600 ' + FM), lc, '600 ' + FM, 'right');
+        else txt(lab, valR, mid, fitSize(lab, valW, fs * 0.9, FB), lc, FB, 'right');
+        const dl = win ? gainLab(i).replace('점', '') : v != null && v < 0 && st.pen ? '−' + st.pen : st.cx && st.cx.includes(i) ? '콤보 끊김' : '';
+        if (dl) {
+          const pop = win && allIn ? 1 + 0.25 * Math.max(0, 1 - (t - n * step - 100) / 250) : 1;
+          txt(dl, xr, mid, fitSize(dl, fs * 5.2, fs * pop, '700 ' + FM), win ? (st.cb && st.cb[i] >= 2 ? '#ff9f43' : '#e3ae45') : '#ff8a7a', '700 ' + FM, 'right');
+        } else txt(fmtPt(st.sc[i]), xr, mid, fs * 0.85, '#ab9fb8', FM, 'right');
+        ctx.globalAlpha = 1;
+      });
+      if (allIn && st.w.length) { // sparks around the title
+        const tt = (t - n * step - 100) / 700;
+        if (tt < 1) for (let j = 0; j < 14; j++) {
+          const a = j / 14 * Math.PI * 2, d = 20 + tt * Math.min(w * 0.45, 140);
+          ctx.fillStyle = alpha(api.players[st.w[0]].color, 1 - tt);
+          ctx.beginPath(); ctx.arc(w / 2 + Math.cos(a) * d, by + tsize * 0.75 + Math.sin(a) * d * 0.5, 3.5 * (1 - tt) + 1, 0, 7); ctx.fill();
+        }
+      }
+    }
+    function gainLab(i) {
+      const g = st.gn ? st.gn[i] : 1, c = st.cb ? st.cb[i] : 0;
+      return '+' + fmtPt(g || 1) + '점' + (c >= 2 && !st.sd ? ' 🔥' + c + '연승 ×' + fmtPt(comboMul(c)) : '');
+    }
+    function drawFinal(w, by, bh, seat) {
+      const ord = Array.from({ length: st.n }, (_, i) => i).sort((a, b) => st.sc[b] - st.sc[a] || a - b);
+      txt('최종 점수', w / 2, by + 22, Math.min(28, w * 0.09), '#e3ae45', FD);
+      const top = by + 50, rh = Math.min(40, (bh - 56) / st.n), fs = Math.max(11, Math.min(17, rh * 0.45));
+      const best = st.sc[ord[0]];
+      ord.forEach((i, r) => {
+        const y = top + r * rh, p = api.players[i];
+        ctx.fillStyle = st.sc[i] === best ? 'rgba(227,174,69,.2)' : i === seat ? 'rgba(242,233,216,.1)' : 'rgba(255,255,255,.04)';
+        rr(10, y + 2, w - 20, rh - 4, 8); ctx.fill();
+        ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(28, y + rh / 2, 6, 0, 7); ctx.fill();
+        txt(p.name, 42, y + rh / 2, fitSize(p.name, w * 0.4, fs, '700 ' + FB), '#f2e9d8', '700 ' + FB, 'left');
+        if (st.bt[i] >= 0) txt('최고 ' + st.bt[i] + 'ms', w - 70, y + rh / 2, fs * 0.75, '#ab9fb8', FM, 'right');
+        txt(fmtPt(st.sc[i]), w - 26, y + rh / 2, fs * 1.1, st.sc[i] === best ? '#e3ae45' : '#f2e9d8', '700 ' + FM, 'right');
+      });
+    }
+
+    /* ---------- loop: events + paint ---------- */
+    const stopLoop = U.loop((dt, now) => {
+      if (!st) return;
+      if (st.ph === 'p') {
+        const el = (now - localStart) * sp();
+        if (introStep === 0) { introStep = 1; api.sfx('whoosh'); }
+        if (introStep === 1 && el >= INTRO) { introStep = 2; api.sfx('tick'); }
+        const fi = el >= INTRO ? frameAt(st, el) : -1;
+        if (fi !== lastFrame) {
+          const m = st.m;
+          if (m === 7 && fi >= 0) { if (st.d[fi] === 'h') highBeep(); else lowBeep(); }
+          if (m === 13 && fi >= 0 && fi < st.k) click();
+          if (m === 21 && fi >= 0) click();
+          if (fi === st.k && shownAt == null) {
+            shownAt = now;
+            if (m === 0 || m === 6) { goBeep(); } else if (m === 4 || m === 8 || m === 12 || m === 22) api.sfx('pop'); else if (m !== 7 && m !== 13 && m !== 16 && m !== 21) api.sfx('card');
+          } else if (fi >= 0 && m !== 7 && m !== 13 && m !== 16 && m !== 21) api.sfx(m === 6 ? 'tick' : 'card');
+          lastFrame = fi;
+        }
+      } else if (st.ph === 'r') {
+        const t = (now - revealAt) * sp();
+        const n = st.n;
+        while (rowsPlayed < n && t >= rowsPlayed * 150) { rowsPlayed++; api.sfx('tick'); }
+        if (!winPlayed && t > n * 150 + 100) {
+          winPlayed = true;
+          const mine = st.w.some((i) => api.canAct(i));
+          if (st.w.length) { api.sfx(mine || !locals().length ? 'win' : 'chip'); if (mine) api.buzz(40); }
+          const hot = st.w.find((i) => st.cb && st.cb[i] >= 2 && !st.sd);
+          if (hot != null) api.toast('🔥 ' + api.players[hot].name + ' ' + st.cb[hot] + '연승! ×' + fmtPt(comboMul(st.cb[hot])));
+          else if (st.cx && st.cx.length) { api.sfx('thud'); api.toast('💨 ' + st.cx.map((i) => api.players[i].name).join(', ') + ' 콤보 끊김'); }
+        }
+      }
+      draw(now);
+    });
+
+    function draw(now) {
+      cv.clear();
+      ctx.fillStyle = '#120e18'; ctx.fillRect(0, 0, cv.w, cv.h);
+      if (!st) return;
+      zones.forEach((z) => {
+        const d = zoneDims(z);
+        ctx.save();
+        rr(z.x, z.y, z.w, z.h, isMulti() ? 12 : 0); ctx.clip();
+        ctx.translate(z.x + z.w / 2, z.y + z.h / 2); ctx.rotate(z.rot); ctx.translate(-d.w / 2, -d.h / 2);
+        drawZone(z, d.w, d.h, now);
+        // tap ripple
+        const rt = z.seat >= 0 && ring[z.seat] ? (now - ring[z.seat]) / 350 : 9;
+        if (rt < 1 && z.seat >= 0) { ctx.strokeStyle = alpha(api.players[z.seat].color, 1 - rt); ctx.lineWidth = 6 * (1 - rt) + 1; rr(3, 3, d.w - 6, d.h - 6, 12); ctx.stroke(); }
+        ctx.restore();
+      });
+    }
+
+    layout();
+    return {
+      update(next) {
+        st = next;
+        const k = next.g + ':' + next.q + ':' + next.ph;
+        if (k !== key) {
+          key = k;
+          if (next.ph === 'p') { localStart = performance.now(); shownAt = null; lastFrame = -2; myTap = {}; introStep = 0; prog = {}; swipes = {}; }
+          if (next.ph === 'r') {
+            revealAt = performance.now(); rowsPlayed = 0; winPlayed = false;
+            if (!api.online) locals().forEach((i) => { // per-challenge best (human seats on this device)
+              const v = next.tp[i];
+              if (api.players[i].ai || v == null || v < 0) return;
+              if (api.best('m' + next.m.toString(36), v, { label: MODES[next.m] + (TIM[next.m] ? ' · 가장 작은 오차' : next.m === 9 ? ' · 가장 빠른 완료' : ' · 가장 빠른 반응'), lower: true, unit: 'ms' })) api.toast('🏆 ' + MODES[next.m] + ' 새 기록! ' + v + 'ms');
+            });
+          }
+          if (next.ph === 'e' && next.cn && !api.online) locals().forEach((i) => {
+            if (api.players[i].ai || next.bt[i] < 0) return;
+            if (api.best('ms', next.bt[i], { label: '가장 빠른 반응', lower: true, unit: 'ms' })) api.toast('🏆 새 최고 기록! ' + next.bt[i] + 'ms');
+            if (next.cn[i] >= 3) api.best('avg', Math.round(next.sm[i] / next.cn[i]), { label: '한 판 평균 반응(3회 이상)', lower: true, unit: 'ms' });
+          });
+          setDriver();
+        }
+        layout();
+        renderHud();
+      },
+      destroy() { stopLoop(); clearTimeout(drv); cv.cv.removeEventListener('pointerdown', onDown); cv.cv.removeEventListener('pointermove', onMove); cv.cv.removeEventListener('pointerup', onUp); cv.cv.removeEventListener('pointercancel', onUp); cv.cv.removeEventListener('contextmenu', noCtx); cv.destroy(); hud.remove(); if (actx) { try { actx.close(); } catch (e) {} } },
+    };
+  }
+
+  L.register({
+    id: 'reaction', name: '순발력 대결', tag: '반응속도', cat: '파티',
+    undo: false, // timing game: core 「↶ 무르기」 would let you take back a false start
+    blurb: '스물네 가지 반응속도 미니게임을 번갈아 해요. 신호가 오면 누구보다 빨리 탭! 너무 빨리 누르면 실격.',
+    quick: [
+      '라운드마다 반응속도 미니게임이 하나 나와요. 정답 순간에 가장 먼저 탭하면 +1점!',
+      '제목 카드의 한 줄 설명을 읽고 → 「준비…」가 뜨면 집중 → 정답 순간에 내 구역을 탭.',
+      '너무 빨리 누르거나 잘못 누르면 그 라운드 탈락(−1점). 라운드가 끝났을 때 점수 1등이 승리!',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '스물네 가지 반응속도 미니게임을 번갈아 해요.',
+        '라운드마다 가장 빨리 정확하게 탭한 사람이 1점(연승하면 콤보 배수). 점수를 가장 많이 모으면 이겨요.'] },
+      { h: '준비', p: [
+        '설정에서 라운드 수(5 · 7 · 10, 기본 7), 게임 종류(24종 중 원하는 것만 여러 개, 기본 전부), 실수 벌점(−1점 · 없음)을 골라요.',
+        '한 폰을 가운데 두면 사람 수만큼 화면이 나뉘어요. 각자 자기 색 구역을 탭해요(동시에 눌러도 돼요).',
+        '온라인이면 각자 자기 폰에서 탭해요.'] },
+      { h: '라운드마다 할 일', p: [
+        '① 제목 카드에 이번 미니게임 이름과 한 줄 설명이 나와요. 꼭 읽으세요!',
+        '② 「준비…」가 뜨면 집중해요. 화면이 바뀌어도 정답 순간이 아니면 참아요.',
+        '③ 정답 순간이 오면 바로 탭!',
+        '④ 모두 누르면(또는 잠시 뒤) 모두의 반응 시간(ms, 1000ms = 1초)이 공개돼요.'] },
+      { h: '점수·승리', p: [
+        '라운드에서 가장 빠른 사람 +1점(완전히 같은 기록이면 함께 +1).',
+        '정답 순간보다 먼저 누르거나 잘못 누르면 그 라운드는 탈락이에요. 실수 벌점이 「−1점」(기본)이면 1점을 잃어요.',
+        '아무도 누르지 않으면 잠시 뒤 라운드가 자동으로 끝나요.',
+        '정해진 라운드가 끝나면 점수가 가장 높은 사람이 승리해요.',
+        '연속 콤보: 라운드를 연달아 1등 하면 점수가 커져요. 2연승 ×1.5(1.5점), 3연승 ×2, 4연승 ×2.5, 5연승부터 ×3(최대). 함께 1등이어도 이어져요.',
+        '1등을 못 하거나 탈락하면 콤보가 끊겨 다시 1점부터. 서든데스 라운드는 콤보 배수 없이 1점이에요(관전하는 사람 콤보는 그대로).',
+        '1위가 동점이면 「서든데스!」 — 동점자끼리만 한 문제씩 더 해서 승부가 날 때까지 겨뤄요(나머지는 관전). 12번 해도 안 나면 공동 승리.'] },
+      { h: '미니게임 24가지', p: [
+        '신호등: 빨간불이 초록불로 바뀌는 순간 탭. 빨간불에 누르면 부정 출발.',
+        '과일 종: 네 자리에 카드가 차례로 한 장씩 펼쳐지고, 다 차면 가장 오래된 카드 위에 새 카드가 덮여요. 보이는 카드에서 같은 과일이 모두 합쳐 정확히 5개가 되면 탭(종 울리기). 4개나 6개일 때 누르면 잘못 누름.',
+        '색과 글자: 색 이름(빨강 · 파랑 …)이 여러 색 글씨로 바뀌어요. 글자 뜻과 글자색이 같을 때만 탭. 예: 빨간 글씨 「빨강」 = 탭! 파란 글씨 「빨강」 = 참기.',
+        '쌍둥이 그림: 두 카드의 그림 네 개가 위치까지 완전히 같아지면 탭.',
+        '화살표: 화살표가 나오면 가리키는 쪽 절반(왼쪽/오른쪽)을 탭. 화살표가 놓인 위치에 속지 마세요. 반대쪽을 누르면 탈락.',
+        '점 세기: 위에 목표 개수(예: 7개)가 나오고, 판 위의 점 개수가 계속 바뀌어요. 점이 목표와 딱 같을 때만 탭.',
+        '속임수 신호: 빨강·노랑·파랑 같은 원이 빠르게 바뀌어요. 초록 원이 뜬 순간에만 탭. 다른 색에 누르면 잘못 누름.',
+        '소리 반응: 스피커에서 낮은 소리가 몇 번 나다가 높은 「삐—」 소리가 나요. 높은 소리에만 탭! (소리를 꺼 두었으면 화면에 「낮은 음/높은 음」 글자로 보여요.)',
+        '움직이는 표적: 과녁이 나타나 이리저리 움직여요. 과녁을 정확히 탭! 과녁 밖을 누르면 빗나감으로 탈락.',
+        '숫자 순서: 1~9 숫자 칸이 섞여 나와요. 1부터 9까지 순서대로 탭. 9를 누른 순간까지의 시간이 기록이에요. 순서를 건너뛰면 탈락.',
+        '같은 모양 찾기: 위에 모양 하나가 나오고 아래 9칸 중 모양과 색이 모두 같은 칸이 딱 하나 있어요. 그 칸을 탭.',
+        '다른 색 찾기: 같은 색 칸들 사이에 아주 살짝 밝거나 어두운 칸이 하나 있어요. 그 칸을 탭.',
+        '방향 밀기: 파란 화살표면 그 방향으로, 주황 화살표면 반대 방향으로 화면을 쓱 밀어요. 손가락을 댄 순간이 기록이에요.',
+        '박자 맞추기: 「똑, 똑, 똑, 똑」 박자 4번이 지나가면, 다섯 번째 박자가 올 때에 맞춰 탭. 반응 속도가 아니라 「오차」(±ms)가 작을수록 이겨요. 박자 반 이상 일찍 누르면 너무 빠름.',
+        '색 이름 함정: 색 이름이 다른 색 글씨로 나와요. 아래 버튼 4개 중 「글씨 색」의 이름을 탭. 예: 파란 글씨 「빨강」 → 「파랑」 버튼.',
+        '큰 수 고르기: 두 자리 수 두 개가 왼쪽·오른쪽에 나와요. 더 큰 수가 있는 쪽 절반을 탭.',
+        '딱 멈춰: 바늘이 막대를 따라 일정한 속도로 움직여요. 초록 선에 닿는 순간 탭. 박자 맞추기처럼 「오차」(±ms)가 작을수록 이겨요. 팁: 바늘 속도를 눈으로 익히고 선 조금 앞에서 손가락을 준비해요.',
+        '번쩍 기억: 9칸 중 한 칸이 잠깐 번쩍해요. 칸들이 밝아지며 「지금!」이 되면 번쩍였던 칸을 탭. 그 전에 누르면 잘못 누름, 다른 칸은 탈락. 팁: 「가운데 위」처럼 말로 기억해요.',
+        '두 점 동시: 9칸 중 두 칸이 빛나요. 두 칸을 모두 누른 순간이 기록이에요(두 손가락으로 동시에 눌러도, 하나씩 눌러도 돼요). 빛나지 않는 칸을 누르면 탈락.',
+        '점 많은 쪽: 왼쪽·오른쪽에 점이 흩어져 나와요. 점이 더 많은 쪽 절반을 탭. 차이는 1~3개뿐! 팁: 하나하나 세기보다 덩어리로 봐요.',
+        '빠른 계산: 위에 덧셈이나 뺄셈이 나오고, 아래 왼쪽·오른쪽에 답이 하나씩 있어요. 맞는 답 쪽 절반을 탭. 팁: 끝자리만 먼저 맞춰 봐요.',
+        '깜빡임 세기: 위에 목표(예: 3번째)가 나오고 불빛이 깜빡여요(딸깍 소리도 나요). 목표 번째 깜빡임에 탭, 그 전에 누르면 잘못 누름. 마지막 불빛은 켜진 채 남아요.',
+        '황금 두더지: 갈색 두더지가 여기저기 고개를 내밀어요. 참았다가 황금 두더지가 나오면 그 구멍을 탭. 갈색일 때 누르면 잘못 누름, 다른 구멍은 탈락.',
+        '구석 불빛: 가운데 도는 고리를 보고 있다가, 네 구석 중 한 곳에 분홍 불빛이 켜지면 그쪽 4분의 1 칸을 탭. 켜지기 전에 누르면 부정 출발, 다른 칸은 탈락. 팁: 눈은 가운데, 신경은 넓게.'] },
+      { h: '게임 종류 고르기', p: [
+        '설정의 「게임 종류」에서 낼 미니게임을 눌러 켜고 꺼요(최소 1개, 기본은 24종 전부). 「전체」를 누르면 한 번에 다 켜요.',
+        '한 판 안에서는 같은 미니게임이 다시 나오지 않아요. 라운드가 고른 개수보다 많으면(예: 5라운드에 3종) 나머지는 안 고른 게임 중에서 무작위로 채워요.',
+        '24종을 다 써도 라운드가 남으면(동점 결승 포함) 그때부터는 고른 게임이 다시 나와요.'] },
+      { h: '기록', p: ['판이 끝나면 각자의 평균 반응 시간과 실수 횟수가 나와요(박자 맞추기·딱 멈춰 오차와 숫자 순서 완료 시간은 반응 시간 평균에서 빠져요).',
+        '이 기기에서 낸 가장 빠른 반응과 평균, 그리고 미니게임마다 가장 좋은 기록이 「내 최고 기록」에 남아요.'] },
+      { h: '조작', p: [
+        '한 폰: 내 색 구역 아무 데나 탭해요. 화살표 게임만 내 구역의 왼쪽/오른쪽 절반을 골라 탭해요.',
+        '온라인: 화면 아무 데나 탭(화살표는 왼쪽/오른쪽 절반). 반응 시간은 각 폰이 화면에 신호를 띄운 순간부터 재요(인터넷이 느려도 공평해요).',
+        '자리를 고르는 게임(표적·숫자·모양·색 칸·버튼·큰 수·기억·두 점·점 많은 쪽·계산·두더지·구석)은 내 구역 안의 그 자리를 탭하고, 방향 밀기는 내 구역에서 손가락을 대고 밀어요.'] },
+      { h: '예시', p: [
+        '과일 종 라운드: 펼쳐진 카드가 사과 2 · 바나나 3 · 사과 2 → 사과가 4개라서 아직 참아요.',
+        '네 번째 자리에 사과 1이 펼쳐지면 사과가 딱 5개! → 탭. 내가 312ms로 가장 빨라서 +1점.',
+        '그 전에 성급하게 누른 사람은 「잘못 누름」으로 탈락, −1점이에요.'] },
+      { h: 'AI', p: ['AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(반응 속도와 부정 출발·멍때림 확률이 달라요). 미니게임마다 찾는 데 걸리는 시간·실수 확률이 따로 있어요(예: 숫자 순서는 오래 걸리고, 박자는 어려움일수록 오차가 작아요).'] },
+    ],
+    minPlayers: 2, maxPlayers: 6, defaultPlayers: 4, aiDelay: 400,
+    options: [
+      { id: 'rounds', label: '라운드 수', choices: [{ v: 5, label: '5' }, { v: 7, label: '7' }, { v: 10, label: '10' }], def: 7 },
+      { id: 'modes', label: '게임 종류', multi: true, tip: '낼 미니게임을 골라요(여러 개). 한 판에 같은 게임은 다시 안 나와요. 라운드가 더 많으면 안 고른 게임으로 채워요.',
+        choices: MODES.map((n, i) => ({ v: i.toString(36), label: n })) },
+      { id: 'pen', label: '실수 벌점', tip: '너무 일찍 누르는 등 실수했을 때.', def: 1, choices: [{ v: 1, label: '−1점', tip: '실수하면 1점 깎여요.' }, { v: 0, label: '없음(탈락만)', tip: '그 라운드만 탈락, 점수는 그대로.' }] },
+    ],
+    init, actor, apply, result, ai, aiDelayFor, mount,
+    _t: { tgt, dline, revealMs, frameAt, fruitSlots, fruitTotals, fruitHit, stroopAt, twinAt, aiPlan, newRound, planOrder, INTRO, SETS, MODES, genOrder, genShape, genOdd, genInk, genBig, movePos, genMore, genCalc, TIM, LOC, STREAM },
+  });
+})();

@@ -1,0 +1,1011 @@
+/* 오목 — 15×15, 렌주룰(흑 3-3·4-4·장목 금수) / 자유룰, 고스트 돌 확정 배치, 패턴 탐색 AI. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const SPD = () => ((L.debug && L.debug.speed) || 1) * (L.speed ? (L.speed() || 1) : 1);
+  const N = 15, NN = N * N;
+  const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  const COLS = 'ABCDEFGHIJKLMNO';
+  const enc = (p) => String.fromCharCode(97 + (p % N)) + String.fromCharCode(97 + ((p / N) | 0));
+  const dec = (s, i) => (s.charCodeAt(i + 1) - 97) * N + (s.charCodeAt(i) - 97);
+  const inb = (x, y) => x >= 0 && y >= 0 && x < N && y < N;
+  const ptName = (p) => COLS[p % N] + (N - ((p / N) | 0));
+
+  /* ---------- rules ---------- */
+  function boardOf(m) {
+    const b = new Int8Array(NN);
+    for (let i = 0; i < m.length; i += 2) b[dec(m, i)] = ((i / 2) % 2) + 1; // 1 = 흑, 2 = 백
+    return b;
+  }
+  /* consecutive stones of colour c through (x,y) in direction d (the cell itself counts as c) */
+  function run(b, x, y, d, c) {
+    let n = 1;
+    for (let k = 1; ; k++) { const xx = x + d[0] * k, yy = y + d[1] * k; if (!inb(xx, yy) || b[yy * N + xx] !== c) break; n++; }
+    for (let k = 1; ; k++) { const xx = x - d[0] * k, yy = y - d[1] * k; if (!inb(xx, yy) || b[yy * N + xx] !== c) break; n++; }
+    return n;
+  }
+  /* does placing c at p (already on the board) win? exact: black under renju needs exactly five */
+  function winsAt(b, p, c, exact) {
+    const x = p % N, y = (p / N) | 0;
+    for (const d of DIRS) { const r = run(b, x, y, d, c); if (exact ? r === 5 : r >= 5) return true; }
+    return false;
+  }
+  function winLine(b, p, c, exact) {
+    const x = p % N, y = (p / N) | 0;
+    for (const d of DIRS) {
+      const r = run(b, x, y, d, c);
+      if (exact ? r !== 5 : r < 5) continue;
+      let a = 0, z = 0;
+      while (inb(x - d[0] * (a + 1), y - d[1] * (a + 1)) && b[(y - d[1] * (a + 1)) * N + x - d[0] * (a + 1)] === c) a++;
+      while (inb(x + d[0] * (z + 1), y + d[1] * (z + 1)) && b[(y + d[1] * (z + 1)) * N + x + d[0] * (z + 1)] === c) z++;
+      return [(y - d[1] * a) * N + x - d[0] * a, (y + d[1] * z) * N + x + d[0] * z];
+    }
+    return null;
+  }
+  /* Black's completion points in direction d (offsets −5..5 from p, p already black) that would make
+     EXACTLY five together with p. Returns the list of offsets. */
+  function fivePoints(b, x, y, d) {
+    const out = [];
+    for (let k = -5; k <= 5; k++) {
+      if (!k) continue;
+      const xx = x + d[0] * k, yy = y + d[1] * k;
+      if (!inb(xx, yy) || b[yy * N + xx] !== 0) continue;
+      // every cell strictly between p and q must be black, so that the five contains p
+      let ok = true;
+      for (let j = Math.sign(k); j !== k; j += Math.sign(k)) if (b[(y + d[1] * j) * N + x + d[0] * j] !== 1) { ok = false; break; }
+      if (!ok) continue;
+      b[yy * N + xx] = 1;
+      const r = run(b, xx, yy, d, 1);
+      b[yy * N + xx] = 0;
+      if (r === 5) out.push(k);
+    }
+    return out;
+  }
+  /* number of fours through p in direction d: 0, 1 (four or straight four), or 2 (e.g. X.XXX.X) */
+  function fourCount(b, x, y, d) {
+    const f = fivePoints(b, x, y, d);
+    if (f.length === 0) return 0;
+    if (f.length === 1) return 1;
+    return Math.abs(f[0] - f[f.length - 1]) === 5 && f.length === 2 ? 1 : 2;
+  }
+  /* real (open) three through p in direction d: some empty q on the line turns it into a straight four
+     (.XXXX. with exact-five completions at both ends) containing p, and q itself is not forbidden. */
+  function openThree(b, x, y, d, depth) {
+    for (let k = -4; k <= 4; k++) {
+      if (!k) continue;
+      const qx = x + d[0] * k, qy = y + d[1] * k;
+      if (!inb(qx, qy) || b[qy * N + qx] !== 0) continue;
+      b[qy * N + qx] = 1;
+      const f = fivePoints(b, qx, qy, d);
+      let straight = false;
+      if (f.length === 2 && Math.abs(f[0] - f[1]) === 5) {
+        // the four stones lie between the two completion points (offsets relative to q); p must be one of them
+        const lo = Math.min(f[0], f[1]), hi = Math.max(f[0], f[1]);
+        straight = -k > lo && -k < hi;
+      }
+      b[qy * N + qx] = 0;
+      if (straight && !forbiddenAt(b, qy * N + qx, depth + 1)) return true;
+    }
+    return false;
+  }
+  /* renju: is p (empty) forbidden for black? 장목, 4-4, 3-3. An exact five always wins first. */
+  function forbiddenAt(b, p, depth) {
+    if (b[p] !== 0) return false;
+    if ((depth || 0) > 6) return false;
+    const x = p % N, y = (p / N) | 0;
+    b[p] = 1;
+    let five = false, over = false;
+    for (const d of DIRS) { const r = run(b, x, y, d, 1); if (r === 5) five = true; else if (r > 5) over = true; }
+    let res = false;
+    if (!five) {
+      if (over) res = true;
+      else {
+        let fours = 0, threes = 0;
+        for (const d of DIRS) {
+          const f = fourCount(b, x, y, d);
+          if (f) { fours += f; continue; }
+          if (openThree(b, x, y, d, depth || 0)) threes++;
+        }
+        res = fours >= 2 || threes >= 2;
+      }
+    }
+    b[p] = 0;
+    return res;
+  }
+  function forbiddenKind(b, p) {
+    if (b[p] !== 0) return '';
+    const x = p % N, y = (p / N) | 0;
+    b[p] = 1;
+    let five = false, over = false, fours = 0, threes = 0;
+    for (const d of DIRS) { const r = run(b, x, y, d, 1); if (r === 5) five = true; else if (r > 5) over = true; }
+    if (!five && !over) for (const d of DIRS) { const f = fourCount(b, x, y, d); if (f) fours += f; else if (openThree(b, x, y, d, 0)) threes++; }
+    b[p] = 0;
+    if (five) return '';
+    if (over) return '장목';
+    if (fours >= 2) return '4-4';
+    if (threes >= 2) return '3-3';
+    return '';
+  }
+  /* black stone within 4 on some line — only those empties can possibly be forbidden */
+  function forbiddenList(b) {
+    const out = [];
+    for (let p = 0; p < NN; p++) {
+      if (b[p]) continue;
+      const x = p % N, y = (p / N) | 0;
+      let blacks = 0;
+      for (const d of DIRS) for (let k = -4; k <= 4; k++) { if (!k) continue; const xx = x + d[0] * k, yy = y + d[1] * k; if (inb(xx, yy) && b[yy * N + xx] === 1) blacks++; }
+      if (blacks < 3) continue;
+      if (forbiddenAt(b, p, 0)) out.push(p);
+    }
+    return out;
+  }
+
+  /* ---------- game ---------- */
+  function init(players, opts) {
+    const r = opts && opts.rule === 'free' ? 'f' : 'r';
+    const hum = players.map((p, i) => (p.ai ? -1 : i)).filter((i) => i >= 0);
+    const solo = hum.length === 1 && players.length === 2 && players.some((p) => p.ai) ? hum[0] : -1;
+    // rq: 온라인 무르기 요청 {by} (대기 중엔 상대가 먼저 답해야 해서 돌 놓기 멈춤) · nr: 거절당한 자리(다음 수까지 다시 요청 못 함)
+    return { r, m: '', seq: 0, nm: players.map((p) => p.name), solo, rq: null, nr: -1, st: null, ev: null };
+  }
+  function actor(s) { return s.st ? null : s.rq ? 1 - s.rq.by : (s.m.length / 2) % 2; }
+  /* 무르기 요청·취소는 차례가 아니어도 낼 수 있다(core offTurn) */
+  function offTurn(s, seat, a) {
+    if (!a || s.st || (seat !== 0 && seat !== 1)) return false;
+    if (a.t === 'rq') return !s.rq;
+    if (a.t === 'rqX') return !!s.rq && s.rq.by === seat;
+    return false;
+  }
+  /* 무르기 요청이 가능한가: 요청한 사람 돌이 판에 있어야 함, 대기 중 X, 거절 직후 X */
+  function canRequest(s, seat) {
+    if (s.st || s.rq || s.nr === seat) return false;
+    return s.m.length / 2 > seat;
+  }
+  /* 요청한 자리의 마지막 수(그 뒤 상대 응수 포함)를 뺀다 */
+  function takeBack(s, seat) {
+    const n = s.m.length / 2;
+    const k = (n - 1) % 2 === seat ? 1 : 2;
+    s.m = s.m.slice(0, -2 * k);
+  }
+  function exactFor(s, c) { return s.r === 'r' && c === 1; }
+  function apply(s, seat, a) {
+    if (s.st) throw new Error('game over');
+    if (!a) throw new Error('bad action');
+    if (seat !== actor(s) && !offTurn(s, seat, a)) throw new Error('not your turn');
+    const n = s.m.length / 2;
+    const done = (k, by) => { s.seq++; s.ev = { id: s.seq, k, by }; return s; };
+    if (a.t === 'rq') { // 온라인: 무르기 요청
+      if (!canRequest(s, seat)) throw new Error('cannot request');
+      s.rq = { by: seat };
+      return done('rq', seat);
+    }
+    if (a.t === 'rqX') { // 요청한 사람이 취소
+      if (!s.rq || s.rq.by !== seat) throw new Error('no request');
+      s.rq = null;
+      return done('rx', seat);
+    }
+    if (a.t === 'rqA') { // 상대의 답: 수락 → 요청한 사람 차례로 되돌림
+      if (!s.rq || s.rq.by === seat) throw new Error('no request');
+      const by = s.rq.by;
+      s.rq = null;
+      if (a.ok) { takeBack(s, by); s.nr = -1; return done('u', by); }
+      s.nr = by;
+      return done('rd', by);
+    }
+    if (s.rq) throw new Error('answer the request first');
+    if (a.t === 'undo') { // 나 vs AI: 내 직전 수 + AI 응수 (여러 번 가능, AI 첫 수는 남김)
+      if (s.solo !== seat || n - 2 < seat) throw new Error('cannot undo');
+      s.m = s.m.slice(0, -4);
+      return done('u', seat);
+    }
+    if (a.t === 'back') { // 한 폰 돌려하기(사람 둘): 마지막 한 수
+      if (s.solo >= 0 || n < 1) throw new Error('cannot undo');
+      s.m = s.m.slice(0, -2);
+      return done('u', 1 - seat);
+    }
+    if (a.t !== 'place') throw new Error('bad action');
+    const p = a.p | 0;
+    if (p < 0 || p >= NN) throw new Error('off board');
+    const b = boardOf(s.m);
+    if (b[p]) throw new Error('occupied');
+    const c = seat + 1;
+    if (c === 1 && s.r === 'r' && forbiddenAt(b, p, 0)) throw new Error('forbidden');
+    b[p] = c;
+    s.m += enc(p);
+    s.seq++;
+    s.ev = null;
+    s.nr = -1;
+    if (winsAt(b, p, c, exactFor(s, c))) {
+      const l = winLine(b, p, c, exactFor(s, c));
+      s.st = { w: seat, l };
+    } else if (s.m.length / 2 >= NN) s.st = { w: -1 };
+    else if (c === 2 && s.r === 'r' && NN - s.m.length / 2 <= 40) { // 판 막바지: 흑이 둘 곳이 전부 금수면 무승부(멈춤 방지)
+      let ok = false;
+      for (let q = 0; q < NN && !ok; q++) if (!b[q] && !forbiddenAt(b, q, 0)) ok = true;
+      if (!ok) s.st = { w: -1 };
+    }
+    return s;
+  }
+  function result(s) {
+    if (!s.st) return null;
+    const n = s.m.length / 2;
+    const b = boardOf(s.m), longest = [0, 0];
+    for (let p = 0; p < NN; p++) if (b[p]) for (const d of DIRS) longest[b[p] - 1] = Math.max(longest[b[p] - 1], run(b, p % N, (p / N) | 0, d, b[p]));
+    const stats = [{ label: '둔 수', values: [String(Math.ceil(n / 2)), String(Math.floor(n / 2))] }, { label: '가장 긴 줄', values: longest.map((v) => v + '목') }];
+    if (s.st.w < 0) return { winners: [], stats, title: '무승부', text: n >= NN ? '판이 가득 찼어요.' : '흑이 둘 수 있는 자리가 남지 않았어요(전부 금수).' };
+    return { winners: [s.st.w], stats, text: (s.st.w === 0 ? '흑' : '백') + '이 ' + n + '수 만에 오목을 완성했어요.' };
+  }
+
+  /* ---------- AI: incremental 5-window evaluation + threat-classified search ---------- */
+  const WIN = [], WDIR = [], CW = [];
+  for (let p = 0; p < NN; p++) CW.push([]);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) DIRS.forEach((d, di) => {
+    const ex = x + d[0] * 4, ey = y + d[1] * 4;
+    if (!inb(ex, ey)) return;
+    const w = [];
+    for (let k = 0; k < 5; k++) w.push((y + d[1] * k) * N + x + d[0] * k);
+    const id = WIN.length; WIN.push(w); WDIR.push(di); w.forEach((c) => CW[c].push(id));
+  });
+  const SC = [0, 2, 18, 120, 1000, 0];
+  const WINV = 1e7;
+  function wv(bc, wc) { return bc && !wc ? SC[Math.min(bc, 4)] : wc && !bc ? -SC[Math.min(wc, 4)] : 0; }
+  // threat levels of a single move
+  const T_FIVE = 6, T_WIN4 = 5, T_43 = 4, T_33 = 3, T_FOUR = 2, T_THREE = 1;
+
+  function Engine(m, rule) {
+    const E = {
+      b: new Int8Array(NN), cnt: [null, new Int8Array(WIN.length), new Int8Array(WIN.length)], near: new Int16Array(NN), score: 0, renju: rule === 'r', n: 0,
+      place(p, c) {
+        this.b[p] = c; this.n++;
+        const bc = this.cnt[1], wc = this.cnt[2], k = this.cnt[c];
+        for (const w of CW[p]) { this.score -= wv(bc[w], wc[w]); k[w]++; this.score += wv(bc[w], wc[w]); }
+        const x = p % N, y = (p / N) | 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (inb(x + dx, y + dy)) this.near[(y + dy) * N + x + dx]++;
+      },
+      take(p) {
+        const c = this.b[p]; this.b[p] = 0; this.n--;
+        const bc = this.cnt[1], wc = this.cnt[2], k = this.cnt[c];
+        for (const w of CW[p]) { this.score -= wv(bc[w], wc[w]); k[w]--; this.score += wv(bc[w], wc[w]); }
+        const x = p % N, y = (p / N) | 0;
+        for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (inb(x + dx, y + dy)) this.near[(y + dy) * N + x + dx]--;
+      },
+      exact(c) { return this.renju && c === 1; },
+      wins(p, c) { return winsAt(this.b, p, c, this.exact(c)); },
+      legal(p, c) { return !this.b[p] && !(c === 1 && this.renju && forbiddenAt(this.b, p, 0)); },
+      /* classify the move p for colour c → {lv, sc} (lv: threat level, sc: heuristic score). null if illegal (renju). */
+      threat(p, c) {
+        const my = this.cnt[c], op = this.cnt[3 - c];
+        const n3 = [0, 0, 0, 0], f4 = [null, null, null, null];
+        let five = false, sc = 0;
+        for (const w of CW[p]) {
+          if (op[w]) continue;
+          const k = my[w] + 1, di = WDIR[w];
+          sc += SC[Math.min(k, 4)];
+          if (k === 5) five = true;
+          else if (k === 4) { let q = -1; for (const z of WIN[w]) if (z !== p && !this.b[z]) { q = z; break; } (f4[di] = f4[di] || {})[q] = 1; }
+          else if (k === 3) n3[di]++;
+        }
+        if (five) {
+          if (this.exact(c)) { this.b[p] = c; const ok = winsAt(this.b, p, c, true); this.b[p] = 0; if (ok) return { lv: T_FIVE, sc: 1e6 }; if (this.renju && forbiddenAt(this.b, p, 0)) return null; }
+          else return { lv: T_FIVE, sc: 1e6 };
+        }
+        let fours = 0, open4 = false, threes = 0;
+        for (let di = 0; di < 4; di++) {
+          if (f4[di]) { const nq = Object.keys(f4[di]).length; fours++; if (nq >= 2) open4 = true; }
+          else if (n3[di] >= 2) threes++;
+        }
+        if (c === 1 && this.renju && (fours + threes >= 2 || fours && open4 || five)) { if (forbiddenAt(this.b, p, 0)) return null; }
+        let lv = 0;
+        if (open4 || fours >= 2) lv = T_WIN4;
+        else if (fours && threes) lv = T_43;
+        else if (threes >= 2) lv = T_33;
+        else if (fours) lv = T_FOUR;
+        else if (threes) lv = T_THREE;
+        const bonus = [0, 300, 700, 3000, 6000, 40000, 1e6][lv];
+        return { lv, sc: sc + bonus };
+      },
+      /* all five-making points for c */
+      fives(c) {
+        const out = [], my = this.cnt[c], op = this.cnt[3 - c], seen = {};
+        for (let w = 0; w < WIN.length; w++) {
+          if (my[w] !== 4 || op[w]) continue;
+          for (const q of WIN[w]) if (!this.b[q] && !seen[q]) { seen[q] = 1; this.b[q] = c; if (this.wins(q, c)) out.push(q); this.b[q] = 0; }
+        }
+        return out;
+      },
+      /* move generation with threat logic. returns {win:true} | {moves:[...]} */
+      gen(c, limit) {
+        const o = 3 - c, mine = [], their = [];
+        let oppWin4 = false, myWin = -1, myWin4 = -1;
+        const oppFive = [];
+        for (let p = 0; p < NN; p++) {
+          if (this.b[p] || !this.near[p]) continue;
+          const a = this.threat(p, c), d = this.threat(p, o);
+          if (a && a.lv === T_FIVE) { myWin = p; break; }
+          if (d && d.lv === T_FIVE) oppFive.push(p);
+          if (d && d.lv >= T_43 && d.lv !== T_FIVE) oppWin4 = true;
+          if (a && a.lv === T_WIN4 && myWin4 < 0) myWin4 = p;
+          mine.push([p, a, d]);
+        }
+        if (myWin >= 0) return { win: true, p: myWin, n: 1 };
+        if (oppFive.length) {
+          const ok = oppFive.filter((p) => this.legal(p, c));
+          return { moves: ok, forced: true };
+        }
+        if (myWin4 >= 0) return { win: true, p: myWin4, n: 3 };
+        let list;
+        if (oppWin4) {
+          // opponent threatens an unstoppable shape next move: block it, or attack with a four
+          list = mine.filter(([p, a, d]) => (a && a.lv >= T_FOUR && a.lv !== T_THREE && a.lv !== T_33) || (a && d && d.lv >= T_FOUR));
+          if (!list.length) list = mine.filter(([, a]) => a);
+        } else list = mine.filter(([, a]) => a);
+        list.forEach((e) => { e[3] = e[1].sc + (e[2] ? e[2].sc * 0.8 : 0); });
+        list.sort((x, y) => y[3] - x[3]);
+        return { moves: list.slice(0, limit).map((e) => e[0]) };
+      },
+    };
+    for (let i = 0; i < m.length; i += 2) E.place(dec(m, i), ((i / 2) % 2) + 1);
+    return E;
+  }
+
+  /* VCF: c keeps making fours (each forcing one block) until a five or an unstoppable shape. */
+  function vcf(E, c, depth, budget) {
+    if (depth <= 0 || budget.n <= 0) return -1;
+    const o = 3 - c;
+    const f = E.fives(c); if (f.length) return f[0];
+    const oppF = E.fives(o);
+    const my = E.cnt[c], op = E.cnt[o], seen = {}, cand = [];
+    for (let w = 0; w < WIN.length; w++) {
+      if (my[w] !== 3 || op[w]) continue;
+      for (const q of WIN[w]) if (!E.b[q] && !seen[q]) { seen[q] = 1; cand.push(q); }
+    }
+    for (const q of cand) {
+      if (budget.n-- <= 0) return -1;
+      if (oppF.length && !oppF.includes(q)) continue;
+      if (c === 1 && E.renju && forbiddenAt(E.b, q, 0)) continue;
+      E.place(q, c);
+      const th = E.fives(c);
+      let ok = false;
+      if (th.length >= 2) ok = !E.fives(o).length || oppF.length > 0;
+      else if (th.length === 1) {
+        const t = th[0];
+        if (o === 1 && E.renju && forbiddenAt(E.b, t, 0)) ok = true; // black cannot block at a forbidden point
+        else { E.place(t, o); if (!E.wins(t, o)) ok = vcf(E, c, depth - 1, budget) >= 0; E.take(t); }
+      }
+      E.take(q);
+      if (ok) return q;
+    }
+    return -1;
+  }
+
+  /* VCT (어려움): c attacks with open threes and fours; the defender may block any cell of the threat or answer with
+     a four of its own. Returns a winning first move or -1. Conservative: any refutation found → no win. */
+  /* does c threaten an unstoppable shape (open four / double four) on its next move? */
+  function forcing(E, c) {
+    for (let p = 0; p < NN; p++) {
+      if (E.b[p] || !E.near[p]) continue;
+      const a = E.threat(p, c);
+      if (a && a.lv === T_WIN4) return true;
+    }
+    return false;
+  }
+  function vct(E, c, depth, B) {
+    const v = vcf(E, c, 8, B);
+    if (v >= 0) return v;
+    if (depth <= 0 || B.n <= 0 || Date.now() > B.end) return -1;
+    const o = 3 - c;
+    if (E.fives(o).length) return -1;
+    const cand = [];
+    for (let p = 0; p < NN; p++) {
+      if (E.b[p] || !E.near[p]) continue;
+      const a = E.threat(p, c);
+      if (a && a.lv >= T_THREE && a.lv !== T_FIVE) cand.push([p, a.sc]);
+    }
+    cand.sort((x, y) => y[1] - x[1]);
+    for (const [q] of cand.slice(0, 7)) {
+      if (B.n-- <= 0 || Date.now() > B.end) return -1;
+      E.place(q, c);
+      let ok = true;
+      const f = E.fives(c);
+      if (f.length >= 2) ok = true;
+      else {
+        let replies;
+        if (f.length === 1) replies = [f[0]];
+        else if (!forcing(E, c)) { E.take(q); continue; } // not a real threat: the defender could just play elsewhere
+        else if (vcf(E, o, 10, { n: 600 }) >= 0) { E.take(q); continue; } // a three is too slow: the defender wins first with fours
+        else {
+          const set = new Set(), my = E.cnt[c], op = E.cnt[o];
+          for (const w of CW[q]) if (my[w] >= 3 && !op[w]) for (const z of WIN[w]) if (!E.b[z]) set.add(z);
+          for (let p = 0; p < NN; p++) if (!E.b[p] && E.near[p] && !set.has(p)) { const d = E.threat(p, o); if (d && d.lv >= T_FOUR && d.lv !== T_THREE && d.lv !== T_33) set.add(p); }
+          replies = [...set];
+        }
+        for (const r of replies) {
+          if (!E.legal(r, o)) continue;
+          E.place(r, o);
+          let w = -1;
+          if (E.wins(r, o)) w = -1;
+          else {
+            const of = E.fives(o);
+            if (of.length >= 2) w = -1;
+            else if (of.length === 1) {
+              const bl = of[0];
+              if (E.legal(bl, c)) { E.place(bl, c); w = E.wins(bl, c) ? 1 : vct(E, c, depth - 1, B); E.take(bl); }
+            } else w = vct(E, c, depth - 1, B);
+          }
+          E.take(r);
+          if (w < 0) { ok = false; break; }
+        }
+      }
+      E.take(q);
+      if (ok) return q;
+    }
+    return -1;
+  }
+
+  function search(E, c, depth, alpha, beta, ply, T) {
+    if (T.stop || ((++T.nodes & 127) === 0 && Date.now() > T.end)) { T.stop = true; return 0; }
+    const g = E.gen(c, ply === 0 ? 16 : depth >= 3 ? 9 : 6);
+    if (g.win) { if (ply === 0) T.best = g.p; return WINV - ply - g.n; }
+    if (!g.moves.length) return g.forced ? -WINV + ply : 0;
+    if (depth <= 0 && !g.forced) return E.score * (c === 1 ? 1 : -1);
+    let best = -Infinity;
+    const o = 3 - c;
+    for (const p of g.moves) {
+      E.place(p, c);
+      const v = -search(E, o, g.forced ? Math.max(depth - 1, 0) : depth - 1, -beta, -alpha, ply + 1, T);
+      E.take(p);
+      if (T.stop) return best === -Infinity ? 0 : best;
+      if (v > best) { best = v; if (ply === 0) T.best = p; }
+      if (v > alpha) alpha = v;
+      if (alpha >= beta) break;
+      if (ply > 30) break;
+    }
+    return best;
+  }
+
+  function think(m, rule, ms, hard, sty) {
+    const E = Engine(m, rule);
+    const c = ((m.length / 2) % 2) + 1, o = 3 - c;
+    if (!E.n) return 7 * N + 7;
+    const t0 = Date.now(), lim = ms || 260;
+    const g0 = E.gen(c, 16);
+    if (g0.win) return g0.p;
+    if (g0.forced) return g0.moves.length ? g0.moves[0] : E.gen(c, 1).moves[0] || anyLegal(E, c);
+    if (g0.moves.length === 1) return g0.moves[0];
+    if (E.n < 4 && !T_rand.off) { // a little variety in the opening: any of the top few quiet moves
+      const top = g0.moves.slice(0, 3);
+      return top[Math.floor(Math.random() * top.length)];
+    }
+    const v = vcf(E, c, hard && GH.vcf ? 20 : 12, { n: hard && GH.vcf ? 12000 : 3000 });
+    if (v >= 0) return v;
+    const T = { end: t0 + lim * (hard ? GH.sf : 0.75), nodes: 0, stop: false, best: -1 };
+    let best = g0.moves[0];
+    for (let d = 2; d <= (hard ? GH.md : GH.nmd); d += 2) {
+      T.best = -1; T.stop = false;
+      const val = search(E, c, d, -Infinity, Infinity, 0, T);
+      if (T.stop) break;
+      if (T.best >= 0) best = T.best;
+      if (val >= WINV - 100 || val <= -WINV + 100) break;
+    }
+    // 어려움: with the time that is left, look for a win by threes and fours (VCT)
+    if (hard && GH.vct && Date.now() < t0 + lim * 0.85) { const t = vct(E, c, GH.vd, { n: GH.vn, end: t0 + lim * 0.9 }); if (t >= 0) return t; }
+    // don't hand the opponent a VCF
+    const budgetEnd = t0 + lim;
+    const safe = (p) => { E.place(p, c); const r = vcf(E, o, hard && GH.safe ? 16 : 10, { n: hard && GH.safe ? 3000 : 1500 }) < 0; E.take(p); return r; };
+    if (!safe(best)) for (const p of g0.moves) { if (Date.now() > budgetEnd) break; if (p !== best && safe(p)) { best = p; break; } }
+    else if (hard && GH.dvct) {
+      // 어려움: also don't allow a VCT (threes and fours) — try the best few candidates in order
+      const end2 = t0 + lim * 0.97;
+      const safe2 = (p) => { E.place(p, c); const r = vct(E, o, 2, { n: 400, end: end2 }) < 0 && Date.now() < end2; E.take(p); return r; };
+      if (!safe2(best)) for (const p of g0.moves.slice(0, 8)) { if (Date.now() > end2) break; if (p !== best && safe(p) && safe2(p)) { best = p; break; } }
+    }
+    // AI 성향: 상위 후보 몇 개 중에서 공격형은 내 공격이 센 수, 수비형은 상대 길을 막는 수를 가끔 고름
+    if ((sty === 'agg' || sty === 'def') && Math.random() < 0.35) {
+      const who = sty === 'agg' ? c : o, sc0 = (p) => { const t = E.threat(p, who); return t ? t.sc : 0; };
+      let alt = best, av = sc0(best);
+      for (const p of g0.moves.slice(0, 3)) { const v = sc0(p); if (v > av * 1.15 && p !== best && safe(p)) { av = v; alt = p; } }
+      best = alt;
+    }
+    return best;
+  }
+  const T_rand = { off: false };
+  const GH = { vcf: 1, vct: 0, safe: 1, sf: 0.6, md: 12, dvct: 0, vd: 4, vn: 2500, nmd: 4 };
+  function anyLegal(E, c) { for (let p = 0; p < NN; p++) if (E.legal(p, c)) return p; return -1; }
+
+  /* 쉬움: no search, no VCF — takes a five, blocks a five, usually answers obvious threats, otherwise plays a
+     noisy pattern-scored move next to its own stones */
+  function easy(m, rule) {
+    const E = Engine(m, rule);
+    const c = ((m.length / 2) % 2) + 1, o = 3 - c;
+    if (!E.n) return 7 * N + 7;
+    const R = Math.random;
+    const all = [];
+    let five = -1, block = -1, win4 = -1;
+    for (let p = 0; p < NN; p++) {
+      if (E.b[p] || !E.near[p]) continue;
+      const a = E.threat(p, c), d = E.threat(p, o);
+      if (!a) continue;
+      if (a.lv === T_FIVE) five = p;
+      if (d && d.lv === T_FIVE && block < 0) block = p;
+      if (a.lv === T_WIN4 && win4 < 0) win4 = p;
+      all.push([p, a, d]);
+    }
+    if (five >= 0) return five;
+    if (block >= 0) return block;
+    if (win4 >= 0 && R() < 0.75) return win4;
+    // biggest opponent threat (open three → four next): block it most of the time
+    let th = null;
+    for (const e of all) if (e[2] && e[2].lv >= T_33 && e[2].lv !== T_FIVE && (!th || e[2].sc > th[2].sc)) th = e;
+    if (th && R() < 0.7) return th[0];
+    if (!th) for (const e of all) if (e[2] && e[2].lv >= T_FOUR && e[2].lv !== T_FIVE && (!th || e[2].sc > th[2].sc)) th = e;
+    if (th && R() < 0.4) return th[0];
+    // near own stones (distance ≤ 2) when it has any
+    const own = (p) => { const x = p % N, y = (p / N) | 0; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (inb(x + dx, y + dy) && E.b[(y + dy) * N + x + dx] === c) return true; return false; };
+    let pool = all.filter((e) => own(e[0]));
+    if (!pool.length) pool = all;
+    let bp = pool.length ? pool[0][0] : anyLegal(E, c), bs = -Infinity;
+    for (const [p, a, d] of pool) { const v = (a.sc + (d ? d.sc * 0.3 : 0)) * (0.35 + R() * 1.3) + R() * 120; if (v > bs) { bs = v; bp = p; } }
+    return bp;
+  }
+  function ai(s, seat, lv) {
+    if (s.rq) return { t: 'rqA', ok: true }; // 사람이 나가 AI가 된 자리: 요청은 그냥 받아 줌(AI전 무르기와 같게)
+    const sty = (L.aiStyle && L.aiStyle(seat)) || 'bal';
+    const p = lv === 1 ? easy(s.m, s.r) : lv === 3 ? think(s.m, s.r, 1100, true, sty) : think(s.m, s.r, 200, false, sty);
+    return { t: 'place', p };
+  }
+  function aiDelayFor(s, seat, lv) { return lv === 1 ? 650 : lv === 3 ? 80 : 300; }
+
+  /* ---------- view ---------- */
+  const FONT = '"IBM Plex Sans KR", system-ui, sans-serif', MONO = '"IBM Plex Mono", ui-monospace, monospace';
+  const STAR = [3 * N + 3, 3 * N + 11, 11 * N + 3, 11 * N + 11, 7 * N + 7];
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    let st = null, G = null, b = new Int8Array(NN), forb = [], forbSet = new Set();
+    let ghost = -1, down = null, drop = null, busy = false, stopLoop = null, shownSeq = -1, waitSeq = -1, waitUntil = 0;
+    let showNum = U.store.get('gomoku.nums', false);
+    const BS = { minHeight: '44px', flex: '1 1 0', minWidth: 0, padding: '6px 4px', fontSize: '13px', whiteSpace: 'nowrap' };
+    const hud = L.h('div', { class: 'hud bottom', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px' } });
+    const numBtn = L.h('button', { 'data-action': 'nums', class: 'btn sm ghost', style: BS, onclick() { showNum = !showNum; U.store.set('gomoku.nums', showNum); api.sfx('click'); api.buzz(8); numLabel(); draw(); } });
+    const undoBtn = L.h('button', { 'data-action': 'undo', class: 'btn sm ghost', style: BS, text: '↶ 무르기', 'aria-label': '한 수 무르기', onclick: onUndo });
+    const placeBtn = L.h('button', { 'data-action': 'place', class: 'btn primary gm-place', style: Object.assign({}, BS, { flex: '1.6 1 0', fontSize: '15px' }), text: '놓기', onclick: () => commit() });
+    hud.append(numBtn, undoBtn, placeBtn);
+    const hint = L.h('div', { class: 'gm-hint', style: { position: 'absolute', left: '12px', right: '12px', textAlign: 'center', fontSize: '12.5px', color: 'var(--muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', pointerEvents: 'none' } });
+    root.append(hud, hint);
+    /* 온라인 무르기 요청: 요청한 쪽은 「요청 취소」, 받은 쪽은 「거절 / 수락」 (hud·안내 자리를 덮음) */
+    const BQ = { minHeight: '44px', flex: '1 1 0', minWidth: 0, padding: '6px 4px', fontSize: '14px', whiteSpace: 'nowrap' };
+    const rqMsg = L.h('div', { style: { fontSize: '13px', fontWeight: '700', color: '#f2e9d8', textAlign: 'center', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', lineHeight: '18px' } });
+    const rqNo = L.h('button', { 'data-action': 'rqno', class: 'btn sm ghost', style: BQ, text: '거절', onclick: () => answer(false) });
+    const rqYes = L.h('button', { 'data-action': 'rqyes', class: 'btn sm primary', style: BQ, text: '수락', onclick: () => answer(true) });
+    const rqCancel = L.h('button', { 'data-action': 'rqcancel', class: 'btn sm ghost', style: BQ, text: '요청 취소', onclick: () => cancelReq() });
+    const rqRow = L.h('div', { style: { display: 'flex', gap: '8px' } }, rqNo, rqYes, rqCancel);
+    const rqBox = L.h('div', { class: 'gm-rq', role: 'dialog', 'aria-label': '무르기 요청', style: { position: 'absolute', left: '10px', right: '10px', bottom: '4px', display: 'none', flexDirection: 'column', gap: '5px', padding: '6px 10px', borderRadius: '14px', background: 'rgba(34,28,46,.97)', border: '1.5px solid #e3ae45', boxShadow: '0 6px 20px rgba(0,0,0,.45)', zIndex: 12 } }, rqMsg, rqRow);
+    root.append(rqBox);
+    // invisible box over the canvas board, so the first-play tutorial can spotlight it
+    const spBoard = L.h('div', { class: 'gm-board', 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none' } });
+    root.append(spBoard);
+    function numLabel() { numBtn.textContent = (showNum ? '● ' : '○ ') + '수 번호'; numBtn.setAttribute('aria-pressed', String(showNum)); }
+    numLabel();
+    const vis = (el, on) => { el.style.display = on ? '' : 'none'; };
+    const setBusy = (v) => { if (busy !== v) { busy = v; api.setBusy(v); if (st) updateHud(); } };
+
+    function myTurn() { const a = st && actor(st); return a != null && !st.rq && api.canAct(a); }
+    function locked() { return st && st.seq === waitSeq && performance.now() < waitUntil; }
+    function send(a) { waitSeq = st.seq; waitUntil = performance.now() + 3000; api.act(a); }
+    function sendAs(seat, a) { waitSeq = st.seq; waitUntil = performance.now() + 3000; api.actAs(seat, a); }
+    /* 무르기 방식: solo = 나 vs AI(내 수 + AI 응수) · hot = 한 폰 둘(마지막 한 수) · net = 온라인 사람 둘(상대에게 요청) */
+    function undoMode() {
+      if (!st) return '';
+      const mine = api.mySeats();
+      if (st.solo >= 0) return api.canAct(st.solo) ? 'solo' : '';
+      if (!api.online && mine.length === 2) return 'hot';
+      if (api.online && mine.length === 1) return 'net';
+      return '';
+    }
+    const meSeat = () => { const m = api.mySeats(); return m.length === 1 ? m[0] : -1; };
+    function canUndo() {
+      if (!st || st.st || st.rq || locked()) return false;
+      const md = undoMode(), n = st.m.length / 2;
+      if (md === 'solo') return myTurn() && actor(st) === st.solo && n - 2 >= st.solo;
+      if (md === 'hot') return n >= 1 && !busy;
+      if (md === 'net') return canRequest(st, meSeat());
+      return false;
+    }
+    function onUndo() {
+      if (!canUndo()) return;
+      const md = undoMode();
+      ghost = -1; api.sfx('click'); api.buzz(15);
+      if (md === 'solo') send({ t: 'undo' });
+      else if (md === 'hot') send({ t: 'back' });
+      else sendAs(meSeat(), { t: 'rq' });
+      updateHud(); draw();
+    }
+    function answer(ok) {
+      if (!st || !st.rq || locked() || undoMode() !== 'net' || meSeat() === st.rq.by) return;
+      api.sfx('click'); api.buzz(12);
+      sendAs(meSeat(), { t: 'rqA', ok });
+      updateHud();
+    }
+    function cancelReq() {
+      if (!st || !st.rq || locked() || meSeat() !== st.rq.by) return;
+      api.sfx('click'); api.buzz(8);
+      sendAs(meSeat(), { t: 'rqX' });
+      updateHud();
+    }
+    function commit() {
+      if (!st || ghost < 0 || !myTurn() || locked() || busy) return;
+      if (b[ghost]) { ghost = -1; draw(); return; }
+      if (forbSet.has(ghost)) { api.buzz(30); api.toast('금수 자리예요 (' + forbiddenKind(b, ghost) + ')'); return; }
+      const p = ghost; ghost = -1;
+      api.buzz(12);
+      send({ t: 'place', p });
+      updateHud(); draw();
+    }
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      const stripH = 38, hudH = 62, hintH = 22, gap = 6;
+      let size = Math.min(W - 12, H - hudH - hintH - stripH * 2 - gap * 3 - 6, 620);
+      size = Math.max(200, size);
+      const cell = size / (N - 1 + 2.2); // margin ≈1.1 cells: coordinates sit clear of edge stones
+      const pad = cell * 1.1;
+      const x0 = Math.round((W - size) / 2);
+      const block = stripH * 2 + gap * 2 + size;
+      const y0 = Math.round(Math.max(4, (H - hudH - hintH - block) / 2));
+      G = { x0, y0, size, pad, cell, stripH, gap, bx: x0 + pad, by: y0 + stripH + gap + pad, topY: y0, botY: y0 + stripH + gap * 2 + size };
+      hint.style.top = (G.botY + stripH + 2) + 'px';
+      Object.assign(spBoard.style, { left: x0 + 'px', top: (y0 + stripH + gap) + 'px', width: size + 'px', height: size + 'px' });
+      buildBg();
+    }
+    let bgc = null;
+    function buildBg() {
+      const dpr = cv.dpr, s = G.size;
+      const c = document.createElement('canvas'); c.width = Math.ceil(s * dpr); c.height = Math.ceil(s * dpr);
+      const x = c.getContext('2d'); x.scale(dpr, dpr);
+      // kaya slab
+      const g = x.createLinearGradient(0, 0, s, s);
+      g.addColorStop(0, '#e8bf74'); g.addColorStop(0.5, '#ddb066'); g.addColorStop(1, '#c99a52');
+      x.fillStyle = g; rr(x, 0, 0, s, s, 8); x.fill();
+      // grain
+      x.save(); rr(x, 0, 0, s, s, 8); x.clip();
+      let seed = 7; const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+      for (let i = 0; i < 46; i++) {
+        const yy = rnd() * s, amp = 2 + rnd() * 6, ph = rnd() * 6;
+        x.strokeStyle = 'rgba(120,70,20,' + (0.04 + rnd() * 0.07).toFixed(3) + ')'; x.lineWidth = 0.6 + rnd() * 1.6;
+        x.beginPath();
+        for (let xx = 0; xx <= s; xx += 6) { const v = yy + Math.sin(xx / (40 + amp * 8) + ph) * amp; xx ? x.lineTo(xx, v) : x.moveTo(xx, v); }
+        x.stroke();
+      }
+      const sh = x.createRadialGradient(s * 0.3, s * 0.25, 10, s * 0.5, s * 0.5, s * 0.8);
+      sh.addColorStop(0, 'rgba(255,240,200,.22)'); sh.addColorStop(1, 'rgba(60,30,0,.12)');
+      x.fillStyle = sh; x.fillRect(0, 0, s, s);
+      x.restore();
+      // grid
+      /* 설정 「보드 판 재질」(라운드 34): 나무는 원래 결 그대로, 나머지는 core 재질 + 선 색 */
+      const BD = (L.ui && L.ui.board) ? L.ui.board() : { id: 'wood' };
+      const hexA = (hx, a) => 'rgba(' + parseInt(hx.slice(1, 3), 16) + ',' + parseInt(hx.slice(3, 5), 16) + ',' + parseInt(hx.slice(5, 7), 16) + ',' + a + ')';
+      if (BD.id !== 'wood') { x.save(); rr(x, 0, 0, s, s, 8); x.clip(); L.ui.drawBoard(x, 0, 0, s, s); x.restore(); }
+      const LN = BD.id === 'wood' ? null : BD.line;
+      const pd = G.pad, cl = G.cell;
+      x.strokeStyle = (LN ? hexA(LN, BD.dark ? 0.75 : 0.85) : 'rgba(40,24,8,.82)'); x.lineWidth = 1;
+      x.beginPath();
+      for (let i = 0; i < N; i++) {
+        const v = Math.round(pd + i * cl) + 0.5;
+        x.moveTo(pd, v); x.lineTo(pd + cl * (N - 1), v);
+        x.moveTo(v, pd); x.lineTo(v, pd + cl * (N - 1));
+      }
+      x.stroke();
+      x.lineWidth = 1.8; x.strokeRect(pd, pd, cl * (N - 1), cl * (N - 1));
+      x.fillStyle = (LN ? hexA(LN, 0.95) : 'rgba(40,24,8,.9)');
+      for (const p of STAR) { x.beginPath(); x.arc(pd + (p % N) * cl + 0.5, pd + ((p / N) | 0) * cl + 0.5, Math.max(2.2, cl * 0.12), 0, 7); x.fill(); }
+      // coordinates
+      const fs = Math.max(8, Math.min(11, pd * 0.42));
+      x.font = '600 ' + fs + 'px ' + MONO; x.fillStyle = (LN ? hexA(LN, 0.75) : 'rgba(60,34,10,.72)'); x.textAlign = 'center'; x.textBaseline = 'middle';
+      for (let i = 0; i < N; i++) {
+        x.fillText(COLS[i], pd + i * cl, s - pd * 0.32);
+        x.fillText(String(N - i), pd * 0.3, pd + i * cl);
+      }
+      bgc = c;
+    }
+    cv.onresize = () => { layout(); draw(); };
+    layout();
+    /* 무대 등장 애니메이션(살짝 축소) 중에 잰 크기로 캔버스가 늘어나 보이는 것 방지: 애니메이션 끝나면 다시 맞춤 */
+    const stageEl = root.closest ? root.closest('.stage') : null;
+    const refit = () => { if (cv.fit) cv.fit(); };
+    if (stageEl) stageEl.addEventListener('animationend', refit);
+    const refitT = setTimeout(refit, 600);
+    function rr(x, a, bb, w, h, r) { x.beginPath(); if (x.roundRect) x.roundRect(a, bb, w, h, r); else x.rect(a, bb, w, h); }
+    const P = (p) => ({ x: G.bx + (p % N) * G.cell, y: G.by + ((p / N) | 0) * G.cell });
+    function hit(px, py) {
+      const cx = Math.round((px - G.bx) / G.cell), cy = Math.round((py - G.by) / G.cell);
+      if (!inb(cx, cy)) return -1;
+      // generous: accept anything within the cell (and a little past the edge)
+      if (Math.abs(px - (G.bx + cx * G.cell)) > G.cell * 0.75 || Math.abs(py - (G.by + cy * G.cell)) > G.cell * 0.75) return -1;
+      return cy * N + cx;
+    }
+
+    function stone(x, y, r, c, alpha) {
+      ctx.save();
+      if (alpha != null) ctx.globalAlpha = alpha;
+      ctx.fillStyle = 'rgba(30,15,0,.38)'; ctx.beginPath(); ctx.arc(x + r * 0.12, y + r * 0.2, r * 1.0, 0, 7); ctx.fill();
+      const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.08, x, y, r);
+      if (c === 1) { g.addColorStop(0, '#6b6670'); g.addColorStop(0.35, '#2a272e'); g.addColorStop(1, '#0b0a0d'); }
+      else { g.addColorStop(0, '#ffffff'); g.addColorStop(0.55, '#ece8e0'); g.addColorStop(1, '#b9b2a6'); }
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+      if (c === 2) { ctx.strokeStyle = 'rgba(90,80,60,.35)'; ctx.lineWidth = 0.8; ctx.stroke(); }
+      ctx.restore();
+    }
+
+    function drawStrip(seat, y) {
+      const p = api.players[seat] || { name: seat ? '백' : '흑', color: '#888' };
+      const x = G.x0, w = G.size, hh = G.stripH;
+      const active = st && !st.st && actor(st) === seat;
+      const won = st && st.st && st.st.w === seat;
+      ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, hh, 12); else ctx.rect(x, y, w, hh);
+      ctx.fillStyle = active ? 'rgba(46,38,64,.95)' : 'rgba(34,28,46,.75)'; ctx.fill();
+      ctx.lineWidth = active || won ? 1.5 : 1; ctx.strokeStyle = active || won ? '#e3ae45' : 'rgba(242,233,216,.13)'; ctx.stroke();
+      const cy = y + hh / 2;
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(x + 14, cy, 5, 0, 7); ctx.fill();
+      stone(x + 34, cy, 10, seat + 1);
+      ctx.font = '700 14px ' + FONT; ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      let name = p.name; const maxW = w * 0.42;
+      while (ctx.measureText(name).width > maxW && name.length > 1) name = name.slice(0, -1);
+      if (name !== p.name) name += '…';
+      ctx.fillText(name, x + 52, cy);
+      let nx = x + 52 + ctx.measureText(name).width + 7;
+      ctx.font = '600 12px ' + FONT; ctx.fillStyle = won ? '#e3ae45' : '#ab9fb8';
+      const tag = won ? '승리' : seat === 0 ? (st && st.r === 'r' ? '흑 · 금수 있음' : '흑 · 선') : '백';
+      ctx.fillText(tag, nx, cy + 0.5);
+      if (!st) return;
+      ctx.textAlign = 'right'; ctx.font = '600 12px ' + MONO; ctx.fillStyle = '#ab9fb8';
+      const cnt = Math.ceil((st.m.length / 2 - seat) / 2);
+      ctx.fillText(cnt + '수', x + w - 12, cy + 0.5);
+    }
+
+    function draw() {
+      cv.clear();
+      if (!G) return;
+      const { x0, size, cell } = G;
+      const yb = G.y0 + G.stripH + G.gap;
+      drawStrip(1, G.topY); drawStrip(0, G.botY);
+      // board shadow + slab
+      ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x0 + 3, yb + 8, size, size, 10); else ctx.rect(x0 + 3, yb + 8, size, size); ctx.fill();
+      if (bgc) ctx.drawImage(bgc, x0, yb, size, size);
+      ctx.strokeStyle = 'rgba(90,50,10,.6)'; ctx.lineWidth = 1; ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x0 + 0.5, yb + 0.5, size - 1, size - 1, 8); else ctx.rect(x0, yb, size, size); ctx.stroke();
+      if (!st) return;
+      const r = cell * 0.46;
+      const moves = [];
+      for (let i = 0; i < st.m.length; i += 2) moves.push(dec(st.m, i));
+      const lastP = moves.length ? moves[moves.length - 1] : -1;
+      const now = performance.now();
+      moves.forEach((p, i) => {
+        const q = P(p);
+        let rr2 = r, al = 1;
+        if (drop && drop.p === p && i === moves.length - 1) {
+          const k = U.clamp((now - drop.t0) / drop.dur, 0, 1);
+          rr2 = r * (1.25 - 0.25 * (1 - Math.pow(1 - k, 3))); al = 0.5 + 0.5 * k;
+        }
+        stone(q.x, q.y, rr2, (i % 2) + 1, al);
+        if (showNum) {
+          ctx.fillStyle = i % 2 ? '#2a2620' : '#f2e9d8';
+          ctx.font = '600 ' + Math.max(7, Math.round(cell * (i >= 99 ? 0.36 : 0.44))) + 'px ' + MONO; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.fillText(String(i + 1), q.x, q.y + 0.5);
+        }
+      });
+      if (lastP >= 0 && !showNum) {
+        const q = P(lastP);
+        ctx.fillStyle = '#ee6a55'; ctx.beginPath(); ctx.arc(q.x, q.y, Math.max(2.5, r * 0.28), 0, 7); ctx.fill();
+      } else if (lastP >= 0) {
+        const q = P(lastP); ctx.strokeStyle = '#ee6a55'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, r + 1.5, 0, 7); ctx.stroke();
+      }
+      // forbidden marks for black
+      const blackTurn = !st.st && actor(st) === 0 && st.r === 'r';
+      if (blackTurn) {
+        ctx.strokeStyle = 'rgba(200,40,30,.9)'; ctx.lineWidth = Math.max(1.6, cell * 0.09); ctx.lineCap = 'round';
+        const k = cell * 0.2;
+        for (const p of forb) { const q = P(p); ctx.beginPath(); ctx.moveTo(q.x - k, q.y - k); ctx.lineTo(q.x + k, q.y + k); ctx.moveTo(q.x + k, q.y - k); ctx.lineTo(q.x - k, q.y + k); ctx.stroke(); }
+      }
+      // winning line
+      if (st.st && st.st.l) {
+        const a = P(st.st.l[0]), z = P(st.st.l[1]);
+        ctx.strokeStyle = 'rgba(227,174,69,.92)'; ctx.lineWidth = Math.max(3, cell * 0.2); ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(z.x, z.y); ctx.stroke();
+      }
+      // ghost + crosshair
+      if (ghost >= 0 && myTurn() && !st.st) {
+        const q = P(ghost), bad = forbSet.has(ghost);
+        ctx.save();
+        ctx.strokeStyle = bad ? 'rgba(238,106,85,.85)' : 'rgba(227,174,69,.9)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(G.bx, q.y); ctx.lineTo(G.bx + cell * (N - 1), q.y); ctx.moveTo(q.x, G.by); ctx.lineTo(q.x, G.by + cell * (N - 1)); ctx.stroke();
+        ctx.restore();
+        stone(q.x, q.y, r, actor(st) + 1, 0.55);
+        ctx.strokeStyle = bad ? '#ee6a55' : '#e3ae45'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, r + 3, 0, 7); ctx.stroke();
+        // coordinate tag
+        const t = ptName(ghost) + (bad ? ' 금수' : '');
+        ctx.font = '700 12px ' + MONO;
+        const tw = ctx.measureText(t).width + 12;
+        let tx = q.x - tw / 2, ty = q.y - r - 26;
+        if (ty < yb + 2) ty = q.y + r + 6;
+        tx = U.clamp(tx, x0 + 2, x0 + size - tw - 2);
+        ctx.fillStyle = 'rgba(16,12,22,.88)'; ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(tx, ty, tw, 20, 10); else ctx.rect(tx, ty, tw, 20); ctx.fill();
+        ctx.fillStyle = bad ? '#ee6a55' : '#f2e9d8'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(t, tx + tw / 2, ty + 10.5);
+      }
+    }
+
+    function updateHud() {
+      const mine = !!st && !st.st && myTurn();
+      vis(placeBtn, mine);
+      placeBtn.disabled = !mine || ghost < 0 || forbSet.has(ghost) || !!locked() || busy;
+      placeBtn.textContent = ghost >= 0 && mine ? (forbSet.has(ghost) ? '금수' : '놓기 · ' + ptName(ghost)) : '놓기';
+      const md = undoMode();
+      vis(undoBtn, !!st && !st.st && !!md);
+      undoBtn.disabled = !canUndo();
+      undoBtn.textContent = md === 'net' ? '↶ 무르기 요청' : '↶ 무르기';
+      undoBtn.setAttribute('aria-label', md === 'net' ? '상대에게 한 수 무르기 요청' : '한 수 무르기');
+      // 무르기 요청 대기 중: hud·안내 대신 요청 상자
+      const rq = !!st && !st.st && !!st.rq;
+      rqBox.style.display = rq ? 'flex' : 'none';
+      hud.style.visibility = rq ? 'hidden' : '';
+      hint.style.visibility = rq ? 'hidden' : '';
+      if (rq) {
+        const me = meSeat(), by = st.rq.by, byName = api.players[by] ? api.players[by].name : (by ? '백' : '흑');
+        const asked = me >= 0 && me === by, toMe = me >= 0 && me !== by;
+        rqMsg.textContent = asked ? '무르기 요청 보냄 · 상대 답을 기다려요' : toMe ? byName + ' 님이 한 수 무르기를 요청했어요' : byName + ' 님이 무르기를 요청했어요';
+        vis(rqNo, toMe); vis(rqYes, toMe); vis(rqCancel, asked); rqRow.style.display = asked || toMe ? 'flex' : 'none';
+        rqNo.disabled = rqYes.disabled = rqCancel.disabled = !!locked();
+      }
+      vis(numBtn, !!st);
+      let h = '';
+      if (st && !st.st) {
+        const a = actor(st);
+        if (mine) h = ghost < 0 ? '놓을 자리를 탭하세요' : '같은 자리 한 번 더 탭 또는 「놓기」로 확정';
+        else h = (api.players[a] ? api.players[a].name : '') + (api.players[a] && api.players[a].ai ? ' 생각 중…' : ' 차례');
+        if (!mine && st.nr >= 0 && st.nr === meSeat() && undoMode() === 'net') h = '무르기 거절됨 · ' + h;
+        if (mine && a === 0 && st.r === 'r' && forb.length) h = '✕ = 흑 금수 · ' + h;
+      } else if (st && st.st) h = st.st.w < 0 ? '무승부' : (st.st.w === 0 ? '흑' : '백') + ' 승리 · ' + st.m.length / 2 + '수';
+      hint.textContent = h;
+    }
+
+    function onDown(e) {
+      if (!st || st.st || st.rq || !myTurn() || locked()) return;
+      const q = cv.local(e), p = hit(q.x, q.y);
+      down = { p, onGhost: p >= 0 && p === ghost, moved: false, id: e.pointerId };
+      if (p >= 0 && !b[p] && p !== ghost) { ghost = p; api.sfx('tick'); api.buzz(6); updateHud(); draw(); }
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+    function onMove(e) {
+      if (!down || e.pointerId !== down.id) return;
+      const q = cv.local(e), p = hit(q.x, q.y);
+      if (p >= 0 && p !== ghost && !b[p]) { ghost = p; down.moved = true; api.sfx('tick'); updateHud(); draw(); }
+    }
+    function onUp(e) {
+      if (!down || e.pointerId !== down.id) return;
+      const d = down; down = null;
+      const q = cv.local(e), p = hit(q.x, q.y);
+      if (d.onGhost && !d.moved && p === ghost) commit();
+    }
+    function onCancel() { down = null; }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onCancel);
+    /* 라운드 34: 판 재질 바뀌면 바탕 다시, 오른쪽 클릭 = 고른 자리(놓기 전) 해제 */
+    const onBoardMat = () => { if (G) { buildBg(); draw(); } };
+    const onRC = (e) => { if (ghost >= 0) { ghost = -1; down = null; updateHud(); draw(); e.preventDefault(); } };
+    window.addEventListener('lounge-board', onBoardMat); window.addEventListener('lounge-cancel', onRC);
+
+    function animate() {
+      if (stopLoop) stopLoop();
+      setBusy(true);
+      const t = setTimeout(() => { drop = null; setBusy(false); draw(); }, drop.dur + 400);
+      stopLoop = U.loop((dt, now) => {
+        if (!drop) { stopLoop(); stopLoop = null; return; }
+        draw();
+        if (now >= drop.t0 + drop.dur) { drop = null; clearTimeout(t); setBusy(false); draw(); stopLoop(); stopLoop = null; }
+      });
+    }
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prev) {
+        const fresh = prev && prev !== next && next.seq !== shownSeq;
+        st = next;
+        b = boardOf(st.m);
+        forb = !st.st && st.r === 'r' && actor(st) === 0 ? forbiddenList(b) : [];
+        forbSet = new Set(forb);
+        if (ghost >= 0 && (b[ghost] || st.st)) ghost = -1;
+        if (fresh) {
+          const ev = next.ev && next.ev.id === next.seq ? next.ev : null, net = undoMode() === 'net', me = meSeat();
+          if (ev && ev.k === 'u') { api.sfx('whoosh'); api.toast(net ? (ev.by === me ? '상대가 수락했어요 · 한 수 물렀어요' : '한 수 물러 줬어요') : '한 수 물렀어요'); ghost = -1; drop = null; }
+          else if (ev && ev.k === 'rq') { ghost = -1; if (ev.by !== me) { api.sfx('turn'); api.buzz(25); } }
+          else if (ev && ev.k === 'rd') { if (ev.by === me) { api.sfx('click'); api.toast('상대가 무르기를 거절했어요'); } }
+          else if (ev && ev.k === 'rx') { if (ev.by !== me) api.toast('상대가 무르기 요청을 취소했어요'); }
+          else if (next.m.length > (prev.m || '').length) {
+            const p = dec(next.m, next.m.length - 2);
+            drop = { p, t0: performance.now(), dur: 160 / SPD() };
+            api.sfx('thud'); api.buzz(10);
+            animate();
+            if (next.st && next.st.w >= 0) api.toast((next.st.w === 0 ? '흑' : '백') + ' 오목!');
+          }
+        }
+        if (!prev) ghost = -1;
+        shownSeq = next.seq;
+        updateHud();
+        draw();
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true);
+        if (stopLoop) stopLoop();
+        setBusy(false);
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onCancel);
+        window.removeEventListener('lounge-board', onBoardMat); window.removeEventListener('lounge-cancel', onRC);
+        clearTimeout(refitT); if (stageEl) stageEl.removeEventListener('animationend', refit);
+        cv.destroy(); hud.remove(); hint.remove(); rqBox.remove();
+      },
+    };
+  }
+
+  L.register({
+    undo: false, id: 'gomoku', name: '오목', tag: '전략', cat: '보드',
+    blurb: '15×15 판에 흑백이 번갈아 돌을 놓아 가로·세로·대각선으로 다섯 개를 먼저 잇는 쪽이 이겨요. 렌주룰에서는 흑에게 3-3·4-4·장목 금수가 있어요.',
+    controls: [
+      { id: 'place', label: '놓기', keys: ['Enter', 'Space'], pad: ['a'] },
+      { id: 'undo', label: '무르기', keys: ['KeyZ', 'Backspace'], pad: ['b'] },
+      { id: 'nums', label: '수 번호 보기', keys: ['KeyN'] },
+    ],
+    minPlayers: 2, maxPlayers: 2, defaultPlayers: 2, hidden: false, aiDelay: 300,
+    options: [{ id: 'rule', label: '규칙', tip: '금수(두면 안 되는 자리) 규칙.', choices: [{ v: 'renju', label: '렌주룰', tip: '흑만 3-3·4-4·장목(6목 이상) 금지, 정확히 5목.' }, { v: 'free', label: '자유룰', tip: '금수 없이 5개 이상 이으면 승리.' }], def: 'renju' }],
+    quick: [
+      '가로·세로·대각선 중 한 줄로 내 돌 다섯 개를 먼저 이으면 이겨요.',
+      '내 차례: 빈 점을 탭 → 한 번 더 탭(또는 「놓기」)해 돌 1개를 놓아요. 흑이 먼저.',
+      '렌주룰(기본)에선 먼저 두는 흑에게만 금지된 자리(빨간 ✕)가 있어요. 흑은 거기에 못 둬요.',
+    ],
+    rules: [
+      { h: '목표', fig: { svg: '<svg viewBox="0 0 340 100" xmlns="http://www.w3.org/2000/svg"><rect x="18" y="2" width="304" height="88" rx="4" fill="#dcb46e"/><line x1="34" y1="12" x2="306" y2="12" stroke="#2a1a0c"/><line x1="34" y1="46" x2="306" y2="46" stroke="#2a1a0c"/><line x1="34" y1="80" x2="306" y2="80" stroke="#2a1a0c"/><line x1="34" y1="12" x2="34" y2="80" stroke="#2a1a0c"/><line x1="68" y1="12" x2="68" y2="80" stroke="#2a1a0c"/><line x1="102" y1="12" x2="102" y2="80" stroke="#2a1a0c"/><line x1="136" y1="12" x2="136" y2="80" stroke="#2a1a0c"/><line x1="170" y1="12" x2="170" y2="80" stroke="#2a1a0c"/><line x1="204" y1="12" x2="204" y2="80" stroke="#2a1a0c"/><line x1="238" y1="12" x2="238" y2="80" stroke="#2a1a0c"/><line x1="272" y1="12" x2="272" y2="80" stroke="#2a1a0c"/><line x1="306" y1="12" x2="306" y2="80" stroke="#2a1a0c"/><circle cx="102" cy="46" r="12" fill="#1a1714"/><circle cx="136" cy="46" r="12" fill="#1a1714"/><circle cx="170" cy="46" r="12" fill="#1a1714"/><circle cx="204" cy="46" r="12" fill="#1a1714"/><circle cx="238" cy="46" r="12" fill="#1a1714"/><circle cx="68" cy="46" r="12" fill="#f7f3ea" stroke="#1a1714"/><circle cx="272" cy="46" r="12" fill="#f7f3ea" stroke="#1a1714"/><circle cx="170" cy="12" r="12" fill="#f7f3ea" stroke="#1a1714"/><circle cx="136" cy="80" r="12" fill="#f7f3ea" stroke="#1a1714"/><line x1="102" y1="46" x2="238" y2="46" stroke="#c8372b" stroke-width="3" opacity=".8"/></svg>', cap: '흑 5개가 한 줄 — 흑 승리! (대각선도 돼요)' }, p: [
+        '1번 자리가 흑, 2번 자리가 백이에요. 흑이 먼저, 한 수씩 번갈아 둬요.',
+        '가로·세로·대각선 중 한 줄로 내 돌 다섯 개를 먼저 이으면 이겨요.',
+        '판(15×15)이 가득 차도록 아무도 못 이으면 무승부예요.'] },
+      { h: '차례에 할 일', p: [
+        '빈 점(선이 만나는 곳) 하나에 돌 1개를 놓아요. 놓은 돌은 움직이거나 잡히지 않아요.',
+        '상대가 4개를 이었는데 양 끝이 열려 있으면(열린 4) 한쪽만 막을 수 있어서 져요. 그 전에, 열린 3일 때 막는 게 중요해요.'] },
+      { h: '특수 규칙: 렌주룰 (기본)', p: [
+        '흑이 먼저 둬서 너무 유리하니까, 흑에게만 「금수」(둘 수 없는 자리)가 있어요.',
+        '3-3 금수: 한 수로 열린 3을 두 개 동시에 만드는 자리.',
+        '4-4 금수: 한 수로 4를 두 개 동시에 만드는 자리(한 줄 안에서 ●.●●●.●처럼 4가 두 번 생겨도 금수).',
+        '장목 금수: 6개 이상 잇는 자리. 흑은 정확히 5개여야 이겨요.',
+        '「열린 3」 = 한 수 더 두면 양쪽이 비어 있는 4(.●●●●.)가 되는 3. 그 한 수가 금수라서 열린 4를 못 만드는 3은 쳐 주지 않아요(이런 거짓 3-3은 둘 수 있어요).',
+        '4-3(4 하나 + 열린 3 하나)은 흑도 둘 수 있어요. 다섯을 만드는 수는 금수 모양이 함께 생겨도 다섯이 우선해 이겨요.',
+        '흑 차례에는 금수 자리에 빨간 ✕가 보여요. 백은 금수가 없고 다섯 개 이상(6목 포함)이면 이겨요.'] },
+      { h: '자유룰 (옵션)', p: ['금수가 없어요. 흑백 모두 다섯 개 이상 이으면 이겨요.'] },
+      { h: '조작', p: [
+        '놓을 자리를 탭하면 반투명 돌 · 십자선 · 좌표가 보여요. 같은 자리를 한 번 더 탭하거나 「놓기」를 누르면 확정. 다른 자리를 탭하면 그쪽으로 옮겨요.',
+        '누른 채로 끌면 미리보기 돌이 따라와요. 손을 떼도 놓이지는 않아요.',
+        '마지막 수는 빨간 점으로 표시돼요. 「수 번호」를 켜면 돌마다 둔 순서가 보여요(기기에 기억).',
+        '↶ 무르기 (AI와 할 때): 내가 둔 수와 AI가 받은 수를 함께 빼요. 여러 번 눌러 처음까지 돌아갈 수 있어요.',
+        '↶ 무르기 (한 폰에서 둘이): 마지막에 둔 돌 하나를 빼요. 그 돌을 둔 사람 차례로 돌아가요.',
+        '↶ 무르기 요청 (온라인·LAN): 상대에게 물어봐요. 상대가 「수락」하면 내 마지막 수(그 뒤 상대 수까지)가 빠지고 내 차례가 돼요. 답을 기다리는 동안은 돌을 못 놓아요. 「요청 취소」도 돼요.',
+        '상대가 「거절」하면 누가 돌을 하나 더 둘 때까지 다시 요청할 수 없어요. 게임이 끝나면 무를 수 없어요.'] },
+      { h: '예시', p: [
+        '백이 가로로 ○○○ 세 개를 양쪽이 빈 채로 이었다(열린 3) → 흑은 지금 한쪽 끝을 막아야 해요. 안 막으면 다음에 열린 4가 돼서 못 막아요.',
+        '흑이 한 수로 가로 열린 3과 세로 열린 3을 동시에 만드는 자리 → 3-3 금수라 빨간 ✕, 둘 수 없어요.',
+        '흑 ●●●● 옆에 하나 더 두면 다섯 → 승리! 그런데 반대편에도 흑 돌이 붙어 6개가 되면 장목이라 흑은 못 둬요.'] },
+      { h: 'AI', p: [
+        '돌 주변 후보 수를 패턴(다섯·열린 4·4·열린 3…)으로 평가하고, 알파-베타 탐색과 연속 4로 이기는 수(VCF) 탐색을 함께 써요. 렌주룰에서 흑을 맡으면 AI도 금수를 지켜요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 눈앞의 위협만 막고, 어려움은 VCF·VCT(열린 3과 4로 몰아붙이기)를 더 깊이 읽어요.'] },
+    ],
+    tutorial: [
+      { sel: '.gm-board', text: '오목판이에요. 나는 흑, 먼저 둬요. 가로·세로·대각선 중 한 줄로 내 돌 다섯 개를 먼저 이으면 이겨요!' },
+      { sel: '.gm-board', text: '빈 점을 탭하면 반투명 돌이 보여요. 같은 자리를 한 번 더 탭하거나 아래 「놓기」를 누르면 확정이에요.' },
+      { sel: '.gm-board', text: '상대가 양쪽이 빈 3개(열린 3)를 만들면 바로 한쪽 끝을 막으세요. 열린 4가 되면 못 막아요!' },
+      { sel: '.gm-hint', text: '렌주룰에선 흑에게 금지된 자리(3-3 · 4-4 · 6목)가 있어요. 흑 차례엔 그 자리에 빨간 ✕가 떠서 바로 알 수 있어요. 시작!' },
+    ],
+    init, actor, offTurn, apply, ai, aiDelayFor, result, mount, _gh: GH,
+    _t: { vct, easy, GH, T_rand, boardOf, forbiddenAt, forbiddenKind, forbiddenList, winsAt, think, enc, dec, Engine, vcf, N },
+  });
+})();

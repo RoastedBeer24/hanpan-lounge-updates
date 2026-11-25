@@ -1,0 +1,854 @@
+/* 양궁 — 70m 리커브. 세트제(6점 먼저) 또는 총점(4엔드), 엔드당 3발을 번갈아 쏜다.
+   바람(방향·세기)은 화살마다 바뀌며 상태 안의 시드로 결정된다. 화살 비행(중력 낙하·공기 저항·바람 편류)은
+   쏘는 기기에서 계산해 명중점(cm)을 보내고, apply는 검증·채점만 한다(다트와 같은 방식). */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* invisible box over a canvas region so the first-play tutorial (sel) can spotlight it.
+     set(x, y, w, h) in stage px; set(null) takes it out of the DOM (the tutorial then shows no ring). */
+  function tutSpot(root, cls) {
+    const e = L.h('div', { class: 'tut-spot ' + cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none', left: '0px', top: '0px', width: '0px', height: '0px' } });
+    let key = '';
+    const set = (x, y, w, h) => {
+      if (x == null || !(w > 0 && h > 0)) { if (e.parentNode) e.remove(); key = ''; return; }
+      if (!e.parentNode) root.append(e);
+      const v = [x, y, w, h].map(Math.round), k = v.join(',');
+      if (k === key) return; key = k;
+      Object.assign(e.style, { left: v[0] + 'px', top: v[1] + 'px', width: v[2] + 'px', height: v[3] + 'px' });
+    };
+    set.el = e;
+    return set;
+  }
+  const DEG = Math.PI / 180;
+
+  /* ---------- target (cm, x right, y up, origin = centre) ---------- */
+  const TR = 61, RW = 6.1, XR = 3.05, ARW = 0.28, BOSS = 66;
+  function ring(x, y) {
+    const rr = Math.max(0, Math.hypot(x, y) - ARW); // touching a line counts the higher ring
+    if (rr <= XR) return { p: 10, x: 1, l: 'X' };
+    const k = Math.max(1, Math.ceil(rr / RW - 1e-9));
+    const p = 11 - k;
+    return p >= 1 ? { p, x: 0, l: String(p) } : { p: 0, x: 0, l: 'M' };
+  }
+
+  /* ---------- flight (m, s): drag + gravity + wind; sight is zeroed for a full draw in calm air ---------- */
+  const DIST = 70, V0 = 68, KD = 0.0019, GR = 9.81, FDT = 1 / 600;
+  function speedOf(q) { return V0 * (0.3 + 0.7 * U.clamp(q, 0, 1)); }
+  function flyRaw(el, az, v0, wx, wz) {
+    let x = 0, y = 0, z = 0, t = 0;
+    let vx = v0 * Math.sin(az) * Math.cos(el), vy = v0 * Math.sin(el), vz = v0 * Math.cos(az) * Math.cos(el);
+    for (let n = 0; n < 6000; n++) {
+      const rx = vx - wx, ry = vy, rz = vz - wz, s = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      const px = x, py = y, pz = z;
+      vx -= KD * s * rx * FDT; vy -= (KD * s * ry + GR) * FDT; vz -= KD * s * rz * FDT;
+      x += vx * FDT; y += vy * FDT; z += vz * FDT; t += FDT;
+      if (z >= DIST) { const f = (DIST - pz) / (z - pz); return { x: px + (x - px) * f, y: py + (y - py) * f, t: t - FDT + FDT * f }; }
+    }
+    return { x, y, t };
+  }
+  const E0 = (() => { let lo = 0, hi = 0.2; for (let i = 0; i < 50; i++) { const m = (lo + hi) / 2; if (flyRaw(m, 0, V0, 0, 0).y > 0) hi = m; else lo = m; } return (lo + hi) / 2; })();
+  function windVec(w) { const s = w[1] / 10, a = w[0] * DEG; return { x: s * Math.cos(a), z: s * Math.sin(a), s }; } // w[0]: 0 = blowing right, 90 = away from the archer
+  /* aim point (cm, where the sight pin sits) + draw + wind → hit point (cm) */
+  function fly(ax, ay, q, w) {
+    const wv = windVec(w);
+    const r = flyRaw(E0 + ay / 100 / DIST, ax / 100 / DIST, speedOf(q), wv.x, wv.z);
+    return { x: r.x * 100, y: r.y * 100, t: r.t };
+  }
+
+  /* ---------- seeded wind ---------- */
+  function rnd(s) { s.rs = (s.rs * 48271) % 2147483647; return s.rs / 2147483647; }
+  function nextWind(s) {
+    let sp = s.w[1] / 10, a = s.w[0];
+    sp += (2 - sp) * 0.2 + (rnd(s) - 0.5) * 1.8;
+    a += (rnd(s) - 0.5) * 90;
+    s.w = [Math.round(((a % 360) + 360) % 360), Math.round(U.clamp(sp, 0.2, 4.5) * 10)];
+  }
+
+  /* ---------- moving target (별개 모드): pattern per arrow, seeded; offset in cm at time t (s since the turn began) ---------- */
+  const MV_A = 50;
+  const MV_NAMES = ['좌우', '왕복', '8자', '타원'];
+  function tpos(tp, t) {
+    if (!tp) return { x: 0, y: 0 };
+    const w = 0.5 + 0.18 * (tp[1] - 1), a = w * t + tp[2] * DEG;
+    if (tp[0] === 0) return { x: MV_A * Math.sin(a), y: 0 };
+    if (tp[0] === 1) return { x: MV_A * (2 / Math.PI) * Math.asin(Math.sin(a)), y: 0 };
+    if (tp[0] === 2) return { x: MV_A * Math.sin(a), y: MV_A * 0.35 * Math.sin(2 * a) };
+    return { x: MV_A * Math.cos(a), y: MV_A * 0.4 * Math.sin(a) };
+  }
+  function nextTarget(s) {
+    if (!s.mv) return;
+    const lvl = s.ph === 'so' ? 3 : Math.min(5, s.e + 1);
+    s.tp = [Math.floor(rnd(s) * 4), lvl, Math.floor(rnd(s) * 360)];
+  }
+  const r2 = (v) => Math.round(v * 100) / 100;
+
+  /* ---------- rules ---------- */
+  const r1 = (v) => Math.round(v * 10) / 10;
+  function init(players, opts) {
+    const n = players.length;
+    const md = opts && opts.mode === 'tot' ? 'tot' : n === 2 ? 'set' : 'tot';
+    const s = { n, md, E: md === 'set' ? 5 : 4, e: 0, ord: players.map((p, i) => i), i: 0, a: [],
+      es: players.map(() => []), sp: players.map(() => 0), t10: players.map(() => 0), tx: players.map(() => 0),
+      w: [0, 0], rs: 1 + Math.floor(Math.random() * 2147483640), ph: 'p', so: null,
+      nm: players.map((p) => String(p.name || '').slice(0, 10)), seq: 0, last: null };
+    s.w = [Math.floor(rnd(s) * 360), Math.round((0.6 + rnd(s) * 2.6) * 10)];
+    if (opts && opts.game === 'mv') { s.mv = 1; nextTarget(s); }
+    return s;
+  }
+  function actor(s) { return s.ph === 'e' ? null : s.ph === 'so' ? s.so.c[s.so.k] : s.ord[s.i % s.n]; }
+  const tot = (s, p) => s.es[p].reduce((a, b) => a + b, 0);
+  function endSum(s, p) { let t = 0; for (const a of s.a) if (a[2] === p) t += ring(a[0], a[1]).p; return t; }
+  function startShootOff(s, c) { s.ph = 'so'; s.so = { c, k: 0, h: [], rd: 1 }; }
+  function apply(s, seat, a) {
+    if (actor(s) !== seat) throw new Error('not your turn');
+    if (!a || a.type !== 'shoot' || typeof a.x !== 'number' || typeof a.y !== 'number' || !isFinite(a.x) || !isFinite(a.y)) throw new Error('bad shot');
+    const x = r1(U.clamp(a.x, -300, 300)), y = r1(U.clamp(a.y, -300, 300));
+    const sc = ring(x, y), w = s.w.slice();
+    s.seq++;
+    const last = { id: s.seq, s: seat, x, y, p: sc.p, X: sc.x, w };
+    if (s.mv) { // the target's offset at impact follows from the release time + flight time (deterministic)
+      const rt = r2(U.clamp(+a.rt || 0, 0, 120)), ft = r2(U.clamp(+a.ft || 1.2, 0.3, 4)), o = tpos(s.tp, rt + ft);
+      Object.assign(last, { tp: s.tp.slice(), rt, ft, tx: r1(o.x), ty: r1(o.y) });
+    }
+    s.last = last;
+    nextWind(s);
+    if (s.ph === 'so') {
+      s.so.h.push([x, y, seat]);
+      s.so.k++;
+      if (s.so.k >= s.so.c.length) {
+        const d = s.so.h.map((h) => Math.round(Math.hypot(h[0], h[1]) * 10)), best = Math.min(...d);
+        const keep = s.so.c.filter((c, i) => d[i] === best);
+        last.so = s.so.h.map((h, i) => [h[0], h[1], h[2], d[i] / 10]);
+        if (keep.length === 1 || s.so.rd >= 8) { s.so.c = keep; s.ph = 'e'; last.fin = 1; }
+        else { s.so = { c: keep, k: 0, h: [], rd: s.so.rd + 1 }; last.again = 1; }
+      }
+      nextTarget(s);
+      return s;
+    }
+    s.a.push([x, y, seat]);
+    if (sc.p === 10) s.t10[seat]++;
+    if (sc.x) s.tx[seat]++;
+    s.i++;
+    if (s.i >= 3 * s.n) { // end over
+      const sums = s.ord.map(() => 0);
+      for (let p = 0; p < s.n; p++) { sums[p] = endSum(s, p); s.es[p].push(sums[p]); }
+      last.end = { e: s.e, sums, a: s.a.slice() };
+      if (s.md === 'set') {
+        const [A, B] = sums;
+        if (A > B) s.sp[0] += 2; else if (B > A) s.sp[1] += 2; else { s.sp[0]++; s.sp[1]++; }
+        last.end.sp = s.sp.slice();
+        if (s.sp[0] >= 6 || s.sp[1] >= 6) s.ph = 'e';
+        else if (s.e + 1 >= s.E) startShootOff(s, [0, 1]);
+        else s.ord = s.sp[1] < s.sp[0] ? [1, 0] : [0, 1]; // lower set score shoots first
+      } else {
+        if (s.e + 1 >= s.E) {
+          const t = s.es.map((r, i) => tot(s, i)), best = Math.max(...t);
+          let c = t.map((v, i) => (v === best ? i : -1)).filter((i) => i >= 0);
+          if (c.length > 1) { const m = Math.max(...c.map((i) => s.t10[i])); c = c.filter((i) => s.t10[i] === m); }
+          if (c.length > 1) { const m = Math.max(...c.map((i) => s.tx[i])); c = c.filter((i) => s.tx[i] === m); }
+          if (c.length > 1) startShootOff(s, c); else s.ph = 'e';
+        } else s.ord = s.ord.slice(1).concat(s.ord[0]);
+      }
+      if (s.ph === 'p') { s.e++; }
+      s.i = 0; s.a = [];
+    }
+    nextTarget(s);
+    return s;
+  }
+  function winners(s) {
+    if (s.ph !== 'e') return null;
+    if (s.so) return s.so.c.slice();
+    if (s.md === 'set') return s.sp[0] > s.sp[1] ? [0] : [1];
+    const t = s.es.map((r, i) => tot(s, i)), best = Math.max(...t);
+    let c = t.map((v, i) => (v === best ? i : -1)).filter((i) => i >= 0);
+    if (c.length > 1) { const m = Math.max(...c.map((i) => s.t10[i])); c = c.filter((i) => s.t10[i] === m); }
+    if (c.length > 1) { const m = Math.max(...c.map((i) => s.tx[i])); c = c.filter((i) => s.tx[i] === m); }
+    return c;
+  }
+  function result(s) {
+    const r = result0(s);
+    if (r) {
+      const P = [...Array(s.n).keys()], ar = (i) => s.es[i].length * 3;
+      r.stats = [
+        { label: '총점', values: P.map((i) => String(tot(s, i))) },
+        { label: '10점 (X)', values: P.map((i) => s.t10[i] + ' (' + s.tx[i] + ')') },
+        { label: '최고 엔드', values: P.map((i) => String(s.es[i].length ? Math.max(...s.es[i]) : 0)) },
+        { label: '화살당 평균', values: P.map((i) => ar(i) ? (tot(s, i) / ar(i)).toFixed(1) : '-') },
+      ];
+    }
+    return r;
+  }
+  function result0(s) {
+    const w = winners(s);
+    if (!w) return null;
+    const nm = (i) => s.nm[i] || (i + 1) + '번';
+    if (s.n === 1) return { winners: [0], title: tot(s, 0) + ' / 120점', text: (s.mv ? '움직이는 표적 · ' : '') + '엔드: ' + s.es[0].join(' · ') + '\n10점 ' + s.t10[0] + '발 (X ' + s.tx[0] + ')' };
+    const so = s.so ? '\n슛오프: 과녁 중심에 더 가까운 화살로 승부' : '';
+    if (s.md === 'set') {
+      const lines = [0, 1].map((i) => nm(i) + ' · 세트 ' + s.sp[i] + ' (' + s.es[i].join(' · ') + ')');
+      return { winners: w, text: (s.mv ? '움직이는 표적 · ' : '') + '세트 점수 ' + s.sp[0] + ' : ' + s.sp[1] + so + '\n' + lines.join('\n') };
+    }
+    const t = s.es.map((r, i) => tot(s, i));
+    const ord = t.map((v, i) => i).sort((a, b) => t[b] - t[a] || s.t10[b] - s.t10[a] || s.tx[b] - s.tx[a] || a - b);
+    const lines = ord.map((i) => nm(i) + ' · ' + t[i] + '점 (10점 ' + s.t10[i] + ', X ' + s.tx[i] + ')');
+    return { winners: w, title: w.length > 1 ? '공동 우승' : undefined, text: (s.mv ? '움직이는 표적\n' : '') + lines.join('\n') + so };
+  }
+
+  /* ---------- AI ---------- */
+  function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  const LVA = { 1: { sig: 10.2, c: 0.45, cs: 0.3, hb: 0.35 }, 2: { sig: 6.2, c: 0.82, cs: 0.14, hb: 0.2 }, 3: { sig: 3.9, c: 0.96, cs: 0.05, hb: 0.08 } };
+  function ai(s, seat, lv) {
+    const P = LVA[lv] || LVA[2];
+    const drift = fly(0, 0, 1, s.w), c = P.c + gauss() * P.cs;
+    const beat = Math.random() < P.hb ? 1.6 + Math.random() * 2.2 : 0; // released on a heartbeat: the sight jolts upward
+    const ax = -drift.x * c + gauss() * P.sig + beat * 0.35, ay = -drift.y * c + gauss() * P.sig + beat;
+    if (s.mv) { // lead the moving target: guess where it will be when the arrow arrives (error grows on easier levels)
+      const LE = { 1: [0.78, 0.3], 2: [0.95, 0.12], 3: [1, 0.04] }[lv] || [0.95, 0.12];
+      const rt = r2(0.9 + Math.random() * 0.8), ft0 = fly(0, 0, 1, s.w).t;
+      const g = tpos(s.tp, rt + ft0 * (LE[0] + gauss() * LE[1]));
+      const h = fly(ax + g.x, ay + g.y, 1, s.w), ft = r2(h.t), o = tpos(s.tp, rt + ft);
+      return { type: 'shoot', x: r1(h.x - o.x), y: r1(h.y - o.y), rt, ft };
+    }
+    const h = fly(ax, ay, 1, s.w);
+    return { type: 'shoot', x: r1(h.x), y: r1(h.y) };
+  }
+
+  /* ---------- view ---------- */
+  const RING_COL = ['#f4f1ea', '#f4f1ea', '#1d1b20', '#1d1b20', '#3d8fd6', '#3d8fd6', '#e0413a', '#e0413a', '#f2c230', '#f2c230'];
+  const AIM = { gain: 0.32, sway: 3.4, rel: 1.2 };
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const top = L.h('div', { class: 'hud top ar-top', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px', alignItems: 'stretch' } });
+    root.append(top);
+    // invisible boxes over the scope / wind gauge / pull zone for the first-play tutorial spotlight
+    const spScope = tutSpot(root, 'ar-scope'), spWind = tutSpot(root, 'ar-wind'), spZone = tutSpot(root, 'ar-zone');
+    let st = null, hud = null, G = null, face = null, time = 0, ptr = null, anim = null, pops = [], flash = null;
+    let shownId = 0, waitSeq = -1, waitUntil = 0, animTimer = 0, hintFlash = 0, breath = 1, holding = false, gasp = 0, beatPh = 0.5;
+    let view = { x: 0, y: 0 }, disp = [], myShot = null, turnT0 = 0;
+    /* where the (moving) target sits now, cm */
+    function tOff() {
+      if (!st || !st.mv) return { x: 0, y: 0 };
+      if (anim) { const l = anim.l; return anim.ph === 'fly' ? tpos(l.tp, l.rt + l.ft * Math.min(1, anim.t / anim.dur)) : { x: l.tx, y: l.ty }; }
+      if (st.ph === 'e' || !st.tp) return st.last && st.last.tx != null ? { x: st.last.tx, y: st.last.ty } : { x: 0, y: 0 };
+      return tpos(st.tp, time - turnT0);
+    }
+    const shots = {}; // arrows shot per human seat (wind tip on the first ones)
+    const color = (i) => (api.players[i] ? api.players[i].color : '#e3ae45');
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      const topH = G ? G.topH : 84;
+      const zoneH = Math.round(U.clamp(H * 0.25, 150, 196));
+      const zoneTop = H - zoneH;
+      const sTop = topH + 34, sBot = zoneTop - 8;
+      const R = Math.max(70, Math.min(W / 2 - 12, (sBot - sTop) / 2));
+      G = { W, H, topH, zoneTop, zoneH, R, cx: W / 2, cy: (sTop + sBot) / 2, k: R * 0.8 / TR, pull: Math.round(U.clamp(H * 0.15, 92, 128)) };
+      G.restY = zoneTop + Math.min(78, zoneH * 0.42);
+      spScope(G.cx - R, G.cy - R, 2 * R, 2 * R); spWind(8, topH + 2, 90, 68); spZone(0, zoneTop, W, zoneH);
+      buildFace();
+    }
+    function buildFace() {
+      const k = G.k, half = BOSS + 4, size = Math.ceil(half * 2 * k);
+      const c = document.createElement('canvas');
+      c.width = Math.round(size * cv.dpr); c.height = Math.round(size * cv.dpr);
+      const b = c.getContext('2d'); b.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+      const o = size / 2;
+      // straw boss
+      const bs = BOSS * k;
+      const sg = b.createLinearGradient(0, o - bs, 0, o + bs);
+      sg.addColorStop(0, '#c9a865'); sg.addColorStop(1, '#a8874a');
+      b.fillStyle = sg; b.fillRect(o - bs, o - bs, bs * 2, bs * 2);
+      b.strokeStyle = 'rgba(90,60,20,.35)'; b.lineWidth = Math.max(0.6, k * 0.5);
+      for (let i = 0; i < 70; i++) { const yy = o - bs + (i + 0.5) * bs * 2 / 70; b.beginPath(); b.moveTo(o - bs, yy); b.bezierCurveTo(o - bs / 2, yy + 2, o + bs / 2, yy - 2, o + bs, yy); b.stroke(); }
+      b.fillStyle = 'rgba(0,0,0,.18)'; b.fillRect(o - bs, o + bs - 4, bs * 2, 4);
+      // face
+      b.fillStyle = 'rgba(0,0,0,.25)'; b.beginPath(); b.arc(o + 1.5, o + 2, (TR + 0.6) * k, 0, 7); b.fill();
+      for (let i = 0; i < 10; i++) {
+        const r = (TR - i * RW) * k;
+        b.fillStyle = RING_COL[i]; b.beginPath(); b.arc(o, o, r, 0, 7); b.fill();
+        b.strokeStyle = i === 2 || i === 3 ? 'rgba(240,240,240,.7)' : 'rgba(20,20,20,.55)'; b.lineWidth = Math.max(0.5, k * 0.18);
+        b.stroke();
+      }
+      b.strokeStyle = 'rgba(20,20,20,.55)'; b.lineWidth = Math.max(0.5, k * 0.14); b.beginPath(); b.arc(o, o, XR * k, 0, 7); b.stroke();
+      b.lineWidth = Math.max(0.5, k * 0.12); b.beginPath(); b.moveTo(o - 0.8 * k, o); b.lineTo(o + 0.8 * k, o); b.moveTo(o, o - 0.8 * k); b.lineTo(o, o + 0.8 * k); b.stroke();
+      // paper texture + pins
+      for (let i = 0; i < 400; i++) { const a = Math.random() * 7, r = Math.sqrt(Math.random()) * TR * k; b.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,.05)' : 'rgba(0,0,0,.05)'; b.fillRect(o + Math.cos(a) * r, o + Math.sin(a) * r, 1, 1); }
+      b.fillStyle = '#d8d0c0';
+      for (const [px, py] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) { b.beginPath(); b.arc(o + px * TR * 0.72 * k, o + py * TR * 0.72 * k, Math.max(1, k * 0.9), 0, 7); b.fill(); }
+      face = { c, size, o };
+    }
+    function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+    const sx = (x) => G.cx + (x - view.x) * G.k, sy = (y) => G.cy - (y - view.y) * G.k;
+
+    /* ---- breathing sway (cm) ---- */
+    /* fatigue: the longer you stay at full draw, the bigger the sway and the faster (and harder) the heartbeat */
+    function fatigue() { return ptr && ptr.anch && ptr.at != null ? U.clamp((time - ptr.at - 2.5) / 6, 0, 1) : 0; }
+    function bpm() { return 72 + 66 * fatigue() + (gasp > 0 ? 18 : 0); }
+    function swayAmp() { return AIM.sway * (holding ? 0.28 : gasp > 0 ? 1.9 : 1) * (1 + 1.5 * fatigue()); }
+    function beatKick() { // a short jolt of the sight on every heartbeat (holding your breath does not stop it)
+      const ph = beatPh % 1, f = fatigue();
+      return ph < 0.18 ? Math.sin(ph / 0.18 * Math.PI) * (0.5 + 1.8 * f) : 0;
+    }
+    function swayAt(t) {
+      const A = swayAmp(), bk = ptr && ptr.anch ? beatKick() : 0;
+      return { x: A * (0.55 * Math.sin(0.9 * t + 1) + 0.25 * Math.sin(2.3 * t)) + bk * 0.35, y: A * (0.85 * Math.sin(1.45 * t) + 0.25 * Math.sin(3.1 * t + 0.5)) + bk };
+    }
+    function humanTurn() {
+      if (!st || anim) return false;
+      const a = actor(st);
+      if (a == null || !api.canAct(a)) return false;
+      return !(st.seq === waitSeq && performance.now() < waitUntil);
+    }
+    function drawQ() { return ptr ? (ptr.anch ? 1 : U.clamp((ptr.y - ptr.sy) / ptr.pl, 0, 1)) : 0; }
+
+    /* ---- drawing ---- */
+    function draw() {
+      cv.clear();
+      if (!G || !face || !st) return;
+      const { W, H } = G;
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, '#1d1727'); bg.addColorStop(1, '#120e18');
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+      drawScope();
+      drawWind();
+      drawInfo();
+      drawZone();
+      drawPops();
+    }
+    function drawScope() {
+      const { cx, cy, R, k } = G;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.clip();
+      // range: sky, tree line, grass
+      const hy = sy(BOSS + 90);
+      const sky = ctx.createLinearGradient(0, cy - R, 0, hy);
+      sky.addColorStop(0, '#8fb3cf'); sky.addColorStop(1, '#cfdbe0');
+      ctx.fillStyle = sky; ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+      ctx.fillStyle = '#3b5a33';
+      ctx.beginPath(); ctx.moveTo(cx - R, hy + 20);
+      for (let i = 0; i <= 24; i++) { const x = cx - R + i * R / 12; ctx.lineTo(x, hy - 12 - 10 * Math.abs(Math.sin(i * 1.7 + view.x * 0.01))); }
+      ctx.lineTo(cx + R, hy + 20); ctx.closePath(); ctx.fill();
+      const gy = sy(-BOSS - 40);
+      const gr = ctx.createLinearGradient(0, hy, 0, cy + R);
+      gr.addColorStop(0, '#5f8a45'); gr.addColorStop(1, '#4b7637');
+      ctx.fillStyle = gr; ctx.fillRect(cx - R, hy, R * 2, cy + R - hy);
+      ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 1;
+      for (let i = 0; i < 6; i++) { const yy = gy + i * i * 6; ctx.beginPath(); ctx.moveTo(cx - R, yy); ctx.lineTo(cx + R, yy); ctx.stroke(); }
+      // stand legs
+      ctx.strokeStyle = '#6b4a2a'; ctx.lineWidth = Math.max(2, 4 * k);
+      const to = tOff();
+      if (st.mv) { ctx.strokeStyle = 'rgba(40,30,20,.55)'; ctx.lineWidth = Math.max(2, 3 * k); ctx.beginPath(); ctx.moveTo(sx(-MV_A - BOSS), gy); ctx.lineTo(sx(MV_A + BOSS), gy); ctx.stroke(); ctx.strokeStyle = '#6b4a2a'; ctx.lineWidth = Math.max(2, 4 * k); }
+      ctx.beginPath(); ctx.moveTo(sx(to.x - BOSS * 0.7), sy(to.y - BOSS)); ctx.lineTo(sx(to.x - BOSS * 0.9), gy); ctx.moveTo(sx(to.x + BOSS * 0.7), sy(to.y - BOSS)); ctx.lineTo(sx(to.x + BOSS * 0.9), gy); ctx.stroke();
+      // wind flag on a pole beside the target: the cloth streams with the wind (sideways part = left/right, length = strength)
+      { const wv = windVec(curWind()), px = sx(BOSS + 34), pb = gy, pt = sy(BOSS + 40), L0 = Math.max(10, 22 * k * 3);
+        ctx.strokeStyle = '#d8d0c0'; ctx.lineWidth = Math.max(1.5, 1.2 * k); ctx.beginPath(); ctx.moveTo(px, pb); ctx.lineTo(px, pt); ctx.stroke();
+        const sd = Math.abs(wv.x) < 0.05 ? 0 : Math.sign(wv.x), droop = U.clamp(1 - wv.s / 3.5, 0, 0.9), ext = 0.25 + 0.75 * Math.min(1, wv.s / 3.5);
+        const fl = L0 * ext, fh = L0 * 0.45, wave = Math.sin(time * (3 + wv.s * 2)) * fh * 0.18 * (0.3 + ext);
+        const dirx = sd || 1, ex = px + dirx * fl * (0.25 + 0.75 * Math.min(1, Math.abs(wv.x) / Math.max(0.3, wv.s))), ey = pt + droop * fl * 0.9;
+        ctx.fillStyle = wv.s >= 3 ? '#ee6a55' : wv.s >= 1.6 ? '#e3ae45' : '#5fd3a0';
+        ctx.beginPath(); ctx.moveTo(px, pt); ctx.quadraticCurveTo((px + ex) / 2, pt + wave + droop * fl * 0.3, ex, ey);
+        ctx.lineTo(ex, ey + fh * (1 - droop * 0.4)); ctx.quadraticCurveTo((px + ex) / 2, pt + fh + wave - droop * fl * 0.1, px, pt + fh); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,.3)'; ctx.lineWidth = 1; ctx.stroke(); }
+      // target
+      ctx.drawImage(face.c, sx(to.x) - face.o, sy(to.y) - face.o, face.size, face.size);
+      // arrows in the target (they ride along with a moving target)
+      for (const d of disp) drawNock(sx(d.x + to.x), sy(d.y + to.y), d.c, 1);
+      if (anim && anim.ph === 'fly') {
+        const p = Math.min(1, anim.t / anim.dur), e = 1 - Math.pow(1 - p, 1.6);
+        const A = { x: cx + anim.ox, y: cy + R * 1.05 }, B = { x: sx(anim.x + to.x), y: sy(anim.y + to.y) };
+        const C = { x: (A.x + B.x) / 2 + anim.cx * G.k, y: Math.min(A.y, B.y) - R * 0.35 };
+        const x = (1 - e) * (1 - e) * A.x + 2 * e * (1 - e) * C.x + e * e * B.x, y = (1 - e) * (1 - e) * A.y + 2 * e * (1 - e) * C.y + e * e * B.y;
+        drawNock(x, y, anim.c, U.lerp(3.2, 1, e));
+      }
+      ctx.restore();
+      // scope body
+      ctx.save();
+      const vg = ctx.createRadialGradient(cx, cy, R * 0.72, cx, cy, R);
+      vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.55)');
+      ctx.fillStyle = vg; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.fill();
+      ctx.lineWidth = 7; ctx.strokeStyle = '#0d0a12'; ctx.beginPath(); ctx.arc(cx, cy, R + 2, 0, 7); ctx.stroke();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.beginPath(); ctx.arc(cx, cy, R + 6, 0, 7); ctx.stroke();
+      // reticle + sight pin
+      const aiming = !anim;
+      if (aiming) {
+        ctx.strokeStyle = 'rgba(15,12,20,.75)'; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx - 12, cy); ctx.moveTo(cx + 12, cy); ctx.lineTo(cx + R, cy);
+        ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy - 12); ctx.moveTo(cx, cy + 12); ctx.lineTo(cx, cy + R); ctx.stroke();
+        ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(15,12,20,.85)'; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, 7); ctx.stroke();
+        ctx.fillStyle = holding ? '#5fd3a0' : '#ffe14d'; ctx.beginPath(); ctx.arc(cx, cy, 2.6, 0, 7); ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = 1; ctx.stroke();
+      }
+      // glare
+      const gl = ctx.createRadialGradient(cx - R * 0.45, cy - R * 0.5, 0, cx - R * 0.45, cy - R * 0.5, R * 0.6);
+      gl.addColorStop(0, 'rgba(255,255,255,.10)'); gl.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+    /* arrow seen from behind: nock + three vanes, a short stub of shaft */
+    function drawNock(x, y, col, s) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2.2 * s; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 3 * s, y + 6 * s); ctx.stroke();
+      ctx.strokeStyle = '#2a2530'; ctx.lineWidth = 1.6 * s; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 2 * s, y + 4.5 * s); ctx.stroke();
+      const bx = x + 2.4 * s, by = y + 5.2 * s;
+      ctx.fillStyle = col; ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 0.7;
+      for (let i = 0; i < 3; i++) {
+        const a = -Math.PI / 2 + i * 2 * Math.PI / 3;
+        ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + Math.cos(a - 0.25) * 6 * s, by + Math.sin(a - 0.25) * 6 * s); ctx.lineTo(bx + Math.cos(a) * 6.5 * s, by + Math.sin(a) * 6.5 * s); ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+      ctx.fillStyle = '#f2e9d8'; ctx.beginPath(); ctx.arc(bx, by, 1.5 * s, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+    function curWind() { return anim ? anim.w : (st ? st.w : [0, 0]); }
+    function drawWind() {
+      const w = curWind(), wv = windVec(w);
+      const x0 = 10, y0 = G.topH + 4, bw = 86, bh = 64;
+      ctx.fillStyle = 'rgba(18,14,24,.84)'; rr(x0, y0, bw, bh, 12); ctx.fill();
+      ctx.strokeStyle = 'rgba(242,233,216,.14)'; ctx.lineWidth = 1; ctx.stroke();
+      // compass: up = toward the target
+      const cx = x0 + 24, cy = y0 + 32, r = 16;
+      ctx.strokeStyle = 'rgba(242,233,216,.3)'; ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.stroke();
+      ctx.fillStyle = 'rgba(242,233,216,.45)'; ctx.beginPath(); ctx.moveTo(cx, cy - r - 3); ctx.lineTo(cx - 3, cy - r + 2); ctx.lineTo(cx + 3, cy - r + 2); ctx.closePath(); ctx.fill();
+      const dx = Math.cos(w[0] * DEG), dy = -Math.sin(w[0] * DEG), len = r * (0.45 + 0.55 * Math.min(1, wv.s / 4));
+      const strong = wv.s >= 3, col = strong ? '#ee6a55' : wv.s >= 1.6 ? '#e3ae45' : '#5fd3a0';
+      ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(cx - dx * len, cy - dy * len); ctx.lineTo(cx + dx * len, cy + dy * len); ctx.stroke();
+      ctx.fillStyle = col; ctx.beginPath();
+      ctx.moveTo(cx + dx * (len + 4), cy + dy * (len + 4)); ctx.lineTo(cx + dx * (len - 4) - dy * 5, cy + dy * (len - 4) + dx * 5); ctx.lineTo(cx + dx * (len - 4) + dy * 5, cy + dy * (len - 4) - dx * 5); ctx.closePath(); ctx.fill();
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#ab9fb8'; ctx.font = '700 11px "IBM Plex Sans KR", sans-serif'; ctx.fillText('바람', x0 + 46, y0 + 20);
+      ctx.fillStyle = '#f2e9d8'; ctx.font = '600 15px "IBM Plex Mono", monospace'; ctx.fillText(wv.s.toFixed(1), x0 + 46, y0 + 38);
+      ctx.fillStyle = '#ab9fb8'; ctx.font = '600 10px "IBM Plex Mono", monospace'; ctx.fillText('m/s', x0 + 46, y0 + 52);
+    }
+    function drawInfo() {
+      const s = hud || st;
+      if (!s) return;
+      let t;
+      if (s.ph === 'so') t = '슛오프' + (s.so.rd > 1 ? ' ' + s.so.rd : '') + ' · 1발';
+      else if (s.ph === 'e') t = '경기 종료';
+      else { const arrow = Math.floor(s.i / s.n) + 1; t = (s.md === 'set' ? '세트 ' : '엔드 ') + (s.e + 1) + (s.md === 'set' ? '' : '/' + s.E) + ' · ' + arrow + '/3발'; }
+      const sub = s.mv && s.tp ? '이동 표적 · 속도 ' + s.tp[1] : '70m · 122cm', subF = s.mv ? '600 11px "IBM Plex Sans KR", sans-serif' : '600 11px "IBM Plex Mono", monospace';
+      ctx.font = subF; const sw0 = ctx.measureText(sub).width;
+      ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      const tw = Math.max(ctx.measureText(t).width, sw0) + 20, x0 = G.W - 10 - Math.max(tw, 70), y0 = G.topH + 4;
+      ctx.fillStyle = 'rgba(18,14,24,.84)'; rr(x0, y0, Math.max(tw, 70), 44, 12); ctx.fill();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#f2e9d8';
+      ctx.fillText(t, x0 + Math.max(tw, 70) / 2, y0 + 14);
+      ctx.fillStyle = s.mv ? '#e3ae45' : '#ab9fb8'; ctx.font = subF;
+      ctx.fillText(sub, x0 + Math.max(tw, 70) / 2, y0 + 31);
+    }
+    function drawZone() {
+      const { W, H, zoneTop } = G;
+      const lg = ctx.createLinearGradient(0, zoneTop, 0, H);
+      lg.addColorStop(0, '#2a2236'); lg.addColorStop(1, '#1a1522');
+      ctx.fillStyle = lg; ctx.fillRect(0, zoneTop, W, H - zoneTop);
+      ctx.fillStyle = 'rgba(227,174,69,.5)'; ctx.fillRect(0, zoneTop, W, 2);
+      const a = actor(st);
+      const human = humanTurn();
+      const q = human ? drawQ() : anim && anim.mine ? 0 : 0;
+      drawBow(q, a != null ? color(a) : '#e3ae45', human || (anim && anim.ph === 'fly' && anim.t < 0.12));
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (!human) {
+        if (a != null && !anim && st.ph !== 'e') {
+          const p = api.players[a];
+          ctx.fillStyle = '#ab9fb8'; ctx.font = '700 13px "IBM Plex Sans KR", sans-serif';
+          ctx.fillText(p ? p.name + (p.ai ? ' 조준 중…' : ' 차례') : '', W / 2, H - 18);
+        }
+        return;
+      }
+      // draw meter
+      const mx = W - 22, my1 = zoneTop + 44, mh = G.zoneH - 66;
+      ctx.fillStyle = 'rgba(18,14,24,.75)'; rr(mx - 7, my1 - 4, 14, mh + 8, 7); ctx.fill();
+      ctx.fillStyle = ptr && ptr.anch ? '#5fd3a0' : '#e3ae45';
+      const fh = mh * q; rr(mx - 4, my1 + mh - fh, 8, fh, 4); ctx.fill();
+      ctx.fillStyle = '#5fd3a0'; ctx.fillRect(mx - 9, my1 - 1, 18, 2);
+      ctx.font = '700 10px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#ab9fb8'; ctx.fillText('당김', mx, my1 - 14);
+      // breath meter while anchored
+      if (ptr && ptr.anch) {
+        const bx = 22, by = my1, bh = mh;
+        ctx.fillStyle = 'rgba(18,14,24,.75)'; rr(bx - 7, by - 4, 14, bh + 8, 7); ctx.fill();
+        ctx.fillStyle = gasp > 0 ? '#ee6a55' : holding ? '#5fd3a0' : 'rgba(91,179,230,.85)';
+        rr(bx - 4, by + bh * (1 - breath), 8, bh * breath, 4); ctx.fill();
+        ctx.fillStyle = '#ab9fb8'; ctx.fillText('숨', bx, by - 14);
+        // heartbeat: a heart that thumps on every beat + rate
+        const f = fatigue(), ph = beatPh % 1, pu = ph < 0.18 ? Math.sin(ph / 0.18 * Math.PI) : 0, hx = 52, hy2 = by + 6, hs = 6 + pu * 2.2;
+        ctx.fillStyle = f > 0.6 ? '#ee6a55' : f > 0.2 ? '#e3ae45' : '#d9798a';
+        ctx.beginPath(); ctx.moveTo(hx, hy2 + hs * 0.9); ctx.bezierCurveTo(hx - hs * 1.6, hy2 - hs * 0.2, hx - hs * 0.6, hy2 - hs * 1.3, hx, hy2 - hs * 0.4);
+        ctx.bezierCurveTo(hx + hs * 0.6, hy2 - hs * 1.3, hx + hs * 1.6, hy2 - hs * 0.2, hx, hy2 + hs * 0.9); ctx.fill();
+        ctx.font = '600 10px "IBM Plex Mono", monospace'; ctx.fillStyle = '#ab9fb8'; ctx.fillText(String(Math.round(bpm())), hx, hy2 + 18);
+        ctx.font = '700 10px "IBM Plex Sans KR", sans-serif';
+      }
+      // hint
+      let hint, col = '#ab9fb8';
+      const sh = shots[a] || 0, wv = windVec(st.w);
+      if (!ptr) { hint = hintFlash > 0 ? '아래로 끝까지 당겼다가 놓으세요' : '화면을 누른 채 아래로 당겨 만작 · 놓으면 발사'; if (hintFlash > 0) col = '#ee6a55'; }
+      else if (!ptr.anch) { const qq = drawQ(); hint = qq < 0.5 ? '더 당기세요 · 여기서 놓으면 취소' : '끝까지 당기면 「딸깍」 · 지금 놓으면 약해요'; col = qq < 0.5 ? '#ab9fb8' : '#e3ae45'; }
+      else if (ptr.cancel) { hint = '여기서 놓으면 취소'; col = '#ee6a55'; }
+      else if (gasp > 0) { hint = '숨이 차요 · 흔들림이 커졌어요'; col = '#ee6a55'; }
+      else if (fatigue() > 0.5) { hint = '팔이 떨려요 · 심장 박동 사이에 빨리 놓으세요'; col = '#ee6a55'; }
+      else if (holding) { hint = '숨 참는 중 · 박동 사이에 놓으세요'; col = '#5fd3a0'; }
+      else if (st.mv && sh < 4) { hint = '과녁이 ' + MV_NAMES[st.tp[0]] + '로 움직여요 · 1초 뒤 올 자리를 겨냥'; col = '#e3ae45'; }
+      else if (sh < 3 && Math.abs(wv.x) > 0.8) { hint = '바람에 밀려요 · ' + (wv.x > 0 ? '왼쪽' : '오른쪽') + '으로 조금 겨냥'; col = '#e3ae45'; }
+      else hint = '손가락을 잠깐 멈추면 숨 참기';
+      ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      const hw = ctx.measureText(hint).width + 24;
+      const hy = ptr ? zoneTop + 16 : H - 16;
+      ctx.fillStyle = 'rgba(18,14,24,.8)'; rr(W / 2 - hw / 2, hy - 12, hw, 24, 12); ctx.fill();
+      ctx.fillStyle = col; ctx.fillText(hint, W / 2, hy + 0.5);
+      if (ptr && ptr.anch) { // cancel ring at the start point
+        ctx.setLineDash([3, 4]); ctx.lineWidth = 1.5; ctx.strokeStyle = ptr.cancel ? '#ee6a55' : 'rgba(171,159,184,.45)';
+        ctx.beginPath(); ctx.arc(ptr.sx, ptr.sy, 26, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    /* recurve bow lying across the bottom, arrow pointing at the target; q = draw 0..1 */
+    function drawBow(q, col, armed) {
+      const { W } = G, cx = W / 2, ry = G.restY - 34;
+      const span = Math.min(W * 0.4, 170);
+      const tipX = span - q * 10, tipY = ry + 18 + q * 16;
+      const sy0 = ry + 26 + q * 4, nockY = sy0 + q * G.pull * 0.9;
+      // limbs
+      ctx.lineCap = 'round';
+      for (const sd of [-1, 1]) {
+        ctx.strokeStyle = '#1b1720'; ctx.lineWidth = 7;
+        ctx.beginPath(); ctx.moveTo(cx + sd * 18, ry); ctx.bezierCurveTo(cx + sd * span * 0.55, ry - 16 + q * 6, cx + sd * (tipX - 6), ry - 4 + q * 10, cx + sd * tipX, tipY);
+        ctx.stroke();
+        ctx.strokeStyle = '#3a3346'; ctx.lineWidth = 3; ctx.stroke();
+        ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.moveTo(cx + sd * tipX, tipY); ctx.lineTo(cx + sd * (tipX + 7), tipY - 7); ctx.stroke();
+      }
+      // string
+      ctx.strokeStyle = 'rgba(242,233,216,.85)'; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(cx - tipX, tipY); ctx.lineTo(cx, armed ? nockY : sy0); ctx.lineTo(cx + tipX, tipY); ctx.stroke();
+      // riser
+      const rg = ctx.createLinearGradient(cx - 18, 0, cx + 18, 0);
+      rg.addColorStop(0, '#2e2440'); rg.addColorStop(0.5, '#5a4a74'); rg.addColorStop(1, '#2e2440');
+      ctx.fillStyle = rg; rr(cx - 20, ry - 9, 40, 18, 7); ctx.fill();
+      ctx.fillStyle = '#e3ae45'; ctx.fillRect(cx - 2, ry - 9, 4, 18);
+      // sight bar
+      ctx.strokeStyle = '#8c8798'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(cx + 20, ry - 2); ctx.lineTo(cx + 44, ry - 30); ctx.stroke();
+      ctx.fillStyle = '#ffe14d'; ctx.beginPath(); ctx.arc(cx + 44, ry - 30, 3, 0, 7); ctx.fill();
+      // arrow
+      if (armed) {
+        const tipYa = nockY - 118;
+        ctx.strokeStyle = '#cfc6b4'; ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(cx, nockY); ctx.lineTo(cx, tipYa); ctx.stroke();
+        ctx.fillStyle = '#c0c4cc'; ctx.beginPath(); ctx.moveTo(cx, tipYa - 7); ctx.lineTo(cx - 3, tipYa + 1); ctx.lineTo(cx + 3, tipYa + 1); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = col;
+        for (const sd of [-1, 1]) { ctx.beginPath(); ctx.moveTo(cx, nockY - 4); ctx.lineTo(cx + sd * 6, nockY - 2); ctx.lineTo(cx + sd * 6, nockY - 16); ctx.lineTo(cx, nockY - 24); ctx.closePath(); ctx.fill(); }
+        ctx.fillStyle = '#f2e9d8'; ctx.fillRect(cx - 2, nockY - 1, 4, 4);
+        if (!ptr && humanTurn()) { // pull-down chevrons
+          ctx.strokeStyle = 'rgba(227,174,69,' + (0.35 + 0.3 * Math.sin(time * 4)) + ')'; ctx.lineWidth = 2.5;
+          for (let i = 0; i < 2; i++) { const yy = nockY + 14 + i * 9 + Math.sin(time * 4) * 2; ctx.beginPath(); ctx.moveTo(cx - 8, yy); ctx.lineTo(cx, yy + 6); ctx.lineTo(cx + 8, yy); ctx.stroke(); }
+        }
+      }
+    }
+    function drawPops() {
+      for (const pp of pops) {
+        const a = pp.t < 0.12 ? pp.t / 0.12 : pp.t > pp.life - 0.3 ? Math.max(0, (pp.life - pp.t) / 0.3) : 1;
+        ctx.save(); ctx.globalAlpha = a;
+        const x = G.cx, y = G.cy - G.R * 0.62 - Math.min(1, pp.t / 0.2) * 8;
+        ctx.font = '400 24px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+        const tw = ctx.measureText(pp.text).width; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+        const sw = pp.sub ? ctx.measureText(pp.sub).width : 0, bw = Math.max(tw, sw) + 30, bh = pp.sub ? 52 : 36;
+        ctx.fillStyle = 'rgba(18,14,24,.6)'; rr(x - bw / 2, y - bh / 2, bw, bh, 12); ctx.fill();
+        ctx.strokeStyle = pp.col; ctx.lineWidth = 2; ctx.stroke();
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = pp.col; ctx.font = '400 24px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+        ctx.fillText(pp.text, x, y - (pp.sub ? 8 : 0) + 1);
+        if (pp.sub) { ctx.fillStyle = '#f2e9d8'; ctx.font = '700 12px "IBM Plex Sans KR", sans-serif'; ctx.fillText(pp.sub, x, y + 14); }
+        ctx.restore();
+      }
+    }
+
+    /* ---- HUD ---- */
+    let hudKey = '';
+    function renderTop() {
+      const s = hud || st;
+      if (!s) return;
+      const cur = anim ? anim.s : actor(s);
+      const key = JSON.stringify([s.es, s.sp, s.a, s.so, cur, s.ph, s.e]);
+      if (key === hudKey) return;
+      hudKey = key;
+      top.innerHTML = '';
+      for (let i = 0; i < s.n; i++) {
+        const p = api.players[i] || { name: '', color: '#fff' }, on = cur === i;
+        const big = s.md === 'set' ? s.sp[i] : tot(s, i);
+        const mine = s.a.filter((a) => a[2] === i).map((a) => ring(a[0], a[1]).l);
+        const chips = [];
+        if (s.ph === 'so' || (s.ph === 'e' && s.so)) {
+          const h = s.so.h.find((x) => x[2] === i);
+          chips.push(L.h('span', { class: 'mono', style: { fontSize: '11px', color: s.so.c.includes(i) ? 'var(--coral)' : 'var(--muted)' }, text: s.so.c.includes(i) ? '슛오프' + (h ? ' ' + ring(h[0], h[1]).l : '') : '—' }));
+        } else for (let j = 0; j < 3; j++) {
+          const l = mine[j];
+          chips.push(L.h('span', { class: 'mono', style: { minWidth: '17px', height: '15px', lineHeight: '15px', textAlign: 'center', fontSize: '10.5px', fontWeight: 700, borderRadius: '4px',
+            background: l == null ? 'transparent' : l === 'X' || l === '10' || l === '9' ? '#f2c230' : l === 'M' ? 'transparent' : 'var(--surface-2)',
+            color: l === 'X' || l === '10' || l === '9' ? '#2a1d05' : 'var(--ink)', border: '1px solid ' + (l == null ? 'rgba(242,233,216,.2)' : 'transparent') }, text: l == null ? '' : l }));
+        }
+        top.append(L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '4px', opacity: on || cur == null ? 1 : 0.65, borderColor: on ? p.color : '', boxShadow: on ? '0 0 0 1px ' + p.color + ' inset' : '' } },
+          L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', fontWeight: 700, minWidth: 0 } },
+            L.h('span', { class: 'dot', style: { '--c': p.color, flex: 'none' } }),
+            L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, text: p.name })),
+          L.h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '4px' } },
+            L.h('span', { class: 'mono', style: { fontSize: s.n > 3 ? '22px' : '26px', fontWeight: 600, lineHeight: 1 }, text: String(big) }),
+            L.h('span', { class: 'muted', style: { fontSize: '10px', fontWeight: 700 }, text: s.md === 'set' ? '세트' : '점' })),
+          L.h('div', { style: { display: 'flex', gap: '2px', minHeight: '15px', overflow: 'hidden' } }, chips)));
+      }
+      requestAnimationFrame(() => { const h = top.getBoundingClientRect().height; if (h && G && Math.abs(h + 4 - G.topH) > 1) { G.topH = h + 4; layout(); } });
+    }
+
+    /* ---- animation ---- */
+    function startAnim(l, prev) {
+      clearTimeout(animTimer);
+      hud = prev || st;
+      const end = l.end, so = l.so;
+      disp = ((prev && prev.ph === 'so') ? (prev.so.h || []) : (prev ? prev.a : [])).map((a) => ({ x: a[0], y: a[1], c: color(a[2]) }));
+      const mine = myShot && myShot.seq === l.id - 1;
+      anim = { ph: 'fly', t: 0, dur: 0.6 / L.debug.speed, x: l.x, y: l.y, s: l.s, c: color(l.s), w: l.w, l, end, so, mine,
+        ox: mine ? 0 : 0, cx: -windVec(l.w).x * 3 };
+      myShot = null;
+      api.setBusy(true);
+      api.sfx('whoosh'); api.buzz(12);
+      animTimer = setTimeout(() => { if (anim && anim.l === l) finish(); }, 4500 / L.debug.speed + 1500);
+      hudKey = ''; renderTop();
+    }
+    function land() {
+      const l = anim.l;
+      disp.push({ x: l.x, y: l.y, c: anim.c });
+      api.sfx('thud'); api.buzz(20);
+      let text = l.p ? (l.X ? 'X' : String(l.p)) : '빗나감', col = l.p >= 9 ? '#f2c230' : l.p >= 7 ? '#e0413a' : l.p >= 5 ? '#5bb3e6' : l.p ? '#f2e9d8' : '#ab9fb8', sub = null;
+      if (l.X) sub = '정중앙 X';
+      if (l.p >= 10) { setTimeout(() => api.sfx('pop'), 90); api.haptic('hit', l.X ? [25, 45, 30, 45, 55] : [25, 45, 40]); }
+      if (l.X) { text = 'X!'; setTimeout(() => api.sfx('chip'), 200); }
+      let hold = 0.55;
+      hud = st; // scoreboard now shows this arrow (and the end result)
+      if (anim.end) {
+        const e = anim.end;
+        hud = Object.assign({}, st, { a: e.a }); // keep the end's arrows visible in the board for a moment
+        if (st.md === 'set') {
+          const [A, B] = e.sums;
+          sub = (A === B ? '동점 · 1점씩' : api.players[A > B ? 0 : 1].name + ' 세트 +2') + ' (' + A + ':' + B + ')';
+          flash = { text: '세트 ' + e.sp[0] + ' : ' + e.sp[1], t0: performance.now() };
+        } else flash = { text: (e.e + 1) + '엔드 끝', t0: performance.now() };
+        hold = 1.5;
+      }
+      if (anim.so) {
+        const best = Math.min(...anim.so.map((h) => h[3]));
+        sub = anim.so.map((h) => api.players[h[2]].name + ' ' + h[3].toFixed(1) + 'cm').join(' · ');
+        flash = { text: l.fin ? '슛오프 승부!' : '다시 슛오프', t0: performance.now() };
+        void best;
+        hold = 1.7;
+      }
+      pops = [{ text, sub, col, t: 0, life: Math.min(1.6, hold + 0.35) / Math.sqrt(L.debug.speed) }];   // 점수 알림은 1.6초 안에
+      anim.ph = 'hold'; anim.t = 0; anim.dur = hold / L.debug.speed;
+      hudKey = ''; renderTop();
+    }
+    function finish() {
+      if (!anim) return;
+      if (anim.ph === 'fly') land();
+      anim = null; clearTimeout(animTimer); turnT0 = time;
+      hud = null; flash = null;
+      syncDisp();
+      hudKey = ''; renderTop();
+      api.setBusy(false);
+    }
+    function syncDisp() {
+      if (!st) return;
+      const src = st.ph === 'so' ? st.so.h : st.ph === 'e' && st.so ? st.so.h : st.a.length || !st.last || !st.last.end ? st.a : st.last.end.a;
+      disp = src.map((a) => ({ x: a[0], y: a[1], c: color(a[2]) }));
+    }
+
+    let lastMove = 0, stillSince = 0;
+    const stopLoop = U.loop((dt) => {
+      time += dt;
+      if (hintFlash > 0) hintFlash -= dt;
+      // breath
+      if (ptr && ptr.anch) {
+        if (!holding && gasp <= 0 && time - stillSince > 0.35 && breath > 0.2) { holding = true; api.buzz(8); }
+        if (holding) { breath -= dt / 3.2; if (breath <= 0) { breath = 0; holding = false; gasp = 2.2; api.buzz(25); } }
+        else breath = Math.min(1, breath + dt * 0.25);
+      } else { holding = false; breath = Math.min(1, breath + dt * 0.6); }
+      if (gasp > 0) gasp -= dt;
+      { const b0 = beatPh; beatPh += dt * bpm() / 60; if (ptr && ptr.anch && Math.floor(beatPh) !== Math.floor(b0) && fatigue() > 0.4) api.buzz(6); }
+      // view: where the scope points
+      let tx = 0, ty = 0;
+      if (!anim) {
+        const sw = swayAt(time);
+        tx = sw.x; ty = sw.y;
+        if (ptr && ptr.anch) { tx += ptr.ax; ty += ptr.ay; }
+      }
+      const k = Math.min(1, dt * (anim ? 10 : 18));
+      view.x += (tx - view.x) * k; view.y += (ty - view.y) * k;
+      // slow-mo on the last stretch of a 10/X arrow (view only; landing point already in state)
+      if (anim) { anim.t += (anim.ph === 'fly' && anim.l.p >= 10 && anim.t > anim.dur * 0.6) ? dt * 0.3 : dt; if (anim.t >= anim.dur) { if (anim.ph === 'fly') land(); else finish(); } }
+      for (const p of pops) p.t += dt;
+      pops = pops.filter((p) => p.t < p.life);
+      draw();
+      if (flash) drawFlash();
+    });
+    function drawFlash() {
+      const k = (performance.now() - flash.t0) / (1500 / Math.sqrt(L.debug.speed));
+      if (k >= 1) { flash = null; return; }
+      ctx.globalAlpha = k < 0.12 ? k / 0.12 : 1 - Math.max(0, (k - 0.7) / 0.3);
+      const y = G.cy + G.R * 0.55;
+      ctx.font = '400 30px "Black Han Sans", "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(23,19,31,.9)'; ctx.strokeText(flash.text, G.cx, y);
+      ctx.fillStyle = '#e3ae45'; ctx.fillText(flash.text, G.cx, y);
+      ctx.globalAlpha = 1;
+    }
+
+    /* ---- input: pull the string down, then aim with the same finger ---- */
+    const el = cv.cv;
+    function onDown(ev) {
+      pops = []; flash = null; // 알림은 누르면 바로 걷힘
+      if (!G || !ev.isPrimary || !humanTurn()) return;
+      const p = cv.local(ev);
+      try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      // the pull needed for a full draw shrinks when the finger starts low, so the anchor point always keeps ~70px of
+      // screen below it for aiming lower after the 「딸깍」 (never less than 40px of pull)
+      ptr = { id: ev.pointerId, sx: p.x, sy: p.y, pl: U.clamp(G.H - 72 - p.y, 40, G.pull), x: p.x, y: p.y, anch: false, fx: 0, fy: 0, ax: 0, ay: 0, cancel: false, hist: [] };
+      lastMove = p; stillSince = time; holding = false;
+      api.sfx('tick'); api.buzz(8);
+      ev.preventDefault();
+    }
+    function onMove(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      const p = cv.local(ev);
+      ptr.x = p.x; ptr.y = p.y;
+      if (Math.hypot(p.x - lastMove.x, p.y - lastMove.y) > 4) { lastMove = p; stillSince = time; if (holding) { holding = false; } }
+      if (!ptr.anch) {
+        if (p.y - ptr.sy >= ptr.pl) { ptr.anch = true; ptr.at = time; ptr.fx = p.x; ptr.fy = p.y; api.sfx('click'); api.buzz(18); stillSince = time; }
+      } else {
+        const lim = st && st.mv ? 130 : 75;
+        ptr.ax = U.clamp((p.x - ptr.fx) * AIM.gain, -lim, lim);
+        ptr.ay = U.clamp(-(p.y - ptr.fy) * AIM.gain, -lim, lim);
+        ptr.cancel = Math.hypot(p.x - ptr.sx, p.y - ptr.sy) < 26;
+      }
+      ptr.hist.push({ t: performance.now(), ax: ptr.ax, ay: ptr.ay });
+      if (ptr.hist.length > 40) ptr.hist.shift();
+    }
+    function onUp(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      const g = ptr; ptr = null;
+      const wasHolding = holding; holding = false;
+      if (ev.type === 'pointercancel' || !humanTurn()) return;
+      const q = g.anch ? 1 : U.clamp((g.y - g.sy) / g.pl, 0, 1);
+      if ((g.anch && g.cancel) || (!g.anch && q < 0.5)) { api.sfx('click'); if (!g.anch && g.hist.length < 3) hintFlash = 1.4; return; }
+      // a lifting thumb wiggles: aim as it was ~60 ms before release
+      const tu = performance.now();
+      let ax = g.ax, ay = g.ay;
+      for (let i = g.hist.length - 1; i >= 0; i--) { const h = g.hist[i]; if (tu - h.t >= 60 || i === 0) { if (tu - h.t < 400) { ax = h.ax; ay = h.ay; } break; } }
+      const sw = swayAt(time);
+      void wasHolding;
+      const aimX = ax + sw.x + gauss() * AIM.rel, aimY = ay + sw.y + gauss() * AIM.rel;
+      const hit = fly(aimX, aimY, q, st.w);
+      const a = actor(st);
+      let mvx = null;
+      if (st.mv) { const rt = r2(time - turnT0), ft = r2(hit.t), o = tpos(st.tp, rt + ft); mvx = { rt, ft }; hit.x -= o.x; hit.y -= o.y; }
+      shots[a] = (shots[a] || 0) + 1;
+      myShot = { seq: st.seq };
+      waitSeq = st.seq; waitUntil = tu + 2500;
+      api.buzz(22); api.sfx('whoosh');
+      api.act(Object.assign({ type: 'shoot', x: r1(hit.x), y: r1(hit.y) }, mvx || {}));
+    }
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+    cv.onresize = () => layout();
+    layout();
+
+    return {
+      update(next, prev) {
+        st = next;
+        if (prev && prev !== next && result(next) && !result(prev)) api.mySeats().forEach((i) => {
+          if (!next.es[i]) return;
+          const pf = next.mv ? 'mv_' : '', pl = next.mv ? '움직이는 표적 ' : '';
+          const nb = next.md === 'tot' && api.best(pf + 'tot', tot(next, i), { label: pl + '총점(4엔드) 최고', unit: '점' });
+          const ne = next.es[i].length && api.best(pf + 'end', Math.max(...next.es[i]), { label: pl + '한 엔드 최고', unit: '점' });
+          if (nb || ne) api.toast('🏆 새 최고 기록!');
+        });
+        const l = next.last;
+        if (l && l.id !== shownId && prev && prev !== next && G) {
+          if (anim) finish();
+          shownId = l.id;
+          startAnim(l, prev);
+        } else {
+          if (!l || l.id !== shownId || !prev) turnT0 = time;
+          shownId = l ? l.id : 0;
+          if (!anim) syncDisp();
+        }
+        if (!humanTurn()) ptr = null;
+        hudKey = ''; renderTop();
+      },
+      destroy() {
+        stopLoop(); clearTimeout(animTimer);
+        el.removeEventListener('pointerdown', onDown); el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', onUp); el.removeEventListener('pointercancel', onUp);
+        cv.destroy(); top.remove(); [spScope, spWind, spZone].forEach((f) => f.el.remove());
+        api.setBusy(false);
+      },
+    };
+  }
+
+  L.register({
+    id: 'archery', name: '양궁', tag: '70m 리커브', cat: '스포츠',
+    blurb: '70m 과녁에 3발씩 번갈아 쏴요. 2명이면 세트제(엔드를 이기면 2점, 6점 먼저), 3명 이상이면 4엔드 총점. 화살마다 바뀌는 바람을 읽고 겨냥하세요.',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2, hidden: false, aiDelay: 900,
+    tint: '#1f4a3a',
+    icon: '<circle cx="24" cy="30" r="18" fill="none" stroke="currentColor" stroke-width="3"/><circle cx="24" cy="30" r="11" fill="none" stroke="currentColor" stroke-width="3"/><circle cx="24" cy="30" r="4" fill="currentColor"/><path d="M24 30L50 6" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/><path d="M44 6h7v7M41 9l4 4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>',
+    options: [
+      { id: 'game', label: '모드', tip: '표적이 가만히 있는지, 좌우로 움직이는지.', choices: [{ v: 'std', label: '정식 경기', tip: '정식 70m 표적, 바람만 신경 써요.' }, { v: 'mv', label: '움직이는 표적', tip: '표적이 좌우로 움직여 타이밍을 맞춰 쏴요.' }], def: 'std' },
+      { id: 'mode', label: '방식', tip: '승부를 정하는 방식.', choices: [{ v: 'set', label: '세트제 (6점 먼저)', tip: '엔드마다 이기면 2점·비기면 1점, 세트 점수 6점 먼저.' }, { v: 'tot', label: '총점 (4엔드)', tip: '4엔드 동안 쏜 점수를 모두 더해 많으면 승리.' }], def: 'set' },
+    ],
+    quick: [
+      '70m 과녁에 한 사람이 3발씩(한 발씩 번갈아) 쏴서 점수를 겨뤄요. 가운데 노랑이 10점이에요.',
+      '내 차례: 손가락을 대고 아래로 당겨 「딸깍」(만작)이 나면, 떼지 말고 움직여 조준하고 손가락을 떼면 발사.',
+      '2명이면 세트제(엔드를 이기면 2점, 6점 먼저), 3명 이상·혼자면 4엔드 총점이 높은 사람이 이겨요.',
+    ],
+    rules: [
+      { h: '목표', p: ['70m 거리의 과녁에 화살을 쏴서 높은 점수를 내요.',
+        '2명이면 세트제(세트 점수 6점을 먼저 따면 승리), 3–4명이나 혼자면 4엔드 총점이 가장 높은 사람이 이겨요.'] },
+      { h: '차례에 할 일', p: ['① 「엔드」는 한 판이에요. 한 엔드에 한 사람당 3발을 쏴요.',
+        '② 한 발씩 번갈아 쏴요(나 → 상대 → 나 …).',
+        '③ 모두 3발을 쏘면 엔드가 끝나고 점수를 비교해요.'] },
+      { h: '조작 (손가락)', p: ['① 화면 아무 데나 손가락을 대고, 활시위를 당기듯 아래로 당기세요.',
+        '② 끝까지 당기면 「딸깍」 소리와 함께 만작(풀 드로우)이 돼요. 이게 딱 맞는 세기예요. 아래쪽에서 시작하면 짧게만 당겨도 「딸깍」이 나요.',
+        '③ 만작 뒤에는 손가락을 떼지 말고 그대로 움직여 조준해요. 스코프 가운데 노란 점(조준기)이 화살이 갈 곳이에요(바람이 없을 때).',
+        '④ 손가락을 떼면 발사!',
+        '숨: 조준은 숨 쉴 때마다 살짝 흔들려요. 손가락을 잠깐 멈추면 숨을 참아 흔들림이 크게 줄어요(초록 점). 숨은 약 3초 버티고, 너무 오래 참으면 숨이 차서 더 흔들려요.',
+        '끝까지 당기기 전에 놓으면 화살이 약해서 아래로 떨어져요. 반도 안 당기고 놓거나, 만작 뒤 처음 누른 자리(점선 원)로 돌아와 놓으면 취소예요.',
+        '만작 뒤에도 조준할 자리가 화면에 항상 남도록 당기는 길이가 저절로 맞춰져요.'] },
+      { h: '과녁과 점수', p: ['과녁은 지름 122cm, 고리 10개예요. 바깥 흰색 1점 → 검정 → 파랑 → 빨강 → 가운데 노랑 10점.',
+        '선에 걸치면 높은 점수로 쳐요. 과녁 밖은 빗나감(0점).',
+        '10점 안의 작은 고리가 X(정중앙)예요. 점수는 10점이지만, 동점을 가릴 때 쓰여요.'] },
+      { h: '승리 — 세트제 (2명)', p: ['엔드마다 3발 합계가 높은 사람이 세트 점수 2점, 같으면 1점씩 가져요.',
+        '세트 점수 6점을 먼저 따면 이겨요. 5엔드 뒤 5:5면 슛오프.',
+        '다음 엔드는 세트 점수가 낮은 사람이 먼저 쏴요(같으면 1번부터).'] },
+      { h: '승리 — 총점 (3–4명·혼자)', p: ['4엔드(12발) 합계가 가장 높은 사람이 이겨요. 엔드마다 먼저 쏘는 사람이 한 칸씩 바뀌어요.',
+        '3–4명이나 혼자 하면 세트제를 골라도 총점 방식이에요.',
+        '총점이 같으면 10점(X 포함) 개수, 그다음 X 개수로 가려요. 그래도 같으면 슛오프.'] },
+      { h: '움직이는 표적 (모드)', p: ['「모드」에서 고르는 별개 경기예요. 점수·세트·엔드 규칙은 정식 경기와 같고, 과녁만 움직여요.',
+        '화살마다 움직임이 바뀌어요: 좌우 · 왕복(일정한 속도) · 8자 · 타원. 오른쪽 위 상자에 속도 단계가 나와요.',
+        '속도는 엔드마다 한 단계씩 빨라져요(1엔드 1단계 → 최대 5단계, 슛오프는 3단계).',
+        '화살은 날아가는 데 약 1.2초 걸려요. 과녁이 1초쯤 뒤에 올 자리를 미리 겨냥(리드)하세요. 바람·숨·심박도 그대로예요.',
+        '꽂힌 화살은 과녁과 함께 움직이고, 점수는 과녁 기준으로 매겨요. 최고 기록은 정식 경기와 따로 남아요.'] },
+      { h: '슛오프', p: ['동점인 사람이 한 발씩 쏴서 과녁 정중앙에 더 가까운 사람이 이겨요. 거리까지 같으면 다시 쏴요.'] },
+      { h: '숨과 심박', p: ['만작 뒤 손가락을 잠깐 멈추면 숨을 참아 흔들림이 확 줄어요(약 3초, 너무 오래 참으면 숨이 차서 더 흔들려요).', '심장이 뛸 때마다 조준점이 위로 톡 튀어요. 왼쪽 아래 하트가 뛰는 걸 보고 박동 사이에 놓으세요.', '만작으로 오래 버틸수록 팔이 떨려 흔들림이 커지고 심박도 빨라져요. 2~3초 안에 쏘는 게 좋아요.'] },
+      { h: '바람', p: ['왼쪽 위 바람 표시와 과녁 옆 깃발: 화살표가 바람이 부는 방향(위쪽 = 과녁 쪽), 숫자가 세기(m/s)예요. 바람은 화살마다 조금씩 바뀌어요.',
+        '옆바람은 화살을 바람 부는 쪽으로 밀어요(4m/s면 약 25cm). 그러니 바람이 오는 쪽으로 조금 겨냥하세요.',
+        '맞바람·뒷바람은 위아래로 조금 영향을 줘요.'] },
+      { h: '예시', p: ['세트제 1엔드: 나 9 + 10 + 8 = 27, 상대 10 + 9 + 7 = 26 → 내가 세트 점수 2점(2:0).',
+        '2엔드: 둘 다 28 → 1점씩(3:1). 이렇게 세트 점수 6점을 먼저 따면 승리!',
+        '바람 예: 오른쪽으로 부는 3m/s 바람 → 화살이 오른쪽으로 밀리니, 노란 점을 10점보다 조금 왼쪽에 두고 쏴요.'] },
+      { h: 'AI', p: ['AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(조준 오차와 바람 읽는 실력이 달라요).'] },
+    ],
+    tutorial: [
+      { sel: '.ar-scope', text: '70m 과녁이에요. 가운데 노랑이 10점, 바깥 흰색이 1점. 한 엔드에 한 사람이 3발씩, 한 발씩 번갈아 쏴요.' },
+      { sel: '.ar-zone', text: '쏘기 ①: 손가락을 대고 아래로 당기세요. 끝까지 당기면 「딸깍」 — 만작(딱 맞는 세기)이에요. 아래쪽에서 시작하면 짧게 당겨도 돼요.' },
+      { sel: '.ar-scope', text: '쏘기 ②: 만작 뒤 손가락을 떼지 말고 움직여 조준해요. 가운데 노란 점이 화살이 갈 곳. 잠깐 멈추면 숨을 참아 덜 흔들려요. 떼면 발사!' },
+      { sel: '.ar-wind', text: '바람은 화살마다 바뀌어요. 옆바람은 화살을 밀어내니, 바람이 오는 쪽으로 조금 겨냥하세요.' },
+      { sel: '.ar-top', text: '위에 점수가 나와요. 2명이면 세트제(엔드를 이기면 2점, 6점 먼저), 3명 이상·혼자면 4엔드 총점이에요.' },
+    ],
+    init, actor, apply, ai, result, mount,
+    _t: { ring, fly, windVec, nextWind, E0, LVA, winners, tpos },
+  });
+})();

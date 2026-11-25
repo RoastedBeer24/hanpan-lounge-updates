@@ -1,0 +1,1048 @@
+/* 블랙잭 — every seat plays against an automatic dealer. 6 rounds, most chips wins. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const ROUNDS = 6, START = 1000, MINBET = 10, MAXHANDS = 4;
+
+  /* ---------- cards ---------- */
+  const RANKS = 'A23456789TJQK', SUITS = 'SHDC';
+  const split2 = (str) => { const a = []; for (let i = 0; i < str.length; i += 2) a.push(str.slice(i, i + 2)); return a; };
+  const cval = (c) => (c[0] === 'A' ? 11 : 'TJQK'.indexOf(c[0]) >= 0 ? 10 : +c[0]);
+  function total(str) {
+    let t = 0, a = 0;
+    for (const c of split2(str)) { t += cval(c); if (c[0] === 'A') a++; }
+    while (t > 21 && a) { t -= 10; a--; }
+    return { t, soft: a > 0 };
+  }
+  const isBJ = (h) => h.c.length === 4 && !h.sp && total(h.c).t === 21;
+  function newShoe() {
+    const a = [];
+    for (let d = 0; d < 2; d++) for (const r of RANKS) for (const s of SUITS) a.push(r + s);
+    return U.shuffle(a).join('');
+  }
+  function draw(s) {
+    if (s.sh.length < 2) s.sh = newShoe();
+    const c = s.sh.slice(0, 2); s.sh = s.sh.slice(2); return c;
+  }
+
+  /* ---------- logic ---------- */
+  function init(players, opts) {
+    const n = players.length;
+    const bp = opts && opts.bust === 0 ? 0 : 1; // show bust odds under 히트 (option, shared so online guests match)
+    const s = {
+      n, nm: players.map((p) => String(p.name).slice(0, 10)), ch: Array(n).fill(START), r: 1, ph: 'bet', cb: 0,
+      sh: newShoe(), dl: '', rv: 0, hd: Array.from({ length: n }, () => []), bt: Array(n).fill(0), lb: Array(n).fill(0),
+      cur: -1, hi: 0, seq: 0, last: null, over: 0, dn: 0, in: Array(n).fill(0), bp,
+    };
+    return s;
+  }
+  function nextBettor(s, from) {
+    for (let i = from + 1; i < s.n; i++) if (s.ch[i] >= MINBET) return i;
+    return -1;
+  }
+  function actor(s) {
+    if (s.over) return null;
+    return s.ph === 'bet' ? s.cb : s.cur;
+  }
+  function canDouble(s, seat, h) { return h.c.length === 4 && !h.x && s.ch[seat] >= h.b && !(h.sp && h.c[0] === 'A'); }
+  // any two cards of the same value (10·J·Q·K all count 10); up to 4 hands; split aces are finished, so never re-split
+  function canSplit(s, seat, h) { return s.ph === 'play' && s.hd[seat].length < MAXHANDS && h.c.length === 4 && !h.x && cval(h.c) === cval(h.c.slice(2)) && !(h.sp && h.c[0] === 'A') && s.ch[seat] >= h.b; }
+  const insAmt = (s, seat) => (s.hd[seat].length ? Math.floor(s.hd[seat][0].b / 2) : 0);
+  const canIns = (s, seat) => s.hd[seat].length > 0 && insAmt(s, seat) > 0 && s.ch[seat] >= insAmt(s, seat);
+  // even money: a natural blackjack against a dealer ace is offered 1:1 right now instead of insurance (needs no extra chips)
+  const canEM = (s, seat) => s.hd[seat].length === 1 && isBJ(s.hd[seat][0]) && !s.hd[seat][0].em;
+  function nextIns(s, from) { for (let i = from + 1; i < s.n; i++) if (canEM(s, i) || canIns(s, i)) return i; return -1; }
+
+  function deal(s, tx) {
+    if (s.sh.length / 2 < 30) { s.sh = newShoe(); tx.push('셔플'); }
+    for (let i = 0; i < s.n; i++) {
+      s.hd[i] = s.bt[i] > 0 ? [{ c: '', b: s.bt[i], x: 0 }] : [];
+      s.ch[i] -= s.bt[i];
+    }
+    s.dl = ''; s.rv = 0; s.dn++; s.in = Array(s.n).fill(0);
+    for (let k = 0; k < 2; k++) {
+      for (let i = 0; i < s.n; i++) if (s.hd[i].length) s.hd[i][0].c += draw(s);
+      s.dl += draw(s);
+    }
+    s.bt = Array(s.n).fill(0);
+    s.ph = 'play';
+    let bj = false;
+    for (let i = 0; i < s.n; i++) for (const h of s.hd[i]) if (isBJ(h)) { h.x = 1; bj = true; }
+    if (bj) tx.push('블랙잭!');
+    s.cur = -1; s.hi = 0;
+    // dealer shows an ace: offer insurance (half the bet, pays 2:1) to every seat with a hand before the peek
+    if (s.dl[0] === 'A') {
+      const first = nextIns(s, -1);
+      if (first >= 0) { s.ph = 'ins'; s.cur = first; return; }
+    }
+    peek(s, tx);
+  }
+  // dealer peeks with an A or 10-value up card: a dealer blackjack ends the round before anyone acts
+  function peek(s, tx) {
+    s.ph = 'play'; s.cur = -1; s.hi = 0;
+    const dBJ = cval(s.dl.slice(0, 2)) >= 10 && total(s.dl).t === 21;
+    let took = false;
+    for (let i = 0; i < s.n; i++) if (s.in[i] > 0) { took = true; if (dBJ) s.ch[i] += s.in[i] * 3; }
+    if (dBJ) {
+      for (let i = 0; i < s.n; i++) for (const h of s.hd[i]) h.x = 1;
+      tx.push(took ? '딜러 블랙잭 · 보험 2:1 지급' : '딜러 블랙잭');
+    } else if (took) tx.push('딜러 블랙잭 아님 · 보험 몰수');
+    advance(s, tx);
+  }
+  function advance(s, tx) {
+    let i = s.cur < 0 ? 0 : s.cur, h = s.cur < 0 ? 0 : s.hi;
+    for (; i < s.n; i++, h = 0) {
+      for (; h < s.hd[i].length; h++) if (!s.hd[i][h].x) { s.cur = i; s.hi = h; return; }
+    }
+    s.cur = -1;
+    dealerPlay(s, tx);
+  }
+  function dealerPlay(s, tx) {
+    s.rv = 1;
+    let live = false;
+    for (let i = 0; i < s.n; i++) for (const h of s.hd[i]) if (total(h.c).t <= 21 && !isBJ(h)) live = true;
+    if (live) while (total(s.dl).t < 17) s.dl += draw(s);
+    const dt = total(s.dl).t, dBJ = s.dl.length === 4 && dt === 21;
+    if (dt > 21) tx.push('딜러 버스트');
+    for (let i = 0; i < s.n; i++) for (const h of s.hd[i]) {
+      if (h.em) { h.o = 'E'; if (!s.ws) s.ws = s.ch.map(() => [0, 0, 0]); s.ws[i][0]++; s.ws[i][2]++; continue; } // even money was already paid 1:1
+      const pt = total(h.c).t, pBJ = isBJ(h);
+      let o;
+      if (pt > 21) o = 'L';
+      else if (pBJ && dBJ) o = 'P';
+      else if (pBJ) o = 'B';
+      else if (dBJ) o = 'L';
+      else if (dt > 21 || pt > dt) o = 'W';
+      else if (pt === dt) o = 'P';
+      else o = 'L';
+      h.o = o;
+      if (!s.ws) s.ws = s.ch.map(() => [0, 0, 0]);
+      if (o === 'W' || o === 'B' || o === 'E') s.ws[i][0]++; else if (o === 'L') s.ws[i][1]++;
+      if (o === 'B' || o === 'E') s.ws[i][2]++;
+      if (o === 'W') s.ch[i] += h.b * 2;
+      else if (o === 'B') s.ch[i] += h.b + Math.floor(h.b * 1.5);
+      else if (o === 'P') s.ch[i] += h.b;
+    }
+    s.r++;
+    const anyone = s.ch.some((c) => c >= MINBET);
+    if (s.r > ROUNDS || !anyone) { s.over = 1; s.ph = 'done'; s.r = Math.min(s.r, ROUNDS); return; }
+    s.ph = 'bet';
+    s.cb = nextBettor(s, -1);
+  }
+
+  function apply(s, seat, a) {
+    if (s.over) throw new Error('game over');
+    if (!a || typeof a.type !== 'string') throw new Error('bad action');
+    if (seat !== actor(s)) throw new Error('not your turn');
+    const tx = [];
+    s.seq++;
+    if (s.ph === 'bet') {
+      if (a.type !== 'bet') throw new Error('bet expected');
+      const amt = Math.floor(+a.amt);
+      if (!(amt >= MINBET && amt <= s.ch[seat])) throw new Error('bad bet');
+      s.bt[seat] = amt; s.lb[seat] = amt;
+      s.cb = nextBettor(s, seat);
+      if (s.cb < 0) { deal(s, tx); s.last = { id: s.seq, k: 'deal', s: null, tx }; }
+      else s.last = { id: s.seq, k: 'bet', s: seat, tx };
+      return s;
+    }
+    if (s.ph === 'ins') {
+      if (a.type !== 'ins') throw new Error('insurance expected');
+      if (canEM(s, seat)) {
+        if (a.take) throw new Error('even money, not insurance');
+        if (a.em) { const h = s.hd[seat][0]; h.em = 1; h.o = 'E'; s.ch[seat] += h.b * 2; tx.push('이븐 머니 +' + h.b); }
+      } else if (a.em) throw new Error('no blackjack');
+      else if (a.take) { const amt = insAmt(s, seat); if (!canIns(s, seat)) throw new Error('cannot insure'); s.ch[seat] -= amt; s.in[seat] = amt; }
+      s.cur = nextIns(s, seat);
+      if (s.cur < 0) peek(s, tx);
+      s.last = { id: s.seq, k: 'ins', s: seat, tx };
+      return s;
+    }
+    const h = s.hd[seat][s.hi];
+    if (!h || h.x) throw new Error('no hand');
+    if (a.type === 'hit') {
+      h.c += draw(s);
+      const t = total(h.c).t;
+      if (t > 21) { h.x = 1; tx.push('버스트'); } else if (t === 21) h.x = 1;
+    } else if (a.type === 'stand') {
+      h.x = 1;
+    } else if (a.type === 'double') {
+      if (!canDouble(s, seat, h)) throw new Error('cannot double');
+      s.ch[seat] -= h.b; h.b *= 2; h.d = 1; h.c += draw(s); h.x = 1;
+      if (total(h.c).t > 21) tx.push('버스트');
+    } else if (a.type === 'split') {
+      if (!canSplit(s, seat, h)) throw new Error('cannot split');
+      s.ch[seat] -= h.b;
+      const aces = h.c[0] === 'A';
+      const h1 = { c: h.c.slice(0, 2) + draw(s), b: h.b, sp: 1, x: 0 };
+      const h2 = { c: h.c.slice(2, 4) + draw(s), b: h.b, sp: 1, x: 0 };
+      // split aces get one card each and stand; a split A+10 is 21, not blackjack
+      for (const hh of [h1, h2]) if (aces || total(hh.c).t === 21) hh.x = 1;
+      s.hd[seat].splice(s.hi, 1, h1, h2);
+    } else throw new Error('unknown action');
+    if (s.hd[seat][s.hi].x) { s.cur = seat; advance(s, tx); }
+    s.last = { id: s.seq, k: a.type, s: seat, tx };
+    return s;
+  }
+
+  function result(s) {
+    if (!s.over) return null;
+    const mx = Math.max(...s.ch);
+    const winners = s.ch.map((c, i) => (c === mx ? i : -1)).filter((i) => i >= 0);
+    const order = s.ch.map((c, i) => i).sort((a, b) => s.ch[b] - s.ch[a]);
+    const solo = s.n === 1 ? '최종 ' + s.ch[0] + '칩 (' + (s.ch[0] >= START ? '+' : '') + (s.ch[0] - START) + ')' : undefined;
+    const ws = s.ws || s.ch.map(() => [0, 0, 0]);
+    const stats = [{ label: '이긴 손', values: ws.map((x) => String(x[0])) }, { label: '진 손', values: ws.map((x) => String(x[1])) },
+      { label: '블랙잭', values: ws.map((x) => String(x[2])) }, { label: '칩 증감', values: s.ch.map((c) => (c >= START ? '+' : '') + (c - START)) }];
+    return { winners, stats, title: winners.length > 1 ? '공동 우승' : solo, text: '최종 칩 — ' + order.map((i) => s.nm[i] + ' ' + s.ch[i]).join(' · ') };
+  }
+
+  /* ---------- AI: basic strategy (2 decks, S17, DAS) ---------- */
+  function strategy(h, up, canD, canS) {
+    const cs = split2(h.c);
+    if (canS) {
+      const v = cval(cs[0]);
+      if (v === 11 || v === 8) return 'split';
+      if (v === 9 && ((up >= 2 && up <= 6) || up === 8 || up === 9)) return 'split';
+      if (v === 7 && up <= 7) return 'split';
+      if (v === 6 && up <= 6) return 'split';
+      if (v === 4 && (up === 5 || up === 6)) return 'split';
+      if ((v === 2 || v === 3) && up <= 7) return 'split';
+    }
+    const { t, soft } = total(h.c);
+    const D = canD ? 'double' : 'hit', Ds = canD ? 'double' : 'stand';
+    if (soft && t <= 21) {
+      if (t >= 19) return 'stand';
+      if (t === 18) return up >= 3 && up <= 6 ? Ds : up <= 8 ? 'stand' : 'hit';
+      if (t === 17) return up >= 3 && up <= 6 ? D : 'hit';
+      if (t === 15 || t === 16) return up >= 4 && up <= 6 ? D : 'hit';
+      if (t === 13 || t === 14) return up >= 5 && up <= 6 ? D : 'hit';
+      return 'hit';
+    }
+    if (t >= 17) return 'stand';
+    if (t >= 13) return up <= 6 ? 'stand' : 'hit';
+    if (t === 12) return up >= 4 && up <= 6 ? 'stand' : 'hit';
+    if (t === 11) return up <= 10 ? D : 'hit';
+    if (t === 10) return up <= 9 ? D : 'hit';
+    if (t === 9) return up >= 3 && up <= 6 ? D : 'hit';
+    return 'hit';
+  }
+  /* Hi-Lo count from what is visible: everything dealt from this shoe is either face up or (dealer hole) hidden */
+  const hilo = (c) => (c[0] >= '2' && c[0] <= '6' ? 1 : 'TJQKA'.indexOf(c[0]) >= 0 ? -1 : 0);
+  function trueCount(s) {
+    if (s.ph === 'bet' && s.sh.length / 2 < 30) return 0; // the next deal reshuffles
+    let rc = 0;
+    for (const c of split2(s.sh)) rc -= hilo(c); // a full shoe sums to 0, so seen = −(unseen)
+    if (!s.rv && s.dl.length >= 4) rc -= hilo(s.dl.slice(2, 4)); // the hole card is still unseen
+    const decks = Math.max(0.5, (s.sh.length / 2 + (s.rv ? 0 : 1)) / 52);
+    return rc / decks;
+  }
+  // a few classic count deviations (Illustrious 18 subset) on top of basic strategy
+  function deviate(h, up, tc, canD, base) {
+    const { t, soft } = total(h.c);
+    if (soft) return base;
+    if (t === 16 && up === 10 && tc >= 0) return 'stand';
+    if (t === 15 && up === 10 && tc >= 4) return 'stand';
+    if (t === 12 && up === 3 && tc >= 2) return 'stand';
+    if (t === 12 && up === 2 && tc >= 3) return 'stand';
+    if (t === 13 && up === 2 && tc <= -1) return 'hit';
+    if (t === 12 && up === 4 && tc < 0) return 'hit';
+    if (canD && t === 10 && (up === 10 || up === 11) && tc >= 4) return 'double';
+    if (canD && t === 9 && up === 2 && tc >= 1) return 'double';
+    if (canD && t === 11 && up === 11 && tc >= 1) return 'double';
+    return base;
+  }
+  // 쉬움: plays by gut feeling — afraid of busting, never doubles soft hands, splits on a whim
+  function gut(h, up, canD, canS) {
+    const { t, soft } = total(h.c);
+    const r = Math.random();
+    if (canS) {
+      const v = cval(h.c);
+      if (v === 10 && r < 0.3) return 'split';        // "two good cards → two hands!"
+      if ((v === 11 || v === 8) && r < 0.55) return 'split';
+      if (r < 0.15) return 'split';
+    }
+    if (canD && !soft && (t === 10 || t === 11) && r < 0.3) return 'double';
+    if (soft) return t >= 18 ? 'stand' : t === 17 ? (r < 0.5 ? 'stand' : 'hit') : 'hit';
+    if (t >= 17) return 'stand';
+    if (t >= 15) return r < 0.7 ? 'stand' : 'hit';  // "too close to busting"
+    if (t >= 12) return r < (up >= 7 ? 0.45 : 0.6) ? 'stand' : 'hit';
+    return 'hit';
+  }
+  const round10 = (v) => Math.round(v / 10) * 10;
+  function betFor(s, seat, lv) {
+    const c = s.ch[seat];
+    let amt;
+    if (lv === 1) amt = c * (0.05 + Math.random() * 0.35);           // random bet sizes
+    else if (lv === 2) amt = c * (0.1 + Math.random() * 0.05);
+    else {
+      const tc = trueCount(s);
+      const unit = Math.max(MINBET, c * 0.06);
+      amt = unit * (tc >= 3 ? 5 : tc >= 2 ? 3.5 : tc >= 1 ? 2 : 1);      // Hi-Lo bet spread 1–5
+      // tournament sense: in the last round, protect a lead or bet enough to overtake the leader
+      if (s.r === ROUNDS && s.n > 1) {
+        let lead = 0; for (let i = 0; i < s.n; i++) if (i !== seat) lead = Math.max(lead, s.ch[i] + s.bt[i]);
+        if (c > lead * 2) amt = MINBET;
+        else if (c <= lead) amt = Math.min(c, lead - c + 20 + c * 0.1);
+        else amt = Math.min(amt, Math.max(MINBET, (c - lead) / 2 - 10));
+      }
+    }
+    return U.clamp(round10(amt), MINBET, c);
+  }
+  function ai(s, seat, lv) {
+    lv = lv || 2;
+    const sty = (L.aiStyle && L.aiStyle(seat)) || 'bal';
+    if (sty !== 'bal' && s.ph !== 'ins' && s.ph !== 'bet') {
+      const a = aiBase(s, seat, lv);
+      return { type: styleTweak(s, seat, a.type, sty) };
+    }
+    return aiBase(s, seat, lv);
+  }
+  // 성향 덧칠: 도박형은 17에서도 히트·더블을 자주, 공격형은 더블을 조금 더, 수비형은 12~16에서 멈추기 쉬움
+  function styleTweak(s, seat, t, sty) {
+    const h = s.hd[seat][s.hi], { t: v, soft } = total(h), r = Math.random();
+    const up = cval(s.dl.slice(0, 2)), canD = canDouble(s, seat, h);
+    if (sty === 'gamble') {
+      if (t === 'stand' && v <= 17 && r < 0.4) return canD && r < 0.15 ? 'double' : 'hit';
+      if (t === 'hit' && canD && v >= 8 && v <= 12 && r < 0.4) return 'double';
+    } else if (sty === 'agg') {
+      if (t === 'hit' && canD && (v === 9 || v === 10 || v === 11 || (soft && v >= 15 && v <= 18)) && r < 0.3) return 'double';
+    } else if (sty === 'def') {
+      if (t === 'hit' && !soft && v >= 12 && v <= 16 && up <= 9 && r < 0.4) return 'stand';
+      if (t === 'double' && v < 11 && r < 0.4) return 'hit';
+    }
+    return t;
+  }
+  function aiBase(s, seat, lv) {
+    const sty = (L.aiStyle && L.aiStyle(seat)) || 'bal';
+    if (s.ph === 'ins') {
+      const em = canEM(s, seat);
+      let take = false;
+      if (lv === 1) take = Math.random() < 0.4;                          // "insurance sounds safe"
+      else if (lv === 3) take = trueCount(s) >= 3;                       // insurance pays when tens are rich
+      return em ? { type: 'ins', em: take } : { type: 'ins', take: take && canIns(s, seat) };
+    }
+    if (s.ph === 'bet') {
+      let amt = betFor(s, seat, lv);
+      // 성향: 도박형·공격형은 크게, 수비형은 작게 건다
+      const k = sty === 'gamble' ? 1.3 + Math.random() * 0.9 : sty === 'agg' ? 1.25 : sty === 'def' ? 0.7 : 1;
+      if (k !== 1) amt = Math.max(MINBET, Math.min(s.ch[seat], Math.round(amt * k)));
+      return { type: 'bet', amt };
+    }
+    const h = s.hd[seat][s.hi];
+    const up = cval(s.dl.slice(0, 2));
+    const canD = canDouble(s, seat, h), canS = canSplit(s, seat, h);
+    if (lv === 1) return { type: gut(h, up, canD, canS) };
+    const base = strategy(h, up, canD, canS);
+    if (lv === 3 && base !== 'split') return { type: deviate(h, up, trueCount(s), canD, base) };
+    return { type: base };
+  }
+  function aiDelayFor(s, seat, lv) { return lv === 1 ? 850 + Math.random() * 400 : lv === 3 ? 480 : 600; }
+
+
+  /* 규칙 그림(라운드 33): 작은 카드 SVG */
+  const FIG_CARD = (x, r, s) => { const red = s === '♥' || s === '♦'; return '<g transform="translate(' + x + ',8)"><rect width="52" height="74" rx="6" fill="#f6efe0" stroke="#3a3040"/><text x="7" y="20" font-size="16" font-weight="700" fill="' + (red ? '#b8322a' : '#1d1a22') + '">' + r + '</text><text x="26" y="54" font-size="24" text-anchor="middle" fill="' + (red ? '#b8322a' : '#1d1a22') + '">' + s + '</text></g>'; };
+  const FIG_ROW = (cards, label) => '<svg viewBox="0 0 340 112" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">' + cards.map((c, i) => FIG_CARD(26 + i * 58 + (cards.length < 5 ? (5 - cards.length) * 29 : 0), c[0], c[1])).join('') + '<text x="170" y="104" font-size="14" text-anchor="middle" fill="#e3ae45" font-weight="700">' + label + '</text></svg>';
+  /* ---------- drawing helpers (cards, chips, felt) ---------- */
+  const RED = '#b8322a', INK = '#1d1a22';
+  function suitPath(ctx, su, x, y, sz) {
+    const k = sz / 2;
+    ctx.beginPath();
+    if (su === 'H') {
+      ctx.moveTo(x, y + k * 0.92);
+      ctx.bezierCurveTo(x - k * 1.15, y + k * 0.05, x - k * 0.95, y - k * 1.0, x, y - k * 0.42);
+      ctx.bezierCurveTo(x + k * 0.95, y - k * 1.0, x + k * 1.15, y + k * 0.05, x, y + k * 0.92);
+    } else if (su === 'D') {
+      ctx.moveTo(x, y - k); ctx.lineTo(x + k * 0.74, y); ctx.lineTo(x, y + k); ctx.lineTo(x - k * 0.74, y); ctx.closePath();
+    } else if (su === 'S') {
+      ctx.moveTo(x, y - k * 0.98);
+      ctx.bezierCurveTo(x + k * 1.2, y - k * 0.05, x + k * 0.95, y + k * 0.82, x + k * 0.05, y + k * 0.36);
+      ctx.lineTo(x + k * 0.32, y + k); ctx.lineTo(x - k * 0.32, y + k); ctx.lineTo(x - k * 0.05, y + k * 0.36);
+      ctx.bezierCurveTo(x - k * 0.95, y + k * 0.82, x - k * 1.2, y - k * 0.05, x, y - k * 0.98);
+    } else {
+      const r = k * 0.4;
+      for (const [cx, cy] of [[x, y - k * 0.48], [x - k * 0.48, y + k * 0.12], [x + k * 0.48, y + k * 0.12]]) { ctx.moveTo(cx + r, cy); ctx.arc(cx, cy, r, 0, Math.PI * 2); }
+      ctx.moveTo(x - k * 0.1, y); ctx.lineTo(x + k * 0.1, y); ctx.lineTo(x + k * 0.3, y + k); ctx.lineTo(x - k * 0.3, y + k); ctx.closePath();
+    }
+    ctx.fill();
+  }
+  function rr(ctx, x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+  function drawCardFace(ctx, x, y, w, c) {
+    const h = w * 1.4, su = c[1], rk = c[0] === 'T' ? '10' : c[0];
+    const col = su === 'H' || su === 'D' ? RED : INK;
+    const g = ctx.createLinearGradient(x, y, x, y + h);
+    g.addColorStop(0, '#fffaf0'); g.addColorStop(1, '#efe5cf');
+    ctx.fillStyle = g; rr(ctx, x, y, w, h, w * 0.1); ctx.fill();
+    ctx.strokeStyle = 'rgba(80,60,30,.35)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    const fs = Math.round(w * 0.3);
+    ctx.font = '700 ' + fs + 'px "IBM Plex Sans KR", system-ui, sans-serif';
+    const cx = x + w * 0.17;
+    if (rk === '10') { ctx.save(); ctx.translate(cx, y + fs * 0.98); ctx.scale(0.78, 1); ctx.fillText(rk, 0, 0); ctx.restore(); }
+    else ctx.fillText(rk, cx, y + fs * 0.98);
+    suitPath(ctx, su, cx, y + fs * 1.42, w * 0.18);
+    ctx.save(); ctx.translate(x + w, y + h); ctx.rotate(Math.PI);
+    if (rk === '10') { ctx.save(); ctx.translate(w * 0.17, fs * 0.98); ctx.scale(0.78, 1); ctx.fillText(rk, 0, 0); ctx.restore(); }
+    else ctx.fillText(rk, w * 0.17, fs * 0.98);
+    suitPath(ctx, su, w * 0.17, fs * 1.42, w * 0.18);
+    ctx.restore();
+    const mx = x + w * 0.58, my = y + h * 0.55;
+    if ('JQK'.indexOf(rk) >= 0) {
+      const fw = w * 0.5, fh = h * 0.56;
+      ctx.fillStyle = su === 'H' || su === 'D' ? 'rgba(184,50,42,.1)' : 'rgba(40,30,60,.1)';
+      rr(ctx, mx - fw / 2, my - fh / 2, fw, fh, 3); ctx.fill();
+      ctx.strokeStyle = '#c99a3a'; ctx.lineWidth = 1.2; ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.font = Math.round(w * 0.36) + 'px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(rk, mx, my - fh * 0.12);
+      suitPath(ctx, su, mx, my + fh * 0.27, w * 0.16);
+    } else {
+      suitPath(ctx, su, mx, my, w * (rk === 'A' ? 0.56 : 0.46));
+    }
+  }
+  function drawCardBack(ctx, x, y, w) {
+    if (L.ui && L.ui.drawCardBack) { L.ui.drawCardBack(ctx, x, y, w, w * 1.4, w * 0.1); return; }  // 설정 「카드 뒷면」(라운드 34)
+    const h = w * 1.4;
+    const g = ctx.createLinearGradient(x, y, x + w, y + h);
+    g.addColorStop(0, '#5a2d5f'); g.addColorStop(1, '#3a1b40');
+    ctx.fillStyle = g; rr(ctx, x, y, w, h, w * 0.1); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 1; ctx.stroke();
+    const ins = w * 0.09;
+    ctx.save();
+    rr(ctx, x + ins, y + ins, w - ins * 2, h - ins * 2, w * 0.05); ctx.clip();
+    ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 1;
+    const step = w * 0.16;
+    ctx.beginPath();
+    for (let d = -h; d < w + h; d += step) { ctx.moveTo(x + d, y); ctx.lineTo(x + d + h, y + h); ctx.moveTo(x + d, y + h); ctx.lineTo(x + d + h, y); }
+    ctx.stroke();
+    ctx.fillStyle = '#e3ae45';
+    ctx.beginPath(); const cx = x + w / 2, cy = y + h / 2, k = w * 0.16;
+    ctx.moveTo(cx, cy - k); ctx.lineTo(cx + k * 0.7, cy); ctx.lineTo(cx, cy + k); ctx.lineTo(cx - k * 0.7, cy); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 1.4;
+    rr(ctx, x + ins, y + ins, w - ins * 2, h - ins * 2, w * 0.05); ctx.stroke();
+  }
+  /* draw a card; flip in [0,1] scales X (1 = flat). */
+  function drawCard(ctx, x, y, w, c, up, sx, alpha) {
+    const h = w * 1.4;
+    ctx.save();
+    if (alpha != null) ctx.globalAlpha = alpha;
+    ctx.translate(x + w / 2, y + h / 2);
+    ctx.scale(Math.max(0.02, sx == null ? 1 : sx), 1);
+    ctx.translate(-w / 2, -h / 2);
+    ctx.shadowColor = 'rgba(0,0,0,.38)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+    ctx.fillStyle = '#000'; rr(ctx, 0.5, 0.5, w - 1, h - 1, w * 0.1); ctx.fill();
+    ctx.shadowColor = 'transparent';
+    if (up && c) drawCardFace(ctx, 0, 0, w, c); else drawCardBack(ctx, 0, 0, w);
+    ctx.restore();
+  }
+  const CHIP = [[500, '#6b3fa0', '#d9c7f2'], [100, '#24202c', '#e9dfc8'], [50, '#2f6fb5', '#dfeeff'], [25, '#2b8a5a', '#d9f5e6'], [10, '#c0392b', '#ffe3dc'], [5, '#e3ae45', '#3a2706'], [1, '#d8d2c4', '#4a4030']];
+  function drawChips(ctx, x, y, amt, r, label) {
+    if (amt <= 0) return;
+    const discs = [];
+    let left = amt;
+    for (const [v, c, e] of CHIP) while (left >= v && discs.length < 9) { discs.push([c, e]); left -= v; }
+    discs.reverse();
+    const ry = r * 0.42, th = Math.max(2.5, r * 0.22);
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(x + 1, y + 2, r * 1.05, ry * 1.1, 0, 0, Math.PI * 2); ctx.fill();
+    discs.forEach(([c, e], i) => {
+      const yy = y - i * th;
+      ctx.fillStyle = shade(c, -35); ctx.beginPath(); ctx.ellipse(x, yy, r, ry, 0, 0, Math.PI); ctx.lineTo(x - r, yy - th); ctx.ellipse(x, yy - th, r, ry, 0, Math.PI, 0, true); ctx.fill();
+      ctx.fillStyle = c; ctx.beginPath(); ctx.ellipse(x, yy - th, r, ry, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = e; ctx.lineWidth = Math.max(1.2, r * 0.16); ctx.setLineDash([r * 0.32, r * 0.42]);
+      ctx.beginPath(); ctx.ellipse(x, yy - th, r * 0.82, ry * 0.82, 0, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+    });
+    ctx.restore();
+    if (label !== false) {
+      ctx.font = '600 12px "IBM Plex Mono", ui-monospace, monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const t = String(amt), tw = ctx.measureText(t).width + 10;
+      ctx.fillStyle = 'rgba(15,12,20,.78)'; rr(ctx, x - tw / 2, y + ry + 3, tw, 16, 8); ctx.fill();
+      ctx.fillStyle = '#f2e9d8'; ctx.fillText(t, x, y + ry + 11.5);
+    }
+  }
+  function shade(hex, amt) {
+    const n = parseInt(hex.slice(1), 16);
+    const r = U.clamp((n >> 16) + amt, 0, 255), g = U.clamp(((n >> 8) & 255) + amt, 0, 255), b = U.clamp((n & 255) + amt, 0, 255);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+  function noiseTile() {
+    const c = document.createElement('canvas'); c.width = c.height = 96;
+    const x = c.getContext('2d'), d = x.createImageData(96, 96);
+    for (let i = 0; i < d.data.length; i += 4) { const v = Math.random() * 255; d.data[i] = d.data[i + 1] = d.data[i + 2] = v; d.data[i + 3] = 14; }
+    x.putImageData(d, 0, 0); return c;
+  }
+  const ease = (t) => 1 - Math.pow(1 - t, 3);
+
+  /* ---------- view ---------- */
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const noise = noiseTile();
+    let st = null, bg = null, G = null;
+    let anims = {}, seen = {}, busy = false, holdUntil = 0, dirty = true, lastId = -1;
+    let pend = 0, pendFor = '';
+    const BAR = 150; // bottom HUD: info row + buttons
+
+    const hud = L.h('div', { class: 'hud bottom', style: { padding: '10px 12px 12px' } });
+    root.append(hud);
+    /* invisible boxes over canvas regions — spotlight targets for the first-play tutorial */
+    const anc = {};
+    function anchor(cls, x, y, w, h) {
+      let el = anc[cls];
+      if (!el) { el = anc[cls] = L.h('div', { class: cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none', visibility: 'hidden' } }); root.append(el); }
+      Object.assign(el.style, { left: Math.round(x) + 'px', top: Math.round(y) + 'px', width: Math.round(w) + 'px', height: Math.round(h) + 'px' });
+    }
+
+    function setBusy(b) { if (b !== busy) { busy = b; api.setBusy(b); } }
+    const spd = () => L.debug.speed || 1;
+
+    function buildBg() {
+      const W = cv.w, H = cv.h;
+      const c = document.createElement('canvas'); c.width = Math.round(W * cv.dpr); c.height = Math.round(H * cv.dpr);
+      const x = c.getContext('2d'); x.scale(cv.dpr, cv.dpr);
+      x.fillStyle = '#17131f'; x.fillRect(0, 0, W, H);
+      // rail
+      const m = 5, R = 30;
+      const FT = (L.ui && L.ui.felt) ? L.ui.felt() : { c: ['#24806a', '#1c6650', '#0c3528'], rail: ['#7a4a24', '#3f230f'], line: 'rgba(227,174,69,.45)' };
+      const wg = x.createLinearGradient(0, 0, 0, H);
+      wg.addColorStop(0, FT.rail[0]); wg.addColorStop(1, FT.rail[1]);
+      x.fillStyle = wg; rr(x, m, m, W - m * 2, H - m * 2, R); x.fill();
+      x.strokeStyle = 'rgba(255,220,170,.18)'; x.lineWidth = 1; rr(x, m + 2, m + 2, W - m * 2 - 4, H - m * 2 - 4, R - 2); x.stroke();
+      const fm = m + 11;
+      x.strokeStyle = '#e3ae45'; x.lineWidth = 1.5; rr(x, fm - 2, fm - 2, W - fm * 2 + 4, H - fm * 2 + 4, R - 9); x.stroke();
+      // felt
+      const fg = x.createRadialGradient(W / 2, H * 0.36, 20, W / 2, H * 0.45, Math.max(W, H) * 0.75);
+      fg.addColorStop(0, FT.c[0]); fg.addColorStop(0.55, FT.c[1]); fg.addColorStop(1, FT.c[2]);
+      x.save(); rr(x, fm, fm, W - fm * 2, H - fm * 2, R - 11); x.clip();
+      x.fillStyle = fg; x.fillRect(0, 0, W, H);
+      x.fillStyle = x.createPattern(noise, 'repeat'); x.fillRect(0, 0, W, H);
+      // printed arc
+      const cxA = W / 2, cyA = G.arcY - 260, rA = 260;
+      if (!G.tight) {
+      x.strokeStyle = 'rgba(227,174,69,.45)'; x.lineWidth = 1.5;
+      x.beginPath(); x.arc(cxA, cyA, rA + 12, Math.PI * 0.2, Math.PI * 0.8); x.stroke();
+      x.beginPath(); x.arc(cxA, cyA, rA - 12, Math.PI * 0.22, Math.PI * 0.78); x.stroke();
+      arcText(x, '블랙잭은 3 : 2 지급  ·  딜러는 17에서 스탠드', cxA, cyA, rA - 4, 'rgba(242,233,216,.55)');
+      }
+      const vg = x.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.7);
+      vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.42)');
+      x.fillStyle = vg; x.fillRect(0, 0, W, H);
+      x.restore();
+      // shoe
+      const sx = G.shoe.x, sy = G.shoe.y;
+      x.fillStyle = 'rgba(0,0,0,.35)'; rr(x, sx - 30, sy - 4, 64, 56, 8); x.fill();
+      const sg = x.createLinearGradient(sx - 32, 0, sx + 32, 0); sg.addColorStop(0, '#2b1a10'); sg.addColorStop(1, '#4a2e18');
+      x.fillStyle = sg; rr(x, sx - 32, sy - 6, 64, 54, 8); x.fill();
+      x.strokeStyle = '#e3ae45'; x.lineWidth = 1.5; x.stroke();
+      for (let i = 0; i < 5; i++) drawCardBack(x, sx - 18 + i * 1.2, sy - 2 + i * 0.6, 34);
+      bg = c;
+    }
+    function arcText(x, text, cx, cy, r, color) {
+      x.save(); x.fillStyle = color; x.font = '700 12px "IBM Plex Sans KR", system-ui, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle';
+      const chars = [...text]; const widths = chars.map((ch) => x.measureText(ch).width + 0.6);
+      const tot = widths.reduce((a, b) => a + b, 0); let ang = Math.PI / 2 + tot / r / 2;
+      chars.forEach((ch, i) => { const a = ang - widths[i] / r / 2; x.save(); x.translate(cx + Math.cos(a) * r, cy + Math.sin(a) * r); x.rotate(a - Math.PI / 2); x.fillText(ch, 0, 0); x.restore(); ang -= widths[i] / r; });
+      x.restore();
+    }
+
+    function geometry() {
+      const W = cv.w, H = cv.h;
+      const others = st ? st.n - 1 : 0;
+      // short screens (e.g. 360x640): smaller cards, compact side panels, no printed arc
+      const tight = H < 700;
+      const dw = tight ? Math.round(U.clamp(W * 0.125, 42, 52)) : Math.round(U.clamp(W * 0.145, 48, 62));
+      let fw = tight ? Math.round(U.clamp(W * 0.15, 48, 60)) : Math.round(U.clamp(W * 0.17, 54, 74));
+      const compH = others > 0 ? (tight ? 104 : 132) : 0;
+      const cw = tight ? 36 : 44, cOff = tight ? 36 : 40;
+      const compTop = H - BAR - compH - 4;
+      const dealerY = 84;
+      const arcY = dealerY + dw * 1.4 + (tight ? 4 : 34);
+      const focusTop = arcY + (tight ? 4 : 10);
+      const focusBottom = compTop - 6;
+      // focus block: header pill (60 above the cards) + cards + total pill (27 below)
+      while (fw > 40 && fw * 1.4 + 87 > focusBottom - focusTop) fw -= 2;
+      G = { W, H, dw, fw, compH, cw, cOff, tight, compTop, dealerY, arcY, focusTop, focusBottom, shoe: { x: W - 52, y: 26 } };
+      anchor('bj-dealer', 12, 14, W - 24, arcY - 14);
+      anchor('bj-focus', 12, focusTop, W - 24, focusBottom - focusTop);
+      anchor('bj-bar', 6, H - BAR, W - 12, BAR - 4);
+    }
+    cv.onresize = () => { geometry(); buildBg(); dirty = true; };
+    geometry(); buildBg();
+    const onFelt = () => { buildBg(); dirty = true; }; window.addEventListener('lounge-felt', onFelt); window.addEventListener('lounge-cardback', onFelt); const onRC = (e) => { if (pend > MINBET && hud.textContent.indexOf('초기화') >= 0) { pend = MINBET; api.sfx('click'); renderHud(); dirty = true; e.preventDefault(); } }; window.addEventListener('lounge-cancel', onRC);  // 오른쪽 클릭 = 고르던 베팅 금액 초기화(라운드 34)
+
+    function focusSeat() {
+      if (!st) return 0;
+      if (Object.keys(anims).length && st.last && st.last.s != null) return st.last.s;
+      const a = actor(st);
+      if (a != null) return a;
+      const v = api.viewer(); return v >= 0 ? v : 0;
+    }
+
+    /* card specs: {key,x,y,w,c,up,o} ; o = deal order */
+    function specs() {
+      const out = [], meta = { dealer: null, focus: null, comp: [] };
+      if (!st) return { out, meta };
+      const W = G.W, rnd = st.dn;
+      // dealer
+      const dc = split2(st.dl), dw = G.dw;
+      const step = Math.min(dw * 0.62, (W - 120 - dw) / Math.max(1, dc.length - 1));
+      const dtot = dw + step * Math.max(0, dc.length - 1);
+      const dx0 = W / 2 - dtot / 2;
+      dc.forEach((c, i) => out.push({ key: 'd' + rnd + '_' + i, x: dx0 + i * step, y: G.dealerY, w: dw, c, up: i !== 1 || !!st.rv, o: i >= 1 && st.rv ? 10000 + i : i * 100 + 99, dealer: 1 }));
+      meta.dealer = { x: W / 2, y: G.dealerY, w: dtot };
+      const f = focusSeat();
+      // focus
+      const hands = st.hd[f] || [];
+      const cardsY = Math.round(G.focusTop + Math.max(0, (G.focusBottom - G.focusTop - G.fw * 1.4 - 87) / 2) + 60);
+      const gapH = hands.length > 2 ? 12 : 22, stepK = hands.length > 1 ? 0.36 : 0.5;
+      const widthFor = (w) => hands.reduce((a, h) => a + w + w * stepK * Math.max(0, h.c.length / 2 - 1), 0) + (hands.length - 1) * gapH;
+      let fw = G.fw;
+      while (fw > 30 && widthFor(fw) > W - 36) fw -= 2; // up to 4 split hands must fit side by side
+      const fh = fw * 1.4, fstep = fw * stepK;
+      const hs = [];
+      let totalW = 0;
+      hands.forEach((h) => { const n = h.c.length / 2; const wd = fw + fstep * Math.max(0, n - 1); hs.push(wd); totalW += wd; });
+      totalW += (hands.length - 1) * gapH;
+      let x = W / 2 - totalW / 2 + (hands.length === 1 ? 18 : 0);
+      meta.focus = { seat: f, hands: [], y: cardsY, h: fh };
+      hands.forEach((h, hi) => {
+        split2(h.c).forEach((c, i) => out.push({ key: 'p' + rnd + '_' + f + '_' + hi + '_' + i + c, x: x + i * fstep, y: cardsY + (h.d && i === 2 ? -6 : 0), w: fw, c, up: true, o: i < 2 && !h.sp ? i * 100 + f : 5000 + i, rot: h.d && i === 2 }));
+        meta.focus.hands.push({ x, w: hs[hi], h, hi });
+        x += hs[hi] + gapH;
+      });
+      // compact others
+      const others = [];
+      for (let i = 0; i < st.n; i++) if (i !== f) others.push(i);
+      const pw = others.length ? (W - 40) / others.length : 0;
+      others.forEach((seat, k) => {
+        const px = 20 + k * pw, py = G.compTop;
+        const box = { seat, x: px + 3, y: py, w: pw - 6, h: G.compH };
+        meta.comp.push(box);
+        const hh = st.hd[seat] || [];
+        const cw = G.cw;
+        hh.forEach((h, hi) => {
+          const n = h.c.length / 2;
+          const off = hh.length > 2 ? 9 : 14;
+          const avail = box.w - 12 - cw - (hh.length - 1) * off;
+          const cs = Math.min(17, avail / Math.max(1, n - 1));
+          const bx = box.x + 6 + hi * off, by = py + G.cOff + hi * (hh.length > 2 ? (G.tight ? 5 : 8) : (G.tight ? 10 : 16));
+          split2(h.c).forEach((c, i) => out.push({ key: 'p' + rnd + '_' + seat + '_' + hi + '_' + i + c, x: bx + i * cs, y: by, w: cw, c, up: true, o: i < 2 && !h.sp ? i * 100 + seat : 5000 + i }));
+        });
+      });
+      return { out, meta };
+    }
+
+    function animKick(prevSt) {
+      const { out } = specs();
+      const now = performance.now();
+      const fresh = [];
+      const cur = {};
+      for (const sp of out) {
+        cur[sp.key] = sp.up;
+        if (!(sp.key in seen)) fresh.push({ sp, kind: 'deal' });
+        else if (seen[sp.key] !== sp.up) fresh.push({ sp, kind: 'flip' });
+      }
+      if (prevSt) {
+        fresh.sort((a, b) => a.sp.o - b.sp.o);
+        const gap = 230 / spd(), dur = 340 / spd();
+        fresh.forEach((f, i) => {
+          anims[f.sp.key] = { t0: now + i * gap, dur, kind: f.kind, up: f.sp.up };
+        });
+        if (fresh.length) { holdUntil = Math.max(holdUntil, now + fresh.length * gap + dur + 120 / spd()); setBusy(true); }
+      }
+      seen = cur;
+      return fresh.length;
+    }
+
+    /* totals */
+    function totalLabel(str) {
+      if (!str) return '';
+      const { t, soft } = total(str);
+      if (t > 21) return '버스트 ' + t;
+      if (str.length === 4 && t === 21) return '21';
+      return (soft ? '소프트 ' : '') + t;
+    }
+    function visibleStr(sp, cardsStr, keys, now) {
+      // only count cards whose deal/flip anim has passed the halfway mark
+      let s = '';
+      split2(cardsStr).forEach((c, i) => {
+        const a = anims[keys[i]];
+        if (!a || now >= a.t0 + a.dur * 0.5) s += c;
+      });
+      return s;
+    }
+
+    function pill(x, y, text, bgc, fg, align, font) {
+      ctx.font = font || '700 13px "IBM Plex Sans KR", system-ui, sans-serif';
+      const tw = ctx.measureText(text).width + 16, h = 22;
+      let lx = align === 'left' ? x : align === 'right' ? x - tw : x - tw / 2;
+      ctx.fillStyle = bgc; rr(ctx, lx, y - h / 2, tw, h, h / 2); ctx.fill();
+      ctx.fillStyle = fg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(text, lx + tw / 2, y + 1);
+      return tw;
+    }
+    const OUT = { W: ['승', '#5fd3a0', '#08261a'], L: ['패', '#ee6a55', '#2b0c06'], P: ['푸시', '#ab9fb8', '#1b1426'], B: ['블랙잭', '#e3ae45', '#2a1d05'], E: ['이븐 머니', '#e3ae45', '#2a1d05'] };
+
+    function frame() {
+      const now = performance.now();
+      let active = false;
+      for (const k in anims) { const a = anims[k]; if (now >= a.t0 + a.dur) delete anims[k]; else active = true; }
+      if (!active && busy && now >= holdUntil) { setBusy(false); renderHud(); dirty = true; }
+      if (active || dirty || busy) { draw(now); dirty = active; }
+    }
+
+    function draw(now) {
+      cv.clear();
+      if (bg) ctx.drawImage(bg, 0, 0, G.W, G.H);
+      if (!st) return;
+      const { out, meta } = specs();
+      const settled = !Object.keys(anims).length;
+      // round label
+      ctx.font = '700 12px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = 'rgba(242,233,216,.7)'; ctx.fillText('라운드 ' + st.r + '/' + ROUNDS, 28, 34);
+      // dealer label
+      const dKeys = out.filter((s) => s.dealer).map((s) => s.key);
+      let dShown = '';
+      split2(st.dl).forEach((c, i) => { const a = anims[dKeys[i]]; const up = i !== 1 || st.rv; if (up && (!a || now >= a.t0 + a.dur * 0.5)) dShown += c; });
+      const dl = '딜러' + (dShown ? ' · ' + (st.rv ? (dShown.length === 4 && total(dShown).t === 21 ? '블랙잭' : totalLabel(dShown)) : String(total(dShown).t)) : '');
+      pill(G.W / 2, G.dealerY - 16, dl, 'rgba(10,8,15,.55)', '#f2e9d8');
+      // compact panels (behind cards)
+      for (const b of meta.comp) {
+        const p = api.players[b.seat] || { color: '#888', name: '' };
+        const isAct = actor(st) === b.seat;
+        ctx.fillStyle = 'rgba(10,8,15,.42)'; rr(ctx, b.x, b.y, b.w, b.h, 12); ctx.fill();
+        ctx.strokeStyle = isAct ? p.color : 'rgba(242,233,216,.12)'; ctx.lineWidth = isAct ? 2 : 1; ctx.stroke();
+        ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(b.x + 11, b.y + 13, 4.5, 0, 7); ctx.fill();
+        ctx.fillStyle = '#f2e9d8'; ctx.font = '700 12px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(clip(p.name, b.w - 24), b.x + 20, b.y + 13);
+        ctx.font = '600 11px "IBM Plex Mono", ui-monospace, monospace'; ctx.fillStyle = '#e3ae45';
+        const hh = st.hd[b.seat];
+        const betNow = st.ph === 'bet' ? st.bt[b.seat] : hh.reduce((a, h) => a + h.b, 0);
+        ctx.fillText(st.ch[b.seat] + (betNow ? '  ·  ' + betNow : ''), b.x + 8, b.y + 29);
+        if (!hh.length) {
+          ctx.fillStyle = 'rgba(242,233,216,.5)'; ctx.font = '500 12px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center';
+          ctx.fillText(st.ch[b.seat] < MINBET ? '파산' : st.ph === 'bet' && st.bt[b.seat] ? '베팅 완료' : '대기', b.x + b.w / 2, b.y + b.h * 0.55);
+        }
+      }
+      // focus header
+      const fs = meta.focus.seat, fp = api.players[fs] || { color: '#888', name: '' };
+      const fy = meta.focus.y;
+      {
+        const name = fp.name, chips = st.ch[fs];
+        ctx.font = '700 15px "IBM Plex Sans KR", system-ui, sans-serif';
+        const nw = ctx.measureText(name).width;
+        ctx.font = '600 13px "IBM Plex Mono", ui-monospace, monospace';
+        const cw = ctx.measureText(String(chips)).width;
+        const tw = 18 + nw + 12 + cw + 14;
+        const hx = G.W / 2 - tw / 2, hy = fy - 46;
+        ctx.fillStyle = 'rgba(10,8,15,.55)'; rr(ctx, hx, hy - 14, tw, 28, 14); ctx.fill();
+        if (actor(st) === fs) { ctx.strokeStyle = fp.color; ctx.lineWidth = 2; ctx.stroke(); }
+        ctx.fillStyle = fp.color; ctx.beginPath(); ctx.arc(hx + 13, hy, 5, 0, 7); ctx.fill();
+        ctx.fillStyle = '#f2e9d8'; ctx.font = '700 15px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText(name, hx + 24, hy + 1);
+        ctx.fillStyle = '#e3ae45'; ctx.font = '600 13px "IBM Plex Mono", ui-monospace, monospace';
+        ctx.fillText(String(chips), hx + 24 + nw + 10, hy + 1);
+        if (st.in && st.in[fs] > 0 && !st.rv) pill(hx + tw + 6, hy, '보험 ' + st.in[fs], 'rgba(91,179,230,.9)', '#08202e', 'left', '700 11px "IBM Plex Sans KR", system-ui, sans-serif');
+      }
+      // focus bets: chips left of each hand
+      const fHands = meta.focus.hands;
+      if (st.ph === 'bet' && actor(st) === fs) {
+        const amt = api.canAct(fs) ? pend : 0;
+        // below the hand if there is room, otherwise left of the (previous round's) cards
+        if (!fHands.length || fy + meta.focus.h + 66 <= G.focusBottom) drawBetSpot(G.W / 2, fHands.length ? fy + meta.focus.h + 40 : fy + meta.focus.h * 0.75, amt, fHands.length === 0);
+        else drawBetSpot(Math.max(48, fHands[0].x - 44), fy + meta.focus.h * 0.55, amt, false);
+      }
+      // cards
+      for (const sp of out) drawSpec(sp, now);
+      // focus hand labels
+      fHands.forEach((fh) => {
+        const keys = out.filter((s) => s.key.startsWith('p' + st.dn + '_' + fs + '_' + fh.hi + '_')).map((s) => s.key);
+        const vs = visibleStr(null, fh.h.c, keys, now);
+        const isCur = st.ph === 'play' && st.cur === fs && st.hi === fh.hi && fHands.length > 1;
+        if (isCur) { ctx.strokeStyle = fp.color; ctx.lineWidth = 2.5; rr(ctx, fh.x - 5, fy - 5, fh.w + 10, meta.focus.h + 10, 10); ctx.stroke(); }
+        const ly = fy + meta.focus.h + 16;
+        let lab = totalLabel(vs);
+        if (isBJ(fh.h) && vs.length === 4) lab = '블랙잭';
+        const many = fHands.length > 2;
+        if (many) lab = lab.replace('소프트 ', 'S').replace('버스트 ', '✕');
+        const roomBelow = ly + 52 <= G.focusBottom;
+        const showChips = st.ph !== 'bet' || actor(st) !== fs;
+        if (lab) pill(fh.x + fh.w / 2, ly, lab + (fh.h.d ? (many ? '·D' : ' · 더블') : '') + (showChips && fHands.length > 1 && !roomBelow ? ' · ' + fh.h.b : ''), 'rgba(242,233,216,.92)', '#1b1426', 'center', many ? '700 11px "IBM Plex Sans KR", system-ui, sans-serif' : null);
+        if (showChips && (fHands.length === 1 || roomBelow)) {
+          drawChips(ctx, fHands.length === 1 ? fh.x - 30 : fh.x + fh.w / 2, fHands.length === 1 ? fy + meta.focus.h * 0.62 : ly + 32, fh.h.b, 13);
+        }
+        if (fh.h.o && settled) {
+          const [t, b, f2] = OUT[fh.h.o];
+          pill(fh.x + fh.w / 2, fy - 16, t, b, f2, 'center', '400 16px "Black Han Sans", "IBM Plex Sans KR", sans-serif');
+        }
+      });
+      if (!fHands.length) {
+        ctx.fillStyle = 'rgba(242,233,216,.55)'; ctx.font = '500 13px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(st.ch[fs] < MINBET ? '칩이 부족해 쉬는 중' : st.ph === 'bet' && actor(st) === fs ? '베팅 금액을 정하세요' : '베팅을 기다리는 중', G.W / 2, fy + meta.focus.h / 2 - 10);
+      }
+      // compact labels
+      for (const b of meta.comp) {
+        const hh = st.hd[b.seat];
+        hh.forEach((h, hi) => {
+          const keys = out.filter((s) => s.key.startsWith('p' + st.dn + '_' + b.seat + '_' + hi + '_')).map((s) => s.key);
+          const vs = visibleStr(null, h.c, keys, now);
+          let lab = isBJ(h) && vs.length === 4 ? 'BJ' : totalLabel(vs).replace('소프트 ', 'S').replace('버스트 ', '✕');
+          const ly = b.y + b.h - (G.tight ? 11 : 13);
+          const lx = hh.length > 1 ? b.x + 6 + hi * (b.w - 12) / hh.length : b.x + 6;
+          ctx.font = '600 ' + (hh.length > 2 ? 10 : 12) + 'px "IBM Plex Mono", ui-monospace, monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.fillStyle = h.o && settled && hh.length > 2 ? OUT[h.o][1] : '#f2e9d8'; ctx.fillText(lab, lx + 2, ly);
+          if (h.o && settled && hh.length <= 2) {
+            const [t, bc, fc] = OUT[h.o];
+            const lw = ctx.measureText(lab).width;
+            ctx.font = '700 11px "IBM Plex Sans KR", system-ui, sans-serif';
+            const tw = ctx.measureText(t).width + 10;
+            const px = Math.min(lx + lw + 6, b.x + b.w - tw - 4);
+            ctx.fillStyle = bc; rr(ctx, px, ly - 9, tw, 18, 9); ctx.fill();
+            ctx.fillStyle = fc; ctx.textAlign = 'center'; ctx.fillText(t, px + tw / 2, ly + 1);
+          }
+        });
+      }
+    }
+    function clip(t, w) {
+      if (ctx.measureText(t).width <= w) return t;
+      while (t.length > 1 && ctx.measureText(t + '…').width > w) t = t.slice(0, -1);
+      return t + '…';
+    }
+    function drawBetSpot(x, y, amt, big) {
+      ctx.strokeStyle = 'rgba(227,174,69,.7)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.ellipse(x, y, 34, 16, 0, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+      if (amt > 0) drawChips(ctx, x, y + 2, amt, 15);
+      else { ctx.fillStyle = 'rgba(242,233,216,.55)'; ctx.font = '600 11px "IBM Plex Sans KR", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('베팅', x, y); }
+    }
+    function drawSpec(sp, now) {
+      const a = anims[sp.key];
+      if (!a) { drawCard(ctx, sp.x, sp.y, sp.w, sp.c, sp.up); return; }
+      let p = (now - a.t0) / a.dur;
+      if (a.kind === 'deal') {
+        if (p < 0) return;
+        p = U.clamp(p, 0, 1);
+        const e = ease(p);
+        const fx = G.shoe.x - sp.w / 2, fy = G.shoe.y;
+        const x = U.lerp(fx, sp.x, e), y = U.lerp(fy, sp.y, e);
+        const w = U.lerp(34, sp.w, e);
+        if (sp.up) {
+          const flipP = U.clamp((p - 0.45) / 0.55, 0, 1);
+          drawCard(ctx, x, y, w, sp.c, flipP > 0.5, Math.abs(Math.cos(flipP * Math.PI)));
+        } else drawCard(ctx, x, y, w, sp.c, false);
+      } else {
+        p = U.clamp(p, 0, 1);
+        drawCard(ctx, sp.x, sp.y - Math.sin(p * Math.PI) * 8, sp.w, sp.c, p > 0.5 ? sp.up : !sp.up, Math.abs(Math.cos(p * Math.PI)));
+      }
+    }
+
+    /* ---------- HUD ---------- */
+    function btn(text, cls, onclick, disabled) {
+      return L.h('button', { class: 'btn ' + (cls || ''), text, onclick, disabled: !!disabled, style: { minWidth: 0, padding: '10px 6px' } });
+    }
+    const ACT_KO = { hit: '히트', stand: '스탠드', double: '더블', split: '스플릿' };
+    // chance that one more card busts this hand (fresh-deck odds: 13 ranks, 10·J·Q·K = 10, A = 1); soft hands can't bust
+    function bustTxt(tt) {
+      if (tt.soft || tt.t <= 11) return '버스트 0%';
+      let n = 0;
+      for (let v = 1; v <= 13; v++) if (tt.t + Math.min(v, 10) > 21) n++;
+      return '버스트 ' + Math.round((n / 13) * 100) + '%';
+    }
+    let hints = !!U.store.get('bj.hints', false);
+    function infoRow(text, withToggle) {
+      return L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', width: '100%', minHeight: '40px' } },
+        L.h('div', { style: { flex: '1', minWidth: 0, fontSize: '14px', lineHeight: '1.25', color: 'var(--ink)' } }, text),
+        withToggle ? L.h('button', { class: 'btn sm' + (hints ? ' primary' : ' ghost'), 'aria-pressed': hints ? 'true' : 'false', style: { minHeight: '40px', flex: 'none', padding: '6px 10px' }, text: hints ? '힌트 켬' : '힌트 끔',
+          onclick() { hints = !hints; U.store.set('bj.hints', hints); api.sfx('click'); api.buzz(10); renderHud(); } }) : null);
+    }
+    function renderHud() {
+      hud.innerHTML = '';
+      if (!st || st.over) return;
+      const a = actor(st);
+      if (a == null || !api.canAct(a)) return;
+      const anim = busy;
+      const grid = (kids, cols) => L.h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(' + cols + ',minmax(0,1fr))', gap: '8px', width: '100%', maxWidth: '460px' } }, kids);
+      const panel = (...kids) => L.h('div', { class: 'panel', style: { display: 'flex', flexDirection: 'column', gap: '8px', width: '100%', maxWidth: '460px' } }, kids);
+      const up = st.dl ? cval(st.dl.slice(0, 2)) : 0, upTxt = up === 11 ? 'A' : String(up);
+      if (st.ph === 'bet') {
+        const pk = a + ':' + st.dn;
+        const last = st.lb[a] || U.store.get('bj.lastBet', 0);
+        if (pendFor !== pk) { pendFor = pk; pend = last || 50; }
+        pend = U.clamp(pend, MINBET, st.ch[a]); // stack may have shrunk since the last bet
+        const add = (v) => () => { pend = U.clamp(pend + v, MINBET, st.ch[a]); api.sfx('chip'); api.buzz(8); renderHud(); dirty = true; };
+        const place = (amt) => { api.sfx('chip'); api.buzz(15); U.store.set('bj.lastBet', amt); api.act({ type: 'bet', amt }); };
+        const again = last ? Math.min(last, st.ch[a]) : 0;
+        hud.append(panel(
+          L.h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(5,minmax(0,1fr))', gap: '6px', width: '100%', whiteSpace: 'nowrap' } },
+            [btn('−10', '', add(-10), pend <= MINBET), btn('+10', '', add(10), pend >= st.ch[a]), btn('+50', '', add(50), pend >= st.ch[a]), btn('+100', '', add(100), pend >= st.ch[a]),
+              btn('초기화', 'ghost', () => { pend = MINBET; api.sfx('click'); renderHud(); dirty = true; })].map((b) => { b.style.fontSize = '14px'; b.style.padding = '10px 2px'; return b; })),
+          grid([
+            again >= MINBET ? L.h('button', { class: 'btn', 'data-action': 'again', disabled: anim, style: { minWidth: 0, padding: '8px 6px', flexDirection: 'column', gap: 0, lineHeight: '1.15' }, onclick() { pend = again; place(again); } },
+              L.h('span', { text: '지난 베팅 그대로' }), L.h('b', { class: 'mono', style: { fontSize: '13px' }, text: String(again) })) : null,
+            L.h('button', { class: 'btn primary', 'data-action': 'ok', disabled: anim || pend < MINBET, style: { minWidth: 0 }, onclick() { place(pend); } },
+              '베팅 확정 ', L.h('b', { class: 'mono', text: String(pend) }))].filter(Boolean), again >= MINBET ? 2 : 1)));
+      } else if (st.ph === 'ins' && canEM(st, a)) {
+        const b = st.hd[a][0].b;
+        hud.append(panel(
+          infoRow([L.h('b', { text: '블랙잭 · 딜러 A · 이븐 머니? ' }), L.h('span', { class: 'muted', text: '지금 1:1 확정' + (hints ? ' · 추천: 안 함' : '') })], true),
+          grid([L.h('button', { class: 'btn' + (hints ? ' primary' : ''), 'data-action': 'no', disabled: anim, style: { minWidth: 0, padding: '8px 6px', flexDirection: 'column', gap: 0, lineHeight: '1.15' }, onclick() { api.sfx('click'); api.act({ type: 'ins', em: false }); } },
+            L.h('span', { text: '안 함' }), L.h('span', { class: 'mono', style: { fontSize: '11px', opacity: 0.85 }, text: '3:2 또는 푸시' })),
+            L.h('button', { class: 'btn', 'data-action': 'yes', disabled: anim, style: { minWidth: 0, padding: '8px 6px', flexDirection: 'column', gap: 0, lineHeight: '1.15' }, onclick() { api.sfx('chip'); api.buzz(12); api.act({ type: 'ins', em: true }); } },
+              L.h('span', { text: '이븐 머니' }), L.h('b', { class: 'mono', style: { fontSize: '12px' }, text: '+' + b }))], 2)));
+      } else if (st.ph === 'ins') {
+        const amt = insAmt(st, a);
+        hud.append(panel(
+          infoRow([L.h('b', { text: '딜러 A · 보험? ' }), L.h('span', { class: 'muted', text: '블랙잭이면 2:1' + (hints ? ' · 추천: 안 함' : '') })], true),
+          grid([(() => { const b = btn('보험 안 함', hints ? 'primary' : '', () => { api.sfx('click'); api.act({ type: 'ins', take: false }); }, anim); b.setAttribute('data-action', 'no'); return b; })(),
+            L.h('button', { class: 'btn', 'data-action': 'yes', disabled: anim, style: { minWidth: 0, padding: '10px 6px' }, onclick() { api.sfx('chip'); api.buzz(12); api.act({ type: 'ins', take: true }); } },
+              '보험 ', L.h('b', { class: 'mono', text: String(amt) }))], 2)));
+      } else if (st.ph === 'play') {
+        const h = st.hd[a][st.hi];
+        const cD = canDouble(st, a, h), cS = canSplit(st, a, h);
+        const rec = hints ? strategy(h, up, cD, cS) : null;
+        const tt = total(h.c);
+        const info = [L.h('span', { text: '딜러 ' }), L.h('b', { class: 'mono', text: upTxt }), L.h('span', { text: ' · 내 패 ' }), L.h('b', { class: 'mono', text: (tt.soft ? 'S' : '') + tt.t }),
+          st.hd[a].length > 1 ? L.h('span', { class: 'muted', text: ' (' + (st.hi + 1) + '/' + st.hd[a].length + ')' }) : null,
+          rec ? L.h('span', { style: { color: 'var(--brass)', fontWeight: 700 }, text: ' · ' + ACT_KO[rec] + ' 추천' }) : null];
+        const mk = (key, label, sub, cls, fn, dis) => {
+          const b = L.h('button', { class: 'btn ' + (cls || ''), 'data-action': key, disabled: !!dis, onclick: fn, style: { minWidth: 0, padding: '8px 4px', flexDirection: 'column', gap: 0, lineHeight: '1.15' } },
+            L.h('span', { text: label }), sub != null ? L.h('span', { class: 'mono', style: { fontSize: '11px', opacity: 0.85, whiteSpace: 'nowrap', fontFamily: key === 'hit' ? 'var(--f-body)' : null }, text: sub }) : null);
+          if (rec === key) b.style.boxShadow = '0 0 0 2px var(--brass), 0 0 14px rgba(227,174,69,.55)';
+          return b;
+        };
+        hud.append(panel(infoRow(info, true), grid([
+          mk('hit', '히트', st.bp !== 0 ? bustTxt(tt) : null, 'primary', () => { api.sfx('card'); api.buzz(10); api.act({ type: 'hit' }); }, anim),
+          mk('stand', '스탠드', null, '', () => { api.sfx('click'); api.buzz(10); api.act({ type: 'stand' }); }, anim),
+          mk('double', '더블', '+' + h.b, '', () => { api.sfx('chip'); api.buzz(15); api.act({ type: 'double' }); }, anim || !cD),
+          mk('split', '스플릿', '+' + h.b, '', () => { api.sfx('chip'); api.buzz(15); api.act({ type: 'split' }); }, anim || !cS),
+        ], 4)));
+      }
+    }
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = hud.querySelector('[data-action="' + id + '"]');
+      if (b && !b.disabled) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    const stopLoop = U.loop(frame);
+    const wd = setInterval(() => { if (busy && performance.now() > holdUntil + 500 / spd()) { anims = {}; setBusy(false); renderHud(); dirty = true; } }, 300);
+    return {
+      update(next, prev) {
+        st = next;
+        geometry();
+        const fresh = animKick(prev && prev !== next ? prev : null);
+        const l = next.last;
+        if (l && l.id !== lastId && prev && prev !== next) {
+          if (fresh) api.sfx('card');
+          if (l.tx && l.tx.length) {
+            const msg = l.tx.join(' · ');
+            const delay = Math.max(0, holdUntil - performance.now() - 200 / spd());
+            setTimeout(() => {
+              api.toast(msg);
+              if (msg.indexOf('블랙잭') >= 0) api.sfx('win'); else if (msg.indexOf('버스트') >= 0) api.sfx('lose');
+            }, delay);
+          }
+          // round settled (also when bet→settle happens in one step, e.g. dealer blackjack, or a guest skipped states)
+          if (next.rv && (!prev.rv || prev.dn !== next.dn)) {
+            // round settled: hold so outcomes are readable before anyone bets
+            holdUntil = Math.max(holdUntil, performance.now()) + 1100 / spd();
+            setBusy(true);
+            const mine = next.hd.some((hh, i) => api.canAct(i) && hh.some((h) => h.o === 'W' || h.o === 'B' || h.o === 'E'));
+            setTimeout(() => api.sfx(mine ? 'win' : 'chip'), Math.max(0, holdUntil - performance.now() - 1000 / spd()));
+          }
+        }
+        lastId = l ? l.id : -1;
+        dirty = true;
+        renderHud();
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true); window.removeEventListener('lounge-felt', onFelt); window.removeEventListener('lounge-cancel', onRC); window.removeEventListener('lounge-cardback', onFelt); stopLoop(); clearInterval(wd); setBusy(false); cv.destroy(); hud.remove(); Object.values(anc).forEach((el) => el.remove()); },
+    };
+  }
+
+  L.register({
+    id: 'blackjack', name: '블랙잭', tag: '카드', hidden: false,
+    blurb: '딜러와 1:1로 21에 가깝게. 블랙잭은 3:2, 딜러는 17에서 멈춰요. 6라운드 뒤 칩이 가장 많은 사람이 승리.',
+    quick: [
+      '모두 각자 딜러와 1:1 승부. 카드 합을 21에 가깝게 만들되, 21을 넘으면(버스트) 바로 져요.',
+      '내 차례: 먼저 칩을 걸고, 카드를 보며 히트(한 장 더) 또는 스탠드(멈춤).',
+      '딜러보다 21에 가까우면 건 만큼 따요(블랙잭은 1.5배). 6라운드 뒤 칩이 가장 많은 사람이 우승!',
+    ],
+    rules: [
+      { h: '그림으로 보기', fig: [
+        { svg: FIG_ROW([['A', '♠'], ['K', '♥']], '블랙잭! A(11) + K(10) = 21'), cap: '처음 2장이 21이면 블랙잭 — 3 : 2로 받아요' },
+        { svg: FIG_ROW([['10', '♣'], ['6', '♦'], ['9', '♠']], '버스트 — 10 + 6 + 9 = 25'), cap: '21을 넘으면 그 자리에서 져요' }] },
+      { h: '목표', p: [
+        '모두 각자 딜러(컴퓨터)와 1:1로 승부해요. 다른 사람과는 겨루지 않아요.',
+        '카드 합을 21에 가깝게 만들되, 21을 넘으면(버스트) 바로 져요.',
+        '6라운드가 끝났을 때 칩이 가장 많은 사람이 이겨요.'] },
+      { h: '카드 값', p: [
+        '2~10은 숫자 그대로, J · Q · K는 10이에요.',
+        'A는 11로 치되, 21을 넘게 되면 1로 쳐요. A를 11로 치고 있는 패를 「소프트」라고 해요(화면에 S17처럼 표시).',
+        '처음 두 장이 A + 10점 카드(10 · J · Q · K)면 「블랙잭」! 가장 센 패예요.'] },
+      { h: '준비', p: [
+        '모두 1000칩으로 시작해요.',
+        '덱 2벌을 쓰고, 30장 미만이 남으면 새로 섞어요.',
+        '칩이 10개 미만이면 파산이라 남은 라운드를 쉬어요. 모두 파산하면 바로 끝나요.'] },
+      { h: '차례에 할 일', p: [
+        '① 베팅: 10칩부터 가진 칩까지 걸어요.',
+        '② 모두 2장씩 받고, 딜러는 1장만 앞면으로 보여줘요.',
+        '③ 내 패를 보고 고르기 — 히트: 한 장 더 받기 · 스탠드: 멈추기 · 더블: 베팅을 2배로 하고 딱 1장만 받기(처음 두 장일 때) · 스플릿: 같은 값 두 장을 두 패로 나누기.',
+        '④ 모두 끝나면 딜러가 숨긴 카드를 열고, 16 이하면 계속 받고 17 이상이면 멈춰요(소프트 17에서도 멈춤).',
+        '⑤ 딜러와 비교해서 정산해요.'] },
+      { h: '점수·승리 (정산)', p: [
+        '딜러보다 21에 가깝거나 딜러가 버스트하면 이겨요 → 건 만큼 따요(1:1).',
+        '같으면 「푸시」 → 건 칩을 돌려받아요.',
+        '블랙잭은 1.5배(3:2)로 받아요. 딜러도 블랙잭이면 푸시예요.',
+        '내가 버스트하면 딜러 결과와 상관없이 져요.',
+        '6라운드 뒤 칩이 가장 많은 사람이 우승이에요.'] },
+      { h: '특수 규칙 ① 스플릿', p: [
+        '처음 두 장의 값이 같으면 두 패로 나눌 수 있어요. 10 · J · Q · K는 모두 10이라 K + Q도 나눠져요.',
+        '나눌 때마다 원래 베팅만큼 칩이 더 들어요. 각 패에 1장씩 더 받아 따로 진행해요.',
+        '나눈 패가 또 같은 값이면 다시 나눌 수 있어요(최대 4패). 나눈 뒤에도 더블할 수 있어요.',
+        'A를 나누면 한 장씩만 받고 끝나요. 다시 나누거나 히트할 수 없어요.',
+        '스플릿 뒤 만든 21(A + 10 포함)은 블랙잭이 아니라 그냥 21이에요.'] },
+      { h: '특수 규칙 ② 보험 · 이븐 머니', p: [
+        '딜러 앞면이 A면, 딜러 블랙잭에 대비해 「보험」을 들지 골라요. 보험료는 베팅의 절반이에요.',
+        '딜러가 블랙잭이면 보험이 2:1로 받아요(보험료 포함 3배). 아니면 보험료만 잃고 그대로 진행해요.',
+        '딜러 앞면이 A인데 내가 블랙잭이면, 보험 대신 「이븐 머니」를 고를 수 있어요 → 그 자리에서 1:1을 확정으로 받고 끝.',
+        '안 받으면: 딜러도 블랙잭이면 푸시, 아니면 3:2를 받아요.',
+        '딜러가 A나 10점 카드를 보이면 블랙잭인지 먼저 확인하고, 블랙잭이면 바로 정산해요.',
+        '보험 · 이븐 머니는 길게 보면 손해라 기본 전략은 「안 함」이에요.'] },
+      { h: '조작', p: [
+        '베팅: −10 · +10 · +50 · +100으로 금액을 정하고 「베팅 확정」. 「초기화」는 10으로, 「지난 베팅 그대로」는 지난번 금액으로 바로 걸어요.',
+        '히트 · 스탠드 · 더블 · 스플릿 버튼으로 행동해요. 더블 · 스플릿 · 보험은 그만큼 칩이 남아 있어야 해요.',
+        '버스트 확률(설정에서 켬/끔, 기본 켬): 히트 버튼 아래에 한 장 더 받으면 21을 넘을 확률(대략)이 나와요.',
+        '「힌트 끔」 버튼을 켜면 기본 전략 추천(예: 딜러 10 · 스탠드 추천)이 보여요.'] },
+      { h: '예시', p: [
+        '100칩을 걸었어요. 내 패 10 + 6 = 16, 딜러 앞면 9.',
+        '→ 히트 → 4가 나와 20. 스탠드.',
+        '→ 딜러가 숨긴 카드를 열어 9 + 7 = 16 → 17이 안 돼서 한 장 더 → 8이 나와 24, 버스트!',
+        '→ 내가 이겨서 +100칩. 블랙잭이었다면 +150칩, 비겼다면 0, 졌다면 −100칩.',
+        '더블했다면: 200칩이 걸리고 딱 1장만 받아요. 이기면 +200칩.'] },
+      { h: 'AI 난이도', p: ['AI 난이도는 자리마다 쉬움(감으로 베팅·플레이)·보통(기본 전략)·어려움(기본 전략 + 카드 카운팅으로 베팅·보험)으로 고를 수 있어요.'] },
+    ],
+    tutorial: [
+      { sel: '.bj-dealer', text: '위는 딜러예요. 모두 각자 딜러와 1:1로 승부해요. 딜러는 1장만 보여주고, 나중에 16 이하면 더 받고 17 이상이면 멈춰요.' },
+      { sel: '.bj-focus', text: '가운데엔 지금 차례인 사람의 패가 크게 보여요. 합을 21에 가깝게! 21을 넘으면 버스트로 바로 져요. J · Q · K = 10, A = 11 또는 1.' },
+      { sel: '.bj-bar', text: '먼저 베팅: −10 · +10 · +50 · +100으로 금액을 정하고 「베팅 확정」. 모두 1000칩으로 시작해요.' },
+      { sel: '.bj-bar', text: '카드를 받으면 여기서 히트(한 장 더) · 스탠드(멈춤) · 더블(2배 걸고 딱 1장) · 스플릿(같은 값 두 장 나누기). 히트 아래 %는 버스트 확률이에요.' },
+      { text: '처음이라면 「힌트」를 켜 보세요. 추천 행동이 빛나요. 블랙잭(A + 10점 카드)은 1.5배! 6라운드 뒤 칩이 가장 많으면 우승이에요.' },
+    ],
+    options: [{ id: 'bust', label: '버스트 확률', tip: '히트 버튼 아래에 한 장 더 받으면 21을 넘을 확률(%)을 보여 줘요.', choices: [{ v: 1, label: '켬' }, { v: 0, label: '끔' }], def: 1 }],
+    controls: [
+      { id: 'hit', label: '히트', keys: ['KeyH', 'Space'], pad: ['a'] },
+      { id: 'stand', label: '스탠드', keys: ['KeyS'], pad: ['b'] },
+      { id: 'double', label: '더블', keys: ['KeyD'], pad: ['x'] },
+      { id: 'split', label: '스플릿', keys: ['KeyP'], pad: ['y'] },
+      { id: 'ok', label: '베팅 확정', keys: ['Enter'], pad: ['start'] },
+      { id: 'again', label: '지난 베팅 그대로', keys: ['KeyR'] },
+      { id: 'yes', label: '보험·이븐 머니 받기', keys: ['KeyY'] },
+      { id: 'no', label: '보험·이븐 머니 안 함', keys: ['KeyN'] },
+    ],
+    minPlayers: 1, maxPlayers: 5, defaultPlayers: 2, aiDelay: 600,
+    init, actor, apply, ai, aiDelayFor, result, mount,
+    _t: { total, strategy, isBJ, trueCount },
+  });
+})();

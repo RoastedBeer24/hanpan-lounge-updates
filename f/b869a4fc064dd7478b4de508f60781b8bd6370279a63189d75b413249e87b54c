@@ -1,0 +1,1469 @@
+/* 사흘 밤의 원정 — 원정 세계 시뮬레이션(순수 로직). 브라우저(호스트 · 손님 예측)와 node 시험에서 같이 씀.
+   좌표: x 동쪽, z 남쪽(three.js), 높이 y. 바라보는 방향 yaw → (sin yaw, cos yaw).
+   - 지형: 고정된 높이(같은 씨앗) + 후보 자리 46곳을 평평하게. 나무 · 바위도 고정. 판마다 바뀌는 것은 거점 종류 · 적 · 보물 · 밤 원 위치 · 보스.
+   - step(W, dt, inpOf, botOf): 한 걸음. inpOf(seat) → 입력 객체 | 'remote'(손님 — 위치는 손님이 보냄) | null(봇).
+   - 손님 기기: ctrl(W, me, inp, dt, 'pred')로 자기 원정자만 먼저 움직이고, 나머지는 unpack으로 호스트 묶음을 받음. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const T = G.NIGHTFALL;
+  if (!T) return;
+  const S = {};
+  const DT = 1 / 30, TAU = Math.PI * 2, PI = Math.PI;
+  const clamp = T.clamp;
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const smt = (t) => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+  const angD = (a, b) => { let d = (b - a) % TAU; if (d > PI) d -= TAU; if (d < -PI) d += TAU; return d; };
+  const turnTo = (a, b, mx) => a + clamp(angD(a, b), -mx, mx);
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+  function prng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function shuffle(R, a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)); const x = a[i]; a[i] = a[j]; a[j] = x; } return a; }
+  const pickW = (R, items, wf) => { let s = 0; for (const it of items) s += Math.max(0, wf(it)); if (s <= 0) return null; let x = R() * s; for (const it of items) { x -= Math.max(0, wf(it)); if (x <= 0) return it; } return items[items.length - 1]; };
+
+  /* ======================= 지형 ======================= */
+  const HALF = 210, GN = 161, GS = HALF * 2 / (GN - 1), WL = -6.2, BOUND = 194;
+  const FA = { x: 128, z: -128 }, REST = { x: 95, z: -95 };
+  function hash2(ix, iz, s) { let h = (Math.imul(ix, 374761393) + Math.imul(iz, 668265263) + Math.imul(s, 1442695041)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16; return (h >>> 0) / 4294967296; }
+  function vn(x, z, s) {
+    const ix = Math.floor(x), iz = Math.floor(z), fx = x - ix, fz = z - iz, u = fx * fx * (3 - 2 * fx), v = fz * fz * (3 - 2 * fz);
+    const a = hash2(ix, iz, s), b = hash2(ix + 1, iz, s), c = hash2(ix, iz + 1, s), d = hash2(ix + 1, iz + 1, s);
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  }
+  function fbm(x, z, s, o) { let t = 0, a = 1, f = 1, n = 0; for (let i = 0; i < o; i++) { t += a * vn(x * f, z * f, s + i * 17); n += a; a *= 0.5; f *= 2.03; } return t / n; }
+  function rawH(x, z) {
+    let h = (fbm(x * 0.0085 + 3.1, z * 0.0085 - 1.7, 3, 4) - 0.45) * 26 + (fbm(x * 0.035, z * 0.035, 9, 2) - 0.5) * 3;
+    const dm = Math.hypot(x + 120, z + 112); if (dm < 70) h += 20 * smt(1 - dm / 70) * (0.6 + fbm(x * 0.05, z * 0.05, 31, 2) * 0.8);   // 북서 바위산
+    const dh = Math.hypot(x - 110, z - 120); if (dh < 55) h += 9 * smt(1 - dh / 55);   // 남동 언덕
+    const dl = Math.hypot(x + 105, z - 95); if (dl < 78) h = lerp(h, -9.5, smt(1 - dl / 78) * 0.95);   // 남서 호수
+    const dp = Math.hypot(x - FA.x, z - FA.z); if (dp < 64) h = lerp(h, 14, smt((64 - dp) / 22));   // 최종 결전 고원
+    const e = Math.max(Math.abs(x), Math.abs(z)) / HALF; if (e > 0.83) h += Math.pow((e - 0.83) / 0.17, 2) * 52;
+    return h;
+  }
+  let TER = null;
+  function terrain() {
+    if (TER) return TER;
+    const R = prng(7771);
+    const H0 = new Float32Array(GN * GN);
+    for (let iz = 0; iz < GN; iz++) for (let ix = 0; ix < GN; ix++) H0[iz * GN + ix] = rawH(-HALF + ix * GS, -HALF + iz * GS);
+    const sites = []; let tries = 0;
+    while (sites.length < 46 && tries++ < 8000) {
+      const x = (R() * 2 - 1) * 180, z = (R() * 2 - 1) * 180;
+      if (Math.hypot(x - FA.x, z - FA.z) < 80 || Math.hypot(x - REST.x, z - REST.z) < 30) continue;
+      const hh = rawH(x, z); if (hh < WL + 1.4) continue;
+      const sl = Math.abs(rawH(x + 7, z) - rawH(x - 7, z)) + Math.abs(rawH(x, z + 7) - rawH(x, z - 7)); if (sl > 7.5) continue;
+      if (sites.some((s) => Math.hypot(s.x - x, s.z - z) < 33)) continue;
+      sites.push({ x, z, h: hh });
+    }
+    const flat = (x0, z0, h0, r, inner) => {
+      const i0 = Math.max(0, Math.floor((x0 - r + HALF) / GS)), i1 = Math.min(GN - 1, Math.ceil((x0 + r + HALF) / GS));
+      const j0 = Math.max(0, Math.floor((z0 - r + HALF) / GS)), j1 = Math.min(GN - 1, Math.ceil((z0 + r + HALF) / GS));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const d = Math.hypot(-HALF + i * GS - x0, -HALF + j * GS - z0); if (d < r) { const k = j * GN + i; H0[k] = lerp(H0[k], h0, smt((r - d) / (r - inner))); } }
+    };
+    for (const s of sites) flat(s.x, s.z, s.h, 19, 11);
+    flat(REST.x, REST.z, rawH(REST.x, REST.z), 14, 6);
+    TER = { H: H0, sites, trees: [], rocks: [] };
+    const near = (x, z, d) => sites.some((s) => Math.hypot(s.x - x, s.z - z) < d) || Math.hypot(x - FA.x, z - FA.z) < 52 || Math.hypot(x - REST.x, z - REST.z) < 16;
+    for (let i = 0; i < 5000 && TER.trees.length < 900; i++) {
+      const x = (R() * 2 - 1) * 192, z = (R() * 2 - 1) * 192; const hh = Hat(x, z);
+      if (hh < WL + 0.8 || near(x, z, 21)) continue;
+      const dn = fbm(x * 0.018, z * 0.018, 41, 2); if (dn < 0.47 && R() > 0.12) continue;
+      TER.trees.push([Math.round(x * 10) / 10, Math.round(z * 10) / 10, 0.8 + R() * 0.6, hh > 10 || R() < 0.35 ? 1 : 0, R() * TAU]);
+    }
+    for (let i = 0; i < 2000 && TER.rocks.length < 260; i++) {
+      const x = (R() * 2 - 1) * 192, z = (R() * 2 - 1) * 192; const hh = Hat(x, z);
+      if (hh < WL - 2 || near(x, z, 17)) continue;
+      TER.rocks.push([Math.round(x * 10) / 10, Math.round(z * 10) / 10, 0.6 + R() * R() * 2.2, R() * TAU, R()]);
+    }
+    return TER;
+  }
+  function Hat(x, z) {
+    const fx = clamp((x + HALF) / GS, 0, GN - 1.001), fz = clamp((z + HALF) / GS, 0, GN - 1.001);
+    const ix = Math.floor(fx), iz = Math.floor(fz), u = fx - ix, v = fz - iz, H = TER.H, k = iz * GN + ix;
+    return (H[k] * (1 - u) + H[k + 1] * u) * (1 - v) + (H[k + GN] * (1 - u) + H[k + GN + 1] * u) * v;
+  }
+  const wet = (x, z) => Hat(x, z) < WL - 1.1;
+
+  /* ======================= 장애물 칸 ======================= */
+  const OC = 8, ON = Math.ceil(HALF * 2 / OC);
+  function obAdd(W, x, z, r) { const i = W.OB.length; W.OB.push([x, z, r]); const c0 = Math.floor((x - r + HALF) / OC), c1 = Math.floor((x + r + HALF) / OC), r0 = Math.floor((z - r + HALF) / OC), r1 = Math.floor((z + r + HALF) / OC); for (let a = r0; a <= r1; a++) for (let b = c0; b <= c1; b++) if (a >= 0 && b >= 0 && a < ON && b < ON) (W.OG[a * ON + b] || (W.OG[a * ON + b] = [])).push(i); }
+  function obNear(W, x, z, fn) { const c = Math.floor((x + HALF) / OC), r = Math.floor((z + HALF) / OC); if (c < 0 || r < 0 || c >= ON || r >= ON) return; const L_ = W.OG[r * ON + c]; if (L_) for (const i of L_) fn(W.OB[i]); }
+  function pushOut(W, o, rad) {
+    obNear(W, o.x, o.z, (b) => { const dx = o.x - b[0], dz = o.z - b[1], d = Math.hypot(dx, dz), m = b[2] + rad; if (d < m && d > 1e-4) { o.x = b[0] + dx / d * m; o.z = b[1] + dz / d * m; } });
+    o.x = clamp(o.x, -BOUND, BOUND); o.z = clamp(o.z, -BOUND, BOUND);
+  }
+  function blockedAt(W, x, z, rad) { if (wet(x, z) || Math.abs(x) > BOUND || Math.abs(z) > BOUND) return true; let b = false; obNear(W, x, z, (o) => { if (!b && Math.hypot(x - o[0], z - o[1]) < o[2] + rad) b = true; }); return b; }
+  /* 카메라용: (x0,z0)→(x1,z1) 사이 첫 장애물까지의 비율(0~1) */
+  function rayOb(W, x0, z0, x1, z1) {
+    const d = Math.hypot(x1 - x0, z1 - z0), n = Math.max(1, Math.ceil(d / 0.4));
+    for (let k = 1; k <= n; k++) { const t = k / n, x = x0 + (x1 - x0) * t, z = z0 + (z1 - z0) * t; let hit = false; obNear(W, x, z, (o) => { if (!hit && Math.hypot(x - o[0], z - o[1]) < o[2] + 0.25) hit = true; }); if (hit) return Math.max(0, (k - 1) / n); }
+    return 1;
+  }
+  const treeOn = (W, t) => !W.FC.some((c) => Math.hypot(c.x - t[0], c.z - t[1]) < 30);
+
+
+  /* ======================= 길찾기 (2m 칸 A*) ======================= */
+  const NC = 2, NN = Math.ceil(HALF * 2 / NC);
+  function buildNav(W) {
+    const g = new Uint8Array(NN * NN);
+    for (let j = 0; j < NN; j++) for (let i = 0; i < NN; i++) { const x = -HALF + (i + 0.5) * NC, z = -HALF + (j + 0.5) * NC; if (wet(x, z) || Math.abs(x) > BOUND || Math.abs(z) > BOUND) g[j * NN + i] = 1; }
+    for (const o of W.OB) {
+      const r = o[2] + 0.3, i0 = Math.max(0, Math.floor((o[0] - r + HALF) / NC)), i1 = Math.min(NN - 1, Math.floor((o[0] + r + HALF) / NC)), j0 = Math.max(0, Math.floor((o[1] - r + HALF) / NC)), j1 = Math.min(NN - 1, Math.floor((o[1] + r + HALF) / NC));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const x = -HALF + (i + 0.5) * NC, z = -HALF + (j + 0.5) * NC; if (Math.hypot(x - o[0], z - o[1]) < r) g[j * NN + i] = 1; }
+    }
+    W.nav = g; W.navG = new Float32Array(NN * NN); W.navC = new Int32Array(NN * NN); W.navS = new Int32Array(NN * NN); W.navStamp = 0;
+  }
+  const cellOf = (x, z) => [clamp(Math.floor((x + HALF) / NC), 0, NN - 1), clamp(Math.floor((z + HALF) / NC), 0, NN - 1)];
+  const navBlk = (W, x, z) => { const [i, j] = cellOf(x, z); return W.nav[j * NN + i] === 1; };
+  function navLine(W, x0, z0, x1, z1) {
+    const d = Math.hypot(x1 - x0, z1 - z0), n = Math.ceil(d / 0.9);
+    for (let k = 1; k < n; k++) { const t = k / n; if (navBlk(W, x0 + (x1 - x0) * t, z0 + (z1 - z0) * t)) return false; }
+    return true;
+  }
+  function astar(W, sx, sz, tx, tz) {
+    let [si, sj] = cellOf(sx, sz); let [ti, tj] = cellOf(tx, tz);
+    const g = W.nav, G_ = W.navG, Cm = W.navC, St = W.navS, st = ++W.navStamp;
+    const free = (i, j) => i >= 0 && j >= 0 && i < NN && j < NN && g[j * NN + i] !== 1;
+    if (!free(ti, tj)) { let ok = false; for (let r = 1; r < 6 && !ok; r++) for (let dj = -r; dj <= r && !ok; dj++) for (let di = -r; di <= r && !ok; di++) if (free(ti + di, tj + dj)) { ti += di; tj += dj; ok = true; } if (!ok) return null; }
+    const heap = [], hf = [];
+    const push = (k, f) => { heap.push(k); hf.push(f); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (hf[p] <= hf[i]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; [hf[p], hf[i]] = [hf[i], hf[p]]; i = p; } };
+    const pop = () => { const top = heap[0], lk = heap.pop(), lf = hf.pop(); if (heap.length) { heap[0] = lk; hf[0] = lf; let i = 0; for (;;) { const l = i * 2 + 1, r = l + 1; let m = i; if (l < heap.length && hf[l] < hf[m]) m = l; if (r < heap.length && hf[r] < hf[m]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; [hf[m], hf[i]] = [hf[i], hf[m]]; i = m; } } return top; };
+    const s0 = sj * NN + si, t0 = tj * NN + ti;
+    St[s0] = st; G_[s0] = 0; Cm[s0] = -1; push(s0, 0);
+    let n = 0, found = false;
+    while (heap.length && n++ < 9000) {
+      const k = pop(); if (k === t0) { found = true; break; }
+      const i = k % NN, j = (k - i) / NN, gk = G_[k];
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        if (!di && !dj) continue; const ni = i + di, nj = j + dj; if (!free(ni, nj)) continue;
+        if (di && dj && (!free(i + di, j) || !free(i, j + dj))) continue;
+        const nk = nj * NN + ni, ng = gk + (di && dj ? 1.414 : 1);
+        if (St[nk] === st && G_[nk] <= ng) continue;
+        St[nk] = st; G_[nk] = ng; Cm[nk] = k; push(nk, ng + Math.hypot(ni - ti, nj - tj));
+      }
+    }
+    if (!found) return null;
+    const pts = []; let k = t0; while (k >= 0 && k !== s0) { const i = k % NN, j = (k - i) / NN; pts.push([-HALF + (i + 0.5) * NC, -HALF + (j + 0.5) * NC]); k = Cm[k]; }
+    pts.reverse();
+    const out = []; let cx = sx, cz = sz, i = 0;
+    while (i < pts.length) { let j = Math.min(pts.length - 1, i + 12); while (j > i && !navLine(W, cx, cz, pts[j][0], pts[j][1])) j--; out.push(pts[j]); cx = pts[j][0]; cz = pts[j][1]; i = j + 1; }
+    return out;
+  }
+  /* 봇 길 따라가기: 곧장 보이면 바로, 아니면 A* 경로 */
+  function navDir(W, p, tx, tz) {
+    const bm = p.bm;
+    if (navLine(W, p.x, p.z, tx, tz)) { bm.path = null; return steer(W, p, tx, tz); }
+    if (!bm.pg || Math.hypot(bm.pg[0] - tx, bm.pg[1] - tz) > 4 || W.t - bm.pT > 4) { bm.path = astar(W, p.x, p.z, tx, tz) || []; bm.pg = [tx, tz]; bm.pT = W.t; }
+    const P = bm.path;
+    if (!P || !P.length) return steer(W, p, tx, tz);
+    while (P.length > 1 && (Math.hypot(P[0][0] - p.x, P[0][1] - p.z) < 1.4 || navLine(W, p.x, p.z, P[1][0], P[1][1]))) P.shift();
+    return steer(W, p, P[0][0], P[0][1]);
+  }
+  /* ======================= 판 만들기 ======================= */
+  const DAYM = [{ hp: 1, dm: 1 }, { hp: 1.75, dm: 1.3 }, { hp: 2.1, dm: 1.45 }];
+  function makeWorld(cfg) {
+    terrain();
+    const R = prng((cfg.seed >>> 0) || 1);
+    const LEN = T.LENS[cfg.len] || T.LENS.std;
+    const n = cfg.n || 1;
+    const W = { seed: cfg.seed, R, n, t: 0, ph: 'day', day: 1, pt: 0, dayLen: LEN.day, hpm: LEN.hpm || 1, rnm: LEN.rnm || 1, len: cfg.len,
+      P: [], E: [], em: {}, Pr: [], Z: [], D: [], CH: [], POI: [], parts: [], OB: [], OG: [], gr: [], fx: [], fxN: 0, nid: 1, plan: null, planT: 0, done: null, hum: [], rm: {}, ack: {},
+      FC: [], bossE: [], bossNm: '', killed: [0, 0], ng: 0, endT: 0, sumN: 0, prN: 0 };
+    const nb = shuffle(R, T.NIGHT_IDS.slice()); W.bosses = [nb[0], nb[1]];
+    W.fin = cfg.fin && T.BOSS[cfg.fin] && T.BOSS[cfg.fin].fin ? cfg.fin : T.FINAL_IDS[Math.floor(R() * T.FINAL_IDS.length)];
+    const sites = TER.sites.map((s, i) => i);
+    shuffle(R, sites);
+    // 밤의 원 중심 둘(넓고 서로 멀리)
+    const okFC = (s) => Math.abs(s.x) < 140 && Math.abs(s.z) < 140 && Math.hypot(s.x - FA.x, s.z - FA.z) > 100;
+    let f1 = sites.find((i) => okFC(TER.sites[i]));
+    let f2 = sites.find((i) => i !== f1 && okFC(TER.sites[i]) && Math.hypot(TER.sites[i].x - TER.sites[f1].x, TER.sites[i].z - TER.sites[f1].z) > 110);
+    if (f2 == null) f2 = sites.find((i) => i !== f1);
+    W.FC = [f1, f2].map((i) => ({ x: TER.sites[i].x, z: TER.sites[i].z }));
+    const free = sites.filter((i) => i !== f1 && i !== f2);
+    // 은총의 터: 서로 멀게 8곳
+    const gIdx = [];
+    while (gIdx.length < 8 && free.length) {
+      let best = -1, bd = -1;
+      for (const i of free) { const s = TER.sites[i]; const d = gIdx.length ? Math.min(...gIdx.map((j) => Math.hypot(TER.sites[j].x - s.x, TER.sites[j].z - s.z))) : R() * 100; if (d > bd) { bd = d; best = i; } }
+      gIdx.push(best); free.splice(free.indexOf(best), 1);
+    }
+    const types = ['fort', 'fort', 'fort', 'fort', 'cave', 'cave', 'cave', 'boss', 'boss', 'boss', 'boss', 'mine', 'mine', 'church', 'church', 'church', 'camp', 'camp', 'camp', 'camp', 'camp', 'camp'];
+    while (types.length < free.length) types.push('ruin');
+    shuffle(R, types);
+    const fbPool = shuffle(R, T.FB_IDS.slice()); let fbN = 0;
+    W._fb = () => fbPool[(fbN++) % fbPool.length];
+    for (const i of gIdx) buildPOI(W, 'grace', TER.sites[i]);
+    free.forEach((i, k) => buildPOI(W, types[k], TER.sites[i]));
+    for (const t of TER.trees) if (treeOn(W, t)) obAdd(W, t[0], t[1], 0.38 * t[2]);
+    for (const r of TER.rocks) if (treeOn(W, r)) obAdd(W, r[0], r[1], r[2] * 0.85);
+    buildNav(W);
+    // 떠도는 무리
+    for (let k = 0; k < 9; k++) spawnPack(W);
+    // 원정자
+    const g0 = W.gr[Math.floor(R() * W.gr.length)] || { x: 0, z: 0 };
+    for (let i = 0; i < n; i++) {
+      const a = (cfg.arch && cfg.arch[i] >= 0 ? cfg.arch[i] : i % T.ARCH.length), ang = i / n * TAU;
+      W.P.push(mkPlayer(W, i, a, g0.x + Math.sin(ang) * 3.5, g0.z + 4 + Math.cos(ang) * 3.5));
+    }
+    W.storm = stormAt(W);
+    return W;
+  }
+  function spawnPack(W) {
+    const R = W.R;
+    for (let t = 0; t < 40; t++) {
+      const x = (R() * 2 - 1) * 170, z = (R() * 2 - 1) * 170;
+      if (wet(x, z) || W.POI.some((p) => Math.hypot(p.x - x, p.z - z) < 30) || Math.hypot(x - FA.x, z - FA.z) < 70) continue;
+      const ty = R() < 0.5 ? 'dog' : 'wolf', k = ty === 'dog' ? 3 : 2;
+      for (let i = 0; i < k; i++) spawnE(W, ty, x + (R() - 0.5) * 5, z + (R() - 0.5) * 5, -1);
+      return;
+    }
+  }
+  function buildPOI(W, ty, s) {
+    const R = W.R, a = R() * TAU, ca = Math.cos(a), sa = Math.sin(a);
+    const poi = { i: W.POI.length, ty, x: s.x, z: s.z, a, r: 14, alive: 0, cl: 0, used: {} };
+    W.POI.push(poi);
+    const wx = (lx, lz) => s.x + lx * ca + lz * sa, wz = (lx, lz) => s.z - lx * sa + lz * ca;
+    const part = (k, lx, ly, lz, sx, sy, sz, ry, col) => { const x = wx(lx, lz), z = wz(lx, lz); W.parts.push([k, Math.round(x * 100) / 100, Math.round((Hat(x, z) + ly) * 100) / 100, Math.round(z * 100) / 100, sx, sy, sz, Math.round(((ry || 0) + a) * 1000) / 1000, col || 0]); };
+    const ob = (lx, lz, r) => obAdd(W, wx(lx, lz), wz(lx, lz), r);
+    const wall = (x0, z0, x1, z1, hh, th, col) => {
+      const L_ = Math.hypot(x1 - x0, z1 - z0); part('box', (x0 + x1) / 2, hh / 2 - 0.3, (z0 + z1) / 2, L_, hh, th, Math.atan2(x1 - x0, z1 - z0) - PI / 2, col);
+      const k = Math.max(1, Math.round(L_ / 1.3)); for (let i = 0; i <= k; i++) ob(lerp(x0, x1, i / k), lerp(z0, z1, i / k), th * 0.5 + 0.35);
+    };
+    const en = (t, lx, lz) => { const e = spawnE(W, t, wx(lx, lz), wz(lx, lz), poi.i); poi.alive++; return e; };
+    const chest = (k, lx, lz, mr) => { const c = { id: W.nid++, k, x: wx(lx, lz), z: wz(lx, lz), poi: poi.i, mr: mr || 0, op: 0 }; W.CH.push(c); part('chest', lx, 0.35, lz, 1.1, 0.7, 0.7, 0, k === 's' ? 2 : k === 'c' ? 1 : 0); ob(lx, lz, 0.6); };
+    const pick = (arr) => arr[Math.floor(R() * arr.length)];
+    if (ty === 'grace') { poi.r = 4; part('plinth', 0, 0.2, 0, 1.6, 0.5, 1.6, 0, 0); W.gr.push({ x: s.x, z: s.z, poi: poi.i }); return; }
+    if (ty === 'fort') {
+      poi.r = 18;
+      for (const [x0, z0, x1, z1] of [[-13, -13, -3, -13], [3, -13, 13, -13], [-13, 13, -3, 13], [3, 13, 13, 13], [-13, -13, -13, -2], [-13, 3, -13, 13], [13, -13, 13, 13]]) wall(x0, z0, x1, z1, 4.5 + R() * 1.5, 1.4, 1);
+      part('cyl', -13, 4.5, -13, 2.6, 10, 2.6, 0, 1); ob(-13, -13, 2.8); part('cyl', 13, 3.8, 13, 2.4, 8, 2.4, 0, 1); ob(13, 13, 2.6);
+      part('box', 3, 1.6, -6, 6, 3.6, 4, 0.2, 1); ob(1, -6, 2); ob(5, -6, 2);
+      chest('w', -4, -7, 1);
+      en('hollow', -6, 4); en('hollow', 6, 3); en('hollow', 0, 10); en('spear', -4, -2); en('archer', 10, -9); en('knight', 0, 0);
+      if (R() < 0.5) en('archer', -9, 8);
+    } else if (ty === 'camp') {
+      poi.r = 12;
+      for (let k = 0; k < 3; k++) { const an = k / 3 * TAU + 0.4, x = Math.sin(an) * 7, z = Math.cos(an) * 7; part('tent', x, 1.3, z, 2.3, 2.6, 2.3, an, 3); ob(x, z, 1.9); }
+      part('fire', 0, 0.15, 0, 1.0, 0.3, 1.0, 0, 0); ob(0, 0, 0.8);
+      part('box', 3, 0.4, 2, 0.9, 0.8, 0.9, 0.3, 3); part('box', 3.6, 0.4, 3, 0.8, 0.8, 0.8, 0.9, 3);
+      chest('c', -2.5, -3);
+      en('zealot', 2, -2); en('zealot', -3, 3); en('dog', 5, 5); en('dog', 6, 4); if (R() < 0.6) en('hollow', -5, -1);
+    } else if (ty === 'church') {
+      poi.r = 14;
+      wall(-5, -8, -5, 8, 6.5, 0.9, 2); wall(5, -8, 5, 8, 6.5, 0.9, 2); wall(-5, -8, 5, -8, 7.5, 0.9, 2); wall(-5, 8, -2.3, 8, 6.5, 0.9, 2); wall(2.3, 8, 5, 8, 6.5, 0.9, 2);
+      part('roof', 0, 7.6, 0, 11.6, 2.6, 17, 0, 4); part('box', 0, 7.5, -8.6, 2.2, 12, 2.2, 0, 2);
+      part('altar', 0, 0.5, -5.6, 2.2, 1.0, 1.0, 0, 2); poi.alt = { x: wx(0, -5.6), z: wz(0, -5.6) };
+      en('hollow', -2, 2); en('hollow', 2.5, -1); en('zealot', 0, 12); if (R() < 0.6) en('archer', -2, -3);
+    } else if (ty === 'mine') {
+      poi.r = 14;
+      for (let k = 0; k < 7; k++) { const x = -9 + k * 3, z = -9 - R() * 3; part('rock', x, 0.5, z, 2.6 + R() * 1.8, 2.4 + R() * 2, 2.6, R() * 3, 5); ob(x, z, 1.9); }
+      part('box', -1.6, 1.7, -7, 0.4, 3.4, 0.4, 0, 3); part('box', 1.6, 1.7, -7, 0.4, 3.4, 0.4, 0, 3); part('box', 0, 3.5, -7, 4, 0.4, 0.5, 0, 3); part('box', 0, 1.6, -7.6, 3, 3, 0.2, 0, 6);
+      part('box', 4, 0.5, 1, 1.2, 0.8, 1.8, 0.4, 3); ob(4, 1, 1);
+      chest('s', -3, -4);
+      en('miner', -3, 1); en('miner', 3, -2); en('miner', 0, 4); en('crawler', -5, -5); if (R() < 0.4) en('troll', 6, 6);
+    } else if (ty === 'cave') {
+      poi.r = 16;
+      for (let k = 0; k < 13; k++) { const an = PI * 0.28 + k / 12 * PI * 1.44; const x = Math.sin(an) * 12, z = -Math.cos(an) * 12; part('rock', x, 1.5, z, 4.8 + R() * 2, 6 + R() * 4, 4.8, R() * 3, 5); ob(x, z, 2.7); }
+      part('box', 0, 2.5, -10.5, 7, 5, 0.6, 0, 6);
+      chest('w', 0, -7.5, 2);
+      en(W._fb(), 0, -2);
+    } else if (ty === 'boss') {
+      poi.r = 15;
+      for (let k = 0; k < 8; k++) { const an = k / 8 * TAU; const x = Math.sin(an) * 12.5, z = Math.cos(an) * 12.5; part('box', x, 2.4, z, 1.6, 5 + R() * 2.5, 1.0, an, 2); ob(x, z, 1.0); }
+      en(W._fb(), 0, 0);
+    } else {
+      poi.r = 11; poi.ty = 'ruin';
+      for (let k = 0; k < 5; k++) { const x = (R() - 0.5) * 16, z = (R() - 0.5) * 16, hh = 1 + R() * 5; part('cyl', x, hh / 2, z, 0.9, hh, 0.9, 0, 2); ob(x, z, 0.75); }
+      wall(-6, -5, 1, -6, 2.5 + R() * 2, 0.9, 2);
+      chest('w', 2, 2, 0);
+      const pool = ['hollow', 'archer', 'dog', 'spear', 'zealot'];
+      const k = 2 + Math.floor(R() * 2); for (let i = 0; i < k; i++) en(pick(pool), (R() - 0.5) * 10, (R() - 0.5) * 10);
+      if (R() < 0.18) en('troll', 0, 0);
+    }
+  }
+
+  /* ======================= 원정자 ======================= */
+  /* sa: 사람 조작용 근접 조준 보정(표적 고정이 없을 때 가까운 적 쪽으로 동작 초반에 돎) — 봇은 쓰지 않음 */
+  const IN0 = () => ({ mx: 0, mz: 0, run: 0, guard: 0, l: 0, h: 0, art: 0, dg: 0, dgy: null, jp: 0, sk: 0, ul: 0, it: -1, use: 0, lk: -2, sw: 0, aim: null, face: null, rw: -1, sa: null });
+  function mkPlayer(W, i, a, x, z) {
+    const p = { i, a, x, z, y: Hat(x, z), vx: 0, vz: 0, vy: 0, yaw: PI, gr: 1, lvl: 1, runes: 0, hp: 0, mhp: 0, st: 0, mst: 0,
+      w: [[T.WI[T.ARCH[a].w0], 0, 0]], wi: 0, it: [null, null, null], fl: 3, flm: 3, ult: 0, skc: 0, act: null, guard: 0, gT0: -9, lock: -1, iv: 0,
+      down: 0, dT: 0, rg: 0, rq: 100, dn: 0, srT: 0, selfRev: 0, sts: { b: 0, f: 0, p: 0, u: 0, bt: 0, pt: 0, ft: 0, dk: 0 }, bf: {}, dgT: -9, ch: -1, lastL: -9, q: null, tp: 0, sU: 0, spr: 0, sp: 0,
+      an: 'idle', at: 0, ad: 0, ws: { dmg: 0, kill: 0, rev: 0, down: 0 }, bm: null, prevX: x, prevZ: z };
+    recalc(p); p.hp = p.mhp; p.st = p.mst;
+    if (W.n === 1) { p.fl = p.flm = 4; }
+    return p;
+  }
+  const curW = (p) => p.w[p.wi] || p.w[0];
+  const curC = (p) => T.CLS[T.WPN[curW(p)[0]].c];
+  function pasOf(p) { const o = {}; for (const [k, v] of T.wPas(curW(p))) o[k] = (o[k] || 0) + v; return o; }
+  function recalc(p) {
+    const pa = pasOf(p), r = p.mhp ? p.hp / p.mhp : 1;
+    p.mhp = Math.round(T.baseHP(p.lvl, p.a) * (1 + (pa.hp || 0) / 100)); p.mst = T.baseST(p.lvl, p.a);
+    if (!p.down) p.hp = Math.min(p.mhp, Math.max(1, Math.round(p.mhp * r)));
+    p.pa = pa;
+  }
+  const buf = (W, p, k) => (p.bf[k] && p.bf[k][1] > W.t ? p.bf[k][0] : 0);
+  function guardAbs(p) {
+    if (T.ARCH[p.a].id === 'shield') return Math.min(0.97, 0.9 + (p.pa.guard || 0) / 100);
+    const c = T.WPN[curW(p)[0]].c; const b = c === 'great' || c === 'hammer' ? 0.68 : c === 'dagger' || c === 'bow' || c === 'staff' ? 0.45 : 0.6;
+    return Math.min(0.95, b + (p.pa.guard || 0) / 100);
+  }
+  function fx(W, ...a) { W.fxN++; W.fx.push([W.fxN, ...a]); if (W.fx.length > 48) W.fx.splice(0, W.fx.length - 48); }
+
+  /* 동작 시작 */
+  function useSt(W, p, c) { if (p.st <= 0) return false; p.st = Math.max(-8, p.st - c); p.sU = W.t; return true; }
+  function startAct(W, p, k, o) {
+    const C = curC(p), A = T.ARCH[p.a].id;
+    o = o || {};
+    if (k === 'roll') {
+      const c = 18 * (A === 'hunter' ? 0.75 : 1); if (!useSt(W, p, c)) return false;
+      const dy = o.dir != null ? o.dir : p.yaw + PI;
+      p.act = { k: 'roll', t: 0, d: 0.62, h: [], dir: dy }; p.yaw = dy; p.iv = W.t + 0.42; p.guard = 0;
+      return true;
+    }
+    if (k === 'l') {
+      const chain = (p.ch >= 0 && W.t - p.lastL < 0.42) ? (p.ch + 1) % C.L.length : 0;
+      if (!useSt(W, p, C.st)) return false;
+      const m = C.L[chain]; p.act = { k: 'l' + chain, mk: 'l', c: chain, t: 0, d: m.d, h: m.h.slice(), m, sx: p.x, sz: p.z };
+      if (!p.gr) { p.act = { k: 'j', mk: 'j', t: 0, d: 0.62, h: [0.36], m: { a: 70, m: 1.5, step: 0.2, pj: m.pj }, sx: p.x, sz: p.z }; }
+      return true;
+    }
+    if (k === 'h') { if (!useSt(W, p, C.st * 1.6)) return false; p.act = { k: 'h', mk: 'h', t: 0, d: C.H.d, h: C.H.h.slice(), m: C.H, sx: p.x, sz: p.z }; return true; }
+    if (k === 'art') { const Ar = T.wArt(curW(p)); if (p.st < Ar.st * 0.5 || !useSt(W, p, Ar.st)) return false; p.act = { k: 'art', mk: 'art', t: 0, d: Ar.d, h: Ar.h.slice(), A: Ar, sx: p.x, sz: p.z, tx: null, tz: null }; aimPt(W, p, p.act, 14); return true; }
+    if (k === 'sk') {
+      if (p.skc > 0) return false;
+      const sk = SK[A]; p.act = { k: 'sk', mk: 'sk', t: 0, d: sk.d, h: sk.h.slice(), sx: p.x, sz: p.z }; p.skc = T.ARCH[p.a].sk.cd; aimPt(W, p, p.act, 14);
+      if (A === 'hunter') { const e = lockT(W, p) || nearestE(W, p, 14, 70); p.act.tg = e ? e.id : -1; p.iv = W.t + 0.5; }
+      return true;
+    }
+    if (k === 'ul') {
+      if (p.ult < 100) return false;
+      const u = UL[A]; p.ult = 0; p.act = { k: 'ul', mk: 'ul', t: 0, d: u.d, h: u.h.slice(), sx: p.x, sz: p.z }; aimPt(W, p, p.act, 14);
+      if (A === 'breaker') p.bf.sa = [1, W.t + u.d];
+      return true;
+    }
+    if (k === 'item') {
+      const s = o.slot | 0;
+      if (s === 0) { if (p.fl <= 0) return false; p.act = { k: 'item', mk: 'item', t: 0, d: 1.0, h: [0.55], slot: 0 }; return true; }
+      const it = p.it[s - 1]; if (!it) return false;
+      const I = T.ITEM[it[0]];
+      p.act = { k: I.ty === 'throw' || I.ty === 'knife' ? 'throw' : 'item', mk: 'item', t: 0, d: I.ty === 'throw' ? 0.75 : I.ty === 'knife' ? 0.55 : 0.85, h: [I.ty === 'throw' ? 0.4 : I.ty === 'knife' ? 0.28 : 0.5], slot: s, I: it[0] };
+      aimPt(W, p, p.act, 12);
+      return true;
+    }
+    return false;
+  }
+  function aimPt(W, p, a, d) {
+    const e = lockT(W, p);
+    if (e) { a.tx = e.x; a.tz = e.z; a.tg = e.id; return; }
+    const y = p.aim != null ? p.aim : p.yaw; a.tx = p.x + Math.sin(y) * d; a.tz = p.z + Math.cos(y) * d;
+  }
+  const lockT = (W, p) => { const e = p.lock >= 0 ? W.em[p.lock] : null; return e && !e.dead ? e : null; };
+  function nearestE(W, p, r, cone) {
+    let best = null, bd = 1e9;
+    for (const e of W.E) { if (e.dead) continue; const d = dist(p, e); if (d > r) continue; if (cone) { const ay = Math.atan2(e.x - p.x, e.z - p.z); if (Math.abs(angD(p.yaw, ay)) > cone * PI / 180) continue; } if (d < bd) { bd = d; best = e; } }
+    return best;
+  }
+  /* 원정자 기술 · 궁극기 (h 판정 시각) */
+  const SK = { shield: { d: 0.9, h: [0.3, 0.45, 0.6] }, hunter: { d: 0.7, h: [0.32] }, ash: { d: 0.85, h: [0.45] }, breaker: { d: 1.15, h: [0.75] }, archer: { d: 0.8, h: [0.4] }, priest: { d: 1.1, h: [0.6] } };
+  const UL = { shield: { d: 1.2, h: [0.6] }, hunter: { d: 0.9, h: [0.5] }, ash: { d: 1.3, h: [0.6] }, breaker: { d: 2.4, h: [2.0] }, archer: { d: 1.4, h: [1.0] }, priest: { d: 1.6, h: [0.9] } };
+  const skPow = (p) => 34 * T.lvMul(p.lvl);
+
+  /* 원정자 한 걸음. mode: 'host' | 'remote'(위치는 손님 기기) | 'pred'(손님 기기 예측 — 판정 없음) */
+  function ctrl(W, p, inp, dt, mode) {
+    inp = inp || IN0();
+    if (p.down) { p.act = null; p.guard = 0; p.an = 'down'; p.at = 0; p.ad = 0; if (mode === 'remote') remotePos(W, p); else ground(W, p, dt); return; }
+    if (inp.aim != null) p.aim = inp.aim;
+    // 표적
+    if (inp.lk === -1) p.lock = -1; else if (inp.lk >= 0) p.lock = inp.lk;
+    if (p.lock >= 0 && (!W.em[p.lock] || W.em[p.lock].dead || dist(p, W.em[p.lock]) > 40)) p.lock = -1;
+    if (p.skc > 0) p.skc = Math.max(0, p.skc - dt);
+    if (inp.sw && p.w.length > 1 && !p.act) { p.wi = (p.wi + 1) % p.w.length; recalc(p); if (mode !== 'pred') fx(W, 'sw', p.i); }
+    // 스태미나
+    const frost = p.sts.ft > W.t;
+    if (!p.act && !p.spr && W.t - p.sU > 0.55) p.st = Math.min(p.mst, p.st + 44 * dt * (1 + (p.pa.stre || 0) / 100) * (p.guard ? 0.35 : 1));
+    // 동작 진행
+    const edge = inp.dg ? ['roll', { dir: inp.dgy }] : inp.it >= 0 ? ['item', { slot: inp.it }] : inp.sk ? ['sk'] : inp.ul ? ['ul'] : inp.art ? ['art'] : inp.h ? ['h'] : inp.l ? ['l'] : null;
+    if (p.act) {
+      const a = p.act, t0 = a.t; a.t += dt;
+      if (edge && a.t > a.d * 0.42 && a.k !== 'hit' && a.k !== 'gbrk') { p.q = edge; p.qsa = inp.sa; }
+      if (mode !== 'pred') for (let i = 0; i < a.h.length; i++) if (t0 < a.h[i] && a.t >= a.h[i]) actHit(W, p, a, i);
+      if (mode !== 'remote') actMove(W, p, a, t0, dt);
+      if (a.t >= a.d) {
+        if (a.k === 'roll') p.dgT = W.t;
+        if (a.mk === 'l') { p.lastL = W.t; p.ch = a.c; }
+        p.act = null;
+        if (p.q) { const q = p.q, qs = p.qsa; p.q = null; p.qsa = null; startAct(W, p, q[0], q[1]); if (qs != null && p.act && p.act.k !== 'roll') p.act.sa = qs; }
+      }
+    } else if (edge) {
+      if (edge[0] === 'l' && p.ch >= 0 && W.t - p.lastL > 0.42) p.ch = -1;
+      if (edge[0] === 'roll' && !p.gr) { /* 공중 구르기 없음 */ } else { startAct(W, p, edge[0], edge[1]); if (inp.sa != null && p.act && p.act.k !== 'roll') p.act.sa = inp.sa; }
+    }
+    // 가드
+    const g = !!inp.guard && !p.act && p.gr;
+    if (g && !p.guard) p.gT0 = W.t;
+    p.guard = g ? 1 : 0;
+    // 상호작용
+    if (inp.use && !p.act && mode !== 'pred') interact(W, p, inp.rw);
+    // 점프
+    if (inp.jp && p.gr && !p.act && useSt(W, p, 6)) { p.vy = 7.6; p.gr = 0; }
+    if (mode === 'remote') { remotePos(W, p); animState(W, p); return; }
+    // 이동
+    const mlen = Math.min(1, Math.hypot(inp.mx, inp.mz));
+    let spd = 0;
+    if (!p.act) {
+      p.spr = !!inp.run && mlen > 0.3 && p.st > 0 && !p.guard;
+      spd = (p.guard ? 2.2 : p.spr ? 8.2 : 5.4) * mlen * (frost ? 0.8 : 1);
+      if (p.spr) { p.st -= 9 * dt; p.sU = W.t; }
+      const tvx = mlen > 0.05 ? inp.mx / Math.max(mlen, 1e-3) * spd : 0, tvz = mlen > 0.05 ? inp.mz / Math.max(mlen, 1e-3) * spd : 0;
+      const ac = (p.gr ? 34 : 9) * dt;
+      p.vx += clamp(tvx - p.vx, -ac, ac); p.vz += clamp(tvz - p.vz, -ac, ac);
+      const lt = lockT(W, p);
+      if (lt && !p.spr) p.yaw = turnTo(p.yaw, Math.atan2(lt.x - p.x, lt.z - p.z), 12 * dt);
+      else if (inp.face != null) p.yaw = turnTo(p.yaw, inp.face, 12 * dt);
+      else if (mlen > 0.1) p.yaw = turnTo(p.yaw, Math.atan2(inp.mx, inp.mz), 14 * dt);
+    } else { p.spr = 0; p.vx *= 0.8; p.vz *= 0.8; }
+    const nx = p.x + p.vx * dt, nz = p.z + p.vz * dt;
+    if (!wet(nx, nz)) { p.x = nx; p.z = nz; } else { p.vx = 0; p.vz = 0; }
+    pushOut(W, p, 0.42);
+    ground(W, p, dt);
+    animState(W, p);
+  }
+  function ground(W, p, dt) {
+    const gy = Hat(p.x, p.z);
+    if (!p.gr) { p.vy -= 22 * dt; p.y += p.vy * dt; if (p.y <= gy) { p.y = gy; p.vy = 0; p.gr = 1; } }
+    else p.y = gy;
+  }
+  function remotePos(W, p) {
+    const r = W.rm[p.i];
+    if (r && r.pos && r.tp === p.tp) { const dx = r.pos[0] - p.x, dz = r.pos[1] - p.z; p.sp = p.sp * 0.7 + Math.hypot(dx, dz) / DT * 0.3; p.x = r.pos[0]; p.z = r.pos[1]; p.y = r.pos[2]; if (!p.act) p.yaw = r.pos[3]; p.gr = r.gr ? 1 : 0; }
+  }
+  function animState(W, p) {
+    if (p.act) { p.an = p.act.k; p.at = p.act.t; p.ad = p.act.d; return; }
+    const sp = Math.hypot(p.vx, p.vz) || p.sp || 0;
+    p.an = !p.gr ? 'jump' : p.guard ? 'guard' : sp > 7 ? 'sprint' : sp > 3.2 ? 'run' : sp > 0.4 ? 'walk' : 'idle'; p.at = 0; p.ad = 0;
+  }
+  function actMove(W, p, a, t0, dt) {
+    let v = 0, dy = p.yaw;
+    if (a.k === 'roll') { const u = a.t / a.d; v = u < 0.65 ? 7.2 : 7.2 * (1 - (u - 0.65) / 0.35); dy = a.dir; }
+    else if (a.m && a.m.step && a.h.length) { const h0 = a.h[0]; if (a.t < h0) v = a.m.step / h0; }
+    else if (a.k === 'art' && a.A.mv) { const h0 = a.h[0]; if (a.t > h0 * 0.25 && a.t < h0) v = a.A.mv / (h0 * 0.75); }
+    else if (a.k === 'sk') { const A = T.ARCH[p.a].id; if (A === 'shield' && a.t < 0.62) v = 13; if (A === 'breaker' && a.t > 0.2 && a.t < 0.75) v = 5 / 0.55; }
+    // 동작 초반엔 표적/입력 쪽으로 돌기
+    if (a.k !== 'roll' && a.k !== 'hit' && a.t < 0.14) { const lt = lockT(W, p); if (lt) p.yaw = turnTo(p.yaw, Math.atan2(lt.x - p.x, lt.z - p.z), 16 * dt); else if (p.aim != null && (curC(p).rng || a.k === 'throw')) p.yaw = turnTo(p.yaw, p.aim, 16 * dt); else if (a.sa != null) p.yaw = turnTo(p.yaw, a.sa, 22 * dt); }
+    if (v > 0) { const nx = p.x + Math.sin(dy) * v * dt, nz = p.z + Math.cos(dy) * v * dt; if (!wet(nx, nz)) { p.x = nx; p.z = nz; } }
+    if (a.k === 'hit' && a.kb) { const nx = p.x + a.kb[0] * dt * (1 - a.t / a.d), nz = p.z + a.kb[1] * dt * (1 - a.t / a.d); if (!wet(nx, nz)) { p.x = nx; p.z = nz; } }
+  }
+
+  /* ======================= 판정 모양 ======================= */
+  function inShape(ox, oz, yaw, sh, tx, tz, tr) {
+    const dx = tx - ox, dz = tz - oz, d = Math.hypot(dx, dz);
+    const k = sh[0];
+    if (k === 'arc') { if (d > sh[1] + tr) return false; if (d < tr + 0.6) return true; const ay = Math.atan2(dx, dz); return Math.abs(angD(yaw + (sh[3] || 0) * PI / 180, ay)) <= sh[2] * PI / 180 + Math.atan2(tr, d); }
+    if (k === 'circ') { const cx = ox + Math.sin(yaw) * sh[2], cz = oz + Math.cos(yaw) * sh[2]; return Math.hypot(tx - cx, tz - cz) <= sh[1] + tr; }
+    if (k === 'ring') return d >= sh[1] - tr && d <= sh[2] + tr;
+    if (k === 'line') { const fx = Math.sin(yaw), fz = Math.cos(yaw); const al = dx * fx + dz * fz, pe = Math.abs(dx * fz - dz * fx); return al >= -tr && al <= sh[1] + tr && pe <= sh[2] / 2 + tr; }
+    return false;
+  }
+
+  /* ======================= 원정자 공격 판정 ======================= */
+  function actHit(W, p, a, i) {
+    const A = T.ARCH[p.a].id, C = curC(p), wv = curW(p), WP = T.WPN[wv[0]];
+    const wfx = WP.fx ? [WP.fx, WP.b] : null;
+    if (a.k === 'roll' || a.k === 'hit' || a.k === 'gbrk') return;
+    if (a.k === 'item' || a.k === 'throw') return useItem(W, p, a);
+    if (a.mk === 'l' || a.k === 'h' || a.k === 'j') {
+      const m = a.m;
+      if (m.pj) return shoot(W, p, m.pj, m.m, (C.pz * (m.pz || 1)), { fx: wfx, kind: a.k === 'h' ? 'h' : 'l', staff: WP.c === 'staff' });
+      return area(W, p, ['arc', C.r * (a.k === 'j' ? 1.05 : 1), m.a || 60], p.x, p.z, p.yaw, m.m, m.pz || 1, { fx: wfx, kind: a.k === 'h' ? 'h' : 'l', rev: a.k === 'h' ? 40 : 26 });
+    }
+    if (a.k === 'art') {
+      const Ar = a.A, o = { fx: Ar.fx ? [Ar.fx, Ar.b] : wfx, kind: 'art', rev: 45 }, pz = Ar.pz || 1.6;
+      if (Ar.ty === 'spin') return area(W, p, ['circ', Ar.r, 0], p.x, p.z, p.yaw, Ar.m, pz, o);
+      if (Ar.ty === 'slam') { fx(W, 'boom', Math.round(p.x * 10), Math.round(p.z * 10), Ar.r * 10, Ar.fx === 'burn' ? 1 : 0); return area(W, p, ['circ', Ar.r, 0.5], p.x, p.z, p.yaw, Ar.m, pz, o); }
+      if (Ar.ty === 'multi' || Ar.ty === 'lunge') return area(W, p, ['arc', Ar.r, Ar.a], p.x, p.z, p.yaw, Ar.m, pz, Object.assign(o, { crit: Ar.ty === 'lunge' ? 0.5 : 0 }));
+      if (Ar.ty === 'ring') { fx(W, 'boom', Math.round(p.x * 10), Math.round(p.z * 10), Ar.r * 10, 2); return area(W, p, ['circ', Ar.r, 0], p.x, p.z, p.yaw, Ar.m, pz, o); }
+      if (Ar.ty === 'charge') return area(W, p, ['line', Ar.len + 1, Ar.w], a.sx, a.sz, p.yaw, Ar.m, pz, o);
+      if (Ar.ty === 'rain') { W.Z.push({ x: a.tx, z: a.tz, r: Ar.r, del: 0.3, life: Ar.ticks * 0.45, tick: 0.45, tk: 0, m: Ar.m, own: p.i, team: 'p', k: 'rain', fx: wfx, pz: 0.5 }); return; }
+      if (Ar.ty === 'proj') return shoot(W, p, { spd: Ar.spd, r: Ar.w ? Ar.w / 2 : 0.45, k: Ar.k, pierce: Ar.pierce, boom: Ar.boom }, Ar.m, C.pz * pz, { fx: o.fx, kind: 'art', staff: WP.c === 'staff' });
+      if (Ar.ty === 'orbs') { for (let k = 0; k < Ar.n; k++) shoot(W, p, { spd: Ar.spd, r: 0.4, k: 'bolt', hom: Ar.hom, spr: (k - (Ar.n - 1) / 2) * 0.35 }, Ar.m, C.pz, { fx: o.fx, kind: 'art', staff: true }); return; }
+      return;
+    }
+    if (a.k === 'sk') return skillHit(W, p, a, i, A);
+    if (a.k === 'ul') return ultHit(W, p, a, i, A);
+  }
+  function skillHit(W, p, a, i, A) {
+    const fixed = skPow(p);
+    if (A === 'shield') return area(W, p, ['circ', 2.2, 1.0], p.x, p.z, p.yaw, 0.8, 4, { fixed, kind: 'sk', rev: 0 });
+    if (A === 'hunter') {
+      const e = a.tg >= 0 ? W.em[a.tg] : null;
+      if (e && !e.dead) { const by = e.yaw; p.x = e.x - Math.sin(by) * (e.r + 1.0); p.z = e.z - Math.cos(by) * (e.r + 1.0); pushOut(W, p, 0.42); p.yaw = Math.atan2(e.x - p.x, e.z - p.z); p.tp += 0; fx(W, 'blink', p.i); }
+      return area(W, p, ['arc', 2.4, 45], p.x, p.z, p.yaw, 1.5, 2, { fixed, kind: 'sk', always: 1, rev: 0 });
+    }
+    if (A === 'ash') { fx(W, 'boom', Math.round(p.x * 10), Math.round(p.z * 10), 60, 1); return area(W, p, ['circ', 6, 0], p.x, p.z, p.yaw, 1.6, 1.5, { fixed, kind: 'sk', fx: ['burn', 60], staffB: 1, rev: 0 }); }
+    if (A === 'breaker') { fx(W, 'boom', Math.round(p.x * 10), Math.round(p.z * 10), 40, 2); return area(W, p, ['circ', 4, 0.5], p.x, p.z, p.yaw, 2.4, 6, { fixed, kind: 'sk', rev: 0 }); }
+    if (A === 'archer') { for (let k = 0; k < 5; k++) shoot(W, p, { spd: 50, r: 0.3, k: 'arrow', spr: (k - 2) * 0.17 }, 1.0, 6, { fixed, kind: 'sk' }); return; }
+    if (A === 'priest') { for (const q of W.P) if (!q.down && dist(p, q) < 8) { q.hp = Math.min(q.mhp, q.hp + q.mhp * 0.25); fx(W, 'heal', q.i); } return; }
+  }
+  function ultHit(W, p, a, i, A) {
+    const fixed = skPow(p);
+    if (A === 'shield') { for (const q of W.P) if (!q.down && dist(p, q) < 10) q.bf.fort = [0.5, W.t + 10]; p.bf.taunt = [1, W.t + 8]; fx(W, 'ult', p.i, 0); return; }
+    if (A === 'hunter') { for (const e of W.E) if (!e.dead && dist(p, e) < 14) e.mk = W.t + 12; fx(W, 'ult', p.i, 1); return; }
+    if (A === 'ash') { W.Z.push({ x: a.tx, z: a.tz, r: 7, del: 1.0, life: 0, tick: 0, tk: 0, m: 6.0, own: p.i, team: 'p', k: 'comet', fx: ['burn', 100], fixed, pz: 8 }); fx(W, 'ult', p.i, 2); return; }
+    if (A === 'breaker') { fx(W, 'boom', Math.round(p.x * 10), Math.round(p.z * 10), 90, 2); area(W, p, ['circ', 9, 0], p.x, p.z, p.yaw, 7.0, 10, { fixed, kind: 'ul', rev: 0 }); p.bf.atk = [25, W.t + 15]; return; }
+    if (A === 'archer') { shoot(W, p, { spd: 75, r: 0.7, k: 'great', pierce: 1, life: 0.6 }, 6.0, 9, { fixed, kind: 'ul' }); return; }
+    if (A === 'priest') { for (const q of W.P) if (dist(p, q) < 12) { if (q.down) revive(W, q, p, 0.5); else q.hp = Math.min(q.mhp, q.hp + q.mhp * 0.5); q.bf.vow = [0.7, W.t + 6]; } fx(W, 'ult', p.i, 5); return; }
+  }
+  function area(W, p, sh, ox, oz, yaw, m, pz, o) {
+    let n = 0;
+    for (const e of W.E) {
+      if (e.dead || Math.abs(e.x - ox) > 30 || Math.abs(e.z - oz) > 30) continue;
+      if (e.air > 2.5 && o.kind !== 'ul') continue;
+      if (inShape(ox, oz, yaw, sh, e.x, e.z, e.r)) { dmgE(W, p, e, m, pz, o, ox, oz); n++; }
+    }
+    if (o.rev) for (const q of W.P) if (q !== p && q.down && inShape(ox, oz, yaw, sh, q.x, q.z, 0.5)) reviveHit(W, q, p, o.rev);
+    return n;
+  }
+  function shoot(W, p, pj, m, pz, o) {
+    const e = lockT(W, p);
+    let yaw = p.aim != null && !e ? p.aim : p.yaw, vy = 0;
+    const y0 = p.y + 1.35;
+    if (e) { yaw = Math.atan2(e.x - p.x, e.z - p.z); const d = Math.max(1, dist(p, e)); vy = ((e.y + e.hh * 0.5) - y0) / d * pj.spd; }
+    yaw += pj.spr || 0;
+    W.Pr.push({ id: W.prN++, k: pj.k, x: p.x + Math.sin(yaw) * 0.6, y: y0, z: p.z + Math.cos(yaw) * 0.6, vx: Math.sin(yaw) * pj.spd, vy, vz: Math.cos(yaw) * pj.spd, r: pj.r || 0.3, life: pj.life || 1.6, team: 'p', own: p.i, m, pz, o, pierce: pj.pierce, boom: pj.boom, hom: pj.hom, tg: e ? e.id : -1, hit: [], lob: 0 });
+  }
+
+  /* 원정자 → 적 피해 */
+  function dmgE(W, p, e, m, pzm, o, ox, oz) {
+    if (e.dead || e.inv) return 0;
+    const C = curC(p), pa = p.pa, A = T.ARCH[p.a].id;
+    let dmg = (o.fixed || T.wDmg(curW(p))) * m * T.lvMul(p.lvl);
+    let mul = 1 + (pa.atk || 0) / 100 + buf(W, p, 'atk') / 100 + buf(W, p, 'inc') / 100;
+    if (p.hp < p.mhp * 0.5) mul += (pa.rage || 0) / 100;
+    if (W.t - p.dgT < 1.0) mul += (pa.dodge || 0) / 100 + (A === 'hunter' ? 0.3 : 0);
+    if (o.kind === 'art') mul += (pa.art || 0) / 100;
+    if (A === 'ash' && (o.staff || o.staffB)) mul += 0.12;
+    if (A === 'archer') { if (Math.hypot(e.x - p.x, e.z - p.z) > 12) mul += 0.2; const ay = Math.atan2(e.x - (ox != null ? ox : p.x), e.z - (oz != null ? oz : p.z)); if (Math.abs(angD(e.yaw, ay)) < 1.0) mul += 0.2; }
+    dmg *= mul;
+    let crit = false;
+    if ((e.stag > 0 && (e.brk || e.pry)) || o.always) { crit = true; dmg *= 2.2 * (1 + (pa.crit || 0) / 100 + (C.crit || 0) + (o.crit || 0)); if (e.pry) e.pry = 0; }
+    if (e.mk > W.t) { dmg *= 1.3; p.hp = Math.min(p.mhp, p.hp + dmg * 0.02); }
+    if (e.st.ft > W.t) dmg *= 1.15;
+    let blk = false;
+    if (e.shield && !crit && e.stag <= 0 && o.kind === 'l') { const ay = Math.atan2(p.x - e.x, p.z - e.z); if (Math.abs(angD(e.yaw, ay)) < 1.1) { dmg *= 0.5; blk = true; } }
+    dmg = Math.max(1, Math.round(dmg));
+    e.hp -= dmg; e.aw = 1; e.ag[p.i] = (e.ag[p.i] || 0) + dmg; if (e.tgt < 0) e.tgt = p.i;
+    if (W.dbg && e.boss) { const k = (o.kind || '?') + (crit ? '*' : ''); W.dbg[k] = (W.dbg[k] || 0) + dmg; }
+    p.ws.dmg += dmg;
+    // 자세
+    const pzv = C.pz * pzm * (e.boss ? 0.7 : 1) * (blk ? 0.5 : 1);
+    e.pz -= pzv;
+    if (e.pz <= 0 && e.hp > 0) {
+      e.pz = e.mpz * (e.boss ? 1.15 : 1); e.mpz *= e.boss ? 1.15 : 1;
+      if (e.boss) { e.stag = 3.2; e.brk = 1; e.act = null; fx(W, 'brk', e.id); }
+      else if (!(e.act && e.elite && R01(W) < 0.3)) { e.stag = 1.3; e.brk = 1; e.act = null; }
+    } else if (!e.boss && !e.fb && !e.elite && e.act && pzv > 12 && e.act.t < e.act.hT && R01(W) < 0.35) { e.act = null; e.stag = 0.5; }
+    // 상태 이상
+    const add = (k, v) => { if (k && v) addSt(W, e, k, v); };
+    if (o.fx) add(o.fx[0], o.fx[1]);
+    for (const k of ['bleed', 'burn', 'frost', 'poison']) if (pa[k]) add(k, pa[k]);
+    if (pa.leech) p.hp = Math.min(p.mhp, p.hp + dmg * pa.leech / 100);
+    p.ult = Math.min(100, p.ult + dmg / (24 * T.lvMul(p.lvl)) * (1 + (pa.ult || 0) / 100) * (o.kind === 'ul' ? 0 : 1));
+    fx(W, crit ? 'crit' : blk ? 'eblk' : 'hit', e.id, dmg, p.i);
+    if (e.hp <= 0) killE(W, e, p);
+    return dmg;
+  }
+  const R01 = (W) => W.R();
+  const STK = { bleed: 'b', burn: 'u', frost: 'f', poison: 'p' };
+  function addSt(W, e, k, v) {
+    const s = e.st, kk = STK[k]; s[kk] += v; s.dk = W.t + 3;
+    const thr = (e.boss ? 260 : e.fb ? 180 : 100) * (s['n' + kk] || 1);
+    if (s[kk] >= thr) {
+      s[kk] = 0; s['n' + kk] = (s['n' + kk] || 1) * (e.boss || e.fb ? 1.3 : 1);
+      const big = e.boss || e.fb;
+      if (k === 'bleed') { const d = Math.round(e.mhp * (big ? 0.045 : 0.13) + 60); e.hp -= d; fx(W, 'st', e.id, 0, d); }
+      if (W.dbg && e.boss) W.dbg['st_' + k] = (W.dbg['st_' + k] || 0) + 1;
+      if (k === 'burn') { s.bt = W.t + 4; fx(W, 'st', e.id, 1, 0); }
+      if (k === 'frost') { const d = Math.round(e.mhp * (big ? 0.02 : 0.07) + 40); e.hp -= d; s.ft = W.t + 8; fx(W, 'st', e.id, 2, d); }
+      if (k === 'poison') { s.pt = W.t + 10; fx(W, 'st', e.id, 3, 0); }
+      if (e.hp <= 0 && !e.dead) killE(W, e, null);
+    }
+  }
+  function stTick(W, e, dt, isP) {
+    const s = isP ? e.sts : e.st; if (!s) return;
+    if (W.t > s.dk) { s.b = Math.max(0, s.b - 8 * dt); s.u = Math.max(0, s.u - 8 * dt); s.f = Math.max(0, s.f - 8 * dt); s.p = Math.max(0, s.p - 8 * dt); }
+    const big = e.boss || e.fb;
+    let d = 0;
+    if (s.bt > W.t) d += isP ? e.mhp * 0.025 * dt : (big ? e.mhp * 0.006 + 15 : e.mhp * 0.025 + 8) * dt;
+    if (s.pt > W.t) d += isP ? e.mhp * 0.012 * dt : (big ? e.mhp * 0.0035 + 8 : e.mhp * 0.015 + 4) * dt;
+    if (d > 0) { e.hp -= d; if (isP) { if (e.hp <= 0) downP(W, e); } else if (e.hp <= 0 && !e.dead) killE(W, e, null); }
+  }
+  function killE(W, e, p) {
+    if (e.dead) return;
+    e.dead = 1; e.deadT = W.t; e.act = null; e.hp = 0; e.stag = 0;
+    const d = T.ET[e.ty];
+    const rn = Math.round((d.rn || 0) * (W.n === 1 ? 1.8 : W.n === 2 ? 1.15 : 1) * (e.sum ? 0.2 : 1) * (W.day >= 2 && !e.boss ? 1.6 : 1) * (e.boss ? 1 : W.rnm));
+    if (rn) for (const q of W.P) q.runes += rn;
+    if (p) {
+      p.ws.kill++;
+      if (p.pa.kheal) p.hp = Math.min(p.mhp, p.hp + p.mhp * p.pa.kheal / 100);
+      if (T.ARCH[p.a].id === 'ash') p.st = Math.min(p.mst, p.st + 30);
+    }
+    if (e.poi >= 0) { const P = W.POI[e.poi]; if (P) { P.alive = Math.max(0, P.alive - 1); checkPOI(W, P); } }
+    fx(W, 'die', e.id, rn);
+    // 떨어뜨리기
+    const R = W.R;
+    if (e.boss) return;
+    if (e.fb) { dropW(W, e.x, e.z, rollRar(W, 2, 0.05)); dropI(W, e.x + 1, e.z); return; }
+    if (e.sum) return;
+    if (R() < (e.elite ? 0.3 : 0.045)) dropW(W, e.x, e.z, rollRar(W, e.elite ? 1 : 0, 0));
+    else if (R() < 0.08) dropI(W, e.x, e.z);
+  }
+  function checkPOI(W, P) { if (!P.cl && P.alive <= 0 && W.CH.every((c) => c.poi !== P.i || c.op)) { P.cl = 1; fx(W, 'poi', P.i); } }
+  function rollRar(W, minR, leg) {
+    const wt = W.day >= 2 ? [26, 38, 27, 9] : [55, 31, 12, 2];
+    if (leg) wt[3] += leg * 100;
+    const r = pickW(W.R, [0, 1, 2, 3].filter((k) => k >= minR && (k < 3 || leg || W.day >= 2)), (k) => wt[k]);
+    return r == null ? minR : r;
+  }
+  function rollWeapon(W, r) {
+    const R = W.R;
+    let pool = T.WPN.filter((w) => (r === 3 ? (R() < 0.6 ? w.t === 3 : w.t < 3) : w.t <= r && w.t < 3));
+    if (!pool.length) pool = T.WPN.filter((w) => w.t < 3);
+    const w = pool[Math.floor(R() * pool.length)];
+    const ps = T.PAS_IDS.filter((k) => !(w.uq && w.uq[0] === k)); shuffle(R, ps);
+    const o = [w.i, r, 0];
+    for (let i = 0; i < T.RAR[r].np; i++) o.push(ps[i]);
+    return o;
+  }
+  function dropAt(W, x, z) { const o = { x: x + (W.R() - 0.5), z: z + (W.R() - 0.5) }; pushOut(W, o, 0.7); for (let k = 0; k < 8 && wet(o.x, o.z); k++) { o.x += (W.R() - 0.5) * 4; o.z += (W.R() - 0.5) * 4; } return o; }
+  function dropW(W, x, z, r) { const w = rollWeapon(W, r), o = dropAt(W, x, z); W.D.push({ id: W.nid++, k: 'w', w, x: o.x, z: o.z, t: W.t }); return w; }
+  function dropI(W, x, z, it) { const o = dropAt(W, x, z); W.D.push({ id: W.nid++, k: 'i', it: it || 1 + Math.floor(W.R() * (T.ITEM.length - 1)), x: o.x, z: o.z, t: W.t }); }
+
+  /* 쓰러짐 · 일으키기 */
+  function downP(W, p) {
+    if (p.down) return;
+    p.down = 1; p.hp = 0; p.act = null; p.guard = 0; p.lock = -1; p.rg = 0; p.rq = Math.round(100 * (1 + 0.6 * p.dn)); p.dn++; p.ws.down++;
+    p.dT = W.ph === 'day' ? 20 : 0;
+    p.srT = (W.n === 1 && p.selfRev > 0 && (W.ph === 'night' || W.ph === 'final')) ? 4 : 0;
+    p.sts.bt = 0; p.sts.pt = 0;
+    fx(W, 'down', p.i);
+  }
+  function reviveHit(W, q, by, amt) {
+    if (!q.down) return;
+    q.rg += amt * (T.ARCH[by.a].id === 'priest' ? 2 : 1);
+    fx(W, 'rvh', q.i);
+    if (q.rg >= q.rq) revive(W, q, by, T.ARCH[by.a].id === 'priest' ? 0.5 : 0.3);
+  }
+  function revive(W, q, by, f) {
+    if (!q.down) return;
+    q.down = 0; q.hp = Math.max(1, Math.round(q.mhp * f)); q.rg = 0; q.iv = W.t + 1.2; q.act = null; q.st = q.mst * 0.5;
+    if (by && by !== q) by.ws.rev++;
+    fx(W, 'rev', q.i, by ? by.i : -1);
+  }
+  function respawnGrace(W, p) {
+    const s = W.storm; let best = null, bd = 1e9;
+    for (const g of W.gr) { const ds = Math.hypot(g.x - s.x, g.z - s.z); if (ds > s.r - 6) continue; const d = Math.hypot(g.x - p.x, g.z - p.z); if (d < bd) { bd = d; best = g; } }
+    if (!best) best = { x: s.x + 3, z: s.z };
+    p.down = 0; p.x = best.x + (W.R() - 0.5) * 3; p.z = best.z + 2 + (W.R() - 0.5) * 2; p.y = Hat(p.x, p.z); p.tp++;
+    if (p.lvl > 1) { p.lvl--; }
+    recalc(p); p.hp = Math.round(p.mhp * 0.6); p.st = p.mst; p.iv = W.t + 2;
+    fx(W, 'resp', p.i, p.lvl);
+  }
+
+  /* 상호작용 */
+  function interact(W, p, rw) {
+    let best = null, bd = 2.8, kind = '';
+    for (const g of W.gr) { const d = Math.hypot(g.x - p.x, g.z - p.z); if (d < bd) { bd = d; best = g; kind = 'g'; } }
+    for (const c of W.CH) if (!c.op) { const d = Math.hypot(c.x - p.x, c.z - p.z); if (d < bd) { bd = d; best = c; kind = 'c'; } }
+    for (const P of W.POI) if (P.alt && !P.used[p.i]) { const d = Math.hypot(P.alt.x - p.x, P.alt.z - p.z); if (d < bd) { bd = d; best = P; kind = 'a'; } }
+    for (const d0 of W.D) { const d = Math.hypot(d0.x - p.x, d0.z - p.z) - 0.4; if (d < bd) { bd = d; best = d0; kind = 'd'; } }
+    if (!best) return false;
+    if (kind === 'g') {
+      p.fl = p.flm; p.hp = p.mhp; p.st = p.mst; let up = 0;
+      while (p.lvl < T.MAXLV && p.runes >= T.lvCost(p.lvl)) { p.runes -= T.lvCost(p.lvl); p.lvl++; up++; }
+      recalc(p); p.hp = p.mhp; p.rest = W.t;
+      fx(W, 'rest', p.i, p.lvl, up);
+      return true;
+    }
+    if (kind === 'c') {
+      best.op = 1;
+      if (best.k === 'w') dropW(W, best.x, best.z + 1, rollRar(W, best.mr, best.mr >= 2 ? 0.12 : 0));
+      else if (best.k === 'c') { dropI(W, best.x - 0.6, best.z + 1); dropI(W, best.x + 0.6, best.z + 1); if (W.R() < 0.5) dropI(W, best.x, best.z + 1.6); }
+      else if (best.k === 's') { for (const q of W.P) if (!q.down && Math.hypot(q.x - best.x, q.z - best.z) < 14) { const w = curW(q); if (w[2] < 3) { w[2]++; fx(W, 'smith', q.i, w[2]); } } }
+      fx(W, 'chest', best.id);
+      const P = W.POI[best.poi]; if (P) checkPOI(W, P);
+      return true;
+    }
+    if (kind === 'a') { best.used[p.i] = 1; if (p.flm < 6) { p.flm++; p.fl++; } fx(W, 'altar', p.i, p.flm); return true; }
+    if (kind === 'd') {
+      if (best.k === 'w') {
+        if (p.w.length < 3) { p.w.push(best.w); p.wi = p.w.length - 1; }
+        else { const ri = rw >= 0 && rw < p.w.length ? rw : p.wi; const old = p.w[ri]; p.w[ri] = best.w; p.wi = ri; const od = { id: W.nid++, k: 'w', w: old, x: p.x, z: p.z, t: W.t }; W.D.push(od); if (p.bm) (p.bm.bad || (p.bm.bad = new Set())).add(od); }
+        recalc(p); fx(W, 'pick', p.i, 0, best.w[0], best.w[1]);
+      } else {
+        let s = p.it.findIndex((x) => x && x[0] === best.it && x[1] < 3);
+        if (s < 0) s = p.it.findIndex((x) => !x);
+        if (s < 0) { fx(W, 'full', p.i); return false; }
+        if (p.it[s]) p.it[s][1]++; else p.it[s] = [best.it, 1];
+        fx(W, 'pick', p.i, 1, best.it, 0);
+      }
+      W.D.splice(W.D.indexOf(best), 1);
+      return true;
+    }
+    return false;
+  }
+  function useItem(W, p, a) {
+    if (a.slot === 0) { if (p.fl <= 0) return; p.fl--; p.hp = Math.min(p.mhp, p.hp + p.mhp * 0.55); fx(W, 'heal', p.i); return; }
+    const it = p.it[a.slot - 1]; if (!it) return;
+    const I = T.ITEM[it[0]];
+    it[1]--; if (it[1] <= 0) p.it[a.slot - 1] = null;
+    if (I.ty === 'throw') {
+      const tx = a.tx, tz = a.tz, d = Math.max(2, Math.hypot(tx - p.x, tz - p.z)), sp = 15, tt = d / sp, yaw = Math.atan2(tx - p.x, tz - p.z);
+      W.Pr.push({ id: W.prN++, k: I.id === 'fpot' ? 'fpot' : 'ipot', x: p.x, y: p.y + 1.6, z: p.z, vx: Math.sin(yaw) * sp, vz: Math.cos(yaw) * sp, vy: 0.5 * 22 * tt - 1.0 / tt, r: 0.3, life: 3, team: 'p', own: p.i, m: I.m, pz: 2, o: { fx: [I.fx, I.b], kind: 'item', fixed: skPow(p) }, boom: I.boom, lob: 1, hit: [] });
+    } else if (I.ty === 'knife') { for (let k = 0; k < 3; k++) shoot(W, p, { spd: 36, r: 0.25, k: 'knife', spr: (k - 1) * 0.12 }, I.m, 2, { fixed: skPow(p) * 0.8, fx: ['bleed', 25], kind: 'item' }); }
+    else if (I.id === 'incense') p.bf.inc = [20, W.t + 30];
+    else if (I.id === 'pill') p.bf.pill = [0.75, W.t + 20];
+    else if (I.id === 'leaf') { p.sts.bt = 0; p.sts.pt = 0; p.sts.ft = 0; p.sts.b = p.sts.u = p.sts.f = p.sts.p = 0; p.hp = Math.min(p.mhp, p.hp + p.mhp * 0.15); }
+    fx(W, 'item', p.i, it[0]);
+  }
+
+  /* 적 → 원정자 피해 */
+  function hitPlayer(W, e, p, dmg, o) {
+    if (p.down) return;
+    if (W.t < p.iv) { if (!o.zone) fx(W, 'evd', p.i); return; }
+    if (o.jp && p.y - Hat(p.x, p.z) > 0.5) { fx(W, 'evd', p.i); return; }
+    let taken = dmg, guarded = false;
+    if (p.guard && e && !o.ub && !o.zone) {
+      const ay = Math.atan2(e.x - p.x, e.z - p.z);
+      if (Math.abs(angD(p.yaw, ay)) < 1.3) {
+        if (W.t - p.gT0 <= 0.2 && o.pr && e.act) { e.stag = 2.4; e.pry = 1; e.act = null; fx(W, 'pry', p.i, e.id); p.ult = Math.min(100, p.ult + 6); return; }
+        const ab = guardAbs(p); taken = dmg * (1 - ab);
+        const sc = dmg * (T.ARCH[p.a].id === 'shield' ? 0.32 : 0.55);
+        p.st -= sc; p.sU = W.t; guarded = true;
+        if (T.ARCH[p.a].id === 'shield') p.ult = Math.min(100, p.ult + 3);
+        if (p.st < 0) { p.st = 0; taken = dmg * 0.6; p.guard = 0; p.act = { k: 'gbrk', t: 0, d: 1.0, h: [] }; }
+        fx(W, 'blk', p.i);
+      }
+    }
+    let mul = 1 - (p.pa.def || 0) / 100;
+    if (buf(W, p, 'fort')) mul *= 0.5;
+    if (buf(W, p, 'vow')) mul *= 0.7;
+    if (buf(W, p, 'pill')) mul *= 0.75;
+    if (p.sts.ft > W.t) mul *= 1.15;
+    const sa = T.ARCH[p.a].id === 'breaker' && p.act && (p.act.k === 'h' || p.act.k === 'art' || p.act.k === 'ul' || p.act.k === 'sk');
+    if (sa) mul *= 0.8;
+    taken = Math.round(taken * mul);
+    p.hp -= taken;
+    p.ult = Math.min(100, p.ult + taken / (34 * T.lvMul(p.lvl)));
+    p.lastHit = W.t;
+    fx(W, 'phit', p.i, taken, guarded ? 1 : 0);
+    if (o.fx && !guarded) addPSt(W, p, o.fx, o.b || 40);
+    if (p.hp <= 0) { downP(W, p); return; }
+    if (!guarded && !sa && taken > p.mhp * 0.06 && !(p.act && p.act.k === 'roll')) {
+      const kb = e ? Math.atan2(p.x - e.x, p.z - e.z) : p.yaw + PI, big = taken > p.mhp * 0.18;
+      p.act = { k: 'hit', t: 0, d: big ? 0.85 : 0.42, h: [], kb: [Math.sin(kb) * (big ? 5 : 2.5), Math.cos(kb) * (big ? 5 : 2.5)] }; p.q = null;
+    }
+  }
+  function addPSt(W, p, k, v) {
+    const s = p.sts, kk = STK[k]; s[kk] += v; s.dk = W.t + 3;
+    if (s[kk] >= 100) {
+      s[kk] = 0;
+      if (k === 'bleed') { p.hp -= Math.round(p.mhp * 0.16); if (p.hp <= 0) downP(W, p); }
+      if (k === 'burn') s.bt = W.t + 4;
+      if (k === 'frost') { p.hp -= Math.round(p.mhp * 0.08); s.ft = W.t + 8; if (p.hp <= 0) downP(W, p); }
+      if (k === 'poison') s.pt = W.t + 10;
+      fx(W, 'pst', p.i, ['bleed', 'burn', 'frost', 'poison'].indexOf(k));
+    }
+  }
+
+  /* ======================= 적 ======================= */
+  const RADF = { hum: 0.42, giant: 0.5, quad: 0.55, crawl: 0.62, wyrm: 0.75, float: 0.5 }, HHF = { hum: 1.75, giant: 2.0, quad: 1.0, crawl: 0.8, wyrm: 1.6, float: 2.0 };
+  function spawnE(W, ty, x, z, poi, o) {
+    const d = T.ET[ty]; o = o || {};
+    const n = W.n;
+    let hp, dm;
+    if (d.boss) { hp = d.hp * (n === 1 ? 0.77 : n === 2 ? 1.45 : 2.2) * W.hpm * (d.fin ? 1 : W.day >= 2 ? 1.3 : 1); dm = d.dmg * (d.fin ? 1 : W.day >= 2 ? 1.2 : 1) * (n === 1 ? 0.64 : n === 2 ? 0.8 : 1); }
+    else { const k = DAYM[Math.min(2, W.day - 1)]; hp = d.hp * k.hp * (1 + 0.3 * (n - 1)) * W.hpm; dm = d.dmg * k.dm; }
+    const e = { id: W.nid++, ty, x, z, y: Hat(x, z), yaw: W.R() * TAU, hp: Math.round(hp), mhp: Math.round(hp), pz: d.pz, mpz: d.pz, dmg: dm, aw: 0, tgt: -1, ag: {}, act: null, cd: {}, gap: 0.5 + W.R(),
+      stag: 0, brk: 0, pry: 0, poi, hx: x, hz: z, r: RADF[d.b] * d.sc, hh: HHF[d.b] * d.sc, an: 'idle', at: 0, sp: 0, st: { b: 0, u: 0, f: 0, p: 0, bt: 0, pt: 0, ft: 0, dk: 0 }, mk: 0,
+      boss: d.boss ? 1 : 0, fb: d.fb ? 1 : 0, elite: d.elite ? 1 : 0, shield: d.shield ? 1 : 0, ph: 1, dead: 0, deadT: 0, sum: o.sum ? 1 : 0, air: 0, inv: 0, wakeT: 0, ng: 0, actN: 0, enr: 0 };
+    W.E.push(e); W.em[e.id] = e;
+    return e;
+  }
+  function stepE(W, e, dt) {
+    if (e.dead) { e.an = 'dead'; e.at = W.t - e.deadT; return; }
+    stTick(W, e, dt, false); if (e.dead) return;
+    const d = T.ET[e.ty];
+    if (e.stag > 0) { e.stag -= dt; e.an = e.brk && e.boss ? 'brk' : 'stag'; e.at += dt; if (e.stag <= 0) { e.brk = 0; e.pry = 0; e.at = 0; } e.air = 0; return; }
+    if (!e.aw) {
+      e.wakeT -= dt; e.an = 'idle';
+      if (e.wakeT <= 0) {
+        e.wakeT = 0.35 + W.R() * 0.2;
+        const wr = e.boss ? 200 : e.fb ? 20 : e.elite ? 24 : (d.rk ? 28 : 21);
+        for (const p of W.P) if (!p.down && Math.abs(p.x - e.x) < wr && Math.abs(p.z - e.z) < wr && dist(p, e) < wr) { wake(W, e); break; }
+      }
+      return;
+    }
+    // 표적
+    e.tT = (e.tT || 0) - dt;
+    if (e.tT <= 0 || e.tgt < 0 || !W.P[e.tgt] || W.P[e.tgt].down) {
+      e.tT = 0.5;
+      let best = -1, bs = 1e9;
+      for (const p of W.P) {
+        if (p.down) continue; const ds = dist(p, e); if (ds > (e.boss ? 120 : 48)) continue;
+        let s = ds - (e.ag[p.i] || 0) / (e.mhp * 0.05) * 1.5 - (p.i === e.tgt ? 3 : 0) - (buf(W, p, 'taunt') ? 30 : 0);
+        if (s < bs) { bs = s; best = p.i; }
+      }
+      e.tgt = best;
+    }
+    const tp = e.tgt >= 0 ? W.P[e.tgt] : null;
+    const leash = !e.boss && Math.hypot(e.x - e.hx, e.z - e.hz) > (e.fb ? 40 : 55);
+    if (!tp || leash) {
+      if (e.act) e.act = null;
+      const dh = Math.hypot(e.hx - e.x, e.hz - e.z);
+      if (dh > 1.5) { moveE(W, e, Math.atan2(e.hx - e.x, e.hz - e.z), d.run, dt); e.an = 'run'; }
+      else { e.aw = e.boss ? 1 : 0; e.tgt = -1; e.ag = {}; if (!e.boss) e.hp = e.mhp; e.an = 'idle'; }
+      return;
+    }
+    const sp = (e.enr ? 1.25 : 1) * (e.ph > 1 ? 1.12 + (e.ph - 2) * 0.08 : 1) * (e.st.ft > W.t ? 0.82 : 1) * (W.n === 1 && (e.boss || e.fb) ? 0.85 : 1);
+    if (e.act) { actE(W, e, d, tp, dt * sp); return; }
+    const ds = dist(tp, e), ay = Math.atan2(tp.x - e.x, tp.z - e.z);
+    e.gap -= dt;
+    if (e.gap <= 0) {
+      const cand = d.mv.map((m, i) => [m, i]).filter(([m, i]) => (m.ph || 1) <= e.ph && !(e.cd[i] > W.t) && ds <= m.rng && ds >= (m.min || 0) && !(m.sm && W.sumN >= 6));
+      const pk = pickW(W.R, cand, ([m]) => m.w * (m.rng < 6 ? 1.4 : 1) * (ds > 8 && m.rng > 8 ? 1.5 : 1));
+      if (pk) { startE(W, e, pk[1], tp); return; }
+    }
+    // 움직임
+    const rk = d.rk || 0;
+    let mr = Math.min(...d.mv.filter((m) => !m.min && !m.sm).map((m) => m.rng).concat([3])) * 0.8;
+    if (rk && ds > 3.5) mr = rk;
+    if (ds > mr + 0.4) { const run = ds > 7; moveE(W, e, ay, run ? d.run : d.spd, dt * (e.boss ? sp : 1)); e.an = run ? 'run' : 'walk'; }
+    else if (rk && ds < rk - 4 && ds > 3.5) { moveE(W, e, ay + PI, d.spd, dt); e.yaw = turnTo(e.yaw, ay, 6 * dt); e.an = 'walk'; }
+    else { e.yaw = turnTo(e.yaw, ay, (e.boss ? 3 : 5) * dt); const side = ((e.id * 7) % 2 ? 1 : -1); if (!e.boss && ds < mr + 1) moveE(W, e, ay + side * PI / 2, d.spd * 0.45, dt, true); e.an = e.boss ? 'idle' : 'walk'; }
+  }
+  function wake(W, e) {
+    e.aw = 1;
+    if (e.poi >= 0) for (const o of W.E) if (!o.aw && !o.dead && o.poi === e.poi && dist(o, e) < 20) { o.aw = 1; }
+  }
+  function moveE(W, e, yaw, spd, dt, keepYaw) {
+    const nx = e.x + Math.sin(yaw) * spd * dt, nz = e.z + Math.cos(yaw) * spd * dt;
+    if (!wet(nx, nz)) { e.x = nx; e.z = nz; }
+    if (!keepYaw) e.yaw = turnTo(e.yaw, yaw, (e.boss ? 4 : 7) * dt);
+    if (!e.boss || e.r < 1.2) pushOut(W, e, e.r);
+    e.y = Hat(e.x, e.z) + e.air;
+  }
+  function startE(W, e, mi, tp) {
+    const m = T.ET[e.ty].mv[mi];
+    e.act = { m: mi, t: 0, d: m.d, hi: 0, pi: 0, zi: 0, tx: tp.x, tz: tp.z, n: ++e.actN, hT: m.h.length ? m.h[0][0] : m.d * 0.5, done: 0, ly: null };
+    if (m.cd) e.cd[mi] = W.t + m.cd;
+    e.an = 'm' + mi; e.at = 0;
+    if (m.sm) fx(W, 'roar', e.id);
+  }
+  function actE(W, e, d, tp, dt) {
+    const a = e.act;
+    if (a.m < 0) { a.t += dt; e.an = 'roar'; e.at = a.t; if (a.t >= a.d) { e.act = null; e.inv = 0; e.gap = 0.3; } return; }
+    const m = d.mv[a.m], t0 = a.t;
+    a.t += dt; e.an = 'm' + a.m; e.at = a.t;
+    const ay = Math.atan2(tp.x - e.x, tp.z - e.z);
+    if (a.t < (m.tr || 0)) { e.yaw = turnTo(e.yaw, ay, (e.boss ? 3.2 : 5) * dt); a.tx = tp.x; a.tz = tp.z; }
+    if (m.lg) {
+      if (a.ly == null && a.t >= m.lg[0]) { a.ly = Math.atan2(a.tx - e.x, a.tz - e.z); a.ld = Math.max(0, Math.hypot(a.tx - e.x, a.tz - e.z) - (e.r + 0.6)); a.lv = Math.min(m.lg[2], a.ld / Math.max(0.05, m.lg[1] - m.lg[0])); e.yaw = a.ly; }
+      if (a.ly != null && a.t < m.lg[1]) { moveE(W, e, a.ly, a.lv, dt); if (m.zt && e.ph >= 2) { a.zT = (a.zT || 0) - dt; if (a.zT <= 0) { a.zT = 0.22; W.Z.push({ x: e.x, z: e.z, r: 2.2, del: 0, life: 4, tick: 0.5, tk: 0.5, m: 0.22, own: e.id, team: 'e', k: 'fire', fx: 'burn', b: 25, dmg: e.dmg * 0.22 }); } } }
+    }
+    if (m.air) { const u = a.t < m.air[0] ? 0 : a.t < m.air[1] ? Math.sin(Math.min(1, (a.t - m.air[0]) / 0.5) * PI / 2) * (1 - smt((a.t - (m.air[1] - 0.35)) / 0.35)) : 0; e.air = m.air[2] * u; e.y = Hat(e.x, e.z) + e.air; }
+    if (m.bl && t0 < m.bl && a.t >= m.bl) {
+      const ang = W.R() * TAU, r = 9 + W.R() * 5; let nx = tp.x + Math.sin(ang) * r, nz = tp.z + Math.cos(ang) * r;
+      const s = W.storm; if (s && Math.hypot(nx - s.x, nz - s.z) > s.r - 4) { nx = s.x + (nx - s.x) * 0.5; nz = s.z + (nz - s.z) * 0.5; }
+      if (!blockedAt(W, nx, nz, 0.5)) { e.x = nx; e.z = nz; e.y = Hat(nx, nz); e.yaw = Math.atan2(tp.x - nx, tp.z - nz); fx(W, 'eblink', e.id); }
+    }
+    if (m.pull && a.t > m.pull[0] && a.t < m.pull[1]) for (const p of W.P) if (!p.down) { const dd = dist(p, e); if (dd < 24 && dd > 2) { const k = m.pull[2] * dt / dd; const nx = p.x + (e.x - p.x) * k, nz = p.z + (e.z - p.z) * k; if (!wet(nx, nz)) { p.x = nx; p.z = nz; } } }
+    while (a.hi < m.h.length && a.t >= m.h[a.hi][0]) { eHit(W, e, m.h[a.hi]); a.hi++; }
+    if (m.pj) while (a.pi < m.pj.length && a.t >= m.pj[a.pi][0]) { eShoot(W, e, m.pj[a.pi][1], tp); a.pi++; }
+    if (m.zn) while (a.zi < m.zn.length && a.t >= m.zn[a.zi][0]) { eZone(W, e, m.zn[a.zi][1]); a.zi++; }
+    if (m.sm && t0 < m.d * 0.6 && a.t >= m.d * 0.6) for (let k = 0; k < m.sm[1]; k++) { const an = W.R() * TAU; const s = spawnE(W, m.sm[0], e.x + Math.sin(an) * 4, e.z + Math.cos(an) * 4, -1, { sum: 1 }); s.aw = 1; s.tgt = e.tgt; W.sumN++; s.isSum = 1; }
+    if (a.t >= a.d) {
+      e.act = null; e.air = 0; e.y = Hat(e.x, e.z);
+      e.gap = (e.boss ? 0.45 + W.R() * 0.9 : e.fb || e.elite ? 0.4 + W.R() * 1.0 : 0.8 + W.R() * 1.4) * (e.ph > 1 ? 0.75 : 1) * (e.enr ? 0.7 : 1);
+    }
+  }
+  function eHit(W, e, h) {
+    const sh = h[1], o = h[3] || {}, dmg = e.dmg * h[2] * (e.enr ? 1.2 : 1);
+    if (sh[0] === 'ring' || (sh[0] === 'circ' && sh[1] > 3)) fx(W, 'eboom', Math.round(e.x * 10), Math.round(e.z * 10), Math.round((sh[0] === 'ring' ? sh[2] : sh[1]) * 10), sh[0] === 'ring' ? 1 : 0, Math.round(e.yaw * 100), sh[0] === 'circ' ? sh[2] * 10 : 0);
+    for (const p of W.P) {
+      if (p.down) continue;
+      if (Math.abs(p.x - e.x) > 30 || Math.abs(p.z - e.z) > 30) continue;
+      if (inShape(e.x, e.z, e.yaw, sh, p.x, p.z, 0.4)) hitPlayer(W, e, p, dmg, { jp: sh[0] === 'ring', pr: o.pr, ub: o.ub, fx: o.fx, b: o.b });
+    }
+  }
+  function eShoot(W, e, pj, tp) {
+    for (let k = 0; k < (pj.n || 1); k++) {
+      const spr = pj.n > 1 ? ((k - (pj.n - 1) / 2) / Math.max(1, pj.n - 1)) * (pj.spr || 20) * PI / 180 * 2 : 0;
+      const yaw = Math.atan2(tp.x - e.x, tp.z - e.z) + spr, d = Math.max(2, dist(tp, e)), y0 = e.y + e.hh * (pj.k === 'rock' ? 1.0 : 0.75);
+      let vy = 0, sp = pj.spd;
+      if (pj.lob) { const tt = d / sp; vy = 0.5 * 22 * tt - (y0 - tp.y) / tt; }
+      else vy = ((tp.y + 1.0) - y0) / d * sp;
+      W.Pr.push({ id: W.prN++, k: pj.k, x: e.x + Math.sin(yaw) * (e.r + 0.5), y: y0, z: e.z + Math.cos(yaw) * (e.r + 0.5), vx: Math.sin(yaw) * sp, vy, vz: Math.cos(yaw) * sp, r: pj.r, life: pj.lob ? 4 : 3, team: 'e', own: e.id, dmg: e.dmg * pj.m, boom: pj.boom, fx: pj.fx, b: pj.b, hom: pj.hom, tg: tp.i, pierce: pj.pierce, hit: [], lob: pj.lob ? 1 : 0, w: pj.w });
+    }
+  }
+  function eZone(W, e, z) {
+    const alive = W.P.filter((p) => !p.down);
+    for (let k = 0; k < z.n; k++) {
+      const p = alive.length ? alive[k % alive.length] : { x: e.x, z: e.z };
+      const an = W.R() * TAU, r = k < alive.length ? W.R() * 1.5 : W.R() * z.sp;
+      W.Z.push({ x: p.x + Math.sin(an) * r, z: p.z + Math.cos(an) * r, r: z.r, del: z.del + k * 0.12, life: z.life || 0, tick: z.tick || 0, tk: 0, m: z.m, own: e.id, team: 'e', k: z.k, fx: z.fx, b: z.b, dmg: e.dmg * z.m });
+    }
+  }
+  function projs(W, dt) {
+    for (let i = W.Pr.length - 1; i >= 0; i--) {
+      const q = W.Pr[i];
+      q.life -= dt;
+      if (q.hom) {
+        let tx, tz;
+        if (q.team === 'p') { let t = q.tg >= 0 ? W.em[q.tg] : null; if (!t || t.dead) { t = null; let bd = 22; for (const e of W.E) if (!e.dead) { const d = Math.hypot(e.x - q.x, e.z - q.z); if (d < bd) { const ay = Math.atan2(e.x - q.x, e.z - q.z); if (Math.abs(angD(Math.atan2(q.vx, q.vz), ay)) < 1.0) { bd = d; t = e; } } } if (t) q.tg = t.id; } if (t) { tx = t.x; tz = t.z; } }
+        else { const p = W.P[q.tg]; if (p && !p.down) { tx = p.x; tz = p.z; } }
+        if (tx != null) { const sp = Math.hypot(q.vx, q.vz), cy = Math.atan2(q.vx, q.vz), ny = turnTo(cy, Math.atan2(tx - q.x, tz - q.z), q.hom * dt); q.vx = Math.sin(ny) * sp; q.vz = Math.cos(ny) * sp; }
+      }
+      if (q.lob) q.vy -= 22 * dt;
+      q.x += q.vx * dt; q.y += q.vy * dt; q.z += q.vz * dt;
+      const gy = Hat(q.x, q.z);
+      let end = q.life <= 0 || Math.abs(q.x) > HALF || Math.abs(q.z) > HALF;
+      if (!q.lob && q.y < gy + 0.2 && !q.hom) q.y = Math.max(q.y, gy + 0.25);
+      if (q.lob && q.y <= gy) end = true;
+      if (!end) {
+        if (q.team === 'p') {
+          for (const e of W.E) {
+            if (e.dead || q.hit.includes(e.id)) continue;
+            if (Math.abs(e.x - q.x) > e.r + q.r + 1 || Math.abs(e.z - q.z) > e.r + q.r + 1) continue;
+            if (Math.hypot(e.x - q.x, e.z - q.z) < e.r + q.r && q.y > e.y - 0.5 && q.y < e.y + e.hh + 1.2) {
+              const p = W.P[q.own];
+              if (q.boom) { end = true; break; }
+              dmgE(W, p, e, q.m, q.pz / Math.max(1, T.CLS[T.WPN[curW(p)[0]].c].pz), q.o, q.x - q.vx * 0.05, q.z - q.vz * 0.05);
+              q.hit.push(e.id);
+              if (!q.pierce) { end = true; break; }
+            }
+          }
+          if (!end && q.k !== 'great') for (const pp of W.P) if (pp.down && pp.i !== q.own && Math.hypot(pp.x - q.x, pp.z - q.z) < 0.8) { reviveHit(W, pp, W.P[q.own], 22); end = true; break; }
+        } else {
+          for (const p of W.P) {
+            if (p.down || q.hit.includes(p.i)) continue;
+            const rr = q.w ? q.w / 2 : q.r;
+            if (Math.hypot(p.x - q.x, p.z - q.z) < rr + 0.4 && q.y > p.y - 0.3 && q.y < p.y + 2.2) {
+              if (q.boom) { end = true; break; }
+              hitPlayer(W, W.em[q.own] || null, p, q.dmg, { fx: q.fx, b: q.b, pr: 0 });
+              q.hit.push(p.i);
+              if (!q.pierce) { end = true; break; }
+            }
+          }
+        }
+      }
+      if (end) {
+        if (q.boom && (q.life > -0.01)) {
+          fx(W, 'pboom', Math.round(q.x * 10), Math.round(q.z * 10), Math.round(q.boom * 10), q.k === 'fpot' || q.fx === 'burn' || (q.o && q.o.fx && q.o.fx[0] === 'burn') ? 1 : q.k === 'ipot' ? 2 : q.k === 'spit' ? 3 : 0);
+          if (q.team === 'p') { const p = W.P[q.own]; for (const e of W.E) if (!e.dead && Math.hypot(e.x - q.x, e.z - q.z) < q.boom + e.r) dmgE(W, p, e, q.m, q.pz / 10, q.o || {}, q.x, q.z); }
+          else for (const p of W.P) if (!p.down && Math.hypot(p.x - q.x, p.z - q.z) < q.boom + 0.4) hitPlayer(W, W.em[q.own] || null, p, q.dmg, { fx: q.fx, b: q.b, jp: 0 });
+        }
+        W.Pr.splice(i, 1);
+      }
+    }
+  }
+  function zones(W, dt) {
+    for (let i = W.Z.length - 1; i >= 0; i--) {
+      const z = W.Z[i];
+      if (z.del > 0) { z.del -= dt; if (z.del <= 0) { zoneHit(W, z); z.tk = z.tick; if (!z.life) { W.Z.splice(i, 1); continue; } } continue; }
+      z.life -= dt;
+      if (z.tick) { z.tk -= dt; if (z.tk <= 0) { z.tk += z.tick; zoneHit(W, z); } }
+      if (z.life <= 0) W.Z.splice(i, 1);
+    }
+  }
+  function zoneHit(W, z) {
+    if (z.team === 'p') { const p = W.P[z.own]; if (z.k === 'comet') fx(W, 'pboom', Math.round(z.x * 10), Math.round(z.z * 10), z.r * 10, 1); for (const e of W.E) if (!e.dead && Math.hypot(e.x - z.x, e.z - z.z) < z.r + e.r) dmgE(W, p, e, z.m, z.pz || 1, { fx: z.fx, kind: z.k === 'comet' ? 'ul' : 'art', fixed: z.fixed }, z.x, z.z); }
+    else { if (!z.tick) fx(W, 'pboom', Math.round(z.x * 10), Math.round(z.z * 10), z.r * 10, z.k === 'meteor' ? 1 : z.k === 'ice' ? 2 : z.k === 'pool' ? 3 : 4); for (const p of W.P) if (!p.down && Math.hypot(p.x - z.x, p.z - z.z) < z.r + 0.3) hitPlayer(W, W.em[z.own] || null, p, z.dmg, { fx: z.fx, b: z.b, zone: 1 }); }
+  }
+
+  /* ======================= 폭풍 · 낮과 밤 ======================= */
+  const SEG = [[0, 0.3, 0, 0], [0.3, 0.44, 0, 1], [0.44, 0.72, 1, 1], [0.72, 0.86, 1, 2], [0.86, 1.0, 2, 2]];
+  function circles(W, day) {
+    const fc = W.FC[day - 1], dl = Math.hypot(fc.x, fc.z) || 1, k = Math.min(dl, 75);
+    return [{ x: 0, z: 0, r: 300 }, { x: fc.x - fc.x / dl * k, z: fc.z - fc.z / dl * k, r: 125 }, { x: fc.x, z: fc.z, r: 34 }];
+  }
+  function stormAt(W) {
+    if (W.ph === 'day') {
+      const C = circles(W, W.day), u = clamp(W.pt / W.dayLen, 0, 0.9999);
+      const si = SEG.findIndex((s) => u >= s[0] && u < s[1]), s = SEG[si];
+      const f = (u - s[0]) / (s[1] - s[0]), a = C[s[2]], b = C[s[3]];
+      const cur = s[2] === s[3] ? a : { x: lerp(a.x, b.x, smt(f)), z: lerp(a.z, b.z, smt(f)), r: lerp(a.r, b.r, smt(f)) };
+      const nx = s[2] === s[3] ? (SEG[si + 1] ? C[SEG[si + 1][3]] : b) : b;
+      return { x: cur.x, z: cur.z, r: cur.r, nx: nx.x, nz: nx.z, nr: nx.r, tn: (s[1] - u) * W.dayLen + (s[2] === s[3] && si < 4 ? 0 : 0), sh: s[2] !== s[3] ? 1 : 0, dmg: 0.016 };
+    }
+    if (W.ph === 'night' || W.ph === 'dawn') { const c = W.FC[W.day - 1]; return { x: c.x, z: c.z, r: 34, nx: c.x, nz: c.z, nr: 34, tn: 0, sh: 0, dmg: 0.08 }; }
+    if (W.ph === 'rest') return { x: FA.x, z: FA.z, r: 96, nx: FA.x, nz: FA.z, nr: 38, tn: Math.max(0, restLen(W) - W.pt), sh: 0, dmg: 0.03 };
+    return { x: FA.x, z: FA.z, r: 38, nx: FA.x, nz: FA.z, nr: 38, tn: 0, sh: 0, dmg: 0.08 };
+  }
+  const restLen = (W) => (W.len === 'taste' ? 22 : 45);
+  function phase(W) {
+    if (W.ph === 'day') {
+      if (W.pt >= W.dayLen * 0.72 && !W.ng) {
+        W.ng = 1; const c = W.FC[W.day - 1]; const g = { x: c.x + 9, z: c.z + 4, tmp: 1 }; if (blockedAt(W, g.x, g.z, 0.6)) { g.x = c.x - 9; }
+        W.gr.push(g); fx(W, 'ngrace');
+      }
+      if (W.pt >= W.dayLen) startNight(W);
+    } else if (W.ph === 'night' || W.ph === 'final') {
+      if (W.bossE.length && W.bossE.every((id) => !W.em[id] || W.em[id].dead)) {
+        if (W.ph === 'night') { W.killed[W.day - 1] = 1; W.ph = 'dawn'; W.pt = 0; bossLoot(W); fx(W, 'dawn', W.day); }
+        else { W.ph = 'won'; W.pt = 0; fx(W, 'won'); }
+      } else if (W.P.every((p) => p.down)) { W.lostAt = (W.ph === 'final' ? '최종 결전' : T.NIGHT_NM[W.day - 1]) + ' · ' + W.bossNm; W.ph = 'lost'; W.pt = 0; fx(W, 'lost'); }
+    } else if (W.ph === 'dawn') {
+      if (W.pt >= 6) {
+        for (const p of W.P) { if (p.down) revive(W, p, null, 0.5); p.fl = p.flm; }
+        W.gr = W.gr.filter((g) => !g.tmp);
+        rmE(W, (e) => e.boss || e.sum); W.bossE = []; W.sumN = 0;
+        if (W.day === 1) {
+          W.day = 2; W.ph = 'day'; W.pt = 0; W.ng = 0;
+          for (const e of W.E) if (!e.dead) { const r = e.hp / e.mhp, d = T.ET[e.ty], k = DAYM[1]; e.mhp = Math.round(d.hp * k.hp * (1 + 0.3 * (W.n - 1)) * W.hpm); e.hp = Math.round(e.mhp * r); e.dmg = d.dmg * k.dm; e.aw = 0; e.act = null; }
+          for (let k = 0; k < 7; k++) spawnPack(W);
+          fx(W, 'day', 2);
+        } else {
+          W.ph = 'rest'; W.pt = 0;
+          W.gr.push({ x: REST.x, z: REST.z, tmp: 1, rest: 1 });
+          W.P.forEach((p, i) => { p.x = REST.x - 3 + i * 2; p.z = REST.z - 4; p.y = Hat(p.x, p.z); p.tp++; p.down = 0; p.act = null; p.yaw = Math.atan2(FA.x - p.x, FA.z - p.z); });
+          rmE(W, (e) => Math.hypot(e.x - FA.x, e.z - FA.z) < 110);
+          fx(W, 'rest');
+        }
+      }
+    } else if (W.ph === 'rest') {
+      if (W.pt >= restLen(W) || W.P.some((p) => !p.down && Math.hypot(p.x - FA.x, p.z - FA.z) < 30)) startFinal(W);
+    } else if (W.ph === 'won' || W.ph === 'lost') {
+      if (W.pt >= 3 && !W.done) {
+        W.done = { win: W.ph === 'won', where: W.ph === 'lost' ? W.lostAt + '에서 모두 쓰러졌다.' : '', time: Math.round(W.t), bosses: W.bosses.slice(), killed: W.killed.slice(), fin: W.fin, arch: W.P.map((p) => p.a), st: W.P.map((p) => ({ lv: p.lvl, dmg: Math.round(p.ws.dmg), kill: p.ws.kill, rev: p.ws.rev, down: p.ws.down })) };
+      }
+    }
+  }
+  function rmE(W, f) { W.E = W.E.filter((e) => { if (f(e)) { delete W.em[e.id]; return false; } return true; }); }
+  function clearNear(W, c, r) { for (const e of W.E) if (!e.dead && !e.boss && Math.hypot(e.x - c.x, e.z - c.z) < r) { e.dead = 1; e.deadT = W.t - 10; if (e.poi >= 0 && W.POI[e.poi]) W.POI[e.poi].alive = Math.max(0, W.POI[e.poi].alive - 1); } }
+  function startNight(W) {
+    const c = W.FC[W.day - 1], id = W.bosses[W.day - 1], B = T.BOSS[id];
+    W.ph = 'night'; W.pt = 0; W.Z.length = 0;
+    clearNear(W, c, 60);
+    W.bossE = [];
+    const yawTo = Math.atan2((W.P[0] ? W.P[0].x : c.x) - c.x, (W.P[0] ? W.P[0].z : c.z + 1) - c.z);
+    if (B.twin) { for (const s of [-1, 1]) { const e = spawnE(W, id, c.x + s * 4, c.z - 6, -1); e.aw = 1; e.yaw = yawTo; e.tw = 1; W.bossE.push(e.id); } }
+    else { const e = spawnE(W, id, c.x, c.z - 4, -1); e.aw = 1; e.yaw = yawTo; W.bossE.push(e.id); }
+    W.bossNm = B.nm; W.sumN = 0;
+    for (const p of W.P) { p.selfRev = 1; if (!p.down && Math.hypot(p.x - c.x, p.z - c.z) > 30) { const a = Math.atan2(p.x - c.x, p.z - c.z); p.x = c.x + Math.sin(a) * 26; p.z = c.z + Math.cos(a) * 26; p.y = Hat(p.x, p.z); p.tp++; } }
+    fx(W, 'night', W.day, id);
+  }
+  function startFinal(W) {
+    W.ph = 'final'; W.pt = 0; W.Z.length = 0;
+    const e = spawnE(W, W.fin, FA.x, FA.z, -1); e.aw = 1; e.yaw = Math.atan2(REST.x - FA.x, REST.z - FA.z);
+    W.bossE = [e.id]; W.bossNm = T.BOSS[W.fin].nm; W.sumN = 0;
+    for (const p of W.P) { p.selfRev = 1; if (Math.hypot(p.x - FA.x, p.z - FA.z) > 32) { const a = Math.atan2(p.x - FA.x, p.z - FA.z); p.x = FA.x + Math.sin(a) * 28; p.z = FA.z + Math.cos(a) * 28; p.y = Hat(p.x, p.z); p.tp++; } }
+    W.gr = W.gr.filter((g) => !g.rest);
+    fx(W, 'final', W.fin);
+  }
+  function bossLoot(W) {
+    const c = W.FC[W.day - 1];
+    W.P.forEach((p, i) => dropW(W, c.x + (i - 1) * 2, c.z, rollRar(W, 2, 0.1)));
+  }
+  function phaseChecks(W) {
+    // 보스 단계 · 쌍둥이 격분
+    for (const id of W.bossE) {
+      const e = W.em[id]; if (!e || e.dead) continue;
+      const B = T.BOSS[e.ty];
+      const f = e.hp / e.mhp;
+      const np = B.p3 && f < B.p3 ? 3 : B.p2 && f < B.p2 ? 2 : 1;
+      if (np > e.ph) { e.ph = np; e.act = { m: -1, t: 0, d: 1.6, hi: 0, pi: 0, zi: 0, tx: e.x, tz: e.z, n: ++e.actN }; e.inv = 1; fx(W, 'bph', e.id, np); }
+      if (B.twin && !e.enr && W.bossE.some((o) => o !== id && W.em[o] && W.em[o].dead)) { e.enr = 1; e.ph = 2; fx(W, 'bph', e.id, 2); }
+    }
+  }
+
+  /* ======================= 한 걸음 ======================= */
+  function step(W, dt, inpOf, botOf) {
+    if (W.done) return;
+    W.t += dt; W.pt += dt;
+    phase(W);
+    W.storm = stormAt(W);
+    if (W.ph === 'night' || W.ph === 'final') phaseChecks(W);
+    for (const p of W.P) {
+      const m = inpOf ? inpOf(p.i) : null;
+      let inp, mode = 'host';
+      if (m === 'remote') { inp = remoteInp(W, p); mode = 'remote'; }
+      else if (m) inp = m;
+      else { const b = botOf ? botOf(p.i) : { lv: 2, hab: habits(W.seed, p.i) }; inp = bot(W, p, b.lv || 2, b.hab || habits(W.seed, p.i), dt); }
+      ctrl(W, p, inp, dt, mode);
+      stTick(W, p, dt, true);
+      // 폭풍
+      const s = W.storm;
+      if (!p.down && Math.hypot(p.x - s.x, p.z - s.z) > s.r && W.ph !== 'won') { p.hp -= (p.mhp * s.dmg + 3) * dt; p.inStorm = 1; if (p.hp <= 0) downP(W, p); } else p.inStorm = 0;
+      if (p.down) {
+        if (p.dT > 0) { p.dT -= dt; if (p.dT <= 0) respawnGrace(W, p); }
+        if (p.srT > 0) { p.srT -= dt; if (p.srT <= 0 && p.down) { p.selfRev = 0; revive(W, p, null, 0.4); } }
+      }
+    }
+    // 적 (깨어 있거나 가까운 것만)
+    for (const e of W.E) {
+      if (e.boss || e.aw || e.dead || e.act) { stepE(W, e, dt); continue; }
+      e.wakeT -= dt; if (e.wakeT <= 0) stepE(W, e, dt);
+    }
+    // 서로 밀기
+    for (const p of W.P) {
+      if (p.down) continue;
+      for (const e of W.E) {
+        if (e.dead) continue; const dx = p.x - e.x, dz = p.z - e.z; if (Math.abs(dx) > 6 || Math.abs(dz) > 6) continue;
+        const d = Math.hypot(dx, dz), m = e.r + 0.42;
+        if (d < m && d > 1e-3 && e.air < 1.5) { const k = (m - d) / d; if (W.rm[p.i] && W.rm[p.i].pos) { e.x -= dx * k; e.z -= dz * k; } else { const w = e.boss ? 1 : 0.6; p.x += dx * k * w; p.z += dz * k * w; e.x -= dx * k * (1 - w); e.z -= dz * k * (1 - w); } }
+      }
+    }
+    projs(W, dt); zones(W, dt);
+    // 정리
+    if ((W.cleanT = (W.cleanT || 0) - dt) <= 0) {
+      W.cleanT = 2;
+      for (let i = W.E.length - 1; i >= 0; i--) { const e = W.E[i]; if (e.dead && W.t - e.deadT > 6 && !e.boss) { if (e.isSum) W.sumN = Math.max(0, W.sumN - 1); delete W.em[e.id]; W.E.splice(i, 1); } }
+      if (W.D.length > 70) W.D.splice(0, W.D.length - 70);
+      W.planT = 0;
+    }
+  }
+  function remoteInp(W, p) {
+    const r = W.rm[p.i], inp = IN0();
+    if (!r) return inp;
+    inp.guard = r.g ? 1 : 0; inp.run = r.run ? 1 : 0; inp.aim = r.aim;
+    while (r.q && r.q.length) {
+      const e = r.q.shift(), k = e[1];
+      if (k === 'l') inp.l = 1; else if (k === 'h') inp.h = 1; else if (k === 'a') inp.art = 1; else if (k === 'd') { inp.dg = 1; inp.dgy = e[2]; } else if (k === 'j') inp.jp = 1;
+      else if (k === 's') inp.sk = 1; else if (k === 'u') inp.ul = 1; else if (k === 'i') inp.it = e[2] | 0; else if (k === 'e') inp.use = 1; else if (k === 'k') inp.lk = e[2]; else if (k === 'w') inp.sw = 1;
+      if (inp.l || inp.h || inp.art || inp.dg || inp.sk || inp.ul || inp.it >= 0) break;   // 한 걸음에 동작 하나
+    }
+    if (inp.lk === -2 && r.lk != null && r.lk !== p.lock) inp.lk = r.lk;
+    return inp;
+  }
+
+  /* ======================= 동료 봇 AI =======================
+     상황 점수 + 자리마다 씨앗 버릇(대담함 agg · 신중함 caut · 욕심 greed · 피하기 감각 dodge · 강공격 선호 heavy · 거리 dist · 일으키기 rev · 옆걸음 strafe). */
+  function habits(seed, s) { const R = prng(((seed >>> 0) ^ Math.imul(s + 1, 2654435761)) >>> 0); return { agg: R(), caut: R(), greed: R(), dodge: R(), heavy: R(), dist: R(), rev: R(), strafe: R() }; }
+  function steer(W, p, tx, tz) {
+    const base = Math.atan2(tx - p.x, tz - p.z);
+    let best = base, bs = -1e9;
+    for (const off of [0, 0.45, -0.45, 0.9, -0.9, 1.4, -1.4, 2.0, -2.0]) {
+      const y = base + off; let s = -Math.abs(off) * 1.2;
+      for (const r of [1.2, 2.4]) { if (blockedAt(W, p.x + Math.sin(y) * r, p.z + Math.cos(y) * r, 0.45)) s -= r < 2 ? 6 : 3; }
+      if (s > bs) { bs = s; best = y; }
+    }
+    return best;
+  }
+  function threat(W, p, react) {
+    let best = null;
+    for (const e of W.E) {
+      if (e.dead || !e.act || e.act.m < 0) continue;
+      if (Math.abs(e.x - p.x) > 32 || Math.abs(e.z - p.z) > 32) continue;
+      const m = T.ET[e.ty].mv[e.act.m];
+      for (let i = e.act.hi; i < m.h.length; i++) {
+        const h = m.h[i], tt = h[0] - e.act.t; if (tt > react) break;
+        let ox = e.x, oz = e.z, yaw = e.yaw;
+        if (m.lg && e.act.t < m.lg[1]) { ox = e.act.tx - Math.sin(yaw) * (e.r + 0.6); oz = e.act.tz - Math.cos(yaw) * (e.r + 0.6); if (e.act.ly == null) yaw = Math.atan2(e.act.tx - e.x, e.act.tz - e.z); }
+        if (inShape(ox, oz, yaw, h[1], p.x, p.z, 1.0)) { if (!best || tt < best.tt) best = { tt, ring: h[1][0] === 'ring', ox, oz, line: h[1][0] === 'line', yaw, key: e.id + ':' + e.act.n + ':' + i, e }; break; }
+      }
+    }
+    for (const z of W.Z) if (z.team === 'e' && z.del > 0 && z.del < react && Math.hypot(z.x - p.x, z.z - p.z) < z.r + 1.0) { const tt = z.del; if (!best || tt < best.tt) best = { tt, ox: z.x, oz: z.z, key: 'z' + z.x.toFixed(1) + z.z.toFixed(1), zone: 1 }; }
+    for (const q of W.Pr) {
+      if (q.team !== 'e') continue; const dx = p.x - q.x, dz = p.z - q.z, d = Math.hypot(dx, dz); if (d > 10) continue;
+      const sp = Math.hypot(q.vx, q.vz) || 1, tt = d / sp; if (tt > react) continue;
+      const cl = Math.abs(dx * q.vz - dz * q.vx) / sp; if ((dx * q.vx + dz * q.vz) > 0 && cl < 1.4 + (q.boom || 0)) { if (!best || tt < best.tt) best = { tt, ox: q.x, oz: q.z, key: 'p' + q.id, proj: 1, yaw: Math.atan2(q.vx, q.vz), line: 1 }; }
+    }
+    return best;
+  }
+  const wScore = (w, rngPref) => { const W_ = T.WPN[w[0]], c = T.CLS[W_.c]; let s = T.wDmg(w) * (c.rng ? (rngPref ? 1.15 : 0.7) : (rngPref ? 0.75 : 1)) * (W_.c === 'dagger' ? 1.25 : W_.c === 'great' ? 0.9 : 1); for (const [k, v] of T.wPas(w)) s *= 1 + (k === 'atk' ? v / 100 : k === 'hp' || k === 'def' ? v / 200 : 0.04); return s; };
+  function bot(W, p, lv, hab, dt) {
+    const inp = IN0();
+    if (p.down) return inp;
+    const bm = p.bm || (p.bm = { tT: 0, mx: 0, mz: 0, run: 0, tgt: -1, seen: {}, atkT: 0, stuckT: 0, sx: p.x, sz: p.z, sideT: 0, side: 1, goal: null, holdT: 0, offA: (p.i * 2.1 + hab.strafe * 3) });
+    const A = T.ARCH[p.a].id, C = curC(p), rngPref = A === 'archer' || A === 'ash';
+    const react = lv === 1 ? 0.3 : lv === 2 ? 0.42 : 0.55;
+    const pDodge = (lv === 1 ? 0.3 : lv === 2 ? 0.62 : 0.88) * (0.85 + 0.3 * hab.dodge);
+    // 1) 위험 — 매 걸음 확인(반응은 한 번만 결정)
+    const th = threat(W, p, react);
+    if (th && !p.act) {
+      let dec = bm.seen[th.key];
+      if (dec == null) { dec = W.R() < pDodge ? 1 : 0; bm.seen[th.key] = dec; bm.seenN = (bm.seenN || 0) + 1; if (bm.seenN > 60) { bm.seen = {}; bm.seenN = 0; } }
+      const win = lv === 3 ? 0.3 : lv === 2 ? 0.34 : 0.4;
+      if (dec && th.tt <= win) {
+        if (th.ring && lv >= 2 && p.gr && th.tt < 0.3) { inp.jp = 1; return inp; }
+        let ay = Math.atan2(p.x - th.ox, p.z - th.oz);
+        if (th.line) { const s = Math.sin(th.yaw) * (p.z - th.oz) - Math.cos(th.yaw) * (p.x - th.ox) > 0 ? 1 : -1; ay = th.yaw + s * PI / 2 * (th.proj ? 1 : -1); }
+        if (p.st > 12) { inp.dg = 1; inp.dgy = ay; return inp; }
+        inp.mx = Math.sin(ay); inp.mz = Math.cos(ay); inp.run = 1; return inp;
+      }
+    }
+    bm.tT -= dt;
+    if (bm.tT > 0 && !(th && th.tt < 0.2)) { Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: bm.run, lk: bm.lk == null ? -2 : bm.lk, face: bm.face, guard: bm.guard, aim: bm.aim }); bm.lk = null; return inp; }
+    bm.tT = (lv === 1 ? 0.42 : lv === 2 ? 0.22 : 0.12) * (0.8 + W.R() * 0.4);
+    bm.face = null; bm.guard = 0; bm.run = 0; bm.mx = 0; bm.mz = 0; bm.aim = null;
+    const s = W.storm;
+    const moveTo = (x, z, run) => { const y = navDir(W, p, x, z); bm.mx = Math.sin(y); bm.mz = Math.cos(y); bm.run = run ? 1 : 0; };
+    // 2) 회복
+    const hpf = p.hp / p.mhp;
+    const nearE = nearestE(W, p, 30, 0);
+    const nd = nearE ? dist(p, nearE) : 99;
+    if (p.fl > 0 && !p.act && (hpf < (lv === 1 ? 0.28 : lv === 2 ? 0.4 : 0.45) && (nd > 4.5 || hpf < 0.2 || lv === 1))) { inp.it = 0; return inp; }
+    // 3) 폭풍 밖
+    if (Math.hypot(p.x - s.x, p.z - s.z) > s.r - 3) { moveTo(s.x, s.z, 1); Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: 1 }); return inp; }
+    // 4) 쓰러진 동료
+    const downs = W.P.filter((q) => q !== p && q.down && dist(p, q) < 40);
+    if (downs.length) {
+      const q = downs.sort((a, b) => dist(p, a) - dist(p, b))[0];
+      const busy = th && th.tt < 0.8;
+      const go = lv === 3 || (lv === 2 && (!busy || W.R() < 0.5 + hab.rev * 0.4)) || (lv === 1 && W.R() < 0.4 + hab.rev * 0.3);
+      if (go) {
+        if (A === 'priest' && p.ult >= 100 && dist(p, q) < 11) { inp.ul = 1; return inp; }
+        const d = dist(p, q);
+        if (d > 1.6) { moveTo(q.x, q.z, d > 5); Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: bm.run }); bm.lk = -1; inp.lk = -1; return inp; }
+        inp.lk = -1; inp.face = Math.atan2(q.x - p.x, q.z - p.z); bm.face = inp.face;
+        if (C.rng) { inp.aim = inp.face; }
+        if (!p.act && p.st > 5 && Math.abs(angD(p.yaw, inp.face)) < 0.5) inp.l = 1;
+        return inp;
+      }
+    }
+    // 5) 싸움
+    let tgt = null;
+    const boss = W.bossE.map((id) => W.em[id]).filter((e) => e && !e.dead);
+    if (boss.length) { tgt = boss.sort((a, b) => dist(p, a) - dist(p, b))[0]; const add = nearestE(W, p, 4, 0); if (add && !add.boss && W.R() < 0.6) tgt = add; }
+    else {
+      let bs = 1e9;
+      for (const e of W.E) {
+        if (e.dead || (bm.ebad && bm.ebad[e.id] > W.t)) continue; const d = dist(p, e); if (d > (e.aw ? 26 : 14)) continue;
+        if (!e.aw && (bm.goal && Math.hypot(bm.goal.x - e.x, bm.goal.z - e.z) > 30) && d > 9) continue;
+        const sc = d - (e.aw ? 4 : 0) - (e.tgt >= 0 && e.tgt !== p.i ? 3 : 0) + (e.fb && avgLv(W) < 4 ? 30 : 0);
+        if (sc < bs) { bs = sc; tgt = e; }
+      }
+    }
+    // 레벨업 · 줍기 (싸움이 없을 때)
+    if (!tgt || (!tgt.aw && dist(p, tgt) > 10)) {
+      const L = lootGoal(W, p, rngPref, hab);
+      if (L) {
+        const d = Math.hypot(L.x - p.x, L.z - p.z);
+        if (bm.lg !== L) { bm.lg = L; bm.lgT = W.t; }
+        if (W.t - bm.lgT > 12) { (bm.bad || (bm.bad = new Set())).add(L); bm.lg = null; }
+        if (d < 2.3) { inp.use = 1; if (L.k === 'w' && p.w.length >= 3) { let wi = 0, wv = 1e9; p.w.forEach((w, i) => { const v = wScore(w, rngPref); if (v < wv) { wv = v; wi = i; } }); inp.rw = wi; } if (W.t - bm.lgT > 3) (bm.bad || (bm.bad = new Set())).add(L); return inp; }
+        moveTo(L.x, L.z, d > 6); Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: bm.run }); return inp;
+      }
+      // 무기 고르기
+      let bi = p.wi, bsv = wScore(curW(p), rngPref);
+      p.w.forEach((w, i) => { const v = wScore(w, rngPref); if (v > bsv * 1.04) { bsv = v; bi = i; } });
+      if (bi !== p.wi && !p.act) { inp.sw = 1; return inp; }
+    }
+    if (tgt) {
+      const d = dist(p, tgt) - tgt.r, ay = Math.atan2(tgt.x - p.x, tgt.z - p.z);
+      if (!tgt.boss) { if (bm.et !== tgt.id) { bm.et = tgt.id; bm.etT = W.t; bm.etD = d; } else if (W.t - bm.etT > 7) { if (d > bm.etD - 1.5 && d > 4) { (bm.ebad || (bm.ebad = {}))[tgt.id] = W.t + 12; bm.et = -1; } else { bm.etT = W.t; bm.etD = d; } } }
+      bm.lk = tgt.id; inp.lk = tgt.id;
+      const rng = C.rng ? 0 : 1;
+      const want = rng ? C.r * 0.82 + 0.1 : 9 + hab.dist * 6;
+      // 스킬 · 궁극기
+      if (!p.act && p.skc <= 0 && skillGood(W, p, A, tgt, d, lv)) { inp.sk = 1; return inp; }
+      if (!p.act && p.ult >= 100 && ultGood(W, p, A, tgt, d, boss.length)) { inp.ul = 1; return inp; }
+      const reserve = 8 + hab.caut * 16 + (lv === 3 ? 10 : lv === 2 ? 5 : -6);
+      const tBusy = tgt.act && tgt.act.m >= 0 && tgt.act.t < tgt.act.hT - 0.1 && dist(p, tgt) < 7 && lv >= 2;
+      const facing = Math.abs(angD(p.yaw, ay)) < 0.6;
+      const canHit = rng ? d < want + 0.4 : d < 24;
+      if (canHit && !p.act && facing && W.t >= bm.atkT && p.st > C.st + reserve * (tgt.boss ? 1 : 0.6) && !(tBusy && lv === 3 && W.R() < 0.5)) {
+        const Ar = T.wArt(curW(p));
+        const crowd = W.E.filter((e) => !e.dead && dist(e, p) < 5).length;
+        if (p.st > Ar.st + reserve && (tgt.stag > 0 || crowd >= 3 || W.R() < 0.08 + hab.agg * 0.08)) inp.art = 1;
+        else if (tgt.stag > 0 || W.R() < hab.heavy * 0.3) inp.h = 1;
+        else inp.l = 1;
+        bm.atkT = W.t + (lv === 1 ? 0.35 + W.R() * 0.8 : lv === 2 ? 0.05 + W.R() * 0.35 : W.R() * 0.15);
+        if (C.rng) inp.aim = ay;
+        return inp;
+      }
+      // 거리 맞추기
+      if (rng) {
+        if (d > want + 0.3) { moveTo(tgt.x, tgt.z, d > 8); }
+        else if (tgt.boss && d < want * 0.6) { const by = ay + PI + bm.side * 0.6; bm.mx = Math.sin(by); bm.mz = Math.cos(by); }
+        else { bm.sideT -= 1; if (bm.sideT <= 0) { bm.side = W.R() < 0.5 ? -1 : 1; bm.sideT = 8 + W.R() * 10; } const sy = ay + bm.side * PI / 2 + (tgt.boss ? (0.3 - hab.agg * 0.4) * bm.side : 0); const k = 0.35 + hab.strafe * 0.4; bm.mx = Math.sin(sy) * k; bm.mz = Math.cos(sy) * k; }
+        if (lv >= 2 && tBusy && p.st > 30 && A === 'shield') bm.guard = 1;
+      } else {
+        if (d > want + 3) moveTo(tgt.x, tgt.z, d > 10);
+        else if (d < want - 4) { const by = ay + PI; bm.mx = Math.sin(by); bm.mz = Math.cos(by); }
+        else { bm.sideT -= 1; if (bm.sideT <= 0) { bm.side = W.R() < 0.5 ? -1 : 1; bm.sideT = 10 + W.R() * 12; } const sy = ay + bm.side * PI / 2; bm.mx = Math.sin(sy) * 0.5; bm.mz = Math.cos(sy) * 0.5; }
+        bm.aim = ay;
+      }
+      Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: bm.run, guard: bm.guard, aim: bm.aim });
+      return inp;
+    }
+    // 6) 목표로 이동 (사람 따라가기 · 거점)
+    bm.lk = -1; inp.lk = -1;
+    const goal = goalOf(W, p, hab);
+    bm.goal = goal;
+    if (goal) {
+      const d = Math.hypot(goal.x - p.x, goal.z - p.z);
+      if (d > (goal.near || 3)) moveTo(goal.x, goal.z, d > 14);
+      // 끼임
+      bm.stuckT += bm.tT || 0.2;
+      if (bm.stuckT > 2) { const mv = Math.hypot(p.x - bm.sx, p.z - bm.sz); if (mv < 0.8 && d > 4) { const y = W.R() * TAU; bm.mx = Math.sin(y); bm.mz = Math.cos(y); bm.tT = 0.8; } bm.stuckT = 0; bm.sx = p.x; bm.sz = p.z; }
+    }
+    Object.assign(inp, { mx: bm.mx, mz: bm.mz, run: bm.run });
+    return inp;
+  }
+  const avgLv = (W) => W.P.reduce((a, p) => a + p.lvl, 0) / W.P.length;
+  function lootGoal(W, p, rngPref, hab) {
+    let best = null, bd = 16 + hab.greed * 10;
+    const bad = p.bm.bad || new Set();
+    for (const d of W.D) {
+      if (bad.has(d)) continue;
+      const dd = Math.hypot(d.x - p.x, d.z - p.z); if (dd > bd) continue;
+      if (d.k === 'w') { const v = wScore(d.w, rngPref), cur = Math.min(...p.w.map((w) => wScore(w, rngPref))); if (!(p.w.length < 3 ? v > wScore(curW(p), rngPref) * 0.9 : v > cur * 1.08)) continue; }
+      else if (!p.it.some((x) => !x || (x[0] === d.it && x[1] < 3))) continue;
+      if (W.P.some((q) => q !== p && !q.down && q.bm && q.bm.loot === d.id && Math.hypot(d.x - q.x, d.z - q.z) < dd)) continue;
+      bd = dd; best = d;
+    }
+    if (best) { p.bm.loot = best.id; return best; }
+    for (const c of W.CH) if (!c.op && !bad.has(c)) { const dd = Math.hypot(c.x - p.x, c.z - p.z); if (dd < 18) { const P = W.POI[c.poi]; if (!P || P.alive <= 0 || dd < 4) return c; } }
+    for (const P of W.POI) if (P.alt && !bad.has(P.alt) && !P.used[p.i] && p.flm < 6 && Math.hypot(P.alt.x - p.x, P.alt.z - p.z) < 24 && P.alive <= 0) return P.alt;
+    // 은총: 레벨을 올릴 수 있으면
+    if (p.runes >= T.lvCost(p.lvl) && p.lvl < T.MAXLV) {
+      for (const g of W.gr) { if (bad.has(g) && W.t - (p.rest || 0) < 20) continue; const dd = Math.hypot(g.x - p.x, g.z - p.z); if (dd < 45) return g; }
+    }
+    if (p.fl < p.flm && p.fl <= 1) for (const g of W.gr) { if (bad.has(g)) continue; const dd = Math.hypot(g.x - p.x, g.z - p.z); if (dd < 30) return g; }
+    return null;
+  }
+  function goalOf(W, p, hab) {
+    const s = W.storm;
+    // 사람 따라가기
+    const hs = W.hum.filter((i) => W.P[i] && !W.P[i].down && i !== p.i);
+    if (hs.length) {
+      const h = W.P[hs[0]], a = p.bm.offA, r = 4 + hab.dist * 4;
+      if (W.ph !== 'day' || Math.hypot(h.x - p.x, h.z - p.z) > 9) return { x: h.x + Math.sin(a) * r, z: h.z + Math.cos(a) * r, near: 2.5 };
+      return null;
+    }
+    if (W.ph === 'rest') { const g = W.gr.find((x) => x.rest); if (g && p.runes >= T.lvCost(p.lvl) && p.lvl < T.MAXLV) return g; if (W.pt > 8 || p.lvl >= T.MAXLV || p.runes < T.lvCost(p.lvl)) return { x: FA.x, z: FA.z, near: 6 }; return g; }
+    if (W.ph !== 'day') return { x: s.x, z: s.z, near: 8 };
+    // 팀 계획
+    if (W.planT <= 0 || !W.plan) { W.planT = 4; W.plan = planTeam(W); }
+    const g = W.plan;
+    if (!g) return { x: s.nx, z: s.nz, near: 10 };
+    const a = p.bm.offA;
+    return { x: g.x + Math.sin(a) * 3, z: g.z + Math.cos(a) * 3, near: 3 };
+  }
+  function planTeam(W) {
+    const s = W.storm, u = W.pt / W.dayLen;
+    const alive = W.P.filter((p) => !p.down); if (!alive.length) return null;
+    const cx = alive.reduce((a, p) => a + p.x, 0) / alive.length, cz = alive.reduce((a, p) => a + p.z, 0) / alive.length;
+    if (u > 0.7) { const g = W.gr.find((x) => x.tmp); const c = W.FC[W.day - 1]; return g ? { x: g.x, z: g.z } : { x: c.x, z: c.z }; }
+    const safe = s.sh || s.tn < 45 ? { x: s.nx, z: s.nz, r: s.nr } : { x: s.x, z: s.z, r: s.r };
+    const lv = avgLv(W), runes = Math.min(...W.P.map((p) => p.runes - T.lvCost(p.lvl)));
+    let best = null, bs = 0;
+    const cur = W.plan;
+    for (const P of W.POI) {
+      if (Math.hypot(P.x - safe.x, P.z - safe.z) > safe.r - 12) continue;
+      let v = 0;
+      if (P.ty === 'grace') v = runes >= 0 ? 9 : 0;
+      else if (!P.cl) {
+        v = { fort: 7, cave: 8, boss: 8, mine: 5, church: 5, camp: 4, ruin: 3.5 }[P.ty] || 3;
+        if ((P.ty === 'cave' || P.ty === 'boss') && lv < (W.day >= 2 ? 6 : 4) && !W.taste) v *= 0.25;
+        if (P.ty === 'fort' && lv < 3 && W.day === 1 && !W.taste) v *= 0.6;
+        if (P.alive <= 0) v = 0;
+      } else if (P.ty === 'church' && W.P.some((p) => !P.used[p.i] && p.flm < 6)) v = 5;
+      if (!v) continue;
+      let sc = v / (1 + Math.hypot(P.x - cx, P.z - cz) / 55);
+      if (cur && cur.poi === P.i) sc *= 1.3;
+      if (sc > bs) { bs = sc; best = P; }
+    }
+    if (!best) return { x: safe.x, z: safe.z };
+    return { x: best.x, z: best.z, poi: best.i };
+  }
+  function skillGood(W, p, A, tgt, d, lv) {
+    const crowd = W.E.filter((e) => !e.dead && e.aw && dist(e, p) < 6).length;
+    if (A === 'shield') return d < 5 && (tgt.boss || crowd >= 2 || W.R() < 0.3);
+    if (A === 'hunter') return d < 12 && (tgt.boss || tgt.elite || tgt.fb || W.R() < 0.3);
+    if (A === 'ash') return crowd >= 2 || (d < 5 && (tgt.boss || tgt.fb));
+    if (A === 'breaker') return d < 5.5 && (tgt.boss || tgt.fb || crowd >= 2 || W.R() < 0.25);
+    if (A === 'archer') return d < 18;
+    if (A === 'priest') return W.P.some((q) => !q.down && dist(p, q) < 8 && q.hp < q.mhp * (lv === 1 ? 0.4 : 0.62));
+    return false;
+  }
+  function ultGood(W, p, A, tgt, d, bossFight) {
+    const crowd = W.E.filter((e) => !e.dead && e.aw && dist(e, p) < 9).length;
+    if (A === 'priest') return W.P.some((q) => q.down && dist(p, q) < 12) || W.P.filter((q) => !q.down && dist(p, q) < 12 && q.hp < q.mhp * 0.45).length >= Math.max(1, W.n - 1);
+    if (A === 'shield') return (bossFight && d < 10) || crowd >= 4;
+    if (A === 'breaker') return d < 6 && (bossFight || tgt.fb || crowd >= 4) && !(tgt.act && tgt.act.t < tgt.act.hT && d < 4);
+    if (A === 'archer') return bossFight || tgt.fb || crowd >= 4;
+    return bossFight || tgt.fb || crowd >= 3;
+  }
+
+  /* ======================= 네트워크 묶기 ======================= */
+  const AN = ['idle', 'walk', 'run', 'sprint', 'jump', 'guard', 'down', 'l0', 'l1', 'l2', 'h', 'j', 'art', 'roll', 'hit', 'gbrk', 'sk', 'ul', 'item', 'throw', 'dead', 'stag', 'brk', 'roar'];
+  const ANI = {}; AN.forEach((k, i) => { ANI[k] = i; });
+  const anCode = (a) => (a && a[0] === 'm' ? 40 + (+a.slice(1)) : ANI[a] != null ? ANI[a] : 0);
+  const anName = (c) => (c >= 40 ? 'm' + (c - 40) : AN[c] || 'idle');
+  const PRK = ['arrow', 'bolt', 'orb', 'lance', 'wave', 'spear', 'sun', 'knife', 'fpot', 'ipot', 'great', 'pot', 'rock', 'spit', 'orb2', 'dark'];
+  const ZK = ['rain', 'comet', 'ice', 'pool', 'void', 'meteor', 'fire'];
+  const TYI = Object.keys(T.ET);
+  const r1 = (v) => Math.round(v * 10), r2 = (v) => Math.round(v * 100);
+  const wCode = (w) => w ? w.join('.') : '';
+  const wDec = (s) => s ? s.split('.').map((x, i) => (i < 3 ? +x : x)) : null;
+  function pack(W, full) {
+    const o = { t: r1(W.t), ph: W.ph, d: W.day, pt: r1(W.pt), sv: [r1(W.storm.x), r1(W.storm.z), r1(W.storm.r), r1(W.storm.nx), r1(W.storm.nz), r1(W.storm.nr), r1(W.storm.tn), W.storm.sh], fx: W.fx.slice(-24), bn: W.bossNm, bE: W.bossE, ng: W.ng, pl: W.plan ? [r1(W.plan.x), r1(W.plan.z)] : 0 };
+    o.P = W.P.map((p) => [r1(p.x), r1(p.z), r1(p.y), r2(p.yaw), anCode(p.an), r2(p.at), r2(p.ad), Math.round(p.hp), p.mhp, Math.round(p.st), p.mst, p.lvl, p.runes,
+      (p.down ? 1 : 0) | (p.guard ? 2 : 0) | (p.gr ? 4 : 0) | (p.inStorm ? 8 : 0) | (p.spr ? 16 : 0), p.wi, p.w.map(wCode).join('|'), Math.round(p.ult), r1(p.skc), p.fl, p.flm, p.it.map((x) => (x ? x[0] + '.' + x[1] : '')).join('|'), p.lock, Math.round(p.rg / p.rq * 100), p.tp, p.a, Math.ceil(p.dT), bfBits(W, p), r1(p.vy), p.act && p.act.k === 'sk' && p.act.tg != null ? p.act.tg : -1]);
+    const near = (e) => W.P.some((p) => Math.abs(p.x - e.x) < 110 && Math.abs(p.z - e.z) < 110);
+    o.E = []; for (const e of W.E) { if (!e.boss && !near(e)) continue; if (e.dead && W.t - e.deadT > 5) continue;
+      o.E.push([e.id, TYI.indexOf(e.ty), r1(e.x), r1(e.z), r1(e.y), r2(e.yaw), anCode(e.an), r2(e.at), Math.round(e.hp / e.mhp * 1000), (e.aw ? 1 : 0) | (e.stag > 0 ? 2 : 0) | (e.brk ? 4 : 0) | (e.mk > W.t ? 8 : 0) | (e.dead ? 16 : 0) | (e.st.bt > W.t ? 32 : 0) | (e.st.pt > W.t ? 64 : 0) | (e.st.ft > W.t ? 128 : 0) | (e.enr ? 256 : 0), e.act ? e.act.m : -1, e.act ? r1(e.act.tx) : 0, e.act ? r1(e.act.tz) : 0, e.ph, e.boss ? Math.round(e.hp) : 0, e.boss ? e.mhp : 0]); }
+    o.Pr = W.Pr.map((q) => [PRK.indexOf(q.k), r1(q.x), r1(q.y), r1(q.z), r2(Math.atan2(q.vx, q.vz)), q.team === 'p' ? 1 : 0]);
+    o.Z = W.Z.map((z) => [r1(z.x), r1(z.z), r1(z.r), r1(Math.max(0, z.del)), ZK.indexOf(z.k), z.team === 'p' ? 1 : 0, r1(z.life)]);
+    o.D = W.D.map((d) => [d.id, d.k === 'w' ? 0 : 1, d.k === 'w' ? wCode(d.w) : d.it, r1(d.x), r1(d.z)]);
+    o.CH = W.CH.filter((c) => c.op).map((c) => c.id);
+    o.PC = W.POI.filter((P) => P.cl).map((P) => P.i);
+    o.AL = W.POI.filter((P) => P.alt).map((P) => [P.i, Object.keys(P.used).join('')]);
+    o.G = W.gr.filter((g) => g.tmp).map((g) => [r1(g.x), r1(g.z), g.rest ? 1 : 0]);
+    o.ack = W.ack;
+    if (W.done) o.done = W.done;
+    void full;
+    return o;
+  }
+  function bfBits(W, p) { return (buf(W, p, 'fort') ? 1 : 0) | (buf(W, p, 'atk') ? 2 : 0) | (buf(W, p, 'inc') ? 4 : 0) | (buf(W, p, 'pill') ? 8 : 0) | (buf(W, p, 'vow') ? 16 : 0) | (p.sts.bt > W.t ? 32 : 0) | (p.sts.pt > W.t ? 64 : 0) | (p.sts.ft > W.t ? 128 : 0) | (buf(W, p, 'taunt') ? 256 : 0); }
+  /* 손님: 호스트 묶음 → 세계. me: 내 자리(위치는 내가 정함) */
+  function unpack(W, o, me) {
+    W.t = o.t / 10; W.ph = o.ph; W.day = o.d; W.pt = o.pt / 10;
+    const v = o.sv; W.storm = { x: v[0] / 10, z: v[1] / 10, r: v[2] / 10, nx: v[3] / 10, nz: v[4] / 10, nr: v[5] / 10, tn: v[6] / 10, sh: v[7], dmg: 0 };
+    W.bossNm = o.bn; W.bossE = o.bE || []; W.ng = o.ng; W.plan = o.pl ? { x: o.pl[0] / 10, z: o.pl[1] / 10 } : null;
+    W.fxIn = o.fx;
+    o.P.forEach((a, i) => {
+      const p = W.P[i]; if (!p) return;
+      const tpChanged = a[23] !== p.tp;
+      if (i !== me || tpChanged || a[13] & 1) { p.tx = a[0] / 10; p.tz = a[1] / 10; p.ty = a[2] / 10; p.tyaw = a[3] / 100; if (i === me) { p.x = p.tx; p.z = p.tz; p.y = p.ty; p.tp = a[23]; } }
+      if (i !== me) { p.an = anName(a[4]); p.at = a[5] / 100; p.ad = a[6] / 100; p.guard = a[13] & 2 ? 1 : 0; p.gr = a[13] & 4 ? 1 : 0; p.spr = a[13] & 16 ? 1 : 0; p.tp = a[23]; }
+      p.hp = a[7]; p.mhp = a[8]; if (i !== me || Math.abs(p.st - a[9]) > 25) p.st = a[9]; p.mst = a[10]; p.lvl = a[11]; p.runes = a[12];
+      const wasDown = p.down; p.down = a[13] & 1; if (p.down && !wasDown) p.act = null;
+      p.inStorm = a[13] & 8 ? 1 : 0;
+      p.wi = a[14]; p.w = a[15].split('|').filter(Boolean).map(wDec); p.ult = a[16]; p.skc = a[17] / 10; p.fl = a[18]; p.flm = a[19];
+      p.it = a[20].split('|').map((s) => (s ? s.split('.').map(Number) : null)); if (i !== me) p.lock = a[21]; p.rgp = a[22]; p.a = a[24]; p.dT = a[25]; p.bfb = a[26]; p.vyN = a[27] / 10; p.skT = a[28];
+      p.pa = pasOf(p);
+    });
+    const seen = {};
+    for (const a of o.E) {
+      const id = a[0]; seen[id] = 1;
+      let e = W.em[id];
+      if (!e) { const ty = TYI[a[1]], d = T.ET[ty]; e = { id, ty, x: a[2] / 10, z: a[3] / 10, y: a[4] / 10, yaw: a[5] / 100, r: RADF[d.b] * d.sc, hh: HHF[d.b] * d.sc, boss: d.boss ? 1 : 0, fb: d.fb ? 1 : 0, elite: d.elite ? 1 : 0, st: { bt: 0, pt: 0, ft: 0 }, cd: {} }; W.em[id] = e; W.E.push(e); }
+      e.tx = a[2] / 10; e.tz = a[3] / 10; e.ty_ = a[4] / 10; e.tyaw = a[5] / 100; e.an = anName(a[6]); e.at = a[7] / 100; e.hpf = a[8] / 1000;
+      const f = a[9]; e.aw = f & 1; e.stag = f & 2 ? 1 : 0; e.brk = f & 4 ? 1 : 0; e.mkF = f & 8 ? 1 : 0; e.dead = f & 16 ? 1 : 0; e.stf = f; e.enr = f & 256 ? 1 : 0;
+      e.act = a[10] >= 0 ? { m: a[10], t: e.at, tx: a[11] / 10, tz: a[12] / 10, hi: 0 } : null; e.ph = a[13]; if (e.boss) { e.hp = a[14]; e.mhp = a[15]; }
+      e.seenT = W.t;
+    }
+    for (let i = W.E.length - 1; i >= 0; i--) if (!seen[W.E[i].id]) { delete W.em[W.E[i].id]; W.E.splice(i, 1); }
+    W.Pr = o.Pr.map((a) => ({ k: PRK[a[0]], x: a[1] / 10, y: a[2] / 10, z: a[3] / 10, yaw: a[4] / 100, team: a[5] ? 'p' : 'e' }));
+    W.Z = o.Z.map((a) => ({ x: a[0] / 10, z: a[1] / 10, r: a[2] / 10, del: a[3] / 10, k: ZK[a[4]], team: a[5] ? 'p' : 'e', life: a[6] / 10 }));
+    W.D = o.D.map((a) => (a[1] === 0 ? { id: a[0], k: 'w', w: wDec(a[2]), x: a[3] / 10, z: a[4] / 10 } : { id: a[0], k: 'i', it: a[2], x: a[3] / 10, z: a[4] / 10 }));
+    const op = {}; for (const id of o.CH) op[id] = 1; for (const c of W.CH) c.op = op[c.id] ? 1 : 0;
+    const pc = {}; for (const i of o.PC) pc[i] = 1; for (const P of W.POI) P.cl = pc[P.i] ? 1 : 0;
+    for (const [i, u] of o.AL || []) { const P = W.POI[i]; if (P) { P.used = {}; for (const ch of u) P.used[ch] = 1; } }
+    W.gr = W.gr.filter((g) => !g.tmp).concat((o.G || []).map((g) => ({ x: g[0] / 10, z: g[1] / 10, tmp: 1, rest: g[2] })));
+    if (o.done) W.done = o.done;
+    W.ack = o.ack || {};
+  }
+
+  Object.assign(S, { rayOb, DT, HALF, GN, GS, WL, BOUND, FA, REST, terrain, Hat, wet, makeWorld, step, ctrl, bot, habits, IN0, pack, unpack, stormAt, circles, inShape, curW, curC, pasOf, recalc, lockT, nearestE, treeOn, dist, angD, prng, AN, PRK, ZK, TYI, SK, UL, interact, lvCostOf: T.lvCost, anName });
+  T.sim = S;
+  if (typeof module === 'object' && module) module.exports = S;
+})();

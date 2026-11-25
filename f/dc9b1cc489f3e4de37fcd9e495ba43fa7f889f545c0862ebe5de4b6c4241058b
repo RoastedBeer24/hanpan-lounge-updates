@@ -1,0 +1,1232 @@
+/* 윷놀이 — 29칸 윷판, 윷가락 4개, 업기·잡기·지름길·빽도. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const SPD = () => ((L.debug && L.debug.speed) || 1) * (L.speed ? (L.speed() || 1) : 1);
+  const OUT = 99, HOME = -1;
+  const P_FLAT = 0.54; // measured from the physics throw below (20k throws, see tests); used only by the AI's risk estimate
+  const RNAME = { '-1': '빽도', 1: '도', 2: '개', 3: '걸', 4: '윷', 5: '모' };
+  const SPOT = { 0: '참먹이', 5: '모', 10: '뒷모', 15: '찌모', 22: '방' };
+
+  /* ---------- board graph ----------
+     outer ring 0..19 counter-clockwise from 참먹이(0, bottom-right): 5 = 모(top-right), 10 = 뒷모(top-left), 15 = 찌모(bottom-left)
+     diagonal 모→방: 20,21 · 방(22) · 방→찌모: 23,24 · 뒷모→방: 25,26 · 방→참먹이: 27,28 */
+  function step(cur, prev) {
+    if (cur === 0) return OUT;
+    if (cur >= 1 && cur <= 18) return cur + 1;
+    if (cur === 19) return 0;
+    return { 20: 21, 21: 22, 22: prev === 21 ? 23 : 27, 23: 24, 24: 15, 25: 26, 26: 22, 27: 28, 28: 0 }[cur];
+  }
+  function first(n) {
+    if (n === HOME) return 1;
+    if (n === 5) return 20;   // 모에 멈췄으면 지름길
+    if (n === 10) return 25;  // 뒷모에 멈췄으면 지름길
+    if (n === 22) return 27;  // 방에 멈췄으면 참먹이 쪽 지름길
+    return step(n, null);
+  }
+  function fwdPath(n) {
+    const out = [];
+    let cur = n, nx = first(n);
+    for (;;) { out.push(nx); if (nx === OUT) break; const p = cur; cur = nx; nx = step(cur, p); }
+    return out;
+  }
+  const PATH = {};
+  for (let n = -1; n <= 28; n++) PATH[n] = fwdPath(n);
+  const DIST = {}; for (const n in PATH) DIST[n] = PATH[n].length; // steps until out
+  const DEFPRED = { 0: 19, 20: 5, 21: 20, 22: 21, 23: 22, 24: 23, 25: 10, 26: 25, 27: 22, 28: 27 };
+  for (let k = 1; k <= 19; k++) DEFPRED[k] = k - 1;
+  const onBoard = (n) => n >= 0 && n <= 28;
+
+  /* ---------- physical stick throw ----------
+     A yut stick is a long half-round stick: a flat-ish belly (배, the split face) and a rounded back (등). It tumbles almost
+     only about its long axis, so each stick is simulated as its CROSS-SECTION: a 2D rigid body (polygon of a circular
+     segment 30 mm wide, 15 mm thick, edges worn round, belly very slightly convex), uniform wood density → real centre of
+     mass (≈6 mm from the belly) and moment of inertia. Gravity, impulse contacts with restitution + Coulomb friction on a
+     soft mat, rolling damping, side walls of the throwing area. Fixed step, seeded PRNG, only + − × ÷ √ → identical on
+     every device, so apply() decides the result and the view replays the very same tumble from the stored seed. */
+  const YP = { a: 0.015, h: 0.015, b: 0.002, rc: 0.002, G: 9.81, DT: 1 / 600, E: 0.15, MU: 0.8, KD: 30, MAXT: 4, WALL: 0.3 };
+  const YSH = (function () {
+    const a = YP.a, h = YP.h, rc = YP.rc, Rc = (a * a + h * h) / (2 * h), cc = Rc - h, P = [], N = 12;
+    for (let i = 0; i <= N; i++) { const x = -a + rc + (2 * a - 2 * rc) * i / N; P.push([x, cc - Math.sqrt(Rc * Rc - x * x)]); } // back (등)
+    const fil = (t) => [1 - t * t / 2 * 2.4674, t * 1.5708 - t * t * t * 0.646]; // ≈ cos/sin of a quarter turn
+    for (let k = 1; k < 4; k++) { const f = fil(k / 4); P.push([a - rc + rc * f[0], -rc + rc * f[1]]); }
+    P.push([a - rc, 0]);
+    for (let i = 1; i < 8; i++) { const u = 1 - i / 4, x = (a - rc) * u; P.push([x, YP.b * (1 - u * u)]); } // belly (배)
+    P.push([-a + rc, 0]);
+    for (let k = 1; k < 4; k++) { const f = fil(1 - k / 4); P.push([-(a - rc) - rc * f[0], -rc + rc * f[1]]); }
+    let A = 0, cx = 0, cy = 0, I = 0;
+    for (let i = 0; i < P.length; i++) {
+      const p = P[i], q = P[(i + 1) % P.length], c2 = p[0] * q[1] - q[0] * p[1];
+      A += c2; cx += (p[0] + q[0]) * c2; cy += (p[1] + q[1]) * c2;
+      I += c2 * (p[0] * p[0] + p[0] * q[0] + q[0] * q[0] + p[1] * p[1] + p[1] * q[1] + q[1] * q[1]);
+    }
+    A /= 2; cx /= 6 * A; cy /= 6 * A; I = I / 12 / A - (cx * cx + cy * cy);
+    return { V: P.map((p) => [p[0] - cx, p[1] - cy]), I: Math.abs(I) };
+  })();
+  function yrng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function YStick(r, i, pw) {
+    pw = pw || 1;
+    let c, s; do { c = r() * 2 - 1; s = r() * 2 - 1; } while (c * c + s * s > 1 || c * c + s * s < 0.05);
+    const l = Math.sqrt(c * c + s * s);
+    this.c = c / l; this.s = s / l;                      // orientation (cos, sin); belly up ⇔ c > 0
+    this.x = (i - 1.5) * 0.05 + (r() - 0.5) * 0.03;      // sideways position (m)
+    this.y = 0.25 + r() * 0.2;                           // height above the mat (m)
+    this.vx = (r() - 0.5) * 1.2 * pw; this.vy = (0.4 + r() * 2) * pw;
+    this.w = (r() < 0.5 ? -1 : 1) * (6 + r() * 30) * (0.6 + 0.4 * pw);      // spin about the long axis (rad/s)
+    this.rest = 0; this.done = false; this.hits = 0; this.touch = false;
+  }
+  YStick.prototype.step = function () {
+    if (this.done) return;
+    const dt = YP.DT, V = YSH.V, I = YSH.I;
+    this.vy -= YP.G * dt;
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    const an = this.w * dt, a2 = an * an, ca = 1 - a2 / 2 + a2 * a2 / 24, sa = an - an * a2 / 6;
+    let c = this.c * ca - this.s * sa, s = this.s * ca + this.c * sa; const l = Math.sqrt(c * c + s * s); c /= l; s /= l;
+    this.c = c; this.s = s;
+    if (this.x > YP.WALL && this.vx > 0) this.vx = -0.4 * this.vx; else if (this.x < -YP.WALL && this.vx < 0) this.vx = -0.4 * this.vx;
+    let touch = false, deep = 0;
+    for (let it = 0; it < 4; it++) {                    // sequential impulses over every vertex below the mat
+      for (let k = 0; k < V.length; k++) {
+        const rx = c * V[k][0] - s * V[k][1], ry = s * V[k][0] + c * V[k][1];
+        const py = this.y + ry;
+        if (py > 0) continue;
+        touch = true; if (-py > deep) deep = -py;
+        const vn = this.vy + this.w * rx;
+        if (vn >= 0) continue;
+        const e = it === 0 && vn < -0.4 ? YP.E : 0;
+        const jn = -(1 + e) * vn / (1 + rx * rx / I);
+        this.vy += jn; this.w += rx * jn / I;
+        const vt = this.vx - this.w * ry;
+        let jt = -vt / (1 + ry * ry / I);
+        const mx = YP.MU * jn; if (jt > mx) jt = mx; else if (jt < -mx) jt = -mx;
+        this.vx += jt; this.w -= ry * jt / I;
+        if (it === 0 && vn < -0.4) this.hits++;
+      }
+    }
+    if (deep > 0) this.y += deep * 0.5;
+    if (touch) { this.w *= 1 - YP.KD * dt; this.vx *= 1 - YP.KD * dt; } // the mat soaks up rolling
+    this.touch = touch;
+    const ke = this.vx * this.vx + this.vy * this.vy + I * this.w * this.w;
+    if (touch && ke < 4e-4) this.rest += dt; else this.rest = 0;
+    if (this.rest > 0.15) { this.done = true; this.vx = this.vy = this.w = 0; }
+  };
+  /* throw four sticks with a seed. With rec = frame interval (s), also returns frames for the view. */
+  function yutThrow(seed, rec, pw) {
+    const r = yrng(seed), st = [0, 1, 2, 3].map((i) => new YStick(r, i, pw));
+    const frames = [], every = rec ? Math.max(1, Math.round(rec / YP.DT)) : 0;
+    let t = 0, n = 0;
+    while (t < YP.MAXT && st.some((k) => !k.done)) {
+      if (every && n % every === 0) frames.push(st.map((k) => [k.x, k.y, k.c, k.s, k.hits]));
+      st.forEach((k) => k.step()); t += YP.DT; n++;
+    }
+    if (every) frames.push(st.map((k) => [k.x, k.y, k.c, k.s, k.hits]));
+    return { flat: st.map((k) => (k.c > 0 ? 1 : 0)), t, frames };
+  }
+
+  function probs(bd) {
+    const p = P_FLAT, q = 1 - p;
+    const r = { 1: 4 * p * q * q * q, 2: 6 * p * p * q * q, 3: 4 * p * p * p * q, 4: p * p * p * p, 5: q * q * q * q };
+    if (bd) { r[-1] = r[1] / 4; r[1] = r[1] * 3 / 4; }
+    return r;
+  }
+
+  /* ---------- state ---------- */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length;
+    const np = [2, 3, 4].includes(opts.pc) ? opts.pc : 4;
+    return {
+      n, np, bd: opts.bd === 0 ? 0 : 1, tm: opts.tm === 1 && n === 4 ? 1 : 0,
+      p: players.map(() => Array(np).fill(HOME)), v: players.map(() => Array(np).fill(0)),
+      t: 0, ph: 'T', q: [], last: null, seq: 0, w: null, tn: 0, g: Math.floor(Math.random() * 1e6),
+    };
+  }
+  const team = (s, seat) => (s.tm ? seat % 2 : seat);
+  const allies = (s, a, b) => team(s, a) === team(s, b);
+  const doneSeat = (s, seat) => s.p[seat].every((x) => x === OUT);
+  function actor(s) { return s.w ? null : s.t; }
+  // 상황 도움말(라운드 35)
+  function hint(s, seat) {
+    const nm = (n) => (n === OUT ? '나가기(골인)' : SPOT[n] ? SPOT[n] : n === HOME ? '출발 전' : n >= 20 ? '지름길' : '바깥 길');
+    const me = seat >= 0 ? seat : s.t;
+    const left = s.p[me].filter((x) => x !== OUT).length;
+    if (s.t !== seat) return [(seat >= 0 ? '상대 차례예요. ' : '') + '내 말 ' + (s.np - left) + '/' + s.np + '개가 나갔어요.', '모·뒷모·방에 딱 멈추면 다음에 지름길로 가요.'];
+    if (s.ph === 'T' || !s.q.length) {
+      const out = ['윷을 던질 차례예요. 길게 누르면 세게, 짧게 누르면 약하게 던져요.'];
+      if (s.q.length) out.push('쌓인 결과: ' + s.q.map((r) => RNAME[r]).join(' · ') + ' — 윷·모·잡기면 한 번 더 던져요.');
+      else out.push('윷(4)·모(5)가 나오거나 상대 말을 잡으면 한 번 더 던져요.');
+      return out;
+    }
+    const out = ['쓸 결과: ' + s.q.map((r) => RNAME[r]).join(' · ') + ' — 결과 하나를 골라 말 하나(업힌 말은 함께)를 옮겨요.'];
+    const seen = {};
+    for (const m of moves(s, seat)) {
+      const key = m.r + ':' + m.dest; if (seen[key]) continue; seen[key] = 1;
+      let tag = '';
+      if (m.dest !== OUT && onBoard(m.dest)) {
+        for (let o = 0; o < s.n; o++) {
+          if (!s.p[o].includes(m.dest) || o === seat) continue;
+          tag = allies(s, o, seat) ? ' → 우리 편 말과 업기' : ' → 상대 말 잡기! (한 번 더)';
+          break;
+        }
+        if (!tag && m.grp.length === 1 && s.p[seat].some((x, j) => x === m.dest && !m.grp.includes(j))) tag = ' → 내 말과 업기(같이 움직여요)';
+        if (!tag && (m.dest === 5 || m.dest === 10 || m.dest === 22)) tag = ' → 지름길 입구';
+      }
+      out.push(RNAME[m.r] + ': ' + (m.from === HOME ? '새 말' : nm(m.from) + (m.grp.length > 1 ? '의 ' + m.grp.length + '말' : ' 말')) + ' → ' + nm(m.dest) + tag);
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+
+  function canBack(s, seat) { return s.p[seat].some(onBoard); }
+  /* all distinct legal moves for seat: one per (group, result value) */
+  function moves(s, seat) {
+    const res = [], seenR = {};
+    s.q.forEach((r, k) => {
+      if (seenR[r]) return; seenR[r] = 1;
+      const seenN = {};
+      s.p[seat].forEach((pos, i) => {
+        if (pos === OUT || seenN[pos]) return;
+        if (r === -1 && !onBoard(pos)) return;
+        seenN[pos] = 1;
+        res.push(moveInfo(s, seat, i, k));
+      });
+    });
+    return res;
+  }
+  function moveInfo(s, seat, i, k) {
+    const r = s.q[k], pos = s.p[seat][i];
+    let path, dest, pv;
+    if (r === -1) { dest = s.v[seat][i]; if (!onBoard(dest)) dest = DEFPRED[pos]; path = [dest]; pv = DEFPRED[dest]; }
+    else {
+      const full = PATH[pos];
+      path = full.slice(0, Math.min(r, full.length));
+      dest = path[path.length - 1];
+      pv = path.length >= 2 ? path[path.length - 2] : pos === HOME ? 0 : pos;
+    }
+    const grp = pos === HOME ? [i] : s.p[seat].map((x, j) => (x === pos ? j : -1)).filter((j) => j >= 0);
+    return { i, k, r, from: pos, dest, path, pv, grp };
+  }
+  function nextSeat(s) {
+    let t = s.t;
+    for (let c = 0; c < s.n; c++) { t = (t + 1) % s.n; if (!doneSeat(s, t)) return t; }
+    return t;
+  }
+  function endTurn(s) { s.q = []; s.ph = 'T'; s.t = nextSeat(s); s.tn++; }
+  function settle(s) {
+    if (s.w || s.ph !== 'M') return;
+    if (!s.q.length) { endTurn(s); return; }
+    if (!moves(s, s.t).length) { if (s.last) s.last.x = s.q.slice(); endTurn(s); }
+  }
+  function checkWin(s) {
+    if (s.tm) {
+      for (const tmId of [0, 1]) if (doneSeat(s, tmId) && doneSeat(s, tmId + 2)) { s.w = [tmId, tmId + 2]; return true; }
+      return false;
+    }
+    for (let i = 0; i < s.n; i++) if (doneSeat(s, i)) { s.w = [i]; return true; }
+    return false;
+  }
+
+  function apply(s, seat, a) {
+    if (s.w || seat !== s.t || !a) throw new Error('not your turn');
+    if (a.t === 'th') {
+      if (s.ph !== 'T') throw new Error('not throwing now');
+      const sd = Math.floor(Math.random() * 2147483647);
+      const pw = Math.round(U.clamp(+a.pw || 1, 0.8, 1.6) * 20) / 20; // 던지는 힘(흔들기·길게 누르기): 높이·회전만 바뀌고 확률은 거의 같다
+      const st = yutThrow(sd, 0, pw).flat; // physics decides which face lands up
+      const c = st[0] + st[1] + st[2] + st[3];
+      let r = c === 0 ? 5 : c;
+      if (s.bd && c === 1 && st[0] === 1) r = -1; // 표시된 윷가락 하나만 배 → 빽도
+      s.q.push(r);
+      if (r >= 4) kst(s)[seat][2]++;
+      s.last = { id: ++s.seq, k: 'T', s: seat, st: st.join(''), r, sd, pw };
+      s.ph = r >= 4 ? 'T' : 'M';
+      settle(s);
+      return s;
+    }
+    if (a.t === 'mv') {
+      if (s.ph !== 'M') throw new Error('throw first');
+      const k = a.k | 0, i = a.i | 0;
+      if (k < 0 || k >= s.q.length) throw new Error('bad result');
+      if (i < 0 || i >= s.np) throw new Error('bad piece');
+      const pos = s.p[seat][i];
+      if (pos === OUT) throw new Error('piece is out');
+      if (s.q[k] === -1 && !onBoard(pos)) throw new Error('빽도 needs a piece on board');
+      const m = moveInfo(s, seat, i, k);
+      s.q.splice(k, 1);
+      for (const j of m.grp) { s.p[seat][j] = m.dest; s.v[seat][j] = m.pv; }
+      const cap = [];
+      let stack = 0;
+      if (onBoard(m.dest)) {
+        for (let o = 0; o < s.n; o++) {
+          if (o === seat) continue;
+          if (allies(s, o, seat)) continue;
+          let c = 0;
+          s.p[o].forEach((x, j) => { if (x === m.dest) { s.p[o][j] = HOME; s.v[o][j] = 0; c++; } });
+          if (c) { cap.push([o, c]); kst(s)[seat][0] += c; s.ks[o][1] += c; }
+        }
+        s.p[seat].forEach((x, j) => { if (x === m.dest) { s.v[seat][j] = m.pv; if (!m.grp.includes(j)) stack++; } });
+      }
+      s.last = { id: ++s.seq, k: 'M', s: seat, f: m.from, pa: m.path, pc: m.grp, r: m.r, cap, up: stack };
+      if (checkWin(s)) return s;
+      if (cap.length) { s.ph = 'T'; return s; } // 잡으면 한 번 더
+      settle(s);
+      return s;
+    }
+    throw new Error('bad action');
+  }
+  // per-seat result stats: [captured, got captured, 윷·모 thrown]
+  function kst(s) { if (!s.ks) s.ks = s.p.map(() => [0, 0, 0]); return s.ks; }
+  function result(s) {
+    if (!s.w) return null;
+    const ks = s.ks || s.p.map(() => [0, 0, 0]);
+    const stats = [{ label: '난 말', values: s.p.map((ps) => ps.filter((x) => x === OUT).length + '/' + s.np) }, { label: '잡은 말', values: ks.map((k) => String(k[0])) },
+      { label: '잡힌 말', values: ks.map((k) => String(k[1])) }, { label: '윷·모', values: ks.map((k) => String(k[2])) }];
+    return { winners: s.w.slice(), stats, text: s.tm ? '같은 팀 두 사람의 말이 모두 났어요.' : '말 ' + s.np + '개를 가장 먼저 모두 냈어요.' };
+  }
+
+  /* ---------- AI ---------- */
+  // chance that some enemy hits node x on their next throw (incl. 빽도 from just ahead)
+  function hitChance(s, seat, x, P) {
+    if (!onBoard(x)) return 0;
+    let miss = 1;
+    for (let o = 0; o < s.n; o++) {
+      if (allies(s, o, seat) || doneSeat(s, o)) continue;
+      let ph = 0;
+      for (const rk in P) {
+        const r = +rk;
+        let hit = false;
+        for (let j = 0; j < s.np && !hit; j++) {
+          const pos = s.p[o][j];
+          if (pos === OUT) continue;
+          if (r === -1) { if (onBoard(pos) && (onBoard(s.v[o][j]) ? s.v[o][j] : DEFPRED[pos]) === x) hit = true; }
+          else { const pa = PATH[pos]; if (r <= pa.length && pa[r - 1] === x) hit = true; }
+        }
+        if (hit) ph += P[rk];
+      }
+      // 윷·모 give another throw: a little extra danger
+      miss *= 1 - Math.min(0.95, ph * 1.15);
+    }
+    return 1 - miss;
+  }
+  function pieceVal(n) { return n === HOME ? 0 : n === OUT ? 30 : 8 + (21 - DIST[n]); }
+  function evalState(s, seat, P) {
+    // my progress minus expected losses, minus enemy progress
+    let v = 0;
+    const nodes = {};
+    s.p[seat].forEach((x) => { v += pieceVal(x); if (onBoard(x)) nodes[x] = (nodes[x] || 0) + 1; });
+    for (const x in nodes) v -= hitChance(s, seat, +x, P) * nodes[x] * (pieceVal(+x) + 4);
+    for (let o = 0; o < s.n; o++) {
+      if (o === seat) continue;
+      let pv = 0; s.p[o].forEach((x) => { pv += pieceVal(x); });
+      v -= allies(s, o, seat) ? -0.5 * pv : pv * (s.tm ? 0.5 : 1 / Math.max(1, s.n - 1));
+    }
+    return v;
+  }
+  /* ---- 어려움: expectimax ----
+     my remaining results are played out (max), an extra throw after a capture is averaged over its outcomes, and the
+     position is then judged by averaging over the next enemy's throw, letting that enemy pick its best reply. */
+  const tryMv = (s, seat, m) => { const c = U.clone(s); c.last = null; try { return apply(c, seat, { t: 'mv', i: m.i, k: m.k }); } catch (e) { return null; } };
+  function stackVal(s, seat) {
+    let v = 0;
+    const cnt = {};
+    s.p[seat].forEach((x) => { if (onBoard(x)) cnt[x] = (cnt[x] || 0) + 1; });
+    for (const x in cnt) if (cnt[x] > 1) v += (cnt[x] - 1) * (DIST[x] > 8 ? 3 : 1.5); // a stack saves throws, worth more far from home
+    return v;
+  }
+  const tnow = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let hardEnd = 0, cheap = false;
+  function leafHard(s, seat, P) {
+    if (s.w) return s.w.includes(seat) ? 1e5 : -1e5;
+    const base = evalState(s, seat, P) + stackVal(s, seat);
+    const o = s.t;
+    if (o === seat || allies(s, o, seat) || cheap || tnow() > hardEnd + 120) return base;
+    // the next enemy's throw: average over outcomes, enemy picks the reply that hurts me most by my own measure
+    let ev = 0, tot = 0;
+    for (const rk in P) {
+      const r = +rk, pr = P[rk];
+      const t = U.clone(s); t.q = [r]; t.ph = 'M'; t.last = null;
+      let worst = null;
+      for (const m of moves(t, o)) {
+        const ns = tryMv(t, o, m);
+        if (!ns) continue;
+        let v = ns.w ? (ns.w.includes(seat) ? 1e5 : -1e5) : evalState(ns, seat, P) + stackVal(ns, seat);
+        if (ns.last && ns.last.cap.length) v -= 6; // they throw again
+        if (worst === null || v < worst) worst = v;
+      }
+      ev += pr * (worst === null ? base : Math.min(base + 2, worst)); tot += pr;
+    }
+    return ev / tot;
+  }
+  function valHard(s, seat, P, budget) {
+    if (s.w) return s.w.includes(seat) ? 1e5 : -1e5;
+    if (s.t !== seat) return leafHard(s, seat, P);
+    if (s.ph === 'M') {
+      let best = -Infinity;
+      for (const m of moves(s, seat)) {
+        const ns = tryMv(s, seat, m);
+        if (!ns) continue;
+        const v = valHard(ns, seat, P, budget);
+        if (v > best) best = v;
+      }
+      return best === -Infinity ? leafHard(s, seat, P) : best;
+    }
+    // extra throw (after a capture or 윷·모 still to come): average over outcomes, once
+    if (budget.x <= 0) return evalState(s, seat, P) + stackVal(s, seat) + 10;
+    budget.x--;
+    let ev = 0, tot = 0;
+    for (const rk in P) {
+      const r = +rk;
+      const t = U.clone(s); t.q = s.q.concat([r]); t.ph = 'M'; t.last = null;
+      let v;
+      if (!moves(t, seat).length) v = evalState(t, seat, P) + stackVal(t, seat);
+      else v = valHard(t, seat, P, budget) + (r >= 4 ? 6 : 0);
+      ev += P[rk] * v; tot += P[rk];
+    }
+    budget.x++;
+    return ev / tot;
+  }
+  function aiHard(s, seat) {
+    const P = probs(s.bd), budget = { x: s.q.length > 2 ? 0 : 1 };
+    cheap = s.q.length > 3; hardEnd = tnow() + 220;
+    let best = null, bv = -Infinity;
+    for (const m of moves(s, seat)) {
+      if (!cheap && tnow() > hardEnd) return aiHardCheap(s, seat, P);
+      const ns = tryMv(s, seat, m);
+      if (!ns) continue;
+      let v = valHard(ns, seat, P, budget);
+      if (m.from === HOME && m.r >= 4) v -= 1;
+      v += Math.random() * 0.05;
+      if (v > bv) { bv = v; best = m; }
+    }
+    cheap = false;
+    return best;
+  }
+  function aiHardCheap(s, seat, P) {
+    cheap = true;
+    let best = null, bv = -Infinity;
+    for (const m of moves(s, seat)) {
+      const ns = tryMv(s, seat, m);
+      if (!ns) continue;
+      const v = valHard(ns, seat, P, { x: 0 });
+      if (v > bv) { bv = v; best = m; }
+    }
+    cheap = false;
+    return best;
+  }
+  /* 쉬움: mostly random, with a simple urge to move forward (and grab an obvious capture now and then) */
+  function aiEasy(s, seat) {
+    const ms = moves(s, seat);
+    if (!ms.length) return null;
+    const R = Math.random();
+    if (R < 0.4) return ms[(Math.random() * ms.length) | 0];
+    let best = null, bv = -Infinity;
+    for (const m of ms) {
+      let v = (DIST[m.from] - (m.dest === OUT ? 0 : DIST[m.dest])) + Math.random() * 4;
+      if (R < 0.6 && onBoard(m.dest) && s.p.some((ps, o) => o !== seat && !allies(s, o, seat) && ps.includes(m.dest))) v += 6;
+      if (v > bv) { bv = v; best = m; }
+    }
+    return best;
+  }
+  /* AI 성향(core 라운드 31): 공격형은 잡기, 수비형은 안전·업기, 도박형은 지름길·큰 이동을 더 좋아함 — 가끔 기본 수 대신 성향 수 */
+  function ai(s, seat, lv) {
+    if (s.ph === 'T') return { t: 'th' };
+    const sty = (L.aiStyle && L.aiStyle(seat)) || 'bal';
+    if (sty !== 'bal' && Math.random() < (lv === 3 ? 0.25 : 0.4)) {
+      let best = null, bv = -1e9;
+      for (const m of moves(s, seat)) {
+        let ns; try { const c = U.clone(s); c.last = null; ns = apply(c, seat, { t: 'mv', i: m.i, k: m.k }); } catch (e) { continue; }
+        if (ns.w && ns.w.includes(seat)) return { t: 'mv', i: m.i, k: m.k };
+        const L2 = ns.last || {};
+        let v = Math.random() * 0.5;
+        if (sty === 'agg') v += (L2.cap && L2.cap.length ? 10 : 0) + (DIST[m.from] - (m.dest === OUT ? 0 : DIST[m.dest])) * 0.3;
+        else if (sty === 'def') v += (L2.up ? 5 : 0) + (m.dest === OUT ? 6 : 0) - (onBoard(m.dest) && s.p.some((ps, o) => o !== seat && !allies(s, o, seat) && ps.some((x) => onBoard(x) && DIST[x] > DIST[m.dest] && DIST[x] - DIST[m.dest] <= 5)) ? 4 : 0);
+        else v += (DIST[m.from] - (m.dest === OUT ? 0 : DIST[m.dest])) * 0.8 + (L2.cap && L2.cap.length ? 4 : 0);
+        if (v > bv) { bv = v; best = m; }
+      }
+      if (best) return { t: 'mv', i: best.i, k: best.k };
+    }
+    if (lv === 1 || lv === 3) {
+      const m = lv === 1 ? aiEasy(s, seat) : aiHard(s, seat);
+      if (m) return { t: 'mv', i: m.i, k: m.k };
+    }
+    const P = probs(s.bd);
+    const ms = moves(s, seat);
+    let best = null, bv = -1e9;
+    for (const m of ms) {
+      const c = U.clone(s);
+      c.last = null;
+      let ns;
+      try { ns = apply(c, seat, { t: 'mv', i: m.i, k: m.k }); } catch (e) { continue; }
+      let v = evalState(ns, seat, P);
+      if (ns.w && ns.w.includes(seat)) v += 1e5;
+      if (ns.last && ns.last.cap.length) v += 14; // extra throw
+      if (ns.last && ns.last.up) v += 2;
+      // keep big throws for pieces that can use them: prefer spending small results on home entries
+      if (m.from === HOME && m.r >= 4) v -= 1.5;
+      v += Math.random() * 0.3;
+      if (v > bv) { bv = v; best = m; }
+    }
+    return best ? { t: 'mv', i: best.i, k: best.k } : { t: 'mv', i: 0, k: 0 };
+  }
+  function aiDelayFor(s, seat, lv) { return (s.ph === 'T' ? 420 : 520) + (lv === 1 ? 200 : lv === 3 ? -120 : 0); }
+
+  /* ---------- geometry ---------- */
+  function nodeN(n) { // normalized position in the inner square (0..1)
+    if (n >= 0 && n <= 19) {
+      if (n <= 5) return [1, 1 - n / 5];
+      if (n <= 10) return [1 - (n - 5) / 5, 0];
+      if (n <= 15) return [0, (n - 10) / 5];
+      return [(n - 15) / 5, 1];
+    }
+    const t = (i) => i / 3;
+    switch (n) {
+      case 20: return [1 - 0.5 * t(1), 0.5 * t(1)];
+      case 21: return [1 - 0.5 * t(2), 0.5 * t(2)];
+      case 22: return [0.5, 0.5];
+      case 23: return [0.5 - 0.5 * t(1), 0.5 + 0.5 * t(1)];
+      case 24: return [0.5 - 0.5 * t(2), 0.5 + 0.5 * t(2)];
+      case 25: return [0.5 * t(1), 0.5 * t(1)];
+      case 26: return [0.5 * t(2), 0.5 * t(2)];
+      case 27: return [0.5 + 0.5 * t(1), 0.5 + 0.5 * t(1)];
+      case 28: return [0.5 + 0.5 * t(2), 0.5 + 0.5 * t(2)];
+    }
+    return [1.16, 1.16];
+  }
+  const BIG = { 0: 1, 5: 1, 10: 1, 15: 1, 22: 1 };
+
+  function rng(seed) { let x = (seed * 2654435761) >>> 0 || 1; return () => { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x / 4294967296; }; }
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+
+  /* 흔들어 던지기(폰 DeviceMotion) — 기기에 저장 (yacht와 같은 방식) */
+  const SHAKE_KEY = 'lounge.yut.shake';
+  const hasMotion = () => typeof window.DeviceMotionEvent !== 'undefined' && ('ontouchstart' in window || (navigator.maxTouchPoints || 0) > 0);
+  const needPerm = () => typeof window.DeviceMotionEvent !== 'undefined' && typeof window.DeviceMotionEvent.requestPermission === 'function';
+  function shakeOn() { try { return localStorage.getItem(SHAKE_KEY) !== 'off'; } catch (e) { return true; } }
+  function setShakeOn(v) { try { localStorage.setItem(SHAKE_KEY, v ? 'on' : 'off'); } catch (e) {} }
+  let motionGranted = false;
+
+  /* ---------- view ---------- */
+  function mount(root, api) {
+    const cv = U.canvas(root);
+    const ctx = cv.ctx;
+    let st = null, ds = null; // latest state, displayed state (lags during animation)
+    let G = null, boardImg = null;
+    let anim = null, sel = null, pending = false, time = 0, shownKey = '', busy = false, wd = 0;
+    const onCancelEv = (e) => { if (sel != null) { sel = null; refresh(); e.preventDefault(); } };
+    window.addEventListener('lounge-cancel', onCancelEv);
+    let flash = null; // {text, sub, col, t, life}
+
+    const top = L.h('div', { class: 'hud top yt-top', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px', alignItems: 'stretch' } });
+    const chipsBox = L.h('div', { class: 'panel yt-chips', style: { flex: '1 1 0', minWidth: 0, display: 'flex', gap: '6px', alignItems: 'center', minHeight: '44px', padding: '5px 8px', overflow: 'hidden' } });
+    const homeBtn = L.h('button', { class: 'btn yt-home', style: { flex: 'none', minWidth: '92px', padding: '6px 10px', gap: '6px' }, onclick() { if (!myMove()) return; api.sfx('click'); api.buzz(10); selectGroup(sel === HOME ? null : HOME); } });
+    const hint = L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, minHeight: '44px', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, padding: '6px 10px', lineHeight: 1.25 } });
+    let noClick = 0, charge = null, rattleUntil = 0;
+    const throwBtn = L.h('button', { 'data-action': 'throw', class: 'btn primary yt-throw', style: { flex: 'none', minWidth: '118px', minHeight: '48px', fontSize: '16px', touchAction: 'none' }, text: '윷 던지기', onclick() { if (performance.now() < noClick) return; doThrow(1); } });
+    // 길게 누르면 손안에서 윷가락이 달그락 → 놓는 순간 던짐(오래 쥘수록 높이·세게)
+    throwBtn.addEventListener('pointerdown', (e) => { if (!myThrow()) return; startCharge(); try { throwBtn.setPointerCapture(e.pointerId); } catch (er) {} });
+    throwBtn.addEventListener('pointerup', () => { if (charge) { noClick = performance.now() + 450; releaseCharge(); } });
+    throwBtn.addEventListener('pointercancel', () => { charge = null; });
+    function startCharge() { charge = { t0: performance.now(), lastTick: 0 }; }
+    function releaseCharge() {
+      if (!charge) return;
+      const held = (performance.now() - charge.t0) / 1000; charge = null;
+      doThrow(held < 0.18 ? 1 : 0.85 + U.clamp(held / 0.9, 0, 1) * 0.7);
+    }
+    const motionDev = hasMotion();
+    const shakeBtn = L.h('button', { class: 'btn', style: { flex: 'none', minHeight: '48px', minWidth: '54px', padding: '2px 6px', fontSize: '12px', lineHeight: 1.15, display: motionDev ? '' : 'none' }, 'aria-label': '흔들어 던지기', onclick: toggleShake });
+    const bottom = L.h('div', { class: 'hud bottom yt-bot', style: { flexDirection: 'column', alignItems: 'stretch', gap: '8px', padding: '8px 12px 12px' } },
+      L.h('div', { style: { display: 'flex', gap: '8px', alignItems: 'stretch' } }, chipsBox, homeBtn),
+      L.h('div', { style: { display: 'flex', gap: '8px', alignItems: 'stretch' } }, hint, shakeBtn, throwBtn));
+    // tutorial spotlight targets (invisible): the whole board, and the 참먹이 corner where pieces start and leave
+    const boardMark = L.h('div', { class: 'yt-board', style: { position: 'absolute', pointerEvents: 'none' } });
+    const startMark = L.h('div', { class: 'yt-start', style: { position: 'absolute', pointerEvents: 'none' } });
+    root.append(boardMark, startMark, top, bottom);
+
+    const setBusy = (b) => { busy = b; api.setBusy(b); };
+    const mine = () => st && !st.w && !anim && api.canAct(st.t) && !pending;
+    const myMove = () => mine() && st.ph === 'M';
+    const myThrow = () => mine() && st.ph === 'T';
+
+    function doThrow(pw) {
+      charge = null;
+      if (!myThrow()) return;
+      pending = true; api.sfx('roll'); api.buzz(15);
+      api.act({ t: 'th', pw: Math.round(U.clamp(typeof pw === 'number' ? pw : 1, 0.8, 1.6) * 20) / 20 });
+      setTimeout(() => { if (pending) { pending = false; refresh(); } }, 3000);
+      refresh();
+    }
+
+    /* ---- 흔들어 던지기 ---- */
+    let listening = false, shakeE = 0, lastShake = 0;
+    function shakeActive() { return motionDev && shakeOn() && (!needPerm() || motionGranted); }
+    function renderShakeBtn() {
+      if (!motionDev) return;
+      const on = shakeOn(), wait = on && needPerm() && !motionGranted;
+      shakeBtn.innerHTML = '';
+      shakeBtn.append(L.h('div', { style: { fontSize: '17px' }, text: '📳' }), L.h('div', { text: wait ? '켜기' : on ? '흔들기' : '꺼짐' }));
+      shakeBtn.style.opacity = on ? '1' : '0.55';
+      shakeBtn.style.borderColor = on && !wait ? 'var(--brass)' : '';
+    }
+    function onMotion(e) {
+      if (!shakeActive()) return;
+      let a = e.acceleration, m;
+      if (a && a.x != null) m = Math.hypot(a.x, a.y, a.z);
+      else { a = e.accelerationIncludingGravity; if (!a || a.x == null) return; m = Math.abs(Math.hypot(a.x, a.y, a.z) - 9.81); }
+      const now = performance.now();
+      shakeE = shakeE * Math.exp(-(now - lastShake) / 350) + (m > 7 ? m - 7 : 0); lastShake = now;
+      if (m > 9 && myThrow()) rattleUntil = time + 0.2;
+      if (shakeE > 22 && myThrow()) { const pw = U.clamp(0.8 + shakeE / 60, 0.9, 1.6); shakeE = 0; doThrow(pw); }
+    }
+    function syncListen() {
+      const want = shakeActive();
+      if (want && !listening) { window.addEventListener('devicemotion', onMotion); listening = true; }
+      else if (!want && listening) { window.removeEventListener('devicemotion', onMotion); listening = false; }
+      renderShakeBtn();
+    }
+    function toggleShake() {
+      api.sfx('click');
+      if (shakeOn() && needPerm() && !motionGranted) { askPerm(); return; }
+      if (shakeOn()) { setShakeOn(false); api.toast('흔들어 던지기 끔'); syncListen(); return; }
+      setShakeOn(true);
+      if (needPerm() && !motionGranted) { askPerm(); return; }
+      api.toast('흔들어 던지기 켬 · 폰을 흔들면 던져요'); syncListen();
+    }
+    function askPerm() {
+      try {
+        window.DeviceMotionEvent.requestPermission().then((r) => {
+          motionGranted = r === 'granted';
+          api.toast(motionGranted ? '흔들어 던지기 켬 · 폰을 흔들면 던져요' : '동작 센서 권한이 없어요 · 버튼으로 던져 주세요');
+          syncListen();
+        }).catch(() => { api.toast('동작 센서를 쓸 수 없어요 · 버튼으로 던져 주세요'); syncListen(); });
+      } catch (e) { syncListen(); }
+    }
+    syncListen();
+    // PC: 스페이스(조작 설정에서 바꾸기)를 누르고 있다가 떼면 던짐
+    const offInput = api.input && api.input.on ? api.input.on((type, id) => {
+      if (id !== 'throw') return;
+      if (type === 'down' && myThrow() && !charge) startCharge();
+      else if (type === 'up' && charge) releaseCharge();
+    }) : null;
+
+    function layout() {
+      const W = cv.w, H = cv.h;
+      const topH = 64, botH = 120;
+      const S = Math.max(160, Math.min(W - 44, H - topH - botH - 16, 560));
+      const bx = (W - S) / 2, by = topH + Math.max(0, (H - topH - botH - S) / 2);
+      const m = S * 0.1;
+      G = { W, H, S, bx, by, m, inner: S - 2 * m, pr: Math.max(11, S * 0.052) };
+      Object.assign(boardMark.style, { left: bx + 'px', top: by + 'px', width: S + 'px', height: S + 'px' });
+      Object.assign(startMark.style, { left: (bx + S * 0.62) + 'px', top: (by + S * 0.5) + 'px', width: (S * 0.38) + 'px', height: (S * 0.5) + 'px' });
+      buildBoard();
+    }
+    function XY(n) {
+      if (n === HOME || n === OUT) { const o = G.S * 0.085; return { x: G.bx + G.S - G.m + o, y: G.by + G.S - G.m + o }; }
+      const [u, v] = nodeN(n);
+      return { x: G.bx + G.m + u * G.inner, y: G.by + G.m + v * G.inner };
+    }
+
+    function rr(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+    function buildBoard() {
+      const pad = 14, S = G.S, size = S + pad * 2;
+      const c = document.createElement('canvas');
+      c.width = Math.round(size * cv.dpr); c.height = Math.round(size * cv.dpr);
+      const b = c.getContext('2d');
+      b.setTransform(cv.dpr, 0, 0, cv.dpr, 0, 0);
+      const o = pad;
+      // shadow under the cloth
+      b.fillStyle = 'rgba(0,0,0,.5)'; rr(b, o + 3, o + 7, S, S, 10); b.fill();
+      // cloth / hanji
+      const g = b.createLinearGradient(o, o, o + S, o + S);
+      g.addColorStop(0, '#efe0bd'); g.addColorStop(0.55, '#e6d2a6'); g.addColorStop(1, '#d9c08e');
+      b.fillStyle = g; rr(b, o, o, S, S, 10); b.fill();
+      b.save(); rr(b, o, o, S, S, 10); b.clip();
+      const R = rng(7);
+      // fibres
+      for (let i = 0; i < 420; i++) {
+        const x = o + R() * S, y = o + R() * S, a = R() * Math.PI, l = 3 + R() * 12;
+        b.strokeStyle = R() < 0.5 ? 'rgba(120,85,40,.10)' : 'rgba(255,250,235,.22)'; b.lineWidth = 0.6;
+        b.beginPath(); b.moveTo(x, y); b.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); b.stroke();
+      }
+      for (let i = 0; i < 900; i++) { b.fillStyle = R() < 0.5 ? 'rgba(90,60,20,.07)' : 'rgba(255,255,255,.08)'; b.fillRect(o + R() * S, o + R() * S, 1.2, 1.2); }
+      const vg = b.createRadialGradient(o + S / 2, o + S / 2, S * 0.35, o + S / 2, o + S / 2, S * 0.78);
+      vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(80,45,10,.28)');
+      b.fillStyle = vg; b.fillRect(o, o, S, S);
+      b.restore();
+      // double border (red-brown silk edge)
+      b.strokeStyle = '#8c2f1f'; b.lineWidth = Math.max(2, S * 0.012); rr(b, o + S * 0.025, o + S * 0.025, S * 0.95, S * 0.95, 6); b.stroke();
+      b.strokeStyle = 'rgba(140,47,31,.55)'; b.lineWidth = 1; rr(b, o + S * 0.04, o + S * 0.04, S * 0.92, S * 0.92, 4); b.stroke();
+      // ink lines
+      const P = (n) => { const [u, v] = nodeN(n); return [o + G.m + u * G.inner, o + G.m + v * G.inner]; };
+      b.lineCap = 'round'; b.lineJoin = 'round';
+      function brush(a, z) {
+        for (let pass = 0; pass < 2; pass++) {
+          b.strokeStyle = pass ? 'rgba(38,24,14,.88)' : 'rgba(38,24,14,.25)'; b.lineWidth = pass ? Math.max(2, S * 0.009) : Math.max(4, S * 0.02);
+          b.beginPath(); b.moveTo(a[0], a[1]); b.lineTo(z[0], z[1]); b.stroke();
+        }
+      }
+      brush(P(0), P(5)); brush(P(5), P(10)); brush(P(10), P(15)); brush(P(15), P(0));
+      brush(P(5), P(15)); brush(P(10), P(0));
+      // stations
+      for (let n = 0; n <= 28; n++) {
+        const [x, y] = P(n), big = BIG[n];
+        const r = big ? S * 0.058 : S * 0.036;
+        b.fillStyle = 'rgba(0,0,0,.18)'; b.beginPath(); b.arc(x + 1, y + 2, r + 1, 0, 7); b.fill();
+        const sg = b.createRadialGradient(x - r * 0.3, y - r * 0.3, 0, x, y, r);
+        sg.addColorStop(0, '#fbf3df'); sg.addColorStop(1, '#e8d4a8');
+        b.fillStyle = sg; b.beginPath(); b.arc(x, y, r, 0, 7); b.fill();
+        b.strokeStyle = '#2a1a0f'; b.lineWidth = Math.max(1.5, S * 0.007); b.stroke();
+        if (big) { b.lineWidth = Math.max(1, S * 0.004); b.beginPath(); b.arc(x, y, r * 0.68, 0, 7); b.stroke(); }
+        if (n === 0) { // 참먹이 seal
+          b.fillStyle = '#a3321f'; b.beginPath(); b.arc(x, y, r * 0.5, 0, 7); b.fill();
+        }
+      }
+      // corner labels
+      b.fillStyle = 'rgba(42,26,15,.78)'; b.textBaseline = 'middle';
+      b.font = '400 ' + Math.max(10, Math.round(S * 0.038)) + 'px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+      const lab = (n, ux, uy) => { const [x, y] = P(n); b.textAlign = 'center'; b.fillText(SPOT[n], x + ux * S, y + uy * S); };
+      lab(5, -0.121, 0.07); lab(10, 0.121, 0.07); lab(15, 0.121, -0.07); lab(0, -0.121, -0.07); lab(22, 0, 0.1);
+      boardImg = { c, size, pad };
+    }
+
+    /* ---- pieces ---- */
+    function drawToken(x, y, col, cnt, opts) {
+      opts = opts || {};
+      const r = G.pr * (opts.scale || 1), lift = opts.lift || 0;
+      ctx.save();
+      ctx.globalAlpha = opts.alpha == null ? 1 : opts.alpha;
+      ctx.fillStyle = 'rgba(0,0,0,.32)'; ctx.beginPath(); ctx.ellipse(x + 1.5, y + r * 0.55, r * 1.02, r * 0.5, 0, 0, 7); ctx.fill();
+      const layers = Math.min(cnt, 4);
+      for (let k = 0; k < layers; k++) {
+        const yy = y - lift - k * r * 0.32;
+        ctx.fillStyle = shade(col, -55); ctx.beginPath(); ctx.ellipse(x, yy + r * 0.18, r, r * 0.86, 0, 0, 7); ctx.fill();
+        const g = ctx.createRadialGradient(x - r * 0.35, yy - r * 0.4, r * 0.1, x, yy, r);
+        g.addColorStop(0, shade(col, 50)); g.addColorStop(0.7, col); g.addColorStop(1, shade(col, -30));
+        ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(x, yy, r, r * 0.86, 0, 0, 7); ctx.fill();
+        ctx.strokeStyle = 'rgba(20,12,24,.7)'; ctx.lineWidth = 1.4; ctx.stroke();
+      }
+      const ty = y - lift - (layers - 1) * r * 0.32;
+      // carved 말 mark
+      ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = Math.max(1.2, r * 0.1);
+      ctx.beginPath(); ctx.ellipse(x, ty, r * 0.52, r * 0.44, 0, 0, 7); ctx.stroke();
+      if (cnt > 1) {
+        const bx = x + r * 0.8, by = ty - r * 0.75, br = Math.max(8, r * 0.48);
+        ctx.fillStyle = '#e3ae45'; ctx.beginPath(); ctx.arc(bx, by, br, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#2a1d05'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = '#2a1d05'; ctx.font = '700 ' + Math.round(br * 1.25) + 'px "IBM Plex Mono", monospace';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; L.ui.strokeText(ctx, String(cnt), bx, by + 0.5);
+      }
+      ctx.restore();
+    }
+    function shade(hex, amt) {
+      const n = parseInt(hex.slice(1), 16);
+      const r = U.clamp((n >> 16) + amt, 0, 255), g = U.clamp(((n >> 8) & 255) + amt, 0, 255), b = U.clamp((n & 255) + amt, 0, 255);
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }
+    function groupsOf(s, skip) {
+      // [{seat, node, idx:[...]}] for pieces on board
+      const out = [];
+      for (let o = 0; o < s.n; o++) {
+        const m = {};
+        s.p[o].forEach((x, j) => { if (!onBoard(x)) return; if (skip && skip.seat === o && skip.idx.includes(j)) return; (m[x] = m[x] || []).push(j); });
+        for (const x in m) out.push({ seat: o, node: +x, idx: m[x] });
+      }
+      return out;
+    }
+
+    /* ---- sticks ---- */
+    function drawStick(x, y, ang, phi, len, wid, marked, alpha) {
+      const c = Math.cos(phi), flat = c >= 0;
+      const w = wid * (0.35 + 0.65 * Math.abs(c));
+      ctx.save(); ctx.globalAlpha = alpha; ctx.translate(x, y); ctx.rotate(ang);
+      rr(ctx, -w / 2, -len / 2, w, len, w / 2);
+      if (flat) {
+        const g = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+        g.addColorStop(0, '#d9b57a'); g.addColorStop(0.5, '#f3dcab'); g.addColorStop(1, '#d6b072');
+        ctx.fillStyle = g; ctx.fill();
+        ctx.strokeStyle = 'rgba(120,80,30,.35)'; ctx.lineWidth = 0.8;
+        for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(i * w * 0.15, -len / 2 + 4); ctx.bezierCurveTo(i * w * 0.15 + 2, -len / 6, i * w * 0.15 - 2, len / 6, i * w * 0.15, len / 2 - 4); ctx.stroke(); }
+        if (marked && Math.abs(c) > 0.35) {
+          ctx.fillStyle = '#b8321f'; ctx.beginPath(); ctx.arc(0, -len * 0.28, Math.min(w * 0.36, len * 0.1), 0, 7); ctx.fill();
+          ctx.fillStyle = '#fbe9cf'; ctx.font = '700 ' + Math.round(Math.min(w * 0.4, len * 0.11)) + 'px "IBM Plex Sans KR", sans-serif';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('빽', 0, -len * 0.28 + 0.5);
+        }
+      } else {
+        const g = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+        g.addColorStop(0, '#4d2d16'); g.addColorStop(0.45, '#9a6534'); g.addColorStop(1, '#3f240f');
+        ctx.fillStyle = g; ctx.fill();
+        ctx.strokeStyle = 'rgba(30,15,5,.75)'; ctx.lineWidth = Math.max(1.2, w * 0.09);
+        for (const yy of [-0.25, 0, 0.25]) { const s2 = w * 0.28, cy = yy * len; ctx.beginPath(); ctx.moveTo(-s2, cy - s2); ctx.lineTo(s2, cy + s2); ctx.moveTo(s2, cy - s2); ctx.lineTo(-s2, cy + s2); ctx.stroke(); }
+      }
+      ctx.strokeStyle = 'rgba(30,16,6,.6)'; ctx.lineWidth = 1; rr(ctx, -w / 2, -len / 2, w, len, w / 2); ctx.stroke();
+      ctx.restore();
+    }
+    /* replay of the physics throw: frames every 1/60 s of simulated time (same seed → same tumble on every device) */
+    const FR = 1 / 60;
+    function stickPlan(last) {
+      if (last.sd == null) return null; // a state from an older version: no recorded throw
+      const res = yutThrow(last.sd, FR, last.pw || 1);
+      const R = rng(last.sd % 100000 + 7);
+      return { frames: res.frames, look: [0, 1, 2, 3].map((i) => ({ yaw: (R() - 0.5) * 0.5, dz: (R() - 0.5) * 0.05 + (i % 2 ? 0.035 : -0.035) })) };
+    }
+    /* ---- animation control ---- */
+    function startAnim(last, prev) {
+      finishAnim(true);
+      ds = prev;
+      sel = null;
+      if (last.k === 'T') {
+        const plan = stickPlan(last);
+        anim = { k: 'T', t: 0, last, plan, dur: plan ? (plan.frames.length - 1) * FR : 0.6, hold: 0.7, thud: false, hits: [0, 0, 0, 0] };
+        api.sfx('whoosh');
+      } else {
+        const pts = [XY(last.f)].concat(last.pa.map(XY));
+        anim = { k: 'M', t: 0, last, pts, hop: 0.17, ticked: 0 };
+      }
+      setBusy(true);
+      clearTimeout(wd);
+      wd = setTimeout(() => finishAnim(), (anim.k === 'T' ? (anim.dur + anim.hold) * 1000 : 4000) / SPD() + 1500);
+    }
+    function finishAnim(silent) {
+      if (!anim) return;
+      const a = anim;
+      anim = null; clearTimeout(wd);
+      ds = st;
+      if (!silent) {
+        if (a.k === 'T') {
+          // nothing more to say unless the turn ended with an unusable 빽도
+          if (a.last.x && a.last.x.length) api.toast(api.players[a.last.s].name + ' · 빽도인데 판에 말이 없어 넘어가요');
+        } else {
+          const l = a.last;
+          if (l.cap.length) { api.sfx('hit'); api.buzz(30); api.toast(api.players[l.s].name + ' → ' + l.cap.map((c) => api.players[c[0]].name).join('·') + ' 말 잡기! 한 번 더'); }
+          else if (l.pa[l.pa.length - 1] === OUT) { api.sfx('win'); api.toast(l.pc.length > 1 ? '말 ' + l.pc.length + '개가 함께 났어요' : '말이 났어요'); }
+          else if (l.up) { api.sfx('pop'); api.toast('업었다! ' + (l.up + l.pc.length) + '개가 함께 가요'); }
+          if (l.x && l.x.length) setTimeout(() => api.toast('빽도는 움직일 말이 없어 버려요'), 700);
+        }
+      }
+      setBusy(false);
+      autoSelect();
+      refresh();
+    }
+
+    function autoSelect() {
+      if (!myMove()) return;
+      const ms = moves(st, st.t);
+      const groups = {};
+      ms.forEach((m) => { groups[m.from] = 1; });
+      const keys = Object.keys(groups);
+      if (keys.length === 1) sel = +keys[0];
+    }
+    function selectGroup(n) { sel = n; refresh(); }
+    function destsFor(n) {
+      if (!st || n == null) return [];
+      const by = {};
+      moves(st, st.t).filter((m) => m.from === n).forEach((m) => {
+        const o = by[m.dest];
+        if (!o || (m.dest === OUT && m.r < o.r)) by[m.dest] = m; // 나기: 가장 작은 결과를 써요
+      });
+      return Object.values(by);
+    }
+
+    /* ---- HUD ---- */
+    function renderTop() {
+      top.innerHTML = '';
+      const s = ds;
+      if (!s) return;
+      const cur = s.w ? null : s.t;
+      for (let i = 0; i < s.n; i++) {
+        const p = api.players[i], on = cur === i;
+        const marks = L.h('div', { style: { display: 'flex', gap: s.n > 3 ? '2px' : '3px', alignItems: 'center', flexWrap: 'nowrap' } });
+        const order = s.p[i].slice().sort((a, b) => (a === OUT ? 1 : 0) - (b === OUT ? 1 : 0) || (a === HOME ? -1 : 0) - (b === HOME ? -1 : 0));
+        const dz = s.n > 3 ? '7px' : '9px';
+        order.forEach((x) => marks.append(L.h('span', { style: {
+          width: dz, height: dz, borderRadius: '50%', flex: 'none',
+          background: x === HOME ? 'transparent' : x === OUT ? 'var(--brass)' : p.color,
+          border: '2px solid ' + (x === OUT ? 'var(--brass)' : p.color), boxSizing: 'border-box', opacity: x === OUT ? 0.9 : 1,
+        } })));
+        const out = s.p[i].filter((x) => x === OUT).length;
+        top.append(L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '4px', opacity: on || cur == null ? 1 : 0.6, borderColor: on ? p.color : '', boxShadow: on ? '0 0 0 1px ' + p.color + ' inset' : '' } },
+          L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', fontWeight: 700, minWidth: 0 } },
+            L.h('span', { class: 'dot', style: { '--c': p.color, flex: 'none' } }),
+            L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }, text: p.name }),
+            s.tm ? L.h('span', { class: 'mono', style: { fontSize: '10px', color: 'var(--muted)', flex: 'none' }, text: (i % 2 ? 'B' : 'A') + '팀' }) : null),
+          L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'space-between' } }, marks,
+            L.h('span', { class: 'mono', style: { fontSize: '12px', color: out ? 'var(--brass)' : 'var(--muted)', flex: 'none' }, text: s.n > 3 ? String(out) : out + '/' + s.np }))));
+      }
+    }
+    function chipEl(r, small) {
+      const col = r === -1 ? 'var(--coral)' : r >= 4 ? 'var(--brass)' : 'var(--ink)';
+      return L.h('span', { style: { display: 'inline-flex', alignItems: 'baseline', gap: '3px', padding: small ? '2px 7px' : '4px 9px', borderRadius: '9px', border: '1.5px solid ' + col, color: col, fontWeight: 700, fontSize: small ? '13px' : '15px', flex: 'none', background: 'rgba(0,0,0,.18)' } },
+        RNAME[r], L.h('span', { class: 'mono', style: { fontSize: '11px', opacity: 0.75 }, text: r === -1 ? '−1' : String(r) }));
+    }
+    function refresh() {
+      renderTop();
+      const s = ds;
+      chipsBox.innerHTML = '';
+      if (s) {
+        const q = s.q;
+        if (!q.length) chipsBox.append(L.h('span', { class: 'muted', style: { fontSize: '12px' }, text: s.w ? '경기 끝' : '던진 결과가 여기 쌓여요' }));
+        else { chipsBox.append(L.h('span', { class: 'label', style: { flex: 'none' }, text: '쓸 결과' })); q.forEach((r) => chipsBox.append(chipEl(r))); }
+      }
+      // home button: current player's waiting pieces
+      homeBtn.innerHTML = '';
+      const hs = st && !st.w ? st.t : 0;
+      const nHome = st ? st.p[hs].filter((x) => x === HOME).length : 0;
+      const canHome = myMove() && moves(st, st.t).some((m) => m.from === HOME);
+      homeBtn.append(L.h('span', { style: { fontSize: '12px' }, text: '새 말' }),
+        L.h('span', { class: 'dot', style: { '--c': api.players[hs] ? api.players[hs].color : '#888', width: '14px', height: '14px' } }),
+        L.h('b', { class: 'mono', text: '×' + nHome }));
+      homeBtn.disabled = !canHome;
+      homeBtn.style.borderColor = sel === HOME && canHome ? 'var(--brass)' : '';
+      homeBtn.style.background = sel === HOME && canHome ? 'color-mix(in srgb, var(--brass) 25%, var(--surface-2))' : '';
+      homeBtn.hidden = !(st && api.canAct(st.t) && !st.w);
+      throwBtn.hidden = !(st && !st.w && api.canAct(st.t));
+      throwBtn.disabled = !myThrow();
+      // hint
+      hint.innerHTML = '';
+      if (!st) return;
+      const p = api.players[st.w ? 0 : st.t];
+      let text, col = 'var(--ink)';
+      if (st.w) text = '경기 끝';
+      else if (anim) text = anim.k === 'T' ? '윷을 던지는 중…' : '말이 가는 중…';
+      else if (!api.canAct(st.t)) { text = p.name + (st.ph === 'T' ? ' 던질 차례' : ' 말 고르는 중'); col = 'var(--muted)'; }
+      else if (st.ph === 'T') text = st.q.length ? '한 번 더! 윷을 던지세요' : '윷을 던지세요';
+      else if (sel == null) text = '움직일 말을 누르세요';
+      else text = '반짝이는 칸을 눌러 이동';
+      if (pending) text = '…';
+      hint.append(L.h('span', { class: 'dot', style: { '--c': p.color } }), L.h('span', { style: { color: col }, text }));
+    }
+
+    /* ---- drawing ---- */
+    function draw() {
+      cv.clear();
+      if (!G || !boardImg) return;
+      ctx.drawImage(boardImg.c, G.bx - boardImg.pad, G.by - boardImg.pad, boardImg.size, boardImg.size);
+      if (!ds) return;
+      const s = ds;
+      const moving = anim && anim.k === 'M' ? { seat: anim.last.s, idx: anim.last.pc } : null;
+      const gs = groupsOf(s, moving);
+      // selectable / selected highlights
+      const hl = myMove() ? moves(st, st.t) : [];
+      const pulse = 0.5 + 0.5 * Math.sin(time * 5);
+      if (hl.length) {
+        const froms = {}; hl.forEach((m) => { if (onBoard(m.from)) froms[m.from] = 1; });
+        for (const n in froms) {
+          const p = XY(+n);
+          ctx.strokeStyle = +n === sel ? '#e3ae45' : 'rgba(227,174,69,' + (0.35 + 0.35 * pulse) + ')';
+          ctx.lineWidth = +n === sel ? 3.5 : 2;
+          ctx.beginPath(); ctx.arc(p.x, p.y - 2, G.pr * 1.35, 0, 7); ctx.stroke();
+        }
+      }
+      // pieces (several seats on one node: spread)
+      const byNode = {};
+      gs.forEach((g) => { (byNode[g.node] = byNode[g.node] || []).push(g); });
+      let capFade = null;
+      if (anim && anim.k === 'M' && anim.phase === 'cap') capFade = anim.ct;
+      for (const n in byNode) {
+        const list = byNode[n], p = XY(+n);
+        list.forEach((g, k) => {
+          const off = (k - (list.length - 1) / 2) * G.pr * 1.1;
+          let alpha = 1, scale = 1, lift = 0;
+          if (capFade != null && +n === anim.last.pa[anim.last.pa.length - 1] && g.seat !== anim.last.s && !allies(s, g.seat, anim.last.s)) {
+            alpha = 1 - capFade; scale = 1 + capFade * 0.4; lift = capFade * G.pr * 2;
+          }
+          drawToken(p.x + off, p.y, api.players[g.seat].color, g.idx.length, { alpha, scale, lift });
+        });
+      }
+      // destinations
+      if (sel != null && myMove()) {
+        for (const m of destsFor(sel)) {
+          const p = XY(m.dest);
+          const r = G.pr * 1.25 + pulse * 2;
+          ctx.save();
+          ctx.fillStyle = 'rgba(227,174,69,' + (0.22 + 0.15 * pulse) + ')'; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill();
+          ctx.setLineDash([5, 4]); ctx.lineDashOffset = -time * 20;
+          ctx.strokeStyle = m.r === -1 ? '#ee6a55' : '#e3ae45'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.stroke();
+          ctx.restore();
+          const label = m.dest === OUT ? RNAME[m.r] + ' 나기' : RNAME[m.r];
+          ctx.font = '700 13px "IBM Plex Sans KR", sans-serif';
+          const tw = ctx.measureText(label).width + 12;
+          const lx = U.clamp(p.x, tw / 2 + 4, G.W - tw / 2 - 4), ly = p.y - r - 13;
+          ctx.fillStyle = m.r === -1 ? '#ee6a55' : '#e3ae45'; rr(ctx, lx - tw / 2, ly - 10, tw, 20, 10); ctx.fill();
+          ctx.fillStyle = '#2a1d05'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, lx, ly + 0.5);
+          if (m.dest === OUT) { ctx.fillStyle = '#e3ae45'; ctx.font = '700 18px "IBM Plex Sans KR", sans-serif'; ctx.fillText('↘', p.x, p.y + 1); }
+        }
+      }
+      // moving group
+      if (anim && anim.k === 'M') {
+        const a = anim, segs = a.pts.length - 1;
+        const f = Math.min(a.t / a.hop, segs);
+        const i = Math.min(Math.floor(f), segs - 1), u = f - i;
+        const A = a.pts[i], B = a.pts[i + 1] || A;
+        const x = U.lerp(A.x, B.x, easeOut(u)), y = U.lerp(A.y, B.y, easeOut(u));
+        const lift = a.phase === 'cap' ? 0 : Math.sin(Math.min(1, u) * Math.PI) * G.pr * 1.1;
+        const outFade = a.last.pa[a.last.pa.length - 1] === OUT && f >= segs - 1 ? 1 - Math.max(0, (f - (segs - 1))) * 0.8 : 1;
+        drawToken(x, y, api.players[a.last.s].color, a.last.pc.length, { lift, alpha: outFade, scale: a.last.f === HOME && f < 1 ? 0.7 + 0.3 * f : 1 });
+      }
+      // sticks
+      if (anim && anim.k === 'T') drawThrow();
+      else if (rattling()) drawRattle();
+      if (flash) {
+        const k = flash.t / flash.life, a = k < 0.15 ? k / 0.15 : k > 0.75 ? (1 - k) / 0.25 : 1;
+        ctx.save(); ctx.globalAlpha = Math.max(0, a);
+        const cx = G.bx + G.S / 2, cy = G.by + G.S * 0.22;
+        const sc = 1 + 0.25 * Math.max(0, 1 - k * 6);
+        ctx.translate(cx, cy); ctx.scale(sc, sc);
+        ctx.font = '400 ' + Math.round(G.S * 0.16) + 'px "Black Han Sans", "IBM Plex Sans KR", sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 7; ctx.strokeStyle = 'rgba(23,19,31,.85)'; ctx.strokeText(flash.text, 0, 0);
+        ctx.fillStyle = flash.col; L.ui.strokeText(ctx, flash.text, 0, 0);
+        if (flash.sub) {
+          ctx.font = '700 ' + Math.round(G.S * 0.05) + 'px "IBM Plex Sans KR", sans-serif';
+          ctx.lineWidth = 5; ctx.strokeText(flash.sub, 0, G.S * 0.11); ctx.fillStyle = '#f2e9d8'; ctx.fillText(flash.sub, 0, G.S * 0.11);
+        }
+        ctx.restore();
+      }
+    }
+    function rattling() { return !!(myThrow() && (charge || time < rattleUntil)); }
+    // 손에 쥐고 흔드는 윷가락: 판 가운데 모여 달그락(쥔 시간만큼 크게) + 힘 막대
+    function drawRattle() {
+      const len = G.S * 0.4, wid = Math.max(14, G.S * 0.075);
+      const pw = charge ? Math.min(1, (performance.now() - charge.t0) / 900) : 0.6;
+      ctx.fillStyle = 'rgba(23,19,31,.28)'; rr(ctx, G.bx, G.by, G.S, G.S, 10); ctx.fill();
+      const cx = G.bx + G.S / 2, cy = G.by + G.S * 0.55;
+      for (let i = 0; i < 4; i++) {
+        const amp = 2 + pw * 5, jx = Math.sin(time * 47 + i * 2.1) * amp, jy = Math.cos(time * 39 + i * 1.3) * amp;
+        drawStick(cx + (i - 1.5) * wid * 1.6 + jx, cy + jy, 0.08 * Math.sin(time * 23 + i), Math.sin(time * 31 + i * 1.7) * 0.5 + (i % 2 ? Math.PI : 0), len * 0.9, wid, i === 0 && st && st.bd, 1);
+      }
+      const bw = G.S * 0.5, bx = cx - bw / 2, by = G.by + G.S * 0.9;
+      ctx.fillStyle = 'rgba(0,0,0,.45)'; rr(ctx, bx, by, bw, 8, 4); ctx.fill();
+      ctx.fillStyle = '#e3ae45'; rr(ctx, bx, by, Math.max(8, bw * pw), 8, 4); ctx.fill();
+      ctx.font = '700 ' + Math.round(Math.max(12, G.S * 0.042)) + 'px "IBM Plex Sans KR", sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(23,19,31,.85)';
+      const t = charge ? '놓으면 던져요' : '달그락…'; ctx.strokeText(t, cx, by - 6); ctx.fillStyle = '#f2e9d8'; ctx.fillText(t, cx, by - 6);
+    }
+    function drawThrow() {
+      const a = anim, len = G.S * 0.4, wid = Math.max(14, G.S * 0.075);
+      const tt = a.t, end = a.dur + a.hold;
+      const dim = Math.min(1, tt / 0.15) * (tt > end - 0.2 ? Math.max(0, (end - tt) / 0.2) : 1);
+      ctx.fillStyle = 'rgba(23,19,31,' + 0.4 * dim + ')'; rr(ctx, G.bx, G.by, G.S, G.S, 10); ctx.fill();
+      if (!a.plan) { // no recorded throw: just show the final faces
+        a.last.st.split('').forEach((f, i) => drawStick(G.bx + G.S * (0.2 + i * 0.2), G.by + G.S / 2, 0, f === '1' ? 0 : Math.PI, len, wid, i === 0 && st && st.bd, dim));
+        return;
+      }
+      const F = a.plan.frames, fi = Math.min(F.length - 1, tt / FR), i0 = Math.floor(fi), i1 = Math.min(F.length - 1, i0 + 1), u = fi - i0;
+      const sc = G.S * 1.35; // metres → px (the throwing area is ±0.3 m wide)
+      const cx = G.bx + G.S / 2, cy = G.by + G.S * 0.56;
+      const order = [0, 1, 2, 3].sort((p, q) => F[i0][p][1] - F[i0][q][1]); // lower sticks first
+      for (const i of order) {
+        const A = F[i0][i], B = F[i1][i];
+        const x = U.lerp(A[0], B[0], u), y = U.lerp(A[1], B[1], u);
+        let c = U.lerp(A[2], B[2], u), sn = U.lerp(A[3], B[3], u); const l = Math.hypot(c, sn) || 1; c /= l; sn /= l;
+        const lk = a.plan.look[i], hgt = Math.max(0, y) * sc * 0.9;
+        // sticks don't collide with each other in the cross-section sim: spread them into lanes so they don't overlap on screen
+        const px = cx + ((i - 1.5) * 0.11 + U.clamp(x * 0.25, -0.035, 0.035)) * sc, py = cy + lk.dz * sc;
+        const ang = lk.yaw + x * 0.6;
+        // shadow on the mat (shrinks and fades as the stick rises)
+        ctx.save(); ctx.globalAlpha = 0.35 * dim * Math.max(0.25, 1 - hgt / (G.S * 0.6)); ctx.fillStyle = '#000';
+        ctx.translate(px + hgt * 0.12, py + 5); ctx.rotate(ang); rr(ctx, -wid / 2, -len / 2, wid, len, wid / 2); ctx.fill(); ctx.restore();
+        ctx.save(); ctx.translate(px, py - hgt); const z = 1 + hgt / (G.S * 1.6); ctx.scale(z, z);
+        drawStick(0, 0, ang, Math.atan2(sn, c), len, wid, i === 0 && st && st.bd, dim);
+        ctx.restore();
+      }
+    }
+
+    function tick(dt) {
+      time += dt;
+      if (charge && !myThrow()) charge = null;
+      if (charge && performance.now() - charge.lastTick > 140) { charge.lastTick = performance.now(); api.sfx('tick'); api.buzz(4); }
+      const sp = SPD();
+      if (flash) { flash.t += dt * Math.sqrt(sp); if (flash.t >= flash.life) flash = null; }
+      if (anim && anim.k === 'T') {
+        anim.t += dt * sp * (anim.t < anim.dur ? 1.35 : 1); // the tumble plays a little faster than real time
+        if (anim.plan && anim.t < anim.dur) { // a knock for every hard landing in the replay
+          const fr = anim.plan.frames[Math.min(anim.plan.frames.length - 1, Math.floor(anim.t / FR))];
+          let n = 0; fr.forEach((k, i) => { if (k[4] > anim.hits[i]) { anim.hits[i] = k[4]; n++; } });
+          if (n) { api.sfx('tick'); }
+        }
+        if (!anim.thud && anim.t >= anim.dur) {
+          anim.thud = true; api.sfx('thud'); api.buzz(14 + Math.round(((anim.last.pw || 1) - 1) * 20));
+          const r = anim.last.r;
+          flash = { text: RNAME[r] + '!', sub: r >= 4 ? '한 번 더 던져요' : r === -1 ? '한 칸 뒤로' : null, col: r === -1 ? '#ee6a55' : r >= 4 ? '#e3ae45' : '#f2e9d8', t: 0, life: 1.0 };
+          if (r >= 4) setTimeout(() => api.sfx('win'), 90);
+          ds = Object.assign({}, ds, { q: ds.q.concat([r]) });
+          refresh();
+        }
+        if (anim.t >= anim.dur + anim.hold) finishAnim();
+      } else if (anim && anim.k === 'M') {
+        const a = anim, segs = a.pts.length - 1;
+        if (!a.phase) {
+          a.t += dt * sp;
+          const f = Math.floor(a.t / a.hop);
+          if (f > a.ticked && f <= segs) { a.ticked = f; api.sfx('tick'); }
+          if (a.t >= segs * a.hop) {
+            if (a.last.cap.length) { a.phase = 'cap'; a.ct = 0; a.t = segs * a.hop; api.sfx('hit'); api.buzz(25); }
+            else finishAnim();
+          }
+        } else {
+          a.ct += dt * sp / 0.4;
+          if (a.ct >= 1) finishAnim();
+        }
+      }
+      draw();
+    }
+    const stopLoop = U.loop(tick);
+
+    /* ---- input ---- */
+    function nodeAt(pt) {
+      let best = null, bd = G.S * 0.075;
+      for (let n = 0; n <= 28; n++) { const p = XY(n); const d = Math.hypot(p.x - pt.x, p.y - pt.y); if (d < bd) { bd = d; best = n; } }
+      return best;
+    }
+    function onDown(ev) {
+      if (!ev.isPrimary || !st || !G) return;
+      const pt = cv.local(ev);
+      if (myThrow()) {
+        if (pt.y > G.by - 10 && pt.y < G.by + G.S + 10) { startCharge(); try { cv.cv.setPointerCapture(ev.pointerId); } catch (er) {} }
+        return;
+      }
+      if (!myMove()) return;
+      // destination?
+      if (sel != null) {
+        const ds_ = destsFor(sel);
+        let hit = null, hd = G.S * 0.08;
+        for (const m of ds_) { const p = XY(m.dest); const d = Math.hypot(p.x - pt.x, p.y - pt.y); if (d < Math.max(hd, 24)) { hd = d; hit = m; } }
+        if (hit) {
+          pending = true; api.buzz(15); api.sfx('click');
+          api.act({ t: 'mv', i: hit.i, k: hit.k });
+          setTimeout(() => { if (pending) { pending = false; refresh(); } }, 3000);
+          sel = null; refresh(); return;
+        }
+      }
+      const n = nodeAt(pt);
+      if (n != null && moves(st, st.t).some((m) => m.from === n)) { api.sfx('click'); api.buzz(10); selectGroup(sel === n ? null : n); return; }
+      if (sel != null) { selectGroup(null); }
+    }
+    function onUp() { if (charge) releaseCharge(); }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.onresize = () => { layout(); };
+    layout();
+
+    return {
+      update(next, prev) {
+        st = next;
+        pending = false;
+        const l = next.last;
+        const key = l ? next.g + ':' + l.id : '';
+        if (l && key !== shownKey && prev && prev !== next && G) {
+          shownKey = key;
+          startAnim(l, prev);
+        } else {
+          shownKey = key;
+          if (!anim) ds = next;
+        }
+        if (!anim) autoSelect();
+        if (sel != null && !(myMove() && destsFor(sel).length)) sel = null;
+        refresh();
+      },
+      destroy() {
+        stopLoop(); clearTimeout(wd); window.removeEventListener('lounge-cancel', onCancelEv);
+        cv.cv.removeEventListener('pointerdown', onDown); cv.cv.removeEventListener('pointerup', onUp);
+        if (listening) window.removeEventListener('devicemotion', onMotion);
+        if (offInput) offInput();
+        cv.destroy(); top.remove(); bottom.remove(); boardMark.remove(); startMark.remove();
+        if (busy) api.setBusy(false);
+      },
+    };
+  }
+
+  L.register({
+    id: 'yut', name: '윷놀이', tag: '전통 판놀이', cat: '보드',
+    blurb: '윷가락 네 개를 던져 도·개·걸·윷·모만큼 말을 옮겨요. 윷·모와 잡기는 한 번 더, 모서리와 방에 멈추면 지름길. 말을 모두 먼저 내면 승리.',
+    minPlayers: 2, maxPlayers: 4, defaultPlayers: 2, aiDelay: 480,
+    controls: [{ id: 'throw', label: '윷 던지기(누르고 있다가 떼기)', keys: ['Space'], pad: ['a'] }],
+    options: [
+      { id: 'pc', label: '말 수', choices: [{ v: 2, label: '2개' }, { v: 3, label: '3개' }, { v: 4, label: '4개' }], def: 4 },
+      { id: 'bd', label: '빽도', tip: '도가 뒤로 한 칸 가는 「빽도」 윷을 쓸지.', choices: [{ v: 1, label: '있음' }, { v: 0, label: '없음' }], def: 1 },
+      { id: 'tm', label: '방식', tip: '4명일 때 2:2 팀(같은 편끼리 말을 업을 수 있어요).', choices: [{ v: 0, label: '개인전' }, { v: 1, label: '2:2 팀전 (4명일 때)' }], def: 0 },
+    ],
+    quick: [
+      '내 말(기본 4개)을 판 한 바퀴 돌려 모두 먼저 내보내면 이겨요.',
+      '내 차례: 윷을 던져 도1·개2·걸3·윷4·모5칸만큼 말 하나를 옮겨요. 윷·모가 나오거나 남의 말을 잡으면 한 번 더!',
+      '모서리나 가운데 방에 딱 멈추면 다음엔 대각선 지름길로 빨리 가요.',
+    ],
+    rules: [
+      { h: '그림으로 보기', fig: [{"svg": "<svg viewBox=\"0 0 340 118\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"sans-serif\"><rect width=\"340\" height=\"118\" rx=\"10\" fill=\"#1f2a24\"/><rect x=\"12\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"26\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M28 28l7 6M28 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"40\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M42 28l7 6M42 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"54\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M56 28l7 6M56 46l7 6\" stroke=\"#5a3a18\"/><text x=\"38\" y=\"88\" font-size=\"16\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">도</text><text x=\"38\" y=\"106\" font-size=\"10\" fill=\"#f3ead2\" text-anchor=\"middle\">1칸</text><rect x=\"78\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"92\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"106\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M108 28l7 6M108 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"120\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M122 28l7 6M122 46l7 6\" stroke=\"#5a3a18\"/><text x=\"104\" y=\"88\" font-size=\"16\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">개</text><text x=\"104\" y=\"106\" font-size=\"10\" fill=\"#f3ead2\" text-anchor=\"middle\">2칸</text><rect x=\"144\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"158\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"172\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"186\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M188 28l7 6M188 46l7 6\" stroke=\"#5a3a18\"/><text x=\"170\" y=\"88\" font-size=\"16\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">걸</text><text x=\"170\" y=\"106\" font-size=\"10\" fill=\"#f3ead2\" text-anchor=\"middle\">3칸</text><rect x=\"210\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"224\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"238\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><rect x=\"252\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#f1dfb4\" stroke=\"#6b4a22\"/><text x=\"236\" y=\"88\" font-size=\"16\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">윷</text><text x=\"236\" y=\"106\" font-size=\"10\" fill=\"#f3ead2\" text-anchor=\"middle\">4칸·한 번 더</text><rect x=\"276\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M278 28l7 6M278 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"290\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M292 28l7 6M292 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"304\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M306 28l7 6M306 46l7 6\" stroke=\"#5a3a18\"/><rect x=\"318\" y=\"14\" width=\"11\" height=\"54\" rx=\"5\" fill=\"#a8763c\" stroke=\"#6b4a22\"/><path d=\"M320 28l7 6M320 46l7 6\" stroke=\"#5a3a18\"/><text x=\"302\" y=\"88\" font-size=\"16\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">모</text><text x=\"302\" y=\"106\" font-size=\"10\" fill=\"#f3ead2\" text-anchor=\"middle\">5칸·한 번 더</text></svg>", "cap": "밝은 면(배)이 위로 나온 개수로 정해요. 넷 다 엎어지면 모"}, {"svg": "<svg viewBox=\"0 0 340 146\" xmlns=\"http://www.w3.org/2000/svg\" font-family=\"sans-serif\"><rect width=\"340\" height=\"146\" rx=\"10\" fill=\"#1f2a24\"/><rect x=\"110\" y=\"12\" width=\"120\" height=\"120\" fill=\"none\" stroke=\"#7d8b6e\" stroke-width=\"2\"/><path d=\"M110 12L230 132M230 12L110 132\" stroke=\"#e3ae45\" stroke-width=\"3\" stroke-dasharray=\"6 4\"/><circle cx=\"110\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"134\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"134\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"36\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"36\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"158\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"158\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"60\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"60\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"182\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"182\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"84\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"84\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"206\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"206\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"108\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"108\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"12\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"230\" cy=\"132\" r=\"6\" fill=\"#d9cfb4\"/><circle cx=\"110\" cy=\"12\" r=\"10\" fill=\"#e3ae45\"/><circle cx=\"230\" cy=\"12\" r=\"10\" fill=\"#e3ae45\"/><circle cx=\"110\" cy=\"132\" r=\"10\" fill=\"#e3ae45\"/><circle cx=\"230\" cy=\"132\" r=\"10\" fill=\"#e3ae45\"/><circle cx=\"170\" cy=\"72\" r=\"10\" fill=\"#e3ae45\"/><circle cx=\"230\" cy=\"132\" r=\"5\" fill=\"#c0392b\"/><text x=\"285\" y=\"136\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">참먹이(출발)</text><text x=\"285\" y=\"18\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">모</text><text x=\"60\" y=\"18\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">뒷모</text><text x=\"170\" y=\"97\" font-size=\"11\" fill=\"#1f2a24\" text-anchor=\"middle\" font-weight=\"700\">방</text><text x=\"287\" y=\"76\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">↑ 반시계로</text><text x=\"55\" y=\"62\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">금색 칸에 딱</text><text x=\"55\" y=\"78\" font-size=\"11\" fill=\"#f3ead2\" text-anchor=\"middle\">멈추면 대각선</text><text x=\"55\" y=\"94\" font-size=\"11\" fill=\"#e3ae45\" text-anchor=\"middle\" font-weight=\"700\">지름길!</text></svg>", "cap": "모서리·가운데 방에 멈추면 다음 이동은 점선 지름길로"}] },
+      { h: '목표', p: [
+        '내 말(기본 4개, 설정에서 2·3개)을 모두 판 한 바퀴 돌려 먼저 내보내면 이겨요. 이걸 「말이 난다」고 해요.',
+        '말은 판 밖에서 출발해요. 오른쪽 아래 참먹이(빨간 점) 바로 위 칸부터 시계 반대 방향(위로 → 왼쪽 → 아래 → 오른쪽)으로 돌아요.'] },
+      { h: '준비', p: [
+        '모든 말은 판 밖에서 기다려요. 아래 「새 말 ×4」가 판 밖에 있는 내 말이에요.',
+        '1번째 사람부터 차례로 던져요.'] },
+      { h: '차례에 할 일', p: [
+        '① 「윷 던지기」를 눌러 윷가락 4개를 던져요. 버튼(또는 판)을 꾹 누르면 손안에서 달그락거리고, 놓는 순간 던져요(오래 쥘수록 높이 날아요 · 결과 확률은 같아요). PC는 스페이스를 누르고 있다가 떼요.',
+        '폰에서는 폰을 흔들어도 던져요(📳 버튼으로 켜고 끄기, 이 기기에 저장). 아이폰은 처음에 📳 「켜기」를 눌러 동작 센서를 허락해 주세요.',
+        '② 윷이나 모가 나오면 한 번 더 던져요. 나온 결과는 아래 「쓸 결과」에 모두 쌓여요.',
+        '③ 결과를 하나씩 골라 말을 옮겨요. 어느 결과를 어느 말에 먼저 쓸지는 내 마음이에요.',
+        '④ 결과를 다 쓰면 다음 사람 차례예요. 움직일 수 있는 말이 없으면 남은 결과는 버려요.'] },
+      { h: '윷 결과와 확률', p: [
+        '윷가락의 평평한 면(배)이 몇 개 위로 나왔는지로 정해요.',
+        '도 = 배 1개 → 1칸 (약 21%)',
+        '개 = 배 2개 → 2칸 (약 36%, 가장 흔해요)',
+        '걸 = 배 3개 → 3칸 (약 30%)',
+        '윷 = 배 4개 → 4칸 + 한 번 더 (약 9%)',
+        '모 = 배 0개(모두 엎어짐) → 5칸 + 한 번 더 (약 4%)',
+        '빽도(설정, 기본 있음): 「빽」 표시 윷가락 하나만 배로 나오면 → 1칸 뒤로. 도가 나올 때의 약 4분의 1이 빽도예요.',
+        '결과는 실제처럼 윷가락이 구르는 물리 계산으로 나와요. 윷가락 하나가 배로 떨어질 확률이 약 55%라서 위 확률이 돼요.'] },
+      { h: '말 옮기기', p: [
+        '판 밖의 말은 한 번에 하나씩만 판에 올라와요. (도가 나오면 참먹이 바로 위 「도」 칸으로)',
+        '판 위의 말은 길을 따라 나온 칸 수만큼 가요.'] },
+      { h: '잡기', p: [
+        '남의 말이 있는 칸에 딱 멈추면 그 말을 잡아요. 잡힌 말(업힌 말까지 모두)은 판 밖으로 돌아가 처음부터 다시 와요.',
+        '잡으면 한 번 더 던져요!',
+        '지나가기만 하면 안 잡혀요. 멈춘 칸만 따져요.'] },
+      { h: '업기', p: [
+        '내 말이 있는 칸에 멈추면 두 말이 업혀서 다음부터 함께 움직여요. 말 위 숫자 배지 = 함께 가는 말 수.',
+        '한 번에 여러 말을 보낼 수 있어 빠르지만, 잡히면 업힌 말이 모두 판 밖으로 가요.'] },
+      { h: '지름길', p: [
+        '판에는 모서리 4곳과 가운데 「방」이 있어요: 모(오른쪽 위) · 뒷모(왼쪽 위) · 찌모(왼쪽 아래) · 참먹이(오른쪽 아래).',
+        '모에 딱 멈춘 말 → 다음엔 대각선으로 방 쪽으로 가요. 방을 지나치면 그대로 찌모 쪽으로 이어져요.',
+        '뒷모에 딱 멈춘 말 → 다음엔 대각선으로 방을 지나 참먹이로 가요.',
+        '방에 딱 멈춘 말 → 다음엔 참먹이 쪽(가장 짧은 길)으로 가요.',
+        '찌모에는 지름길이 없어요. 지나가기만 하면 지름길을 탈 수 없어요.',
+        '가장 빠른 길: 모에 멈춤 → 방에 멈춤 → 참먹이로 나기.'] },
+      { h: '빽도', p: [
+        '빽도는 판 위에 있는 말에만 쓰고, 왔던 길로 한 칸 돌아가요. 뒤로 간 칸에 남의 말이 있으면 잡아요.',
+        '판에 내 말이 하나도 없을 때 나온 빽도는 버려요. (같이 쌓인 다른 결과로 먼저 말을 올리면 빽도도 쓸 수 있어요.)',
+        '도 칸(첫 칸)에서 빽도를 쓰면 참먹이로 가요.'] },
+      { h: '나기 · 승리', p: [
+        '참먹이를 지나가면 말이 나요(판에서 나가요). 남는 칸 수는 버려도 괜찮아요.',
+        '내 말을 모두 가장 먼저 내면 승리! (팀전은 같은 팀 두 사람의 말이 모두 나야 해요.)',
+        '참먹이에 딱 멈추면 그 자리에서 기다렸다가, 다음에 앞으로 가는 결과가 나오면 무엇이든 바로 나요.',
+        '말이 나는 결과를 고르면 참먹이 밖에 「나기」 표시가 떠요.'] },
+      { h: '팀전 (설정)', p: [
+        '4명일 때만 2:2 팀전을 고를 수 있어요. 1·3번째 사람이 A팀, 2·4번째 사람이 B팀.',
+        '각자 자기 말만 움직여요. 같은 팀 말끼리는 잡지도 업지도 않고 한 칸에 같이 있을 수 있어요.',
+        '같은 팀 두 사람의 말이 모두 나면 그 팀 승리. 말을 다 낸 사람은 차례를 건너뛰어요.'] },
+      { h: '조작', p: [
+        '「윷 던지기」를 누르거나 판을 톡 치면 던져요.',
+        '움직일 말을 눌러요: 판 위의 내 말, 또는 아래 「새 말」. 갈 수 있는 칸이 결과 이름(도·개·걸…)과 함께 반짝여요.',
+        '반짝이는 칸을 누르면 이동해요. 다른 말을 다시 누르면 바꿀 수 있어요.',
+        '위쪽 칸에 사람마다 말 상태와 「난 말 수/전체」가 보여요.'] },
+      { h: '예시', p: [
+        '첫 던지기에 윷! → 한 번 더 → 개. 쓸 결과: [윷, 개].',
+        '새 말에 윷을 써서 4칸(모 바로 앞)으로, 그 말에 개를 써서… 대신 새 말을 하나 더 올려도 돼요. 고르는 건 나!',
+        '다음 차례에 도가 나와 모에 딱 멈추면, 그다음엔 대각선 지름길로 방 → 참먹이로 빨리 날 수 있어요.',
+        '상대 말이 내 말 2칸 앞에 있을 때 개가 나오면 잡고 한 번 더!'] },
+      { h: 'AI 난이도', p: [
+        'AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요.',
+        '쉬움은 거의 아무 말이나 앞으로 보내요. 어려움은 다음 윷 확률, 잡힐 위험, 업기의 가치까지 따져 말을 골라요.'] },
+    ],
+    tutorial: [
+      { sel: '.yt-start', text: '오른쪽 아래가 참먹이(빨간 점)예요. 말은 참먹이 위 칸부터 시계 반대 방향으로 한 바퀴 돌아, 참먹이를 지나가면 말이 나요. 내 말을 모두 먼저 내면 승리!' },
+      { sel: '.yt-bot', text: '「윷 던지기」(또는 판을 톡)로 던져요. 도 1칸 · 개 2칸 · 걸 3칸 · 윷 4칸 · 모 5칸. 윷이나 모가 나오면 한 번 더 던져요!' },
+      { sel: '.yt-chips', text: '던진 결과는 여기 「쓸 결과」에 쌓여요. 원하는 순서로, 원하는 말에 하나씩 써요.' },
+      { sel: '.yt-home', text: '「새 말」은 아직 판 밖에 있는 내 말이에요. 이걸 누르거나 판 위의 내 말을 누르면, 갈 수 있는 칸이 반짝여요. 그 칸을 누르면 이동!' },
+      { sel: '.yt-board', text: '남의 말이 있는 칸에 딱 멈추면 잡아서 판 밖으로 보내고 한 번 더 던져요. 내 말이 있는 칸에 멈추면 업혀서 함께 움직여요.' },
+      { sel: '.yt-board', text: '지름길: 모서리(오른쪽 위 모, 왼쪽 위 뒷모)나 가운데 방에 딱 멈추면, 다음엔 대각선으로 질러가요. 지나가기만 하면 안 돼요.' },
+      { sel: '.yt-top', text: '위쪽에서 사람마다 말 상태와 난 말 수를 볼 수 있어요. 자, 윷을 던져 볼까요?' },
+    ],
+    init, actor, apply, ai, aiDelayFor, result, mount, hint,
+    _t: { PATH, DIST, DEFPRED, moves, probs, OUT, HOME, yutThrow, YP },
+  });
+})();

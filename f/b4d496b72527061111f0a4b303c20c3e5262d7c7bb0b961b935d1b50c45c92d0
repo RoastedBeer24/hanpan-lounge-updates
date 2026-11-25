@@ -1,0 +1,371 @@
+/* 엄폐 사격 (covershot) — 한 손 엄폐 사격. 누르면 사격, 떼면 엄폐와 장전.
+   파일 구성:
+   - 이 파일: 자료(사수 9 · 무기 9(6종류) · 적 24 · 우두머리 7 · 강화 33 · 전장 5) · 판 상태(init/result) · 규칙 · 도감 · 옵션 · L.register · 불러오기.
+   - assets/covershot/sim.js: 순수 시뮬(초당 60 고정 걸음, 시드 난수 — Math.random 없음) + 봇. node에서도 돎.
+   - assets/covershot/art.js: 코드 그림(사수 뒷모습 · 초상 실루엣 · 엄폐물 · 적 · 우두머리 · 배경).
+   - assets/covershot/view.js: 화면(HUD · 조작 · 연출 · 소리 · 고르기 창).
+   1인 전용 실시간. 판 상태(state)는 { seed, o(옵션), done, sum }만 — 진행은 화면 쪽 시뮬이 맡고 끝나면 api.setState로 결과를 넘긴다. */
+(function () {
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'covershot';
+  const TITLE = '엄폐 사격';   // 게임 이름은 여기 한 곳
+
+  /* ───────── 무기 ───────── */
+  const WCLS = {
+    ar: { n: '돌격소총', d: '고른 연사. 거리와 상황을 가리지 않음.' },
+    sr: { n: '저격총', d: '모아 쏘는 한 발. 약점에 큰 피해.' },
+    sg: { n: '산탄총', d: '가까운 적에게 강함. 멀수록 약해짐.' },
+    mg: { n: '기관총', d: '쏠수록 빨라지는 연사. 장전이 김.' },
+    gl: { n: '유탄 발사기', d: '범위 폭발. 방패 너머에도 피해.' },
+    smg: { n: '기관단총', d: '짧고 빠른 연사. 장전이 빠름.' },
+  };
+  // mode: auto 연사 · burst 점사 · charge 모아 쏘기 · semi 단발 · heat 예열 · gren 유탄
+  const WEAPONS = {
+    ar1: { cls: 'ar', n: '제식 돌격소총', mode: 'auto', dmg: 9, rof: 9, mag: 30, rld: 1.5, sp: 1.6, wk: 1.5 },
+    ar2: { cls: 'ar', n: '점사 소총', mode: 'burst', dmg: 13, rof: 2.3, bn: 3, mag: 24, rld: 1.4, sp: 1.1, wk: 1.6 },
+    sr1: { cls: 'sr', n: '대구경 저격총', mode: 'charge', dmg: 100, chg: 0.85, mag: 5, rld: 2.0, sp: 0.2, wk: 1.8 },
+    sr2: { cls: 'sr', n: '지정사수 소총', mode: 'semi', dmg: 36, rof: 2.4, mag: 10, rld: 1.7, sp: 0.5, wk: 1.8 },
+    sg1: { cls: 'sg', n: '전투 산탄총', mode: 'semi', dmg: 9.5, pel: 8, rof: 1.35, mag: 6, rld: 2.1, sp: 5.5, wk: 1.2, far: 0.45 },
+    mg1: { cls: 'mg', n: '분대 기관총', mode: 'heat', dmg: 8, rof: 5, rof2: 16, heat: 1.6, mag: 100, rld: 3.4, sp: 2.2, wk: 1.4 },
+    gl1: { cls: 'gl', n: '연발 유탄 발사기', mode: 'gren', dmg: 58, rof: 1.15, mag: 4, rld: 2.5, aoe: 11, sp: 1.2, wk: 1 },
+    smg1: { cls: 'smg', n: '기관단총', mode: 'auto', dmg: 6.2, rof: 14, mag: 28, rld: 0.9, sp: 2.4, wk: 1.4 },
+    smg2: { cls: 'smg', n: '기관권총', mode: 'auto', dmg: 6.6, rof: 11, mag: 24, rld: 0.8, sp: 2.0, wk: 1.5 },
+  };
+
+  /* ───────── 사수(전원 성인 여성 · 호출 부호) ─────────
+     look: 코드 그림과 그림 지시문(assets/covershot/PROMPTS.md)이 함께 쓰는 외모 설정 */
+  const SHOOTERS = [
+    { id: 'vanguard', n: '선봉', w: 'ar1', hp: 120, role: '주력 사수',
+      sk: { id: 'focus', n: '집중 사격', dur: 6, d: '6초 동안 연사 +60% · 피해 +20% · 탄 소모 없음' },
+      look: { hair: 'pony', hc: '#d8bf78', oc: '#3d5878', ac: '#e3ae45', gear: 'headset', age: '20대 후반', memo: '금발 높은 묶음머리, 남색 전술 재킷, 침착한 분대장' } },
+    { id: 'hawkeye', n: '매눈', w: 'sr1', hp: 90, role: '저격수',
+      sk: { id: 'lance', n: '관통 저격', v: 280, d: '조준한 세로줄의 적 전부에게 피해 280' },
+      look: { hair: 'long', hc: '#2c2f3d', oc: '#4a5a48', ac: '#9fd0c0', gear: 'cap', age: '30대 초반', memo: '검은 긴 생머리, 올리브색 위장 망토와 모자, 말수가 적음' } },
+    { id: 'breaker', n: '파쇄', w: 'sg1', hp: 140, role: '근접 제압',
+      sk: { id: 'blast', n: '근접 폭풍', v: 170, v2: 60, stun: 2, d: '가까운 적 피해 170 · 기절 2초, 먼 적 피해 60' },
+      look: { hair: 'short', hc: '#b5533c', oc: '#5a3d3a', ac: '#ee6a55', gear: 'goggles', age: '20대 후반', memo: '붉은 짧은 머리, 적갈색 방탄 조끼, 이마에 고글' } },
+    { id: 'ironrain', n: '쇠비', w: 'mg1', hp: 150, role: '화력 지원',
+      sk: { id: 'barrage', n: '제압 탄막', dur: 7, v: 0.45, d: '7초 동안 적의 조준 속도 −55% · 예열 최대 · 탄 소모 없음' },
+      look: { hair: 'braid', hc: '#8a8f9c', oc: '#3c4350', ac: '#c9d2e0', gear: 'none', age: '30대 초반', memo: '은회색 굵게 땋은 머리, 짙은 회색 중장비 조끼, 체격이 큼' } },
+    { id: 'salvo', n: '포화', w: 'gl1', hp: 105, role: '폭발물',
+      sk: { id: 'carpet', n: '융단 포격', v: 115, cnt: 6, d: '체력이 많은 적 6곳에 폭발 피해 115' },
+      look: { hair: 'bob', hc: '#e9e2d0', oc: '#6a5a34', ac: '#f0c86a', gear: 'headset', age: '20대 중반', memo: '백금색 단발, 황토색 공병 재킷, 탄띠를 어깨에 걸침' } },
+    { id: 'gale', n: '질풍', w: 'smg1', hp: 100, role: '교란',
+      sk: { id: 'smoke', n: '연막탄', dur: 5, d: '5초 동안 적의 조준 전부 해제 · 새 조준 불가' },
+      look: { hair: 'side', hc: '#5a8fb8', oc: '#2f3a4c', ac: '#7fd0ff', gear: 'mask', age: '20대 중반', memo: '푸른빛 옆묶음 머리, 검푸른 경량 전투복, 목에 두른 복면' } },
+    { id: 'bulwark', n: '방벽', w: 'ar2', hp: 135, role: '방어',
+      sk: { id: 'fortify', n: '엄폐 보강', dur: 5, v: 0.45, d: '엄폐 내구 +45% 수리 · 5초 동안 엄폐 무적 · 분대 피해 −50%' },
+      look: { hair: 'bun', hc: '#6b4a33', oc: '#4c5a66', ac: '#b8c4cc', gear: 'none', age: '30대 초반', memo: '갈색 올림머리, 청회색 장갑 재킷, 어깨에 방탄판' } },
+    { id: 'pulse', n: '맥박', w: 'smg2', hp: 105, role: '의무',
+      sk: { id: 'medic', n: '응급 처치', v: 0.35, d: '분대 체력 35% 회복 · 쓰러진 사수 복귀(체력 35%)' },
+      look: { hair: 'wolf', hc: '#d98fa6', oc: '#e6e2da', ac: '#6ad0a0', gear: 'none', age: '20대 후반', memo: '분홍빛 층진 중간 머리, 흰 의무 재킷과 녹색 완장' } },
+    { id: 'frost', n: '서리', w: 'sr2', hp: 95, role: '지정 사수',
+      sk: { id: 'mark', n: '약점 표식', dur: 8, v: 0.4, d: '8초 동안 모든 적이 받는 피해 +40%' },
+      look: { hair: 'twin', hc: '#cfe0ea', oc: '#56607a', ac: '#a8c8ff', gear: 'beret', age: '20대 후반', memo: '옅은 은청색 낮게 묶은 두 갈래 머리, 회청색 코트, 베레모' } },
+  ];
+
+  /* ───────── 적 ─────────
+     f: 등장 시기(0 처음 ~ 1 끝) · c: 편성 비용 · row: 서는 깊이(작을수록 멂)
+     공격 a.k: aim 직사(붉은 선 — 숨기) · sup 제압 사격(붉은 선 — 계속 숨기) · lob 곡사(주황 원 — 나와 있기 / 포탄 격추)
+               prc 관통(보라 선 — 먼저 쏴서 끊기) · flk 측면(화살표 — 먼저 격추) · boom 자폭(먼저 격추) · rkt 유도탄(격추 가능 · 숨기) · smk 연막 */
+  const ENEMIES = {
+    rifle: { n: '소총병', sh: 'inf', tint: '#8a4a44', hp: 120, r: 5, c: 1, f: 0, row: [30, 66], mv: 'hold', a: { k: 'aim', T: 2.3, dmg: 13, cov: 7, cd: [2.2, 3.8] }, d: '기본 보병. 붉은 조준선이 차면 쏨.' },
+    trooper: { n: '돌격병', sh: 'inf', tint: '#9a5a3a', hp: 150, r: 5, c: 1.5, f: 0, row: [44, 72], mv: 'strafe', a: { k: 'aim', T: 1.5, dmg: 6, n: 3, cov: 4, cd: [2, 3.4] }, d: '자리를 옮기며 세 발씩 점사.' },
+    shield: { n: '방패병', sh: 'shield', tint: '#6a6f80', hp: 195, r: 5.4, c: 2, f: 0.1, row: [46, 72], mv: 'adv', shield: 1, a: { k: 'aim', T: 1.9, dmg: 15, cov: 8, cd: [2.4, 3.6] }, d: '방패가 총탄을 막음. 조준하는 동안만 드러남. 폭발은 절반 통함.' },
+    sniper: { n: '저격수', sh: 'inf', tint: '#4a6a58', long: 1, hp: 95, r: 4.6, c: 2, f: 0.12, row: [18, 30], mv: 'hold', a: { k: 'aim', T: 3.0, dmg: 34, cov: 5, cd: [3, 4.5] }, d: '먼 곳에서 긴 조준 뒤 큰 피해.' },
+    bomber: { n: '자폭병', sh: 'bomb', tint: '#b0453a', hp: 90, r: 4.8, c: 1.5, f: 0.12, row: [20, 30], mv: 'rush', spd: 13, a: { k: 'boom', dmg: 26, cov: 50 }, d: '엄폐물로 달려와 폭발. 닿기 전에 처치.' },
+    mortar: { n: '박격포병', sh: 'mortar', tint: '#7a6a44', hp: 130, r: 5, c: 2, f: 0.2, row: [18, 34], mv: 'hold', a: { k: 'lob', T: 1.0, fl: 2.4, dmg: 26, cov: 10, cd: [3.2, 4.8] }, d: '포탄이 엄폐물 뒤에 떨어짐. 나와 있으면 피함. 포탄 격추 가능.' },
+    drone: { n: '정찰 무인기', sh: 'drone', tint: '#5a7a8a', fly: 1, hp: 75, r: 4.2, c: 1.5, f: 0.2, row: [20, 40], mv: 'flank', spd: 15, a: { k: 'flk', T: 1.3, dmg: 12, cd: [2.2, 3] }, d: '옆으로 돌아 엄폐를 무시하고 사격. 도착 전에 격추.' },
+    stalker: { n: '은폐병', sh: 'inf', tint: '#4f5a70', cloak: 1, hp: 120, r: 5, c: 2, f: 0.3, row: [40, 68], mv: 'hop', a: { k: 'aim', T: 1.25, dmg: 17, cov: 6, cd: [2.6, 4] }, d: '평소엔 흐릿해 조준 보조가 안 붙음. 조준할 때 드러남.' },
+    grenadier: { n: '척탄병', sh: 'inf', tint: '#7a5a34', hp: 140, r: 5, c: 2, f: 0.25, row: [40, 62], mv: 'strafe', a: { k: 'lob', T: 0.7, fl: 1.6, dmg: 20, cov: 8, cd: [3, 4.4] }, d: '수류탄을 던짐. 빠르게 떨어지는 곡사.' },
+    gunner: { n: '중기관총 사수', sh: 'heavy', tint: '#6a4a4a', hp: 255, r: 5.8, c: 3, f: 0.3, row: [30, 52], mv: 'hold', a: { k: 'sup', T: 1.7, dur: 2.2, dmg: 5, cov: 5, cd: [3, 4.4] }, d: '한 자리를 길게 긁음. 끝날 때까지 숨어야 함.' },
+    atrifle: { n: '대물 저격수', sh: 'inf', tint: '#6a4a80', long: 1, hp: 150, r: 4.8, c: 3, f: 0.35, row: [18, 32], mv: 'hold', a: { k: 'prc', T: 3.4, dmg: 24, cov: 35, stg: 0.5, cd: [3.5, 5] }, d: '엄폐물을 뚫는 탄. 모으는 동안 피해를 줘서 끊어야 함.' },
+    aegis: { n: '방호 무인기', sh: 'drone', tint: '#4a8a9a', fly: 1, hp: 130, r: 4.4, c: 2.5, f: 0.4, row: [26, 50], mv: 'hover', aura: { k: 'shield', R: 20, v: 0.45 }, d: '주변 적이 받는 피해를 크게 줄임. 먼저 격추.' },
+    engineer: { n: '정비병', sh: 'inf', tint: '#5a8a5a', hp: 130, r: 5, c: 2, f: 0.3, row: [26, 50], mv: 'strafe', aura: { k: 'heal', R: 26, v: 14, ev: 2.5 }, d: '주변 적을 수리. 공격은 하지 않음.' },
+    fire: { n: '소이탄병', sh: 'inf', tint: '#b06a2a', hp: 130, r: 5, c: 2.5, f: 0.45, row: [36, 58], mv: 'hold', a: { k: 'lob', T: 0.9, fl: 2.0, dmg: 8, cov: 4, burn: 3.5, bdps: 9, cd: [4, 5.5] }, d: '엄폐물 뒤에 불을 냄. 불이 꺼질 때까지 숨으면 피해.' },
+    jumper: { n: '도약병', sh: 'inf', tint: '#8a7a3a', hp: 110, r: 4.8, c: 2, f: 0.4, row: [36, 70], mv: 'hop', a: { k: 'aim', T: 1.1, dmg: 11, cov: 5, cd: [1.6, 2.6] }, d: '쏘고 바로 뛰어 자리를 바꿈. 조준이 빠름.' },
+    jugger: { n: '중장갑병', sh: 'heavy', tint: '#50505c', hp: 650, r: 6.8, c: 5, f: 0.5, row: [30, 40], mv: 'adv', armor: 0.5, a: { k: 'aim', T: 2.0, dmg: 9, n: 4, cov: 10, cd: [2.6, 3.6] }, d: '장갑이 피해를 절반으로 줄임. 머리(약점)는 그대로.' },
+    swarm: { n: '자폭 무인기', sh: 'drone', tint: '#a04a3a', fly: 1, hp: 35, r: 3.4, c: 0.7, f: 0.3, row: [16, 26], mv: 'rush', spd: 17, a: { k: 'boom', dmg: 11, cov: 26 }, d: '작고 빠름. 떼로 날아와 엄폐물에서 폭발.' },
+    officer: { n: '지휘관', sh: 'inf', tint: '#a08a3a', hp: 235, r: 5.2, c: 3, f: 0.4, row: [24, 44], mv: 'strafe', aura: { k: 'haste', R: 24, v: 1.3 }, a: { k: 'aim', T: 2.0, dmg: 12, cov: 6, cd: [3, 4] }, d: '주변 적의 조준을 빠르게 함.' },
+    rocket: { n: '유도탄병', sh: 'inf', tint: '#7a3a5a', hp: 140, r: 5, c: 2.5, f: 0.45, row: [24, 46], mv: 'hold', a: { k: 'rkt', T: 1.2, fl: 1.9, dmg: 28, cov: 40, cd: [3.8, 5.2] }, d: '느린 유도탄. 격추하거나 숨기. 엄폐물을 크게 깎음.' },
+    smoker: { n: '연막병', sh: 'inf', tint: '#6a7a7a', hp: 120, r: 5, c: 2, f: 0.5, row: [40, 60], mv: 'strafe', a: { k: 'smk', T: 0.8, R: 16, dur: 5, cd: [6, 8] }, d: '연막 속 적은 조준 보조가 안 붙고 총탄 피해 절반.' },
+    turret: { n: '자동 포탑', sh: 'turret', tint: '#5a6470', hp: 285, r: 5.6, c: 3, f: 0.5, row: [40, 64], mv: 'hold', shield: 1, a: { k: 'aim', T: 1.6, dmg: 7, n: 4, cov: 9, cd: [2.4, 3.2] }, d: '닫힌 동안 총탄을 막음. 쏠 때만 열림.' },
+    jammer: { n: '교란 무인기', sh: 'drone', tint: '#8a5aa0', fly: 1, hp: 120, r: 4.4, c: 2.5, f: 0.55, row: [18, 36], mv: 'hover', aura: { k: 'jam' }, d: '떠 있는 동안 조준 보조 끊김 · 기술 충전 절반.' },
+    hound: { n: '사냥개 기체', sh: 'hound', tint: '#7a4a3a', hp: 100, r: 4.6, c: 2, f: 0.5, row: [20, 30], mv: 'flank', spd: 21, a: { k: 'flk', T: 0.9, dmg: 15, cd: [1.8, 2.4] }, d: '빠르게 옆으로 파고들어 엄폐 무시 공격.' },
+    elite: { n: '정예 소총병', sh: 'inf', tint: '#a03a3a', hp: 200, r: 5.2, c: 2.5, f: 0.55, row: [30, 60], mv: 'strafe', a: { k: 'aim', T: 1.7, dmg: 16, n: 2, cov: 9, cd: [1.8, 3] }, d: '빠른 조준으로 두 발씩.' },
+  };
+
+  /* ───────── 우두머리 ─────────
+     parts: 부위(파괴하면 연결된 공격이 사라지고 잠시 무력화) · pats: 공격(need 부위 · ph 단계부터 · w 빈도)
+     단계: 체력 60% · 30%에서 바뀜(간격이 짧아지고 새 공격) */
+  const BOSSES = {
+    walker: { n: '공성 보행기 「철각」', sh: 'walker', tint: '#6a6470', hp: 8100, r: 13, y: 39, sway: 10, gap: [2.6, 2.0, 1.5],
+      parts: [{ id: 'lg', n: '왼쪽 기관포', hp: 780, ox: -13, oy: -2, r: 4.6 }, { id: 'rg', n: '오른쪽 기관포', hp: 780, ox: 13, oy: -2, r: 4.6 }, { id: 'pod', n: '유도탄 포대', hp: 900, ox: 0, oy: -13, r: 5 }],
+      pats: [{ k: 'sweep', need: 'lg', w: 3, dmg: 5, cov: 5, T: 1.3, dur: 0.9 }, { k: 'aim3', need: 'rg', w: 3, T: 1.8, dmg: 15, cov: 9 }, { k: 'rkt', need: 'pod', w: 3, n: 3, dmg: 22, cov: 25, fl: 2.1 },
+        { k: 'lob', w: 2, n: 2, dmg: 24, cov: 10, fl: 2.3 }, { k: 'add', ph: 1, w: 2, list: ['rifle', 'rifle', 'shield'] }, { k: 'aim1', ph: 2, w: 3, T: 1.0, dmg: 16, cov: 8, n: 2 }],
+      d: '두 팔의 기관포와 등의 유도탄 포대. 부위를 부수면 그 공격이 사라짐.' },
+    heli: { n: '강습 회전익기 「맹금」', sh: 'heli', tint: '#5a6a5a', fly: 1, hp: 7200, r: 12, y: 33, sway: 26, gap: [2.4, 1.9, 1.4],
+      parts: [{ id: 'lp', n: '왼쪽 로켓 포드', hp: 660, ox: -11, oy: 3, r: 4.2 }, { id: 'rp', n: '오른쪽 로켓 포드', hp: 660, ox: 11, oy: 3, r: 4.2 }, { id: 'tail', n: '꼬리 회전날개', hp: 840, ox: 15, oy: -6, r: 4 }],
+      pats: [{ k: 'sweep', w: 4, dmg: 5, cov: 4, T: 1.1, dur: 0.8 }, { k: 'rkt', need: 'lp', w: 2, n: 2, dmg: 22, cov: 25, fl: 1.9 }, { k: 'rkt', need: 'rp', w: 2, n: 2, dmg: 22, cov: 25, fl: 1.9 },
+        { k: 'add', w: 2, list: ['trooper', 'trooper'] }, { k: 'aim1', ph: 1, w: 3, T: 1.1, dmg: 15, cov: 7, n: 2 }, { k: 'add', ph: 2, w: 2, list: ['swarm', 'swarm', 'swarm'] }],
+      d: '좌우로 크게 움직이며 세 자리를 차례로 긁음. 꼬리 회전날개를 부수면 오래 흔들림.' },
+    cannon: { n: '열차포 「천둥」', sh: 'cannon', tint: '#5a5048', hp: 9300, r: 14, y: 37, sway: 3, gap: [2.8, 2.2, 1.7],
+      parts: [{ id: 'barrel', n: '포신', hp: 1080, ox: 0, oy: 6, r: 5 }, { id: 'loader', n: '장전기', hp: 780, ox: -12, oy: -4, r: 4.4 }, { id: 'plate', n: '측면 포대', hp: 780, ox: 12, oy: -4, r: 4.4 }],
+      pats: [{ k: 'prc', need: 'barrel', w: 4, T: 3.6, dmg: 30, cov: 55, stg: 0.07 }, { k: 'lob', need: 'loader', w: 3, n: 3, dmg: 24, cov: 10, fl: 2.4 }, { k: 'aim3', need: 'plate', w: 3, T: 1.9, dmg: 14, cov: 8 },
+        { k: 'fire', ph: 1, w: 2, dmg: 8, cov: 4, fl: 2.0, burn: 3.5, bdps: 9 }, { k: 'add', w: 2, list: ['shield', 'rifle', 'mortar'] }, { k: 'add', ph: 2, w: 2, list: ['atrifle', 'shield'] }],
+      d: '포신이 보라색으로 빛나면 관통 포격. 모으는 동안 집중 사격으로 끊어야 함.' },
+    spider: { n: '다족 전차 「긴다리」', sh: 'spider', tint: '#4a5a6a', hp: 7800, r: 12, y: 40, sway: 18, gap: [2.3, 1.8, 1.3],
+      parts: [{ id: 'll', n: '왼쪽 앞다리', hp: 720, ox: -14, oy: 6, r: 4.2 }, { id: 'rl', n: '오른쪽 앞다리', hp: 720, ox: 14, oy: 6, r: 4.2 }, { id: 'tur', n: '상부 포탑', hp: 900, ox: 0, oy: -11, r: 4.8 }],
+      pats: [{ k: 'aim1', need: 'tur', w: 4, T: 1.3, dmg: 15, cov: 8, n: 2 }, { k: 'flk', w: 3, T: 1.6, dmg: 14 }, { k: 'add', w: 2, list: ['bomber', 'bomber'] },
+        { k: 'sweep', ph: 1, w: 3, dmg: 5, cov: 5, T: 1.2, dur: 0.8 }, { k: 'add', ph: 2, w: 2, list: ['hound', 'hound'] }, { k: 'lob', ph: 1, w: 2, n: 2, dmg: 22, cov: 9, fl: 2.0 }],
+      d: '옆으로 뛰어 측면을 노림. 앞다리 둘을 모두 부수면 주저앉아 큰 피해를 받음.' },
+    fort: { n: '사령 요새 「철옹」', sh: 'fort', tint: '#5c5c56', hp: 9600, r: 15, y: 37, sway: 0, gap: [2.5, 2.0, 1.5],
+      parts: [{ id: 't0', n: '왼쪽 포탑', hp: 780, ox: -16, oy: -6, r: 4.4 }, { id: 't1', n: '가운데 포탑', hp: 780, ox: 0, oy: -12, r: 4.4 }, { id: 't2', n: '오른쪽 포탑', hp: 780, ox: 16, oy: -6, r: 4.4 }],
+      pats: [{ k: 'aimS', need: 't0', slot: 0, w: 3, T: 1.7, dmg: 16, cov: 9 }, { k: 'aimS', need: 't1', slot: 1, w: 3, T: 1.7, dmg: 16, cov: 9 }, { k: 'aimS', need: 't2', slot: 2, w: 3, T: 1.7, dmg: 16, cov: 9 },
+        { k: 'lob', w: 2, n: 3, dmg: 22, cov: 10, fl: 2.4 }, { k: 'add', w: 2, list: ['sniper', 'rifle', 'rifle'] }, { k: 'prc', ph: 2, w: 3, T: 3.2, dmg: 26, cov: 45, stg: 0.06 }, { k: 'add', ph: 1, w: 2, list: ['turret', 'engineer'] }],
+      d: '포탑 셋이 각자 한 자리씩 맡음. 내 앞의 포탑부터 부수면 그 자리가 안전해짐.' },
+    ghost: { n: '은폐 기체 「잔영」', sh: 'ghost', tint: '#4a4a66', cloak: 1, hp: 6600, r: 10, y: 44, sway: 30, gap: [2.1, 1.7, 1.2],
+      parts: [{ id: 'gen', n: '은폐 발생기', hp: 780, ox: 0, oy: -10, r: 4.4 }, { id: 'arm', n: '칼날 팔', hp: 780, ox: 11, oy: 1, r: 4.4 }],
+      pats: [{ k: 'flk', need: 'arm', w: 4, T: 1.4, dmg: 16 }, { k: 'aim1', w: 3, T: 1.0, dmg: 14, cov: 7, n: 2 }, { k: 'prc', w: 2, T: 3.0, dmg: 22, cov: 50, stg: 0.07 },
+        { k: 'add', ph: 1, w: 2, list: ['stalker', 'stalker'] }, { k: 'aim3', ph: 2, w: 3, T: 1.4, dmg: 13, cov: 7 }],
+      d: '공격 사이에 모습을 감춤(조준 보조 끊김). 은폐 발생기를 부수면 더는 숨지 못함.' },
+    hive: { n: '무인기 모함 「벌집」', sh: 'hive', tint: '#6a5a44', fly: 1, hp: 7500, r: 14, y: 33, sway: 12, gap: [2.6, 2.1, 1.6],
+      parts: [{ id: 'lb', n: '왼쪽 격납구', hp: 720, ox: -13, oy: 3, r: 4.6 }, { id: 'rb', n: '오른쪽 격납구', hp: 720, ox: 13, oy: 3, r: 4.6 }, { id: 'ant', n: '지휘 안테나', hp: 660, ox: 0, oy: -13, r: 4 }],
+      pats: [{ k: 'add', need: 'lb', w: 3, list: ['swarm', 'swarm', 'swarm'] }, { k: 'add', need: 'rb', w: 3, list: ['drone', 'drone'] }, { k: 'sweep', need: 'ant', w: 3, dmg: 5, cov: 4, T: 1.2, dur: 0.8 },
+        { k: 'lob', w: 2, n: 2, dmg: 22, cov: 9, fl: 2.2 }, { k: 'aim3', ph: 1, w: 3, T: 1.7, dmg: 13, cov: 8 }, { k: 'add', ph: 2, w: 2, list: ['aegis', 'jammer'] }],
+      d: '격납구에서 무인기를 계속 내보냄. 격납구를 부수면 그쪽 무인기가 끊김.' },
+  };
+
+  /* ───────── 강화(판 안에서만 · 구간마다 셋 중 하나 · 같은 강화는 3단계까지) ─────────
+     fx: 단계마다 더해지는 값 · cls: 그 무기 종류의 사수가 분대에 있을 때만 나옴 · t: 키워드(「이름: 수치」) */
+  const UPG = [
+    { id: 'dmg', n: '고위력탄', g: '공격', fx: { dmg: 0.12 }, t: [['피해', '+12%']] },
+    { id: 'rof', n: '가속 장치', g: '공격', fx: { rof: 0.10 }, t: [['연사', '+10%']] },
+    { id: 'mag', n: '확장 탄창', g: '공격', fx: { mag: 0.25 }, t: [['탄창', '+25%']] },
+    { id: 'rld', n: '빠른 손', g: '공격', fx: { rld: 0.15 }, t: [['장전 시간', '−15%']] },
+    { id: 'wk', n: '약점 조준경', g: '공격', fx: { wk: 0.30 }, t: [['약점 피해', '+30%']] },
+    { id: 'crit', n: '예리한 탄두', g: '공격', fx: { crit: 0.10 }, t: [['치명', '+10%'], ['치명 피해', '2배']] },
+    { id: 'first', n: '선제 사격', g: '공격', fx: { first: 0.25 }, t: [['엄폐에서 나온 뒤 1.2초 피해', '+25%']] },
+    { id: 'exe', n: '마무리', g: '공격', fx: { exe: 0.30 }, t: [['체력 30% 이하 적 피해', '+30%']] },
+    { id: 'aoe', n: '고폭약', g: '공격', fx: { aoe: 0.20, aoeD: 0.10 }, t: [['폭발 반경', '+20%'], ['폭발 피해', '+10%']] },
+    { id: 'boss', n: '대형 표적 훈련', g: '공격', fx: { boss: 0.15 }, t: [['우두머리 · 부위 피해', '+15%']] },
+    { id: 'stg', n: '저지탄', g: '공격', fx: { stg: 0.40, shp: 0.15 }, t: [['관통 공격 끊기', '+40%'], ['방패 관통', '15%']] },
+    { id: 'kill', n: '탄 회수', g: '공격', fx: { kill: 0.08 }, t: [['처치 시 탄 회복', '8%']] },
+    { id: 'hp', n: '방탄복', g: '방어', fx: { hp: 0.18 }, t: [['최대 체력', '+18%']] },
+    { id: 'cov', n: '보강 엄폐물', g: '방어', fx: { cov: 0.30 }, t: [['엄폐 내구', '+30%']] },
+    { id: 'rep', n: '공병 지원', g: '방어', fx: { rep: 0.25 }, t: [['구간마다 엄폐 수리', '+25%']] },
+    { id: 'med', n: '구급낭', g: '방어', fx: { med: 0.10 }, t: [['구간마다 체력 회복', '+10%']] },
+    { id: 'low', n: '낮은 자세', g: '방어', fx: { low: 0.20 }, t: [['엄폐 뒤에서 받는 피해', '−20%']] },
+    { id: 'quick', n: '반사 신경', g: '방어', fx: { quick: 0.20 }, t: [['숨는 속도', '+20%']] },
+    { id: 'armor', n: '강화 섬유', g: '방어', fx: { armor: 0.10 }, t: [['나와 있을 때 받는 피해', '−10%']] },
+    { id: 'rev', n: '재정비', g: '방어', fx: { rev: 0.20 }, t: [['쓰러진 사수 복귀 체력', '+20%']] },
+    { id: 'sk', n: '전술 단말', g: '지원', fx: { sk: 0.20 }, t: [['기술 충전', '+20%']] },
+    { id: 'ally', n: '사격 통제', g: '지원', fx: { ally: 0.20 }, t: [['동료 피해', '+20%']] },
+    { id: 'judg', n: '분대 훈련', g: '지원', fx: { judg: 0.10 }, t: [['동료 회피 판단', '+10%']] },
+    { id: 'burst', n: '합동 신호', g: '지원', fx: { burst: 0.30, burstT: 0.5 }, t: [['일제 사격 피해', '+30%'], ['일제 사격 시간', '+0.5초']] },
+    { id: 'slow', n: '교란 장치', g: '지원', fx: { slow: 0.10 }, t: [['적 조준 시간', '+10%']] },
+    { id: 'dodge', n: '아슬한 회피', g: '지원', fx: { dodge: 3 }, t: [['조준선을 숨어서 피하면 기술', '+3']] },
+    { id: 'icpt', n: '대공 조준', g: '지원', fx: { icpt: 0.40, icD: 30 }, t: [['포탄 · 유도탄 격추 판정', '+40%'], ['격추 폭발 피해', '30']] },
+    { id: 'c_ar', n: '총열 안정', g: '돌격소총', cls: 'ar', fx: { arSp: 0.40, arD: 0.08 }, t: [['탄 퍼짐', '−40%'], ['피해', '+8%']] },
+    { id: 'c_sr', n: '빠른 집중', g: '저격총', cls: 'sr', fx: { srC: 0.18 }, t: [['모으는 시간 · 발사 간격', '−18%']] },
+    { id: 'c_sg', n: '강선탄', g: '산탄총', cls: 'sg', fx: { sgFar: 0.20, sgPel: 1 }, t: [['먼 거리 피해', '+20%p'], ['산탄', '+1발']] },
+    { id: 'c_mg', n: '예열 유지', g: '기관총', cls: 'mg', fx: { mgHeat: 0.40, mgKeep: 1.5 }, t: [['예열 속도', '+40%'], ['숨어도 예열 유지', '+1.5초']] },
+    { id: 'c_gl', n: '집속탄', g: '유탄 발사기', cls: 'gl', fx: { glClu: 1 }, t: [['작은 폭발(피해 40%)', '+1개']] },
+    { id: 'c_smg', n: '경량 기관부', g: '기관단총', cls: 'smg', fx: { smgR: 0.12, smgL: 0.12 }, t: [['연사', '+12%'], ['장전 시간', '−12%']] },
+  ];
+  const UPG_MAX = 3;
+
+  /* ───────── 전장(배경 색) · 임무 ───────── */
+  const THEMES = [
+    { id: 'city', n: '도심 폐허', sky: ['#2a2f45', '#6a5a66', '#c08a62'], far: '#2a2836', gnd: ['#55504e', '#3a3636'], line: '#6a6462', prop: 'bld' },
+    { id: 'port', n: '항만 야적장', sky: ['#1f3344', '#4a7080', '#a8b8a8'], far: '#22323c', gnd: ['#4a5258', '#30363c'], line: '#66727a', prop: 'crane' },
+    { id: 'snow', n: '설원 기지', sky: ['#3a4a66', '#8a9ab4', '#dfe6ee'], far: '#56627a', gnd: ['#c4ccd6', '#8c96a6'], line: '#aab4c2', prop: 'peak' },
+    { id: 'dune', n: '사막 검문소', sky: ['#4a3a4a', '#c0785a', '#f0c88a'], far: '#7a5a48', gnd: ['#b89868', '#8a6e4a'], line: '#a8875a', prop: 'dune' },
+    { id: 'plant', n: '공장 지대', sky: ['#1c2028', '#3c444c', '#7a7466'], far: '#20242a', gnd: ['#45484a', '#2c2e30'], line: '#5c6062', prop: 'stack' },
+  ];
+  const MISSIONS = { clear: { n: '소탕', d: '적 전부 처치' }, hold: { n: '버티기', d: '시간이 다 될 때까지 버티기' }, hvt: { n: '표적 제거', d: '표시된 지휘관 처치' }, boss: { n: '우두머리', d: '우두머리 격파' } };
+  const LENS = { short: { n: 8, mid: 0 }, normal: { n: 10, mid: 5 }, long: { n: 12, mid: 6 } };   // n: 구간 수(마지막은 우두머리) · mid: 중간 우두머리 구간(0 없음)
+
+  /* 그림(M1 WAI v17 + S18 엔드필드 게임풍 1.0 — 자세한 것은 assets/covershot/PROMPTS.md). 경로가 비어 있거나 안 불러와지면 코드 그림이 받침으로 쓰임
+     portrait: 사수 초상(3:4) · cutin: 기술 컷인(16:9) · bg: 전장 배경
+     boss: 우두머리(정면, 투명) + bossm[k] = [원점 x 비율, 원점 y 비율, 그림 너비(시뮬 단위)] — 원점 = 시뮬의 몸 가운데. 부위 판정 · 고리 · 부서진 모습은 view.js가 얹음
+     enemy: 적(정면, 투명 — 방패병 · 포탑의 열린 모습은 키 + '2') + enm[키] = [기준, 가운데 x 비율, (무인기) 가운데 y 비율] — 사람은 기준 = 머리 가운데 y 비율, 무인기는 너비 · 포탑 · 사냥개는 높이(R 배수). 둘 다 없으면 코드 그림
+     focus: 작은 칸에 넣을 때의 얼굴 초점 [가운데x, 가운데y, 보이는 너비](그림 크기에 대한 비율) */
+  const ART = {
+    portrait: { vanguard: 'assets/covershot/p_vanguard.webp', hawkeye: 'assets/covershot/p_hawkeye.webp', breaker: 'assets/covershot/p_breaker.webp', ironrain: 'assets/covershot/p_ironrain.webp', salvo: 'assets/covershot/p_salvo.webp', gale: 'assets/covershot/p_gale.webp', bulwark: 'assets/covershot/p_bulwark.webp', pulse: 'assets/covershot/p_pulse.webp', frost: 'assets/covershot/p_frost.webp' },
+    cutin: { vanguard: 'assets/covershot/c_vanguard.webp', hawkeye: 'assets/covershot/c_hawkeye.webp', breaker: 'assets/covershot/c_breaker.webp', ironrain: 'assets/covershot/c_ironrain.webp', salvo: 'assets/covershot/c_salvo.webp', gale: 'assets/covershot/c_gale.webp', bulwark: 'assets/covershot/c_bulwark.webp', pulse: 'assets/covershot/c_pulse.webp', frost: 'assets/covershot/c_frost.webp' },
+    bg: { city: 'assets/covershot/bg_city.webp', port: 'assets/covershot/bg_port.webp', snow: 'assets/covershot/bg_snow.webp', dune: 'assets/covershot/bg_dune.webp', plant: 'assets/covershot/bg_plant.webp' },
+    /* 적 · 우두머리 그림은 보류(2026-11-21 사용자 「나중의 목록으로」) — 그림이 다 모이고 화면 확인을 마칠 때까지 꺼 둠(코드 그림으로 나옴). 켜는 법: assets/covershot/PROMPTS.md 「적 그림 — 보류」 */
+    enemyOn: false, bossOn: false,
+    boss: { walker: 'assets/covershot/b_walker.webp', cannon: 'assets/covershot/b_cannon.webp' },
+    bossm: { walker: [0.4964, 0.5049, 33.94], cannon: [0.5028, 0.5297, 37.67] },
+    enemy: { rifle: 'assets/covershot/e_rifle.webp', jugger: 'assets/covershot/e_jugger.webp', bomber: 'assets/covershot/e_bomber.webp', shield2: 'assets/covershot/e_shield2.webp',
+      aegis: 'assets/covershot/e_aegis.webp', drone: 'assets/covershot/e_drone.webp', hound: 'assets/covershot/e_hound.webp', jammer: 'assets/covershot/e_jammer.webp', swarm: 'assets/covershot/e_swarm.webp', turret2: 'assets/covershot/e_turret2.webp',
+      trooper: 'assets/covershot/e_trooper.webp', sniper: 'assets/covershot/e_sniper.webp', mortar: 'assets/covershot/e_mortar.webp', atrifle: 'assets/covershot/e_atrifle.webp', grenadier: 'assets/covershot/e_grenadier.webp', stalker: 'assets/covershot/e_stalker.webp' },
+    enm: { rifle: [0.065, 0.52], trooper: [0.06, 0.51], sniper: [0.07, 0.48], mortar: [0.13, 0.5], atrifle: [0.22, 0.55], grenadier: [0.19, 0.47], stalker: [0.065, 0.5], jugger: [0.12, 0.49], bomber: [0.075, 0.56], shield2: [0.075, 0.47],
+      aegis: [2.6, 0.5, 0.5], drone: [2.9, 0.5, 0.55], jammer: [2.8, 0.5, 0.55], swarm: [2.7, 0.5, 0.5], turret2: [2.5, 0.5], turret: [2.5, 0.5], hound: [2.3, 0.5] },
+    /* 전투 중 사수(뒷모습 전신, 투명 배경): fire 사격 자세 · cover 엄폐 자세. 셋 다(fire · cover · figm) 있어야 그림으로 그리고, 하나라도 없으면 코드 인형
+       figm[id] = { f: [키 비율(서 있는 키 = 1), 발 가운데 x, 총구 x, 총구 y], c: [키 비율, 발 가운데 x, 가라앉힘(아래쪽을 사수 카드 띠 밑으로 내려 가리는 비율)] } — x · y는 그림 크기에 대한 비율, 그림 아래 끝이 발 */
+    fire: { vanguard: 'assets/covershot/fire_vanguard.webp', hawkeye: 'assets/covershot/fire_hawkeye.webp', breaker: 'assets/covershot/fire_breaker.webp', ironrain: 'assets/covershot/fire_ironrain.webp', salvo: 'assets/covershot/fire_salvo.webp', gale: 'assets/covershot/fire_gale.webp', bulwark: 'assets/covershot/fire_bulwark.webp', pulse: 'assets/covershot/fire_pulse.webp', frost: 'assets/covershot/fire_frost.webp' },
+    cover: { vanguard: 'assets/covershot/cover_vanguard.webp', hawkeye: 'assets/covershot/cover_hawkeye.webp', breaker: 'assets/covershot/cover_breaker.webp', ironrain: 'assets/covershot/cover_ironrain.webp', salvo: 'assets/covershot/cover_salvo.webp', gale: 'assets/covershot/cover_gale.webp', bulwark: 'assets/covershot/cover_bulwark.webp', pulse: 'assets/covershot/cover_pulse.webp', frost: 'assets/covershot/cover_frost.webp' },
+    figm: { vanguard: { f: [1, 0.57, 0.92, 0.14], c: [0.75, 0.42, 0] }, hawkeye: { f: [1.09, 0.5, 0.72, 0], c: [0.78, 0.5, 0.1] }, breaker: { f: [1.17, 0.43, 0.93, 0.01], c: [0.84, 0.5, 0.2] },
+      ironrain: { f: [1.14, 0.4, 0.9, 0], c: [0.82, 0.5, 0.18] }, salvo: { f: [1.19, 0.42, 0.9, 0.01], c: [0.84, 0.5, 0.2] }, gale: { f: [0.96, 0.45, 0.7, 0.16], c: [0.9, 0.5, 0.06] },
+      bulwark: { f: [1, 0.55, 0.85, 0.2], c: [0.7, 0.55, 0] }, pulse: { f: [1, 0.55, 0.87, 0.06], c: [0.68, 0.5, 0.12] }, frost: { f: [1.06, 0.5, 0.8, 0.005], c: [0.76, 0.5, 0.06] } },
+    focus: { portrait: { vanguard: [0.69, 0.42, 0.96], hawkeye: [0.517, 0.437, 1], breaker: [0.472, 0.344, 1], ironrain: [0.521, 0.319, 0.735], salvo: [0.444, 0.418, 1], gale: [0.412, 0.392, 1], bulwark: [0.454, 0.42, 1], pulse: [0.436, 0.379, 1], frost: [0.322, 0.446, 1] },
+      cutin: { vanguard: [0.36, 0.47, 0.75], hawkeye: [0.42, 0.47, 0.75], breaker: [0.62, 0.47, 0.75], ironrain: [0.517, 0.403, 0.751], salvo: [0.6, 0.434, 0.935], gale: [0.525, 0.528, 0.973], bulwark: [0.552, 0.476, 0.973], pulse: [0.727, 0.391, 0.935], frost: [0.52, 0.6, 0.75] } },
+  };
+
+  const DATA = { ID, TITLE, WCLS, WEAPONS, SHOOTERS, ENEMIES, BOSSES, UPG, UPG_MAX, THEMES, MISSIONS, LENS, ART };
+  const CS = G.COVERSHOT = G.COVERSHOT || {};
+  CS.DATA = DATA;
+  DATA.wLine = (w) => wLine(w);
+
+  /* ───────── 판 상태 ───────── */
+  function init(players, opts) {
+    const o = opts || {};
+    return {
+      seed: (Math.random() * 4294967296) >>> 0,
+      o: { len: LENS[o.len] ? o.len : 'short', boss: BOSSES[o.boss] ? o.boss : 'rnd', assist: o.assist === 'off' ? 0 : 1, aim: o.aim === 'direct' ? 'direct' : 'rel' },
+      done: 0, sum: null,
+    };
+  }
+  const fmt = (n) => Math.round(n).toLocaleString('ko-KR');
+  function result(s) {
+    if (!s || !s.done || !s.sum) return null;
+    const m = s.sum, won = !!m.won;
+    const stats = [
+      { label: '돌파 구간', value: m.st + ' / ' + m.n },
+      { label: '시간', value: Math.floor(m.t / 60) + '분 ' + Math.floor(m.t % 60) + '초' },
+      { label: '처치', value: fmt(m.kills) },
+    ];
+    (m.sq || []).forEach((q) => stats.push({ label: q.n + ' 피해 · 명중 · 피격', value: fmt(q.dmg) + ' · ' + q.acc + '% · ' + q.hits + '회' }));
+    stats.push({ label: '고른 강화', value: (m.ups ? m.nup : 0) + '개' });
+    const hl = [];
+    if (m.boss) hl.push((won ? '격파: ' : '마지막 상대: ') + m.boss);
+    if (m.mvp) hl.push('가장 큰 피해: ' + m.mvp);
+    if (m.dodge) hl.push('숨어서 피한 공격: ' + m.dodge + '회');
+    if (m.ups && m.ups.length) hl.push('강화: ' + m.ups.join(' · '));
+    return { winners: won ? [0] : [], title: won ? '임무 완수' : '임무 실패', text: won ? '구간 ' + m.n + '개를 모두 돌파했습니다.' : m.st + '구간까지 돌파했습니다.', stats, highlights: hl };
+  }
+
+  /* ───────── 도감(수치는 위 자료에서 자동 생성) ───────── */
+  const svg = (inner) => '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+  const IC = {
+    ar: svg('<path d="M3 11h14l3-2v4l-3-1H9l-1 5H6l1-5H3z"/>'), sr: svg('<path d="M2 12h19M6 12l-1 5M9 9h6v3"/><circle cx="12" cy="8" r="1.4"/>'),
+    sg: svg('<path d="M3 10h17v3H10l-2 5H6l1-5H3z"/><path d="M12 13v2"/>'), mg: svg('<path d="M3 10h13l5 1-5 1H3zM7 12l-2 6M12 12v5h4"/>'),
+    gl: svg('<path d="M4 10h10v4H4z"/><circle cx="17" cy="12" r="3"/><path d="M7 14l-1 5"/>'), smg: svg('<path d="M4 10h12v3H9v6H7v-6H4z"/><path d="M16 11h3"/>'),
+    who: svg('<circle cx="12" cy="8" r="3.4"/><path d="M5 21c0-5 3-7 7-7s7 2 7 7"/>'),
+    inf: svg('<circle cx="12" cy="6" r="3"/><path d="M8 21v-7l-1-4h10l-1 4v7M5 13l14-3"/>'), shield: svg('<path d="M12 3l7 3v6c0 5-3 8-7 9-4-1-7-4-7-9V6z"/>'),
+    bomb: svg('<circle cx="11" cy="14" r="6"/><path d="M15 9l3-3M18 4v2M20 6h-2"/>'), mortar: svg('<path d="M6 20l8-13 3 2-8 13zM4 21h12"/><circle cx="18" cy="5" r="1.6"/>'),
+    drone: svg('<rect x="9" y="10" width="6" height="4" rx="1"/><path d="M9 11L4 8M15 11l5-3M2 8h4M18 8h4M12 14v3"/>'), heavy: svg('<rect x="6" y="8" width="12" height="10" rx="2"/><circle cx="12" cy="5" r="2.4"/><path d="M6 12H3M18 12h3M9 18v3M15 18v3"/>'),
+    turret: svg('<path d="M5 20h14l-2-7H7z"/><path d="M12 13V8M12 8h8"/>'), hound: svg('<path d="M4 12l4-3h8l4 2-2 2h-3l-1 6M8 13l-1 6M4 12v3"/>'),
+    boss: svg('<path d="M4 18l2-9 4 4 2-7 2 7 4-4 2 9z"/><path d="M4 21h16"/>'), up: svg('<path d="M12 20V6M6 12l6-6 6 6"/>'), map: svg('<path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v14M15 6v14"/>'),
+  };
+  const ATK = { aim: '직사', sup: '제압 사격', lob: '곡사', prc: '관통', flk: '측면', boom: '자폭', rkt: '유도탄', smk: '연막' };
+  const AVOID = { aim: '숨기', sup: '끝까지 숨기', lob: '나와 있기 · 포탄 격추', prc: '쏴서 끊기', flk: '먼저 격추', boom: '먼저 처치', rkt: '격추 · 숨기', smk: '—' };
+  function wLine(w) {
+    const p = [];
+    if (w.mode === 'charge') p.push('피해 ' + w.dmg, '모으기 ' + w.chg + '초');
+    else if (w.mode === 'burst') p.push('피해 ' + w.dmg + ' × ' + w.bn + '점사', '초당 ' + w.rof + '회');
+    else if (w.mode === 'heat') p.push('피해 ' + w.dmg, '연사 초당 ' + w.rof + '→' + w.rof2 + '발(예열 ' + w.heat + '초)');
+    else if (w.pel) p.push('피해 ' + w.dmg + ' × ' + w.pel + '발', '초당 ' + w.rof + '회', '먼 거리 ' + Math.round(w.far * 100) + '%');
+    else if (w.mode === 'gren') p.push('폭발 피해 ' + w.dmg, '반경 ' + w.aoe, '초당 ' + w.rof + '발');
+    else p.push('피해 ' + w.dmg, '연사 초당 ' + w.rof + '발');
+    p.push('탄창 ' + w.mag, '장전 ' + w.rld + '초');
+    if (w.wk > 1) p.push('약점 ' + w.wk + '배');
+    return p.join(' · ');
+  }
+  function codexData() {
+    const WHO = SHOOTERS.map((s) => { const w = WEAPONS[s.w]; return { icon: IC[w.cls], name: s.n, tag: s.role + ' · ' + WCLS[w.cls].n, desc: '체력 ' + s.hp + ' · ' + w.n + ' · 기술 「' + s.sk.n + '」: ' + s.sk.d }; });
+    const WPN = Object.keys(WEAPONS).map((k) => { const w = WEAPONS[k], who = SHOOTERS.filter((s) => s.w === k).map((s) => s.n).join(' · '); return { icon: IC[w.cls], name: w.n, tag: WCLS[w.cls].n + ' · ' + who, desc: wLine(w) + ' — ' + WCLS[w.cls].d }; });
+    const EN = Object.keys(ENEMIES).map((k) => {
+      const e = ENEMIES[k], a = e.a, p = ['체력 ' + e.hp];
+      if (a) { p.push(ATK[a.k] + (a.dmg ? ' 피해 ' + a.dmg + (a.n > 1 ? ' × ' + a.n : '') : '')); if (a.T && a.k !== 'smk') p.push('예고 ' + (a.T + (a.fl || 0)).toFixed(1) + '초'); p.push('대응: ' + AVOID[a.k]); }
+      if (e.shield) p.push('방패'); if (e.armor) p.push('장갑 −' + Math.round(e.armor * 100) + '%'); if (e.cloak) p.push('은폐');
+      return { icon: IC[e.sh] || IC.inf, name: e.n, tag: a ? ATK[a.k] : '지원', desc: p.join(' · ') + ' — ' + e.d };
+    });
+    const BS = Object.keys(BOSSES).map((k) => { const b = BOSSES[k]; return { icon: IC.boss, name: b.n, tag: '우두머리', desc: '체력 ' + fmt(b.hp) + ' · 부위: ' + b.parts.map((p) => p.n + ' ' + p.hp).join(', ') + ' · 공격: ' + Array.from(new Set(b.pats.map((p) => ({ sweep: '훑어 쏘기', aim3: '세 자리 직사', aim1: '빠른 직사', aimS: '포탑 직사', rkt: '유도탄', lob: '곡사', add: '증원', prc: '관통', fire: '소이탄', flk: '측면' })[p.k]))).join(', ') + ' — ' + b.d }; });
+    const UP = UPG.map((u) => ({ icon: u.cls ? IC[u.cls] : IC.up, name: u.n, tag: u.g + (u.cls ? ' 전용' : ''), desc: u.t.map((x) => x[0] + ': ' + x[1]).join(' · ') + ' (단계마다 · 최대 ' + UPG_MAX + '단계)' }));
+    return [
+      { h: '사수', p: ['분대는 3명. 한 명을 직접 조작하고 둘은 스스로 쏘고 숨습니다. 기술은 게이지가 차면 누릅니다.'], rows: WHO },
+      { h: '무기', p: ['무기는 여섯 종류. 사수마다 정해져 있습니다.'], rows: WPN },
+      { h: '적', p: ['예고의 색과 모양으로 대응이 갈립니다 — 붉은 선: 숨기 · 주황 원: 나와 있기 · 보라 선: 쏴서 끊기 · 옆 화살표: 먼저 격추.', '수치는 첫 구간 기준. 뒤 구간일수록 체력 · 피해가 오릅니다(짧게: 최대 +70% · +30%, 보통: +80% · +35%, 길게: +90% · +40%).'], rows: EN },
+      { h: '우두머리', p: ['부위를 부수면 연결된 공격이 사라지고 잠시 무력화됩니다(무력화 중 받는 피해 +30%). 체력 60% · 30%에서 단계가 바뀝니다.', '중간 우두머리는 체력이 35%입니다.'], rows: BS },
+      { h: '강화', p: ['구간을 치우면 셋 중 하나를 고릅니다. 판이 끝나면 사라집니다.'], rows: UP },
+      { h: '전장 · 임무', p: ['전장과 임무는 판마다 무작위입니다.'], rows: THEMES.map((t) => ({ icon: IC.map, name: t.n, tag: '전장', desc: '배경만 다르고 규칙은 같음' })).concat(Object.keys(MISSIONS).map((k) => ({ icon: IC.map, name: MISSIONS[k].n, tag: '임무', desc: MISSIONS[k].d }))) },
+    ];
+  }
+
+  /* ───────── 규칙 ───────── */
+  const QUICK = ['화면을 누르고 있으면 엄폐에서 나와 쏩니다. 누른 채 끌면 조준이 움직입니다.', '손을 떼면 숨고, 숨어 있는 동안 탄이 찹니다.', '적의 붉은 조준선이 다 차기 전에 손을 떼서 숨으세요.', '구간을 모두 치우고 우두머리를 쓰러뜨리면 완수입니다.'];
+  const RULES = [
+    { h: '목표', p: ['사수 3명으로 구간을 차례로 돌파하고 마지막 우두머리를 쓰러뜨립니다.', '사수 셋이 모두 쓰러지면 실패입니다. 쓰러진 사수는 다음 구간에 체력 일부로 돌아옵니다.'] },
+    { h: '조작', p: ['누르고 있기 = 엄폐에서 나와 사격. 누른 채 끌면 조준점이 움직입니다(손가락과 조준점은 떨어져 있어 가리지 않습니다).', '떼기 = 엄폐. 숨어 있으면 탄이 다시 찹니다. 탄이 떨어지면 스스로 숨었다가 다 차면 다시 나옵니다.', '아래 초상을 누르면 조작할 사수를 바꿉니다. 초상 옆 기술 칸이 다 차면 눌러서 기술을 씁니다.', '세 사람의 기술이 모두 차면 「일제 사격」이 열립니다. 셋의 기술을 한꺼번에 쓰는 대신 훨씬 강합니다.', 'PC: 마우스를 누르고 있기 = 사격, 떼기 = 엄폐. 숫자 1 · 2 · 3 사수 바꾸기, Space 기술, F 일제 사격.'] },
+    { h: '예고 읽기', p: ['붉은 선(직사): 선이 굵어지고 고리가 다 닫히면 쏩니다. 그 전에 숨으면 엄폐물이 대신 맞습니다.', '주황 원(곡사): 포탄이 엄폐물 뒤에 떨어집니다. 떨어지는 순간 나와 있으면 피합니다. 날아오는 포탄을 쏴서 떨어뜨려도 됩니다.', '보라 선(관통): 엄폐물을 뚫습니다. 모으는 동안 그 적을 쏘면 끊깁니다(선 옆의 칸이 다 비면 끊김).', '옆 화살표(측면) · 달려오는 적(자폭): 엄폐가 소용없습니다. 도착하기 전에 처치합니다.', '불(소이탄): 불이 꺼질 때까지 그 자리에 숨어 있으면 피해를 받습니다. 나와 있거나 다른 사수로 바꾸세요.'] },
+    { h: '엄폐물 · 회복', p: ['엄폐물에는 내구가 있습니다. 숨어서 막을 때마다 닳고, 다 닳으면 숨어도 피해의 절반을 받습니다.', '구간을 치울 때마다 엄폐물이 30% 수리되고 체력이 10% 회복됩니다.', '마지막 우두머리 앞에서는 엄폐물이 전부 수리되고 체력이 30% 더 회복됩니다(중간 우두머리 앞: 엄폐물 50% · 체력 15%).'] },
+    { h: '동료', p: ['조작하지 않는 두 사수는 스스로 쏘고 숨습니다. 사람보다 피해가 낮고 가끔 늦게 숨습니다.', '위험한 사수가 있으면 그 사수로 바꿔 직접 숨기세요.'] },
+    { h: '강화', p: ['구간을 치우면 강화 셋 중 하나를 고릅니다. 같은 강화는 3단계까지 겹칩니다. 한 판에 한 번 다시 뽑을 수 있습니다.', '강화는 그 판에서만 유지됩니다.'] },
+    { h: '예시', p: ['붉은 선이 내 사수에게 걸렸다 → 선이 굵어지는 동안 계속 쏜다 → 고리가 거의 닫히면 손을 뗀다 → 총소리가 지나가면 다시 누른다.'] },
+    { h: '혼자 하는 게임', p: ['1인 전용입니다. 자리를 AI로 두면 AI가 대신 플레이합니다(쉬움 · 보통 · 어려움은 반응 속도와 조준, 숨는 판단이 다릅니다).'] },
+  ];
+
+  /* ───────── 불러오기 · 화면 ───────── */
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error(src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  const loadAll = () => (CS.SIM ? Promise.resolve() : loadScript('assets/covershot/sim.js')).then(() => (CS.DRAW ? null : loadScript('assets/covershot/art.js'))).then(() => (CS.VIEW ? null : loadScript('assets/covershot/view.js')));
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', background: 'radial-gradient(circle at 50% 46%,#2a2c3c,#0d0e14)', color: '#f2e9d8', zIndex: 5 } },
+      h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '28px', letterSpacing: '2px' }, text: TITLE }),
+      h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '전장을 준비하는 중' }));
+    root.append(box);
+    loadAll().then(() => {
+      if (dead) return;
+      view = CS.VIEW.mount(root, api);
+      box.remove();
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { box.lastChild.textContent = '파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'; });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+    };
+  }
+
+  const ICON = '<circle cx="28" cy="21" r="11" fill="none" stroke="currentColor" stroke-width="3"/><path d="M28 6v8M28 28v8M13 21h8M35 21h8" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><circle cx="28" cy="21" r="2.4" fill="currentColor"/><path d="M8 50V41h40v9z" fill="currentColor" opacity=".85"/><path d="M14 41v-3h9v3M33 41v-3h9v3" fill="currentColor" opacity=".55"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '한 손 엄폐 사격', cat: '아케이드', icon: ICON, tint: '#2c3a52',
+    blurb: '누르면 엄폐에서 나와 쏘고, 떼면 숨어서 장전. 사수 셋으로 구간을 돌파하고 우두머리를 쓰러뜨립니다.',
+    time: '6–15분', realtime: true, aiDelay: 0, mood: 'tension', ambient: false, undo: false, menuCorner: 'tr',
+    minPlayers: 1, maxPlayers: 1, defaultPlayers: 1,
+    options: [
+      { id: 'len', label: '길이', def: 'normal', tip: '구간 수. 마지막 구간은 우두머리.', choices: [{ v: 'short', label: '짧게 8구간' }, { v: 'normal', label: '보통 10구간', tip: '5구간에 중간 우두머리' }, { v: 'long', label: '길게 12구간', tip: '6구간에 중간 우두머리' }] },
+      { id: 'boss', label: '우두머리', def: 'rnd', choices: [{ v: 'rnd', label: '무작위' }].concat(Object.keys(BOSSES).map((k) => ({ v: k, label: BOSSES[k].n.replace(/^.*「(.+)」$/, '$1'), tip: BOSSES[k].n }))) },
+      { id: 'assist', label: '조준 보조', def: 'on', tip: '조준점이 가까운 적에게 살짝 붙습니다.', choices: [{ v: 'on', label: '켬' }, { v: 'off', label: '끔' }] },
+      { id: 'aim', label: '터치 조준', def: 'rel', tip: '마우스는 늘 가리킨 곳을 조준합니다.', choices: [{ v: 'rel', label: '끌어서 움직이기', tip: '어디를 눌러도 됨. 끈 만큼 조준점이 움직임.' }, { v: 'direct', label: '누른 곳 위', tip: '손가락 조금 위를 조준.' }] },
+    ],
+    controls: [
+      { id: 's1', label: '1번 사수', keys: ['Digit1'], pad: ['x'] }, { id: 's2', label: '2번 사수', keys: ['Digit2'], pad: ['y'] }, { id: 's3', label: '3번 사수', keys: ['Digit3'], pad: ['b'] },
+      { id: 'skill', label: '기술(조작 중인 사수)', keys: ['Space'], pad: ['a'] }, { id: 'burst', label: '일제 사격', keys: ['KeyF'], pad: ['rb'] },
+      { id: 'k1', label: '1번 사수 기술', keys: ['KeyQ'], pad: ['left'] }, { id: 'k2', label: '2번 사수 기술', keys: ['KeyW'], pad: ['up'] }, { id: 'k3', label: '3번 사수 기술', keys: ['KeyE'], pad: ['right'] },
+    ],
+    quick: QUICK, rules: RULES,
+    get codex() { return codexData(); },
+    panelInfo(s) { return s && s.pi ? s.pi : null; },
+    init, result,
+    actor() { return null; },
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai() { return null; },   // 봇은 화면 쪽 시뮬에서 돎(assets/covershot/sim.js의 bot)
+    mount,
+  });
+})();

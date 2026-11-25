@@ -1,0 +1,1187 @@
+/* 무대 프로듀서 — 레슨 카드로 한 시즌을 키워 오디션에 올리는 1인 육성 덱 게임.
+   순수 로직(init/actor/apply/ai/result) + DOM 뷰. 무작위는 상태 안의 시드(s.rs)로만 굴려서 미리 보기와 실제 결과가 같다.
+   그림: app/assets/stageprod/(인물 3 × 평소 · 집중 · 호조 · 지침 · 무대 · 결의 + 얼굴, 배경 7, 경쟁자 초상 8) — 없어도 화면이 깨지지 않게 도형으로 대신한다. */
+(function () {
+  'use strict';
+  const L = window.Lounge, ID = 'stageprod';
+  const min = Math.min, max = Math.max, floor = Math.floor, round = Math.round, ceil = Math.ceil;
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const STN = ['보컬', '댄스', '표현'], STC = ['#f08aa8', '#6dbcf0', '#ecc85a'];
+
+  /* ---------- 무작위(상태 시드) ---------- */
+  function rnd(s) { let t = (s.rs = (s.rs + 0x6D2B79F5) | 0); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+  const ri = (s, n) => floor(rnd(s) * n);
+  function shuf(s, a) { for (let i = a.length - 1; i > 0; i--) { const j = ri(s, i + 1); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+  function hash(n, k) { let t = (n ^ Math.imul(k + 1, 0x9E3779B1)) | 0; t = Math.imul(t ^ (t >>> 16), 0x85EBCA6B); t = Math.imul(t ^ (t >>> 13), 0xC2B2AE35); return ((t ^ (t >>> 16)) >>> 0) / 4294967296; }
+
+  /* ---------- 키워드 ---------- */
+  const KW = {
+    g: { n: '기력', c: '#7fd6c4', d: '카드 비용을 체력 대신 먼저 치름. 레슨 · 심사가 끝나면 사라짐.' },
+    f: { n: '집중', c: '#9bbcff', d: '점수를 낼 때마다 집중 수치만큼 더함. 여러 번 점수를 내는 카드는 매번 더함.' },
+    gc: { n: '호조', c: '#ffb85a', turn: 1, d: '남은 턴 동안 내는 점수가 1.5배.' },
+    pk: { n: '절정', c: '#ff8672', turn: 1, d: '호조와 겹친 동안 점수 배율이 1.5배 대신 2배.' },
+    mo: { n: '의욕', c: '#b9e372', d: '기력을 얻을 때마다 의욕 수치만큼 더 얻음.' },
+    ht: { n: '열기', c: '#ff9552', d: '턴이 끝날 때 열기의 2배만큼 점수를 얻고, 열기는 절반(내림)으로 줄어듦.' },
+    ez: { n: '여유', c: '#a4e2f2', turn: 1, d: '카드 비용이 절반(올림).' },
+    bd: { n: '부담', c: '#cfa6ee', turn: 1, d: '카드 비용 +2.' },
+    x: { n: '추가 행동', c: '#f2e9d8', d: '이번 턴에 카드를 한 장 더 냄. 턴마다 기본은 한 장.' },
+    once: { n: '1회', c: '#d8cbe4', d: '한 번 내면 그 레슨 · 심사에서는 다시 나오지 않음.' },
+  };
+  const kwv = (k, v) => KW[k].n + ': ' + v + (KW[k].turn ? '턴' : '');
+
+  /* ---------- 카드 ----------
+     t: a 어필(점수) · m 준비.  c: 비용(기력 먼저, 모자라면 체력) · hc: 체력으로만 치르는 비용.
+     e: 효과 목록, u: 강화하면 바뀌는 값.  r: 0 기본 · 1 흔함 · 2 드묾 · 3 귀함.  o: 전용 인물(1~3).  g: 그림 기호. */
+  const C = {
+    first: { n: '첫 음', t: 'a', c: 3, e: [['s', 9]], u: { e: [['s', 13]] }, r: 0, g: 'note' },
+    bar: { n: '한 소절', t: 'a', c: 2, e: [['s', 6], ['g', 2]], u: { e: [['s', 8], ['g', 3]] }, r: 0, g: 'note' },
+    breath: { n: '호흡 고르기', t: 'm', c: 0, e: [['g', 5]], u: { e: [['g', 8]] }, r: 0, g: 'wave' },
+    leap: { n: '도약', t: 'a', c: 5, e: [['s', 16]], u: { e: [['s', 22]] }, r: 1, g: 'shoe' },
+    steps: { n: '연속 스텝', t: 'a', c: 4, e: [['s', 5, 2]], u: { e: [['s', 7, 2]] }, r: 1, g: 'shoe' },
+    long: { n: '길게 뻗는 음', t: 'a', c: 4, e: [['s', 8, 1, 2]], u: { e: [['s', 11, 1, 2]] }, r: 2, g: 'note' },
+    gaze: { n: '시선 처리', t: 'a', c: 3, e: [['s', 7], ['d', 1], ['x', 1]], u: { e: [['s', 10], ['d', 1], ['x', 1]] }, r: 2, g: 'eye' },
+    pose: { n: '마무리 포즈', t: 'a', c: 4, e: [['s', 10], ['if', ['last'], [['s', 15]]]], u: { e: [['s', 13], ['if', ['last'], [['s', 20]]]] }, r: 1, g: 'star' },
+    counter: { n: '받아치기', t: 'a', c: 0, e: [['sg', 60, 0]], u: { e: [['sg', 90, 0]] }, r: 2, g: 'shield' },
+    dive: { n: '몸을 던져', t: 'a', c: 0, hc: 4, e: [['s', 18]], u: { e: [['s', 24]] }, r: 1, g: 'flame' },
+    intro: { n: '속삭이는 도입', t: 'a', c: 1, e: [['s', 4], ['h', 1]], u: { e: [['s', 6], ['h', 2]] }, r: 1, g: 'sun' },
+    unison: { n: '합 맞추기', t: 'a', c: 3, e: [['s', 8], ['if', ['f', 4], [['s', 8]]]], u: { e: [['s', 10], ['if', ['f', 4], [['s', 10]]]] }, r: 1, g: 'metro' },
+    word: { n: '숨 고른 한마디', t: 'a', c: 2, e: [['s', 7], ['hp', 2]], u: { e: [['s', 9], ['hp', 3]] }, r: 1, g: 'heart' },
+    climax: { n: '클라이맥스', t: 'a', c: 6, once: 1, e: [['s', 14, 2]], u: { e: [['s', 18, 2]] }, r: 3, g: 'star' },
+    echo: { n: '잔향', t: 'a', c: 3, e: [['s', 6], ['ht', 3]], u: { e: [['s', 8], ['ht', 4]] }, r: 1, g: 'flame' },
+    camera: { n: '카메라 앞에서', t: 'a', c: 3, e: [['s', 8], ['if', ['gc'], [['s', 8]]]], u: { e: [['s', 10], ['if', ['gc'], [['s', 10]]]] }, r: 1, g: 'eye' },
+    rest1: { n: '한 박자 쉬고', t: 'a', c: 2, e: [['s', 4], ['e', 2]], u: { e: [['s', 6], ['e', 3]] }, r: 1, g: 'hour' },
+    modul: { n: '전조', t: 'a', c: 4, e: [['s', 9], ['f', 2]], u: { e: [['s', 11], ['f', 3]] }, r: 2, g: 'metro' },
+    cross: { n: '끝에서 끝으로', t: 'a', c: 5, e: [['s', 7, 3], ['b', 2]], u: { e: [['s', 9, 3], ['b', 2]] }, r: 2, g: 'shoe' },
+    offbeat: { n: '엇박', t: 'a', c: 3, e: [['s', 3, 3]], u: { e: [['s', 4, 3]] }, r: 1, g: 'metro' },
+    chord: { n: '화음 쌓기', t: 'a', c: 3, e: [['s', 6], ['m', 1], ['g', 3]], u: { e: [['s', 8], ['m', 1], ['g', 4]] }, r: 1, g: 'note' },
+    turn: { n: '돌아보는 동작', t: 'a', c: 2, e: [['s', 5], ['nd', 1]], u: { e: [['s', 8], ['nd', 1]] }, r: 1, g: 'mask' },
+    high: { n: '고음', t: 'a', c: 5, e: [['s', 20], ['b', 1]], u: { e: [['s', 26], ['b', 1]] }, r: 2, g: 'note' },
+    improv: { n: '즉흥', t: 'a', c: 2, e: [['sn', 4]], u: { e: [['sn', 6]] }, r: 2, g: 'mask' },
+    trick: { n: '잔기술', t: 'a', c: 1, e: [['s', 4], ['x', 1]], u: { e: [['s', 6], ['x', 1]] }, r: 2, g: 'spark' },
+    allin: { n: '온 힘을 실어', t: 'a', c: 4, e: [['s', 7], ['sg', 120, 1]], u: { e: [['s', 7], ['sg', 160, 1]] }, r: 3, g: 'shield' },
+    stretch: { n: '스트레칭', t: 'm', c: 0, e: [['g', 3], ['hp', 3]], u: { e: [['g', 4], ['hp', 4]] }, r: 1, g: 'heart' },
+    mirror: { n: '거울 앞 점검', t: 'm', c: 2, e: [['f', 3]], u: { e: [['f', 4]] }, r: 1, g: 'metro' },
+    warm: { n: '준비 운동', t: 'm', c: 2, e: [['h', 3]], u: { e: [['h', 4]] }, r: 1, g: 'sun' },
+    resolve: { n: '마음 다잡기', t: 'm', c: 1, e: [['m', 2], ['g', 2]], u: { e: [['m', 3], ['g', 2]] }, r: 1, g: 'leaf' },
+    score: { n: '악보 읽기', t: 'm', c: 0, e: [['d', 2], ['x', 1]], u: { e: [['d', 3], ['x', 1]] }, r: 1, g: 'spark' },
+    water: { n: '물 한 모금', t: 'm', c: 0, once: 1, e: [['hp', 4]], u: { e: [['hp', 6]] }, r: 1, g: 'heart' },
+    rehear: { n: '리허설', t: 'm', c: 3, once: 1, e: [['per', 'f', 1]], u: { c: 2 }, r: 3, g: 'metro' },
+    routine: { n: '루틴', t: 'm', c: 3, once: 1, e: [['per', 'g', 3]], u: { e: [['per', 'g', 4]] }, r: 2, g: 'wave' },
+    deep: { n: '깊은 숨', t: 'm', c: 1, e: [['g', 7], ['e', 1]], u: { e: [['g', 9], ['e', 2]] }, r: 1, g: 'wave' },
+    image: { n: '이미지 트레이닝', t: 'm', c: 2, e: [['h', 2], ['x', 1]], u: { e: [['h', 3], ['x', 1]] }, r: 2, g: 'sun' },
+    silence: { n: '무대 뒤의 정적', t: 'm', c: 0, once: 1, e: [['t', 1]], u: { e: [['t', 1], ['g', 4]] }, r: 3, g: 'hour' },
+    route: { n: '약속된 동선', t: 'm', c: 2, e: [['f', 2], ['h', 2]], u: { e: [['f', 3], ['h', 2]] }, r: 2, g: 'shoe' },
+    loosen: { n: '긴장 풀기', t: 'm', c: 0, e: [['cb'], ['g', 4]], u: { e: [['cb'], ['g', 6]] }, r: 1, g: 'leaf' },
+    monitor: { n: '모니터링', t: 'm', c: 1, e: [['f', 1], ['x', 1]], u: { e: [['f', 2], ['x', 1]] }, r: 2, g: 'eye' },
+    grit: { n: '악착같이', t: 'm', c: 0, hc: 3, e: [['ht', 4], ['g', 3]], u: { e: [['ht', 6], ['g', 3]] }, r: 1, g: 'flame' },
+    center: { n: '중심 잡기', t: 'm', c: 1, e: [['g', 6], ['f', 1]], u: { e: [['g', 8], ['f', 1]] }, r: 1, g: 'shield' },
+    smile: { n: '여유로운 미소', t: 'm', c: 2, e: [['e', 3]], u: { e: [['e', 4], ['g', 2]] }, r: 1, g: 'hour' },
+    /* 메트로놈 전용 */
+    beat: { n: '정박', t: 'm', c: 2, e: [['f', 2]], u: { e: [['f', 3]] }, r: 0, o: 1, g: 'metro' },
+    eight: { n: '여덟 박자', t: 'a', c: 3, e: [['s', 4, 2]], u: { e: [['s', 4, 3]] }, r: 1, o: 1, g: 'metro' },
+    exact: { n: '오차 없이', t: 'a', c: 4, e: [['s', 6, 1, 3]], u: { e: [['s', 8, 1, 3]] }, r: 2, o: 1, g: 'star' },
+    count: { n: '박자 세기', t: 'm', c: 1, e: [['f', 1], ['d', 1], ['x', 1]], u: { e: [['f', 2], ['d', 1], ['x', 1]] }, r: 1, o: 1, g: 'metro' },
+    drill: { n: '정밀한 군무', t: 'a', c: 5, e: [['s', 10], ['if', ['f', 6], [['s', 10]]]], u: { e: [['s', 12], ['if', ['f', 6], [['s', 12]]]] }, r: 2, o: 1, g: 'shoe' },
+    off: { n: '메트로놈 끄기', t: 'm', c: 0, once: 1, e: [['f2', 8]], u: { e: [['f2', 12]] }, r: 3, o: 1, g: 'spark' },
+    slow: { n: '느린 연습', t: 'm', c: 2, e: [['f', 2], ['g', 4]], u: { e: [['f', 3], ['g', 5]] }, r: 1, o: 1, g: 'wave' },
+    last8: { n: '끝 여덟 마디', t: 'a', c: 6, once: 1, e: [['s', 8, 3]], u: { e: [['s', 10, 3]] }, r: 3, o: 1, g: 'star' },
+    /* 한낮 전용 */
+    hello: { n: '가벼운 인사', t: 'm', c: 2, e: [['h', 2], ['g', 2]], u: { e: [['h', 3], ['g', 2]] }, r: 0, o: 2, g: 'sun' },
+    seats: { n: '객석을 보는 눈', t: 'a', c: 3, e: [['s', 8], ['if', ['gc'], [['h', 1]]]], u: { e: [['s', 10], ['if', ['gc'], [['h', 1]]]] }, r: 1, o: 2, g: 'eye' },
+    laugh: { n: '웃음이 번질 때', t: 'a', c: 4, e: [['s', 12], ['if', ['gc'], [['s', 6]]]], u: { e: [['s', 14], ['if', ['gc'], [['s', 8]]]] }, r: 1, o: 2, g: 'sun' },
+    sunny: { n: '볕 드는 자리', t: 'm', c: 3, e: [['p', 3]], u: { e: [['p', 4], ['h', 1]] }, r: 2, o: 2, g: 'sun' },
+    mood: { n: '분위기 띄우기', t: 'm', c: 1, e: [['h', 1], ['x', 1]], u: { e: [['h', 2], ['x', 1]] }, r: 1, o: 2, g: 'spark' },
+    clap: { n: '박수 유도', t: 'a', c: 3, e: [['s', 4], ['sc', 4]], u: { e: [['s', 4], ['sc', 6]] }, r: 2, o: 2, g: 'star' },
+    flow: { n: '흐름을 타고', t: 'a', c: 5, req: 'gc', e: [['s', 9, 2]], u: { e: [['s', 11, 2]] }, r: 2, o: 2, g: 'wave' },
+    encore: { n: '앙코르 표정', t: 'm', c: 2, once: 1, e: [['h2', 5]], u: { e: [['h2', 8]] }, r: 3, o: 2, g: 'mask' },
+    /* 잔불 전용 */
+    clench: { n: '이 악물기', t: 'm', c: 0, hc: 2, e: [['ht', 3], ['g', 3]], u: { e: [['ht', 4], ['g', 4]] }, r: 0, o: 3, g: 'flame' },
+    sweat: { n: '땀에 젖은 셔츠', t: 'a', c: 0, hc: 3, e: [['s', 12]], u: { e: [['s', 17]] }, r: 1, o: 3, g: 'flame' },
+    edge: { n: '한계 직전', t: 'a', c: 2, e: [['sl', 10]], u: { e: [['sl', 14]] }, r: 2, o: 3, g: 'heart' },
+    kindle: { n: '불씨 지피기', t: 'm', c: 0, hc: 4, e: [['ht', 7]], u: { e: [['ht', 9]] }, r: 1, o: 3, g: 'flame' },
+    ash: { n: '다 타고 남은 것', t: 'a', c: 3, once: 1, e: [['sh', 4]], u: { e: [['sh', 6]] }, r: 3, o: 3, g: 'star' },
+    until: { n: '쓰러질 때까지', t: 'a', c: 0, hc: 5, e: [['s', 9, 2], ['ht', 2]], u: { e: [['s', 11, 2], ['ht', 2]] }, r: 2, o: 3, g: 'shoe' },
+    dawn: { n: '새벽 연습', t: 'm', c: 0, once: 1, e: [['hp', 5], ['ht', 2]], u: { e: [['hp', 7], ['ht', 2]] }, r: 1, o: 3, g: 'hour' },
+    gasp: { n: '숨이 턱까지', t: 'a', c: 0, hc: 2, e: [['s', 8], ['if', ['low'], [['s', 10]]]], u: { e: [['s', 10], ['if', ['low'], [['s', 12]]]] }, r: 1, o: 3, g: 'heart' },
+  };
+  const CIDS = Object.keys(C);
+  function cardOf(d) { const b = C[d[0]]; if (!d[1] || !b.u) return b; return Object.assign({}, b, b.u); }
+  const cname = (d) => C[d[0]].n + (d[1] ? '+' : '');
+
+  /* ---------- 담당 인물 ---------- */
+  const CH = [
+    { id: 'metro', n: '메트로놈', sub: '한 박자도 흘리지 않는 은발의 댄서', way: '집중을 쌓는 쪽', st: [50, 70, 40], mhp: 42, col: '#9bbcff', own: 1, start: ['beat', 'beat'],
+      p: [{ on: 'pm', e: [['f', 1]] }], pd: '준비 카드를 낼 때마다 집중 +1',
+      tip: '초반에 준비 카드로 집중을 올려 두면 뒤로 갈수록 모든 점수가 커짐. 여러 번 점수를 내는 카드와 잘 맞음.' },
+    { id: 'noon', n: '한낮', sub: '객석의 공기를 먼저 읽는 금발의 보컬', way: '호조를 유지하는 쪽', st: [70, 40, 50], mhp: 42, col: '#ffb85a', own: 2, start: ['hello', 'hello'],
+      p: [{ on: 'bs', e: [['h', 2]] }, { on: 'gct', e: [['g', 3]] }], pd: '레슨 · 심사 시작 시 호조 +2턴, 호조인 채로 턴을 시작하면 기력 +3',
+      tip: '호조를 끊기지 않게 이어 가며 점수를 1.5배로 받음. 절정을 겹치면 2배.' },
+    { id: 'ember', n: '잔불', sub: '늦게까지 남아 연습하는 검은 머리의 연기파', way: '체력을 깎아 몰아치는 쪽', st: [45, 50, 65], mhp: 46, col: '#ff9552', own: 3, start: ['clench', 'sweat'],
+      p: [{ on: 'hpc', e: [['ht', 1]] }], pd: '카드 비용으로 체력이 줄 때마다 열기 +1',
+      tip: '체력으로만 치르는 카드가 강함. 열기는 턴 끝마다 점수가 됨. 휴식 시기를 잘 잡아야 함.' },
+  ];
+
+  /* ---------- 지원 물품 ---------- */
+  const IT = {
+    wrist: { n: '손목 보호대', g: 'shield', pas: { mhp: 5 } },
+    flask: { n: '보온병', g: 'heart', pas: { rest: 5 } },
+    ledger: { n: '가계부', g: 'coin', pas: { coin: 8 } },
+    coupon: { n: '단골 할인권', g: 'coin', pas: { shop: 20 } },
+    diary: { n: '연습 일지', g: 'leaf', pas: { stat: 15 } },
+    memo: { n: '트레이너의 메모', g: 'leaf', pas: { cls: 6 } },
+    check: { n: '체크리스트', g: 'star', pas: { sp: 15 } },
+    flower: { n: '선물받은 꽃', g: 'heart', pas: { heal: 1 } },
+    coinl: { n: '행운의 동전', g: 'coin', pas: { opt: 1 } },
+    candle: { n: '향초', g: 'hour', pas: { lturn: 1 } },
+    blanket: { n: '무릎 담요', g: 'heart', pas: { skip: 2 } },
+    pin: { n: '은색 핀', g: 'spark', pas: { fa: 3 } },
+    socks: { n: '두꺼운 양말', g: 'shoe', pas: { immune: 1 } },
+    heels: { n: '무대용 구두', g: 'shoe', pas: { shoes: 2 } },
+    notes: { n: '메모지 묶음', g: 'spark', pas: { hand1: 2 } },
+    sneak: { n: '새 연습화', g: 'shoe', on: 'bs', e: [['g', 5]] },
+    candy: { n: '목 캔디', g: 'sun', on: 'bs', e: [['h', 2]] },
+    hmirror: { n: '손거울', g: 'metro', on: 'bs', e: [['f', 2]] },
+    band: { n: '헤어밴드', g: 'leaf', on: 'bs', e: [['m', 1]] },
+    warmer: { n: '손난로', g: 'flame', on: 'bs', e: [['ht', 4]] },
+    letter: { n: '응원 편지', g: 'heart', on: 'xs', e: [['g', 8], ['f', 1]] },
+    phones: { n: '이어폰', g: 'note', on: 't3', e: [['d', 1], ['x', 1]] },
+    watch: { n: '스톱워치', g: 'hour', on: 'tl', e: [['x', 1]] },
+    ebar: { n: '에너지 바', g: 'flame', on: 'low', e: [['g', 3]] },
+    sheet: { n: '낡은 악보', g: 'note', on: 'pm', e: [['g', 1]] },
+    ribbon: { n: '리본 장식', g: 'star', on: 'te10', e: [['s', 4]] },
+  };
+  const IIDS = Object.keys(IT);
+  const ON_T = { bs: '레슨 · 심사 시작 시', xs: '심사 시작 시', t3: '3턴마다 턴 시작 시', tl: '마지막 턴 시작 시', low: '체력이 절반 이하인 채 턴을 시작하면', pm: '준비 카드를 낼 때마다', te10: '턴이 끝날 때 기력이 10 이상이면', gct: '호조인 채로 턴을 시작하면', hpc: '카드 비용으로 체력이 줄 때마다' };
+  const PAS_T = { mhp: (v) => '최대 체력 +' + v, rest: (v) => '휴식 회복 +' + v, coin: (v) => '레슨 활동비 +' + v, shop: (v) => '상점 값 −' + v + '%', stat: (v) => '레슨 능력치 획득 +' + v + '%', cls: (v) => '수업 능력치 획득 +' + v,
+    sp: (v) => '특훈 목표 −' + v + '%', heal: () => '심사 전 체력을 모두 회복', opt: (v) => '레슨 보상 카드 후보 +' + v, lturn: (v) => '레슨 · 특훈 턴 +' + v, skip: (v) => '쉬어 가기 회복 +' + v, fa: (v) => '턴마다 처음 내는 어필 카드의 점수 +' + v,
+    immune: () => '부담을 받지 않음', shoes: (v) => '심사 중 턴마다 처음 내는 카드 비용 −' + v, hand1: (v) => '첫 턴 손패 +' + v };
+  function itemText(id) {
+    const it = IT[id]; const out = [];
+    if (it.pas) for (const k of Object.keys(it.pas)) out.push(PAS_T[k](it.pas[k]));
+    if (it.on) out.push(ON_T[it.on] + ' ' + it.e.map((e) => fxText(e)).join(' · '));
+    return out.join(' · ');
+  }
+  function pas(s, k) { let v = 0; for (const id of s.items) { const p = IT[id].pas; if (p && p[k]) v += p[k]; } return v; }
+
+  /* ---------- 심사 ---------- */
+  const heavy = (k) => { const a = (k + 1) % 3, b = (k + 2) % 3; return [k, a, k, b, k, k, a, k, b, k, k, a]; };
+  const EXAMS = {
+    open: { n: '공개 평가', d: '세 능력치를 고르게 봄.', dT: 0, pat: [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2], k: 1 },
+    vocal: { n: '가창 심사', d: '절반 넘는 턴이 보컬 기준.', dT: 0, pat: heavy(0), k: 1 },
+    dance: { n: '군무 심사', d: '절반 넘는 턴이 댄스 기준.', dT: 0, pat: heavy(1), k: 1 },
+    act: { n: '연기 심사', d: '절반 넘는 턴이 표현 기준.', dT: 0, pat: heavy(2), k: 1 },
+    live: { n: '생방송 무대', d: '4턴 · 7턴 · 10턴이 시작될 때 부담 1턴.', dT: 0, pat: [1, 0, 2, 2, 0, 1, 1, 2, 0, 0, 1, 2], gm: 'live', k: 0.94 },
+    small: { n: '소극장 공연', d: '턴이 2 적은 대신 매 턴 손패 +1.', dT: -2, pat: [2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1], gm: 'small', k: 0.84 },
+    long: { n: '장기 공연', d: '턴이 2 많은 대신 턴이 끝날 때마다 체력 −1.', dT: 2, pat: [1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0], gm: 'long', k: 1.16 },
+    encore: { n: '앙코르 무대', d: '마지막 두 턴은 점수 배율 1.5배.', dT: 0, pat: [0, 2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1], gm: 'encore', k: 1.12 },
+    first: { n: '첫인상 심사', d: '처음 두 턴은 점수 배율 1.5배.', dT: 0, pat: [2, 1, 0, 2, 1, 0, 2, 1, 0, 2, 1, 0], gm: 'first', k: 1.05 },
+  };
+  const XIDS = Object.keys(EXAMS);
+  const RIVALS = ['유리구두', '새벽 방송', '폭죽 소리', '북극성', '종이학', '은방울', '먹구름', '첫차'];
+  const SPREAD = [1.18, 1.03, 0.9, 0.78, 0.64];
+  const LEN = { s: { n: '짧게', W: 8, mid: 4 }, n: { n: '보통', W: 12, mid: 6 } };
+  const RB = { s: [80, 185], n: [108, 272] };   // 경쟁자 기준 점수(길이별 · 중간/최종)
+  const GOAL = { a: { n: '본선 진출', cut: [5, 4], d: '중간 5위 · 최종 4위 안' }, b: { n: '입상', cut: [4, 3], d: '중간 4위 · 최종 3위 안' }, c: { n: '정상', cut: [3, 1], d: '중간 3위 안 · 최종 1위' } };
+  const XT = [8, 10];   // 기본 턴(중간 · 최종)
+
+  /* ---------- 외출 사건 ----------
+     효과: hp · coin · mhp · st(능력치: 0~2, 'hi' 가장 높은 것, 'lo' 가장 낮은 것, 'all') · card(c 흔함 · r 귀함 · o 전용) · item · up · rm */
+  const EV = [
+    { n: '레코드 가게', t: '오래된 음반 가게. 진열장 앞에서 한참을 서 있었다.', o: [{ l: '음반을 산다', fx: [['coin', -30], ['card', 'r']] }, { l: '듣기만 한다', fx: [['st', 0, 8]] }] },
+    { n: '강변 산책', t: '해가 기우는 강변. 바람이 조금 차다.', o: [{ l: '천천히 걷는다', fx: [['hp', 8]] }, { l: '끝까지 달린다', fx: [['hp', -4], ['st', 1, 12]] }] },
+    { n: '소극장 연극', t: '객석 서른 석짜리 극장. 배우의 숨소리까지 들린다.', o: [{ l: '끝까지 본다', fx: [['hp', -3], ['st', 2, 12]] }, { l: '대본을 산다', fx: [['coin', -25], ['up']] }] },
+    { n: '선배의 연습실', t: '문틈으로 선배의 연습이 보인다.', o: [{ l: '동작을 따라 한다', fx: [['hp', -4], ['st', 1, 10]] }, { l: '조언을 구한다', fx: [['rm']] }] },
+    { n: '편의점 야식', t: '연습이 끝난 밤, 불 켜진 편의점.', o: [{ l: '든든히 먹는다', fx: [['coin', -15], ['hp', 10]] }, { l: '참고 돌아간다', fx: [['coin', 10]] }] },
+    { n: '거리 공연', t: '광장 한쪽에서 누군가 기타를 친다.', o: [{ l: '함께 부른다', fx: [['hp', -4], ['st', 0, 12]] }, { l: '모자에 동전을 넣는다', fx: [['coin', -10], ['st', 2, 9]] }] },
+    { n: '옥상의 저녁', t: '연습동 옥상. 아무도 올라오지 않는 시간.', o: [{ l: '아무것도 하지 않는다', fx: [['hp', 6], ['mhp', 2]] }, { l: '가사를 고쳐 쓴다', fx: [['up']] }] },
+    { n: '벼룩시장', t: '주말 벼룩시장. 쓸 만한 물건이 섞여 있다.', o: [{ l: '물건을 산다', fx: [['coin', -60], ['item']] }, { l: '구경만 한다', fx: [['coin', 12]] }] },
+    { n: '팬레터', t: '사무실에 편지 한 통이 와 있다.', o: [{ l: '답장을 쓴다', fx: [['st', 2, 8], ['st', 0, 4]] }, { l: '서랍에 넣어 둔다', fx: [['hp', 5]] }] },
+    { n: '심야 버스', t: '막차. 창에 비친 얼굴이 낯설다.', o: [{ l: '창밖을 본다', fx: [['hp', 4], ['st', 2, 6]] }, { l: '연습 노트를 편다', fx: [['hp', -3], ['card', 'o']] }] },
+    { n: '녹음실 견학', t: '방음문 안쪽은 생각보다 좁다.', o: [{ l: '부스에 서 본다', fx: [['hp', -5], ['st', 0, 14]] }, { l: '엔지니어 곁에 앉는다', fx: [['st', 'lo', 12]] }] },
+    { n: '체육관', t: '평일 낮의 체육관은 한산하다.', o: [{ l: '기초 체력 훈련', fx: [['hp', -6], ['mhp', 4]] }, { l: '가볍게 푼다', fx: [['hp', 5], ['st', 1, 5]] }] },
+    { n: '서점', t: '예술 서가 앞. 읽을 책은 많고 시간은 적다.', o: [{ l: '이론서를 산다', fx: [['coin', -35], ['st', 'all', 6]] }, { l: '잡지를 넘겨 본다', fx: [['st', 2, 7]] }] },
+    { n: '비 오는 날', t: '아침부터 비. 연습실은 비어 있을 것이다.', o: [{ l: '쉰다', fx: [['hp', 9]] }, { l: '빈 연습실에 간다', fx: [['hp', -5], ['st', 'hi', 14]] }] },
+    { n: '단기 일거리', t: '행사 진행 보조. 하루면 끝난다.', o: [{ l: '맡는다', fx: [['hp', -6], ['coin', 45]] }, { l: '거절한다', fx: [['hp', 3]] }] },
+    { n: '다른 팀의 무대', t: '경쟁 팀의 공개 리허설.', o: [{ l: '객석에서 본다', fx: [['st', 2, 10]] }, { l: '무대 뒤를 본다', fx: [['hp', -2], ['rm']] }] },
+    { n: '의상 수선집', t: '무대 의상의 품이 조금 남는다.', o: [{ l: '수선을 맡긴다', fx: [['coin', -40], ['mhp', 3], ['st', 2, 8]] }, { l: '직접 고친다', fx: [['hp', -3], ['st', 2, 8]] }] },
+    { n: '오래된 영상', t: '십 년 전 무대 영상을 찾았다.', o: [{ l: '따라 불러 본다', fx: [['st', 0, 9], ['st', 1, 5]] }, { l: '멈추고 메모한다', fx: [['hp', -2], ['up']] }] },
+    { n: '동기와의 식사', t: '오랜만에 동기와 마주 앉았다.', o: [{ l: '계산한다', fx: [['coin', -20], ['hp', 7], ['st', 2, 5]] }, { l: '각자 낸다', fx: [['hp', 5]] }] },
+    { n: '오디션 공지', t: '자정에 휴대폰이 울린다. 일정이 나왔다.', o: [{ l: '덮고 잔다', fx: [['hp', 10]] }, { l: '지난 무대를 돌려 본다', fx: [['hp', -6], ['card', 'r']] }] },
+  ];
+
+  /* ---------- 글 만들기 ---------- */
+  const condT = (c) => c[0] === 'gc' ? '호조 중' : c[0] === 'f' ? '집중 ' + c[1] + ' 이상' : c[0] === 'low' ? '체력 절반 이하' : '마지막 턴';
+  function condOK(s, bt, c) { return c[0] === 'gc' ? bt.gc > 0 : c[0] === 'f' ? bt.f >= c[1] : c[0] === 'low' ? s.hp * 2 <= s.mhp : bt.t >= bt.T; }
+  // 효과 한 줄. bt가 있으면 지금 상태로 계산한 수치.
+  function fxText(e, s, bt) {
+    const live = !!bt, N = (v, base) => (live && v !== base ? '<b class="sp-up">' + v + '</b>' : '' + v);
+    switch (e[0]) {
+      case 's': { const v = live ? hit(s, bt, e[1], e[3]) : e[1]; return '점수 ' + N(v, e[1]) + (e[2] > 1 ? ' ×' + e[2] : '') + (e[3] > 1 && !live ? ' (집중 ' + e[3] + '배 반영)' : ''); }
+      case 'sg': return live ? '점수 ' + N(hit(s, bt, floor(bt.g * e[1] / 100)), -1) + ' (기력의 ' + e[1] + '%' + (e[2] ? ', 기력 모두 씀' : '') + ')' : (e[2] ? '기력을 모두 쓰고 그 ' : '기력의 ') + e[1] + '%만큼 점수';
+      case 'sh': return live ? '점수 ' + N(hit(s, bt, bt.ht * e[1]), -1) + ' (열기 ×' + e[1] + ', 열기 모두 씀)' : '열기의 ' + e[1] + '배만큼 점수, 열기 모두 씀';
+      case 'sl': return live ? '점수 ' + N(hit(s, bt, floor((s.mhp - s.hp) * e[1] / 10)), -1) + ' (잃은 체력 ×' + (e[1] / 10) + ')' : '잃은 체력의 ' + (e[1] / 10) + '배만큼 점수';
+      case 'sc': return live ? '점수 ' + N(hit(s, bt, bt.gc * e[1]), -1) + ' (호조 남은 턴 ×' + e[1] + ')' : '호조 남은 턴 ×' + e[1] + '만큼 점수';
+      case 'sn': return live ? '점수 ' + N(hit(s, bt, max(0, bt.hd.length - (bt.dry ? 0 : 1)) * e[1]), -1) + ' (남은 손패 한 장당 ' + e[1] + ')' : '남은 손패 한 장당 점수 ' + e[1];
+      case 'g': return '기력 +' + N(live ? e[1] + bt.mo : e[1], e[1]);
+      case 'f': return '집중 +' + e[1];
+      case 'h': return '호조 +' + e[1] + '턴';
+      case 'p': return '절정 +' + e[1] + '턴';
+      case 'm': return '의욕 +' + e[1];
+      case 'ht': return '열기 +' + e[1];
+      case 'e': return '여유 +' + e[1] + '턴';
+      case 'b': return '부담 +' + e[1] + '턴';
+      case 'x': return '추가 행동 +' + e[1];
+      case 'd': return '카드 ' + e[1] + '장 뽑기';
+      case 'nd': return '다음 턴 손패 +' + e[1];
+      case 'hp': return '체력 +' + e[1];
+      case 't': return '턴 +' + e[1];
+      case 'f2': return '집중 2배(최대 +' + e[1] + ')';
+      case 'h2': return '호조 턴 2배(최대 +' + e[1] + ')';
+      case 'per': return '지속: 턴 시작마다 ' + KW[e[1]].n + ' +' + e[2];
+      case 'cb': return '부담 해제';
+      case 'if': { const ok = !live || condOK(s, bt, e[1]); return '<span class="' + (ok ? 'sp-cd' : 'sp-cd off') + '">' + condT(e[1]) + ': ' + e[2].map((x) => fxText(x, s, bt)).join(' · ') + '</span>'; }
+    }
+    return '';
+  }
+  function cardText(d, s, bt) { const c = cardOf(d); const a = c.e.map((e) => fxText(e, s, bt)); if (c.req) a.unshift('호조 중에만 낼 수 있음'); if (c.once) a.push('1회'); return a.join(' · '); }
+  function costText(c) { const a = []; if (c.c) a.push('비용 ' + c.c); if (c.hc) a.push('체력 ' + c.hc); return a.length ? a.join(' · ') : '비용 0'; }
+  function evFxText(s, fx, ev) {
+    return fx.map((f) => {
+      switch (f[0]) {
+        case 'hp': return '체력 ' + (f[1] > 0 ? '+' : '−') + Math.abs(f[1]);
+        case 'coin': return '활동비 ' + (f[1] > 0 ? '+' : '−') + Math.abs(f[1]);
+        case 'mhp': return '최대 체력 +' + f[1];
+        case 'st': return (f[1] === 'all' ? '모든 능력치' : f[1] === 'hi' ? '가장 높은 능력치(' + STN[hiSt(s)] + ')' : f[1] === 'lo' ? '가장 낮은 능력치(' + STN[loSt(s)] + ')' : STN[f[1]]) + ' +' + f[2];
+        case 'card': return '카드 「' + C[ev.c[f[1]]].n + '」 얻음';
+        case 'item': return ev.it ? '물품 「' + IT[ev.it].n + '」 얻음' : '활동비 +30';
+        case 'up': return '카드 한 장 강화';
+        case 'rm': return '카드 한 장 제거';
+      }
+      return '';
+    }).join(' · ');
+  }
+  const hiSt = (s) => { let b = 0; for (let i = 1; i < 3; i++) if (s.st[i] > s.st[b]) b = i; return b; };
+  const loSt = (s) => { let b = 0; for (let i = 1; i < 3; i++) if (s.st[i] < s.st[b]) b = i; return b; };
+
+  /* ---------- 전투(레슨 · 심사) ---------- */
+  function tmOf(s, bt, t) {
+    if (bt.k !== 'x') return 1;
+    let m = s.st[bt.cr[min(t, bt.cr.length) - 1]] / 100; const gm = EXAMS[bt.x].gm;
+    if (gm === 'encore' && t > bt.T - 2) m *= 1.5;
+    if (gm === 'first' && t <= 2) m *= 1.5;
+    return m;
+  }
+  const condMul = (bt) => (bt.gc > 0 ? (bt.pk > 0 ? 2 : 1.5) : 1);
+  function hit(s, bt, base, fmul) { return max(0, floor((base + bt.f * (fmul || 1) + (bt.fx || 0)) * condMul(bt) * tmOf(s, bt, bt.t) + 1e-6)); }
+  function gain(s, bt, k, n) {
+    if (k === 'g') { bt.g += n + bt.mo; return; }
+    if (k === 'bd' && pas(s, 'immune')) return;
+    bt[k] += n; if (KW[k] && KW[k].turn) bt.nw[k] = 1;
+  }
+  function drawN(s, bt, n) {
+    for (let i = 0; i < n; i++) {
+      if (bt.hd.length >= 5) return;
+      if (!bt.dr.length) { if (!bt.ds.length) return; bt.dr = shuf(s, bt.ds); bt.ds = []; }
+      bt.hd.push(bt.dr.pop());
+    }
+  }
+  function runFx(s, bt, list) {
+    for (const e of list) {
+      switch (e[0]) {
+        case 's': for (let i = 0; i < (e[2] || 1); i++) bt.sc += hit(s, bt, e[1], e[3]); break;
+        case 'sg': bt.sc += hit(s, bt, floor(bt.g * e[1] / 100)); if (e[2]) bt.g = 0; break;
+        case 'sh': bt.sc += hit(s, bt, bt.ht * e[1]); bt.ht = 0; break;
+        case 'sl': bt.sc += hit(s, bt, floor((s.mhp - s.hp) * e[1] / 10)); break;
+        case 'sc': bt.sc += hit(s, bt, bt.gc * e[1]); break;
+        case 'sn': bt.sc += hit(s, bt, bt.hd.length * e[1]); break;
+        case 'g': gain(s, bt, 'g', e[1]); break;
+        case 'f': gain(s, bt, 'f', e[1]); break;
+        case 'h': gain(s, bt, 'gc', e[1]); break;
+        case 'p': gain(s, bt, 'pk', e[1]); break;
+        case 'm': gain(s, bt, 'mo', e[1]); break;
+        case 'ht': gain(s, bt, 'ht', e[1]); break;
+        case 'e': gain(s, bt, 'ez', e[1]); break;
+        case 'b': gain(s, bt, 'bd', e[1]); break;
+        case 'x': bt.act += e[1]; break;
+        case 'd': drawN(s, bt, e[1]); break;
+        case 'nd': bt.nd += e[1]; break;
+        case 'hp': s.hp = min(s.mhp, s.hp + e[1]); break;
+        case 't': bt.T += e[1]; break;
+        case 'f2': gain(s, bt, 'f', min(e[1], bt.f)); break;
+        case 'h2': if (bt.gc > 0) gain(s, bt, 'gc', min(e[1], bt.gc)); break;
+        case 'per': bt.per.push([e[1], e[2]]); break;
+        case 'cb': bt.bd = 0; break;
+        case 'if': if (condOK(s, bt, e[1])) runFx(s, bt, e[2]); break;
+      }
+    }
+  }
+  function hook(s, bt, on) {
+    for (const p of CH[s.ch].p) if (p.on === on) runFx(s, bt, p.e);
+    for (const id of s.items) if (IT[id].on === on) runFx(s, bt, IT[id].e);
+  }
+  function costOf(s, bt, c) {
+    let a = c.c || 0, h = c.hc || 0;
+    if (bt.bd > 0) a += 2;
+    if (bt.k === 'x' && bt.pl === 0) a = max(0, a - pas(s, 'shoes'));
+    if (bt.ez > 0) { a = ceil(a / 2); h = ceil(h / 2); }
+    return [a, h];
+  }
+  // 낼 수 없는 까닭('' = 낼 수 있음)
+  function whyNot(s, bt, hi) {
+    const c = cardOf(s.deck[bt.hd[hi]]); const k = costOf(s, bt, c);
+    if (c.req === 'gc' && !(bt.gc > 0)) return '호조 필요';
+    if (s.hp < k[1] || bt.g + s.hp - k[1] < k[0]) return '체력 부족';
+    return '';
+  }
+  function startBattle(s, k, o) {
+    const bt = { k, t: 0, T: o.T, tg: o.tg || 0, pf: o.pf || 0, st: o.st, o: o.o || null, sc: 0, g: 0, f: 0, gc: 0, pk: 0, mo: 0, ht: 0, ez: 0, bd: 0, act: 0, pl: 0, pa: 0, nd: 0, fx: 0,
+      dr: shuf(s, s.deck.map((_, i) => i)), hd: [], ds: [], xh: [], per: [], nw: {}, lg: '' };
+    if (k === 'x') { bt.x = o.x; bt.cr = o.cr; bt.xi = o.xi; }
+    s.bt = bt; s.ph = 'bt';
+    hook(s, bt, 'bs'); if (k === 'x') hook(s, bt, 'xs');
+    startTurn(s, bt);
+  }
+  function startTurn(s, bt) {
+    bt.t++; bt.act = 1; bt.pl = 0; bt.pa = 0; bt.nw = {};
+    for (const p of bt.per) gain(s, bt, p[0], p[1]);
+    if (bt.k === 'x' && EXAMS[bt.x].gm === 'live' && bt.t > 1 && (bt.t - 1) % 3 === 0) gain(s, bt, 'bd', 1);
+    let n = 3 + bt.nd; bt.nd = 0;
+    if (bt.k === 'x' && EXAMS[bt.x].gm === 'small') n++;
+    if (bt.t === 1) n += pas(s, 'hand1');
+    drawN(s, bt, n);
+    if (bt.gc > 0) hook(s, bt, 'gct');
+    if (bt.t % 3 === 0) hook(s, bt, 't3');
+    if (bt.t >= bt.T) hook(s, bt, 'tl');
+    if (s.hp * 2 <= s.mhp) hook(s, bt, 'low');
+  }
+  function playCard(s, bt, hi) {
+    const di = bt.hd[hi], c = cardOf(s.deck[di]); const k = costOf(s, bt, c);
+    const hp0 = s.hp;
+    const fromG = min(bt.g, k[0]); bt.g -= fromG; s.hp -= (k[0] - fromG) + k[1];
+    bt.hd.splice(hi, 1);
+    bt.fx = c.t === 'a' && bt.pa === 0 ? pas(s, 'fa') : 0;
+    if (s.hp < hp0) hook(s, bt, 'hpc');
+    runFx(s, bt, c.e);
+    bt.fx = 0;
+    if (c.t === 'a') bt.pa++; else hook(s, bt, 'pm');
+    bt.pl++; bt.act--;
+    (c.once ? bt.xh : bt.ds).push(di);
+  }
+  function endTurn(s, bt) {
+    if (bt.g >= 10) hook(s, bt, 'te10');
+    if (bt.ht > 0) { bt.sc += floor(bt.ht * 2 * tmOf(s, bt, bt.t) + 1e-6); bt.ht = floor(bt.ht / 2); }
+    if (bt.k === 'x' && EXAMS[bt.x].gm === 'long') s.hp = max(0, s.hp - 1);
+    for (const k of ['gc', 'pk', 'ez', 'bd']) if (bt[k] > 0 && !bt.nw[k]) bt[k]--;
+    while (bt.hd.length) bt.ds.push(bt.hd.pop());
+  }
+  const rivalNow = (bt, fin, t) => floor(fin * Math.pow(min(1, t / bt.T), 1.15));
+  function rankOf(sc, arr) { let r = 1; for (const v of arr) if (v > sc) r++; return r; }
+
+  /* ---------- 시즌 진행 ---------- */
+  const lessonTG = (w) => round(34 + 10 * (w - 1) + 0.3 * (w - 1) * (w - 1));
+  function mkLesson(s, st, sp) {
+    const w = s.wk; let tg = lessonTG(w) * (sp ? 1.4 : 1); if (sp) tg *= 1 - pas(s, 'sp') / 100;
+    tg = round(tg);
+    return { k: 'l', st, sp, T: (sp ? 7 : 6) + pas(s, 'lturn'), tg, pf: round(tg * 1.6), gain: round((18 + 2 * w) * (sp ? 1.5 : 1) * (1 + pas(s, 'stat') / 100)), coin: (sp ? 28 : 18) + pas(s, 'coin'), it: sp ? rollItems(s, 1)[0] || '' : '' };
+  }
+  const restAmt = (s) => round(s.mhp * 0.5) + pas(s, 'rest');
+  function examWeek(s, w) { const Ln = LEN[s.len]; return w === Ln.mid ? 0 : w === Ln.W ? 1 : -1; }
+  function nextExam(s) { const Ln = LEN[s.len]; return s.wk <= Ln.mid ? 0 : 1; }
+  function rollCards(s, n, kind) {
+    const own = CH[s.ch].own; const pool = [];
+    for (const id of CIDS) {
+      const c = C[id]; if (c.r === 0 || (c.o && c.o !== own)) continue;
+      if (kind === 'o' && !c.o) continue;
+      if (kind === 'r' && c.r < 2) continue;
+      pool.push([id, (c.r === 1 ? 6 : c.r === 2 ? 3 + s.wk * 0.2 : 1 + s.wk * 0.15) * (c.o ? 1.7 : 1)]);
+    }
+    const out = [];
+    while (out.length < n && pool.length) {
+      let tot = 0; for (const p of pool) tot += p[1];
+      let x = rnd(s) * tot, i = 0; while (i < pool.length - 1 && (x -= pool[i][1]) > 0) i++;
+      out.push(pool[i][0]); pool.splice(i, 1);
+    }
+    return out;
+  }
+  function rollItems(s, n) { const pool = IIDS.filter((id) => s.items.indexOf(id) < 0 && !(s.sh && s.sh.it.some((x) => x.id === id))); shuf(s, pool); return pool.slice(0, n); }
+  function addItem(s, id) { s.items.push(id); const p = IT[id].pas; if (p && p.mhp) { s.mhp += p.mhp; s.hp += p.mhp; } }
+  function genWeek(s) {
+    const Ln = LEN[s.len], w = s.wk; const of = [];
+    const sts = shuf(s, [0, 1, 2]).slice(0, 2); const spRoll = w >= 3 && rnd(s) < 0.4;
+    sts.forEach((st, i) => of.push(mkLesson(s, st, i === 0 && spRoll ? 1 : 0)));
+    of.push({ k: 'rest', hp: restAmt(s) });
+    const pre = examWeek(s, w + 1) >= 0;
+    let k4 = 'shop';
+    if (!pre) { const cand = ['out', 'cls', 'shop', 'out', 'cls'].filter((k) => k !== s.l4); k4 = cand[ri(s, cand.length)]; }
+    s.l4 = k4;
+    if (k4 === 'out') { let e = ri(s, EV.length); if (s.evs.indexOf(e) >= 0) e = (e + 1 + ri(s, EV.length - 1)) % EV.length; of.push({ k: 'out', ev: e }); }
+    else if (k4 === 'cls') of.push({ k: 'cls', n: 10 + w + pas(s, 'cls') });
+    else of.push({ k: 'shop' });
+    s.of = of; s.ph = 'week';
+    void Ln;
+  }
+  function nextWeek(s) {
+    s.bt = null; s.rw = null; s.ev = null; s.sh = null; s.pk = null; s.cl = null; s.of = null;
+    s.wk++;
+    const xi = examWeek(s, s.wk);
+    if (xi >= 0) {
+      const heal = pas(s, 'heal') ? s.mhp : round(s.mhp * 0.5);
+      s.xh = min(s.mhp, s.hp + heal) - s.hp; s.hp += s.xh; s.xi = xi; s.ph = 'xi';
+    } else genWeek(s);
+  }
+  function examSpec(s, xi) { const id = s.ex[xi], X = EXAMS[id], T = XT[xi] + X.dT; return { id, X, T, cr: X.pat.slice(0, T) }; }
+  function note(s, a) { s.note = a; }
+  function finishLesson(s) {
+    const bt = s.bt, o = bt.o; const clr = bt.sc >= bt.tg, pf = bt.sc >= bt.pf;
+    const g = pf ? round(o.gain * 1.5) : clr ? o.gain : round(o.gain * (0.3 + 0.4 * min(1, bt.sc / bt.tg)));
+    const coin = clr ? o.coin + (pf ? 6 : 0) : round(o.coin / 2);
+    s.st[o.st] += g; s.coin += coin; s.cnt.l++; if (pf) s.cnt.pf++; else if (clr) s.cnt.cl++;
+    let it = ''; if (o.sp && clr && o.it && s.items.indexOf(o.it) < 0) { it = o.it; addItem(s, it); }
+    s.rw = { st: o.st, sp: o.sp, sc: bt.sc, tg: bt.tg, pf: bt.pf, res: pf ? 2 : clr ? 1 : 0, g, coin, it, cards: rollCards(s, 3 + pas(s, 'opt')) };
+    s.bt = null; s.ph = 'rw';
+  }
+  function finishExam(s) {
+    const bt = s.bt, xi = bt.xi; const rv = s.rv[xi]; const rank = rankOf(bt.sc, rv); const cut = GOAL[s.goal].cut[xi];
+    const pass = rank <= cut;
+    s.xr = { xi, sc: bt.sc, rank, pass, T: bt.T }; s.xs[xi] = { sc: bt.sc, rank };
+    s.bt = null; s.ph = 'xr';
+    if (xi === 0 && pass) { s.coin += 40; for (let i = 0; i < 3; i++) s.st[i] += 10; s.xr.its = rollItems(s, 3); }
+  }
+  function endSeason(s) {
+    const m = s.xs[0], f = s.xs[1]; let g;
+    if (!f) g = 'D'; else g = f.rank === 1 ? 'S' : f.rank === 2 ? 'A' : f.rank === 3 ? 'B' : 'C';
+    const win = !!f && f.rank <= GOAL[s.goal].cut[1];
+    s.res = { g, win, mr: m ? m.rank : 0, fr: f ? f.rank : 0, fs: f ? f.sc : 0, sum: s.st[0] + s.st[1] + s.st[2] };
+    s.ph = 'end';
+  }
+  function afterStep(s) {   // 강화 · 제거 고르기가 남았으면 그쪽으로, 아니면 다음 주
+    if (s.q && s.q.length) { const m = s.q.shift(); if (m === 'rm' ? s.deck.length > 5 : s.deck.some((d) => !d[1])) { s.pk = { m }; s.ph = 'pk'; return; } return afterStep(s); }
+    nextWeek(s);
+  }
+  function applyEvFx(s, fx, ev) {
+    const out = [];
+    for (const f of fx) {
+      switch (f[0]) {
+        case 'hp': s.hp = max(0, min(s.mhp, s.hp + f[1])); break;
+        case 'coin': s.coin = max(0, s.coin + f[1]); break;
+        case 'mhp': s.mhp += f[1]; s.hp += f[1]; break;
+        case 'st': if (f[1] === 'all') for (let i = 0; i < 3; i++) s.st[i] += f[2]; else s.st[f[1] === 'hi' ? hiSt(s) : f[1] === 'lo' ? loSt(s) : f[1]] += f[2]; break;
+        case 'card': s.deck.push([ev.c[f[1]], 0]); break;
+        case 'item': if (ev.it) addItem(s, ev.it); else s.coin += 30; break;
+        case 'up': case 'rm': s.q.push(f[0]); break;
+      }
+    }
+    return out;
+  }
+  const evCost = (fx) => { let c = 0; for (const f of fx) if (f[0] === 'coin' && f[1] < 0) c -= f[1]; return c; };
+  const price = (s, p) => round(p * (1 - pas(s, 'shop') / 100));
+  function genShop(s) {
+    s.sh = { c: [], it: [], up: 0, rm: 0, dr: 0 };
+    s.sh.c = rollCards(s, 4).map((id) => ({ id, p: price(s, 30 + C[id].r * 14 + ri(s, 8)), x: 0 }));
+    s.sh.it = rollItems(s, 2).map((id) => ({ id, p: price(s, 85 + ri(s, 20)), x: 0 }));
+  }
+  const SVC = { up: { n: '카드 강화', p: 45 }, rm: { n: '카드 제거', p: 40 }, dr: { n: '이온 음료', p: 22, hp: 8 } };
+
+  /* ---------- 규약 함수 ---------- */
+  function init(players, opts) {
+    opts = opts || {};
+    const seed = (Math.random() * 0x7fffffff) | 0;
+    const s = { v: 1, seed, rs: seed, sq: 0, len: LEN[opts.len] ? opts.len : 'n', goal: GOAL[opts.goal] ? opts.goal : 'b', ph: 'pick', ch: -1, wk: 0, hp: 0, mhp: 0, st: [0, 0, 0], coin: 40,
+      deck: [], items: [], evs: [], l4: '', q: [], note: null, xs: [null, null], cnt: { l: 0, cl: 0, pf: 0 }, of: null, bt: null, rw: null, ev: null, sh: null, pk: null, cl: null, xr: null, res: null, last: null };
+    const mids = XIDS.filter((x) => x !== 'long'); s.ex = [mids[ri(s, mids.length)], ''];
+    const fins = XIDS.filter((x) => x !== s.ex[0] && x !== 'small'); s.ex[1] = fins[ri(s, fins.length)];
+    s.rn = shuf(s, RIVALS.map((_, i) => i)).slice(0, 5);
+    s.rv = [0, 1].map((xi) => { const base = RB[s.len][xi] * EXAMS[s.ex[xi]].k; return shuf(s, SPREAD.slice()).map((m) => round(base * m * (0.94 + rnd(s) * 0.12))); });
+    const hero = opts.hero;
+    if (hero === 'rand') pickCh(s, ri(s, 3));
+    else if (hero === 'metro' || hero === 'noon' || hero === 'ember') pickCh(s, CH.findIndex((c) => c.id === hero));
+    return s;
+  }
+  function pickCh(s, i) {
+    const c = CH[i]; s.ch = i; s.st = c.st.slice(); s.mhp = c.mhp; s.hp = c.mhp;
+    s.deck = ['first', 'first', 'bar', 'bar', 'breath', 'breath'].concat(c.start).map((id) => [id, 0]);
+    nextWeek(s);
+  }
+  const actor = (s) => (s.ph === 'end' ? null : 0);
+  const bad = (m) => { throw new Error('stageprod: ' + m); };
+  function apply(s, seat, a) {
+    if (!a || s.ph === 'end') bad('no action');
+    s.sq++; s.last = { id: s.sq, t: a.t };
+    switch (s.ph) {
+      case 'pick': if (a.t !== 'ch' || !CH[a.i]) bad('pick'); pickCh(s, a.i); break;
+      case 'week': {
+        if (a.t !== 'go' || !s.of[a.i]) bad('week'); const o = s.of[a.i]; s.note = null;
+        if (o.k === 'l') startBattle(s, 'l', { T: o.T, tg: o.tg, pf: o.pf, st: o.st, o });
+        else if (o.k === 'rest') { const h = min(s.mhp, s.hp + o.hp) - s.hp; s.hp += h; note(s, ['휴식', '체력 +' + h]); nextWeek(s); }
+        else if (o.k === 'out') { s.evs.push(o.ev); s.ev = { i: o.ev, c: { c: rollCards(s, 1)[0], r: rollCards(s, 1, 'r')[0], o: rollCards(s, 1, 'o')[0] }, it: rollItems(s, 1)[0] || '' }; s.ph = 'ev'; }
+        else if (o.k === 'cls') { s.cl = { n: o.n }; s.ph = 'cls'; }
+        else { genShop(s); s.ph = 'shop'; }
+        break;
+      }
+      case 'bt': {
+        const bt = s.bt; const sc0 = bt.sc;
+        if (a.t === 'play') {
+          if (!(a.i >= 0 && a.i < bt.hd.length) || bt.act <= 0 || whyNot(s, bt, a.i)) bad('play');
+          s.last.c = s.deck[bt.hd[a.i]][0]; s.last.ty = cardOf(s.deck[bt.hd[a.i]]).t;
+          playCard(s, bt, a.i);
+        } else if (a.t === 'skip') { if (bt.pl === 0) { s.hp = min(s.mhp, s.hp + 2 + pas(s, 'skip')); s.last.rest = 1; } bt.act = 0; }
+        else bad('bt');
+        const done = bt.k !== 'x' && bt.sc >= bt.pf;
+        if (!done && bt.act > 0 && bt.hd.length) { s.last.d = bt.sc - sc0; break; }
+        const sc1 = bt.sc; endTurn(s, bt); s.last.d = sc1 - sc0; s.last.hd = bt.sc - sc1; s.last.te = 1;
+        if (done || bt.t >= bt.T || (bt.k !== 'x' && bt.sc >= bt.pf)) { if (bt.k === 'x') finishExam(s); else finishLesson(s); }
+        else startTurn(s, bt);
+        break;
+      }
+      case 'rw': {
+        const rw = s.rw; if (a.t !== 'rw') bad('rw');
+        const head = [STN[rw.st] + (rw.sp ? ' 특훈' : ' 레슨'), STN[rw.st] + ' +' + rw.g];
+        if (a.k === 'card') { if (!rw.cards[a.i]) bad('rw card'); s.deck.push([rw.cards[a.i], 0]); head.push('「' + C[rw.cards[a.i]].n + '」 얻음'); }
+        else if (a.k === 'up') { const d = s.deck[a.i]; if (!d || d[1]) bad('rw up'); d[1] = 1; head.push('「' + C[d[0]].n + '」 강화'); }
+        else if (a.k === 'rm') { if (!s.deck[a.i] || s.deck.length <= 5) bad('rw rm'); head.push('「' + cname(s.deck[a.i]) + '」 제거'); s.deck.splice(a.i, 1); }
+        else if (a.k === 'skip') { s.coin += 12; head.push('활동비 +12'); }
+        else bad('rw kind');
+        note(s, head); nextWeek(s); break;
+      }
+      case 'ev': {
+        const E = EV[s.ev.i], o = E.o[a.i]; if (a.t !== 'ev' || !o || s.coin < evCost(o.fx)) bad('ev');
+        s.q = []; const txt = evFxText(s, o.fx, s.ev); applyEvFx(s, o.fx, s.ev); note(s, [E.n, txt]); afterStep(s); break;
+      }
+      case 'cls': {
+        if (a.t !== 'cls' || !(a.i >= 0 && a.i < 3)) bad('cls'); s.st[a.i] += s.cl.n; note(s, ['수업', STN[a.i] + ' +' + s.cl.n]); s.q = ['up']; afterStep(s); break;
+      }
+      case 'pk': {
+        if (a.t !== 'pk') bad('pk');
+        if (a.i >= 0) {
+          const d = s.deck[a.i]; if (!d) bad('pk idx');
+          if (s.pk.m === 'up') { if (d[1]) bad('pk up'); d[1] = 1; if (s.note) s.note.push('「' + C[d[0]].n + '」 강화'); }
+          else { if (s.deck.length <= 5) bad('pk rm'); if (s.note) s.note.push('「' + cname(d) + '」 제거'); s.deck.splice(a.i, 1); }
+        }
+        s.pk = null;
+        if (s.sh) s.ph = 'shop'; else afterStep(s);
+        break;
+      }
+      case 'shop': {
+        const sh = s.sh;
+        if (a.t === 'leave') { note(s, ['상점', '활동비 ' + s.coin + ' 남음']); nextWeek(s); break; }
+        if (a.t !== 'buy') bad('shop');
+        if (a.k === 'c' || a.k === 'it') {
+          const x = (a.k === 'c' ? sh.c : sh.it)[a.i]; if (!x || x.x || s.coin < x.p) bad('buy');
+          s.coin -= x.p; x.x = 1; if (a.k === 'c') s.deck.push([x.id, 0]); else addItem(s, x.id);
+        } else if (SVC[a.k]) {
+          const p = price(s, SVC[a.k].p); if (sh[a.k] || s.coin < p) bad('svc');
+          if (a.k === 'dr') { s.coin -= p; sh.dr = 1; s.hp = min(s.mhp, s.hp + SVC.dr.hp); }
+          else { if (a.k === 'up' ? !s.deck.some((d) => !d[1]) : s.deck.length <= 5) bad('svc none'); s.coin -= p; sh[a.k] = 1; s.pk = { m: a.k }; s.ph = 'pk'; }
+        } else bad('buy kind');
+        break;
+      }
+      case 'xi': {
+        if (a.t !== 'start') bad('xi'); const sp = examSpec(s, s.xi); s.note = null;
+        startBattle(s, 'x', { T: sp.T, x: sp.id, cr: sp.cr, xi: s.xi }); break;
+      }
+      case 'xr': {
+        const xr = s.xr;
+        if (xr.its && xr.its.length) { if (a.t !== 'itm' || !xr.its[a.i]) bad('itm'); addItem(s, xr.its[a.i]); note(s, ['중간 심사 통과', '「' + IT[xr.its[a.i]].n + '」 얻음 · 활동비 +40 · 모든 능력치 +10']); xr.its = null; s.xr = null; nextWeek(s); break; }
+        if (a.t !== 'next') bad('xr');
+        if (xr.xi === 1 || !xr.pass) endSeason(s); else { s.xr = null; nextWeek(s); }
+        break;
+      }
+      default: bad('phase');
+    }
+    return s;
+  }
+  const GRADE_T = { S: '객석이 먼저 일어섰다. 이번 시즌의 이름으로 남을 무대.', A: '한 걸음 차이. 심사위원의 메모에는 다음 시즌이 적혀 있다.', B: '시상대 끝자리. 무대 위에서 흔들리지 않았다는 평.', C: '끝까지 섰다. 순위표의 숫자가 다음 계획의 출발점.', D: '중간 심사에서 멈췄다. 연습실 불은 오늘도 켜져 있다.' };
+  function result(s) {
+    if (s.ph !== 'end' || !s.res) return null;
+    const r = s.res, c = CH[s.ch], G = GOAL[s.goal];
+    return { winners: r.win ? [0] : [], title: r.g + ' 등급 — ' + (r.win ? '목표 달성' : '목표 미달'), text: GRADE_T[r.g],
+      highlights: [c.n + ' · 목표 「' + G.n + '」(' + G.d + ')', r.fr ? '최종 심사 ' + r.fr + '위 · ' + r.fs + '점' : '중간 심사 ' + r.mr + '위로 탈락'],
+      stats: [{ label: '보컬 · 댄스 · 표현', value: s.st.join(' · ') }, { label: '중간 심사', value: r.mr ? r.mr + '위' : '—' }, { label: '최종 심사', value: r.fr ? r.fr + '위' : '—' },
+        { label: '레슨(퍼펙트/클리어/전체)', value: s.cnt.pf + ' / ' + s.cnt.cl + ' / ' + s.cnt.l }, { label: '덱 · 물품', value: s.deck.length + '장 · ' + s.items.length + '개' }] };
+  }
+
+  /* ---------- AI(점검용 · 상황 점수 + 판 시드 버릇) ---------- */
+  function habits(s) { return { rest: 0.3 + hash(s.seed, 1) * 0.16, card: 0.8 + hash(s.seed, 2) * 0.5, thin: hash(s.seed, 3), shop: 70 + hash(s.seed, 4) * 50, bold: 0.8 + hash(s.seed, 5) * 0.4, pref: floor(hash(s.seed, 6) * 3) }; }
+  function cardRate(s, id, up) {
+    const c = C[id]; let v = 3 + c.r * 1.6; const own = CH[s.ch].own; const txt = JSON.stringify(c.e);
+    if (c.o) v += 1.6;
+    if (own === 1 && (/"f"|"f2"|"per","f"/.test(txt) || (c.e[0][0] === 's' && c.e[0][2] > 1))) v += 1.5;
+    if (own === 2 && /"h"|"p"|"gc"|"h2"|"sc"/.test(txt)) v += 1.5;
+    if (own === 3 && (c.hc || /"ht"|"sh"|"sl"|"low"/.test(txt))) v += 1.5;
+    if (own !== 2 && (c.req || /"gc"|"sc"|"p"/.test(txt)) && !s.deck.some((d) => /"h"/.test(JSON.stringify(C[d[0]].e)))) v -= 3;
+    if (own !== 3 && /"sh"|"sl"/.test(txt)) v -= 3;
+    if (own !== 1 && /"f2"/.test(txt)) v -= 2;
+    if (c.r === 0) v = id === 'breath' ? 2.2 : id === 'bar' ? 2 : id === 'first' ? 2.6 : 3.6;
+    return v + (up ? 1.5 : 0);
+  }
+  function examW(s) { const sp = examSpec(s, nextExam(s)); const w = [0, 0, 0]; for (const k of sp.cr) w[k] += 1 / sp.T; return w; }
+  function evalPlay(s0, hi, lv) {   // 한 장을 내 본 뒤의 값
+    const s = clone(s0), bt = s.bt; const b0 = s0.bt, hp0 = s0.hp; bt.dry = 1;
+    const c = cardOf(s.deck[bt.hd[hi]]);
+    playCard(s, bt, hi);
+    const r = bt.T - bt.t; const ex = bt.k === 'x';
+    let tmF = 1; if (ex) { tmF = 0; for (let t = bt.t + 1; t <= bt.T; t++) tmF += tmOf(s, bt, t); tmF = r > 0 ? tmF / r : 0; }
+    const tmN = tmOf(s, bt, bt.t), avg = 9 + bt.f;
+    let dsc = bt.sc - b0.sc; let v;
+    if (ex) v = dsc; else { const need = max(0, bt.tg - b0.sc), toPf = max(0, bt.pf - b0.sc); v = min(dsc, need) * 1.5 + max(0, min(dsc, toPf) - need) * (toPf - need < avg * (r + 1) * 1.2 ? 0.9 : 0.35); if (bt.sc >= bt.pf) v += 12; }
+    v += (bt.f - b0.f) * r * 1.15 * tmF * (c.t === 'a' ? 1 : 1);
+    v += (min(bt.gc, r + 1) - min(b0.gc, r + 1)) * avg * 0.5 * tmF * 0.9;
+    v += (min(bt.pk, r + 1) - min(b0.pk, r + 1)) * avg * (bt.gc > 0 ? 0.5 : 0.15) * tmF;
+    const lowHP = s.hp + bt.g < 8;
+    v += (bt.g - b0.g) * (ex ? (lowHP ? 0.9 : 0.35) : 0.75);
+    v += (bt.mo - b0.mo) * r * 0.7;
+    v += (bt.ht - b0.ht) * 3.4 * (r > 0 ? (tmN + tmF) / 2 : tmN);
+    v += (min(bt.ez, r) - min(b0.ez, r)) * 1.6 - (min(bt.bd, r) - min(b0.bd, r)) * 2.4;
+    v += (bt.T - b0.T) * avg * (ex ? tmF || tmN : 1) * 0.9 + bt.nd * 1.5;
+    for (let i = b0.per.length; i < bt.per.length; i++) v += bt.per[i][0] === 'f' ? r * (r + 1) / 2 * 1.1 * tmF : bt.per[i][1] * r * 0.5;
+    if (bt.act > 0 && bt.hd.length) v += 4 + avg * 0.35 * tmN;
+    const dhp = hp0 - s.hp;
+    v -= dhp * (ex ? (s.hp < 5 ? 0.9 : 0.3) : (s.hp * 2 < s.mhp ? 1.5 : 1.0));
+    if (!ex && c.once && r > 2) v += 0;
+    return v * (lv >= 3 ? 1 : 1) + 0;
+  }
+  function aiBattle(s, lv) {
+    const bt = s.bt; let best = { t: 'skip' }, bv = bt.pl === 0 ? (2 + pas(s, 'skip')) * (bt.k === 'x' ? 0.3 : (s.hp * 2 < s.mhp ? 1.5 : 1.0)) * (s.hp >= s.mhp ? 0 : 1) : 0.01;
+    const noise = lv >= 3 ? 0.4 : lv === 2 ? 5 : 12;
+    for (let i = 0; i < bt.hd.length; i++) {
+      if (whyNot(s, bt, i)) continue;
+      const v = evalPlay(s, i, lv) + Math.random() * noise;
+      if (v > bv) { bv = v; best = { t: 'play', i }; }
+    }
+    return best;
+  }
+  function ai(s, seat, lv) {
+    lv = lv || 2; const H = habits(s); const nz = () => Math.random() * (lv >= 3 ? 1 : lv === 2 ? 8 : 20);
+    switch (s.ph) {
+      case 'pick': return { t: 'ch', i: floor(hash(s.seed, 9) * 3) };
+      case 'week': {
+        const w = examW(s); let bi = 0, bv = -1e9; const hpR = s.hp / s.mhp; const toX = (nextExam(s) ? LEN[s.len].W : LEN[s.len].mid) - s.wk;
+        s.of.forEach((o, i) => {
+          let v = 0;
+          if (o.k === 'l') { v = o.gain * (0.55 + 1.35 * w[o.st]) + 10 * H.card + (o.sp ? 6 * H.bold : 0) + (o.st === H.pref ? 2 : 0); if (hpR < H.rest) v -= 40; else if (hpR < H.rest + 0.15 && o.sp) v -= 10; }
+          else if (o.k === 'rest') v = hpR < H.rest ? 60 : (s.mhp - s.hp) * 0.9 - (toX <= 1 ? 8 : 0);
+          else if (o.k === 'cls') v = o.n * (0.55 + 1.35 * max(w[0], w[1], w[2])) + 9;
+          else if (o.k === 'shop') v = s.coin >= H.shop ? 30 + (s.coin - H.shop) * 0.2 : 4;
+          else v = 20 + (hpR < H.rest ? 6 : 0);
+          v += nz(); if (v > bv) { bv = v; bi = i; }
+        });
+        return { t: 'go', i: bi };
+      }
+      case 'bt': return aiBattle(s, lv);
+      case 'rw': {
+        const rw = s.rw; let bc = -1, bcv = -1; rw.cards.forEach((id, i) => { const v = cardRate(s, id) + nz() * 0.1; if (v > bcv) { bcv = v; bc = i; } });
+        let bu = -1, buv = -1; s.deck.forEach((d, i) => { if (!d[1]) { const v = cardRate(s, d[0]) + (C[d[0]].r === 0 ? -1 : 1) + nz() * 0.1; if (v > buv) { buv = v; bu = i; } } });
+        const big = s.deck.length >= 15 + floor(H.thin * 4);
+        if (bc >= 0 && bcv * H.card >= (big ? 7.4 : 5.2)) return { t: 'rw', k: 'card', i: bc };
+        if (H.thin > 0.6 && s.deck.length > 8) { let wi = -1, wv = 9; s.deck.forEach((d, i) => { const v = cardRate(s, d[0], d[1]); if (v < wv) { wv = v; wi = i; } }); if (wv < 2.4) return { t: 'rw', k: 'rm', i: wi }; }
+        if (bu >= 0) return { t: 'rw', k: 'up', i: bu };
+        return bc >= 0 ? { t: 'rw', k: 'card', i: bc } : { t: 'rw', k: 'skip' };
+      }
+      case 'ev': {
+        const E = EV[s.ev.i]; let bi = -1, bv = -1e9; const miss = s.mhp - s.hp;
+        E.o.forEach((o, i) => {
+          if (s.coin < evCost(o.fx)) return; let v = 0;
+          for (const f of o.fx) v += f[0] === 'hp' ? (f[1] > 0 ? min(f[1], miss) * 1.1 : f[1] * (s.hp + f[1] < s.mhp * 0.3 ? 2.2 : 1)) : f[0] === 'coin' ? f[1] * 0.22 : f[0] === 'mhp' ? f[1] * 3 : f[0] === 'st' ? f[2] * (f[1] === 'all' ? 3 : 1) : f[0] === 'card' ? 9 : f[0] === 'item' ? 22 : f[0] === 'up' ? 9 : 5;
+          v += nz() * 0.3; if (v > bv) { bv = v; bi = i; }
+        });
+        return { t: 'ev', i: bi };
+      }
+      case 'cls': { const w = examW(s); let bi = 0, bv = -1; for (let i = 0; i < 3; i++) { const v = w[i] + nz() * 0.01 + (i === H.pref ? 0.03 : 0); if (v > bv) { bv = v; bi = i; } } return { t: 'cls', i: bi }; }
+      case 'pk': {
+        if (s.pk.m === 'up') { let bu = -1, buv = -1; s.deck.forEach((d, i) => { if (!d[1]) { const v = cardRate(s, d[0]) + (C[d[0]].r === 0 ? -1 : 1) + nz() * 0.05; if (v > buv) { buv = v; bu = i; } } }); return { t: 'pk', i: bu }; }
+        let wi = -1, wv = 99; s.deck.forEach((d, i) => { const v = cardRate(s, d[0], d[1]); if (v < wv) { wv = v; wi = i; } }); return { t: 'pk', i: s.deck.length > 5 ? wi : -1 };
+      }
+      case 'shop': {
+        const sh = s.sh;
+        for (let i = 0; i < sh.it.length; i++) if (!sh.it[i].x && s.coin >= sh.it[i].p) return { t: 'buy', k: 'it', i };
+        if (!sh.dr && s.hp < s.mhp * 0.5 && s.coin >= price(s, SVC.dr.p)) return { t: 'buy', k: 'dr' };
+        let bi = -1, bv = 6.4; sh.c.forEach((x, i) => { if (!x.x && s.coin >= x.p) { const v = cardRate(s, x.id); if (v > bv) { bv = v; bi = i; } } });
+        if (bi >= 0 && s.deck.length < 20) return { t: 'buy', k: 'c', i: bi };
+        if (!sh.up && s.coin >= price(s, SVC.up.p) && s.deck.some((d) => !d[1])) return { t: 'buy', k: 'up' };
+        if (!sh.rm && H.thin > 0.5 && s.coin >= price(s, SVC.rm.p) + 20 && s.deck.length > 8) return { t: 'buy', k: 'rm' };
+        return { t: 'leave' };
+      }
+      case 'xi': return { t: 'start' };
+      case 'xr': { if (s.xr.its && s.xr.its.length) return { t: 'itm', i: floor(Math.random() * s.xr.its.length) }; return { t: 'next' }; }
+    }
+    return null;
+  }
+
+  const TY = { a: '어필', m: '준비' };
+  const plain = (h) => h.replace(/<[^>]+>/g, '');
+
+  /* ---------- 그림 기호(카드 · 물품 · 일정) ---------- */
+  const GL = {
+    note: '<path d="M9 17V5l9-2v12"/><circle cx="6.500" cy="17" r="2.500" fill="@"/><circle cx="15.500" cy="15" r="2.500" fill="@"/>',
+    wave: '<path d="M3 9c3-3 5 3 8 0s5-3 8 0M3 15c3-3 5 3 8 0s5-3 8 0"/>',
+    shoe: '<path d="M4 16V9l4 1 3 4 7 1c1.500.3 2 1.200 2 2.500H4z" fill="@" stroke="none"/><path d="M4 19.500h16"/>',
+    eye: '<path d="M2.500 12c3-5 7-6.500 9.500-6.500s6.500 1.500 9.500 6.500c-3 5-7 6.500-9.500 6.500S5.500 17 2.500 12z"/><circle cx="12" cy="12" r="3" fill="@"/>',
+    star: '<path d="M12 3l2.700 5.600 6.100.8-4.500 4.200 1.100 6.100L12 16.800l-5.400 2.900 1.100-6.100-4.500-4.200 6.100-.8z" fill="@" stroke="none"/>',
+    shield: '<path d="M12 3l7.500 2.500v6c0 4.500-3 7.800-7.500 9.500-4.500-1.700-7.500-5-7.500-9.500v-6z"/>',
+    flame: '<path d="M12 21c-4 0-6.500-2.700-6.500-6 0-3 2-4.500 3-7 .6 1.600 1.300 2.300 2.300 2.800-.3-3.300.7-5.800 3.200-7.800 0 3.500 4.500 6 4.500 11.500 0 3.600-2.700 6.500-6.500 6.500z" fill="@" stroke="none"/>',
+    sun: '<circle cx="12" cy="12" r="4.200" fill="@" stroke="none"/><path d="M12 2.500v3M12 18.500v3M2.500 12h3M18.500 12h3M5.300 5.300l2.100 2.100M16.600 16.600l2.100 2.100M5.300 18.700l2.100-2.100M16.600 7.400l2.100-2.100"/>',
+    metro: '<path d="M8.500 3.500h7l3.500 17H5z"/><path d="M12 17l4.500-11"/><circle cx="12" cy="17" r="1.300" fill="@"/>',
+    heart: '<path d="M12 20.500c-6-4-9-7.200-9-11.200 0-2.700 2-4.800 4.600-4.800 1.800 0 3.400 1 4.400 2.600 1-1.600 2.600-2.600 4.400-2.600 2.600 0 4.600 2.100 4.600 4.800 0 4-3 7.200-9 11.200z" fill="@" stroke="none"/>',
+    hour: '<path d="M6 3h12M6 21h12M7 3c0 5 5 6 5 9s-5 4-5 9M17 3c0 5-5 6-5 9s5 4 5 9"/>',
+    mask: '<path d="M4 5c5 1.500 11 1.500 16 0v7c0 5-3.500 8.500-8 8.500S4 17 4 12z"/><path d="M8 10.500h2.500M13.500 10.500H16M9 15c2 1.500 4 1.500 6 0"/>',
+    spark: '<path d="M12 2.500l2 6.500 6.500 2-6.500 2-2 6.500-2-6.500-6.500-2 6.500-2z" fill="@" stroke="none"/>',
+    leaf: '<path d="M5 19c0-9 5-14 15-14 0 10-5 15-14 15"/><path d="M5 19l9-9"/>',
+    coin: '<circle cx="12" cy="12" r="8.500"/><path d="M9 9.500h6M9 12.500h6M12 9.500V17"/>',
+  };
+  function glyph(g, col, sz) { return '<svg viewBox="0 0 24 24" width="' + (sz || 24) + '" height="' + (sz || 24) + '" fill="none" stroke="' + col + '" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (GL[g] || GL.star).replace(/@/g, col) + '</svg>'; }
+
+  /* ---------- 화면 ---------- */
+  const CSS = [
+    '.sp{position:absolute;inset:0;display:flex;flex-direction:column;background:#17131f;color:#f2e9d8;font-family:var(--f-body);font-size:14px;line-height:1.4;user-select:none;-webkit-user-select:none;overflow:hidden;word-break:keep-all}',
+    '.sp *{box-sizing:border-box}.sp button{font:inherit;color:inherit;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+    '.sp-in{flex:1;display:flex;flex-direction:column;width:100%;max-width:760px;margin:0 auto;min-height:0;position:relative}',
+    '.sp .mono{font-family:var(--f-mono);font-weight:700}',
+    '.sp-top{flex:none;display:flex;align-items:center;gap:10px;min-height:46px;padding:4px 58px 2px 12px}',
+    '.sp-tt{flex:none;display:flex;flex-direction:column;line-height:1.2}.sp-tt b{font-family:var(--f-display);font-weight:400;font-size:19px;color:#f6d58a}.sp-tt span{font-size:13px;color:#cbbfd6}',
+    '.sp-pips{flex:1;min-width:0;display:flex;gap:3px;justify-content:flex-end;align-items:center}.sp-pips i{flex:1 1 0;min-width:4px;max-width:12px;height:8px;border-radius:4px;background:#3a3149}.sp-pips i.dn{background:#8a7a4a}.sp-pips i.nw{background:#e3ae45;height:12px}.sp-pips i.xm{flex:1.4 1 0;max-width:16px;border:2px solid #ee6a55;background:transparent}.sp-pips i.xm.dn{background:#8a4a48}.sp-pips i.xm.nw{background:#ee6a55}',
+    '.sp-sb{flex:none;display:flex;align-items:center;gap:12px;padding:2px 12px}',
+    '.sp-hp{flex:1;display:flex;align-items:center;gap:8px;font-size:13px}.sp-hp span{color:#cbbfd6}.sp-bar{flex:1;height:10px;border-radius:5px;background:#3a3149;overflow:hidden;min-width:40px}.sp-bar i{display:block;height:100%;background:#7fd6c4;border-radius:5px;transition:width .25s}.sp-hp.low .sp-bar i{background:#ee6a55}.sp-hp.low b{color:#ff9a8a}',
+    '.sp-coin{flex:none;display:flex;align-items:center;gap:4px;font-size:14px}',
+    '.sp-sts{flex:none;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:4px 12px 6px}.sp-sts div{display:flex;justify-content:space-between;align-items:baseline;padding:4px 10px;border-radius:9px;background:#221c2e;border-left:3px solid var(--c);font-size:13px}.sp-sts span{color:#cbbfd6}.sp-sts b{font-size:16px}.sp-sts em{font-style:normal;font-size:13px;color:var(--c);margin-left:2px}',
+    '.sp-art{position:relative;flex:1;min-height:96px;margin:0 10px;border-radius:14px;overflow:hidden;background:#231c30 center/cover no-repeat}',
+    '.sp-art:before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(23,19,31,.5) 0%,rgba(23,19,31,.22) 46%,rgba(23,19,31,0) 78%)}',
+    '.sp-art.stage:before{background:linear-gradient(90deg,rgba(23,19,31,.46) 0%,rgba(23,19,31,.16) 50%,rgba(23,19,31,0) 80%),radial-gradient(60% 90% at 74% 0%,var(--lc,rgba(255,255,255,.14)),transparent 70%)}',
+    '.sp-chw{position:absolute;right:0;top:3%;bottom:0;width:min(60%,300px);display:flex;flex-direction:column;pointer-events:none}',
+    '.sp-chi{display:block;flex:none;width:100%;height:auto;margin-top:auto;pointer-events:none;transition:filter .3s}',
+    '.sp-chw.tall{display:contents}.sp-chi.tall{position:absolute;right:0;top:auto;bottom:0;width:auto;height:auto;margin:0;max-width:80%;max-height:97%}.sp-chi.glow{filter:brightness(1.08) saturate(1.1)}.sp-chi.dim{filter:saturate(.7) brightness(.84)}',
+    '.sp-sil{position:absolute;right:6%;bottom:0;height:92%;width:46%}',
+    '.sp-al{position:absolute;left:10px;top:8px;bottom:8px;width:calc(52% - 14px);display:flex;flex-direction:column;gap:6px;justify-content:flex-end}',
+    '.sp-note{padding:7px 10px;border-radius:10px;background:rgba(23,19,31,.78);border:1px solid #4a3f5c;font-size:13px;line-height:1.45}.sp-note b{color:#f6d58a}',
+    '.sp-xchip{display:flex;align-items:center;gap:6px;min-height:44px;padding:4px 10px;border-radius:10px;background:rgba(34,28,46,.88);border:1px solid #5a4e6c;font-size:13px;text-align:left;line-height:1.25}.sp-xchip b{display:block}.sp-xchip small{font-size:13px;color:#cbbfd6}',
+    '.sp-cr{display:inline-flex;gap:2px;vertical-align:middle}.sp-cr i{width:7px;height:12px;border-radius:2px;background:var(--c)}',
+    '.sp-list{flex:none;display:flex;flex-direction:column;gap:6px;padding:8px 10px 0}',
+    '.sp-opt{display:flex;align-items:center;gap:10px;min-height:56px;padding:6px 12px;border-radius:12px;border:1px solid #4a3f5c;border-left:4px solid var(--c);background:#221c2e;text-align:left;width:100%}',
+    '.sp-opt.sel{background:#33294a;border-color:#e3ae45;border-left-color:var(--c);box-shadow:0 0 0 1px #e3ae45 inset}.sp-opt.no{opacity:.62}',
+    '.sp-oi{flex:none;width:28px;display:flex;justify-content:center}.sp-ot{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.3}.sp-ot b{font-size:15px}.sp-ot small{font-size:13px;color:#cbbfd6}.sp-or{flex:none;font-size:14px;font-weight:700;color:var(--c);text-align:right;white-space:nowrap}',
+    '.sp-warn{color:#ff9a8a}.sp-up{color:#f6d58a}.sp-cd.off{opacity:.55}.sp-mut{color:#ab9fb8}',
+    '.sp-bot{flex:none;display:flex;gap:8px;padding:8px 10px 10px;align-items:stretch}.sp-bot .btn{min-height:48px;padding:6px 12px;font-size:14px}.sp-bot .sp-pri{flex:1;font-size:16px}.sp .btn[disabled]{opacity:.45;cursor:default}',
+    /* 전투 */
+    '.sp-bh{flex:none;display:flex;align-items:center;gap:8px;min-height:44px;padding:4px 58px 0 12px}.sp-bh b{font-family:var(--f-display);font-weight:400;font-size:18px;color:#f6d58a;white-space:nowrap}.sp-bh span{font-size:13px;color:#cbbfd6;white-space:nowrap}',
+    '.sp-tp{flex:none;display:flex;gap:3px;padding:2px 12px 4px;flex-wrap:wrap}.sp-tp i{font-style:normal;min-width:22px;height:22px;padding:0 3px;border-radius:6px;font-size:13px;line-height:20px;text-align:center;border:1px solid var(--c,#5a4e6c);color:var(--c,#cbbfd6);background:transparent}.sp-tp i.dn{opacity:.4}.sp-tp i.nw{background:var(--c,#e3ae45);color:#17131f;font-weight:700;border-color:var(--c,#e3ae45)}.sp-tp i.bz{box-shadow:0 0 0 2px rgba(246,213,138,.45)}',
+    '.sp-sc{position:relative;flex:none;display:flex;align-items:center;gap:12px;padding:2px 12px 4px}.sp-scn{font-size:30px;line-height:1;color:#f6d58a;min-width:62px}.sp-scr{flex:1;min-width:0;font-size:13px;line-height:1.35}.sp-scr b{font-size:15px}.sp-scr span{display:block;color:#cbbfd6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.sp-trk{position:relative;flex:none;height:16px;margin:0 14px 6px;border-radius:8px;background:#2a2238}.sp-trk i{position:absolute;top:0;bottom:0;left:0;border-radius:8px;background:linear-gradient(90deg,#8a7a4a,#e3ae45);transition:width .25s}.sp-trk u{position:absolute;top:-3px;bottom:-3px;width:2px;background:#f2e9d8}.sp-trk u.pf{background:#ff8672}.sp-trk s{position:absolute;top:3px;width:10px;height:10px;margin-left:-5px;border-radius:50%;background:#8d809c;border:1px solid #17131f}.sp-trk s.cut{background:#ee6a55}.sp-trk s.me{top:0;width:16px;height:16px;margin-left:-8px;background:#f6d58a;border:2px solid #17131f;z-index:2;transition:left .25s}',
+    '.sp-xr{flex:1;min-width:0;min-height:48px;display:grid;grid-template-columns:auto 1fr;column-gap:8px;align-items:baseline;padding:4px 12px;border-radius:10px;border:1px solid #5a4e6c;background:#221c2e;text-align:left;line-height:1.3}.sp-xr b{font-size:18px}.sp-xr em{font-style:normal;font-size:13px;color:#cbbfd6}.sp-xr small{grid-column:1/3;font-size:13px;color:#d8cbe4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    '.sp-pop{position:absolute;left:10px;top:38%;z-index:3;font-family:var(--f-mono);font-weight:700;font-size:24px;color:#fff3c4;text-shadow:0 1px 4px #000,0 0 2px #000;pointer-events:none;animation:sp-pop .9s ease-out forwards}.sp-pop.h{color:#ffb98a;top:54%}@keyframes sp-pop{0%{opacity:0;transform:translateY(8px)}20%{opacity:1;transform:translateY(0)}75%{opacity:1}100%{opacity:0;transform:translateY(-12px)}}html.no-anim .sp-pop{animation-duration:.01s}',
+    '.sp-chips{position:absolute;left:8px;top:8px;bottom:52px;width:calc(52% - 12px);display:flex;flex-direction:column;gap:4px;align-items:flex-start;justify-content:flex-start;overflow:hidden}',
+    '.sp-chip{flex:none;min-height:30px;padding:3px 10px;border-radius:15px;border:1px solid var(--c);background:rgba(23,19,31,.8);font-size:13px;font-weight:700;color:var(--c);white-space:nowrap}.sp-chip.q{color:#cbbfd6;border-color:#5a4e6c;font-weight:400}',
+    '.sp-chiprow{display:flex;gap:4px;flex-wrap:wrap}',
+    '.sp-bst{position:absolute;left:8px;right:8px;bottom:6px;display:flex;align-items:center;gap:8px;padding:5px 9px;border-radius:10px;background:rgba(23,19,31,.84);font-size:13px}.sp-bst .sp-hp{flex:1}.sp-gk{flex:none;color:#7fd6c4;font-weight:700}',
+    '.sp-info{flex:none;height:78px;margin:6px 10px 0;padding:6px 10px;border-radius:10px;background:#221c2e;font-size:13px;line-height:1.42;overflow-y:auto;touch-action:pan-y}.sp-info b.n{font-size:15px;color:#f6d58a}.sp-info em{font-style:normal;color:#cbbfd6}',
+    '.sp-hand{flex:none;display:flex;gap:5px;padding:6px 10px 0;justify-content:center}',
+    '.sp-card{position:relative;flex:1 1 0;min-width:0;max-width:120px;height:112px;padding:22px 3px 4px;border-radius:10px;border:1px solid #5a4e6c;border-top:4px solid var(--c);background:#2a2238;display:flex;flex-direction:column;align-items:center;gap:1px;overflow:hidden}',
+    '.sp-card.sel{background:#3a2f52;border-color:#e3ae45;border-top-color:var(--c);box-shadow:0 0 0 1px #e3ae45 inset;transform:translateY(-4px)}.sp-card.no{background:#211c2a;border-style:dashed}.sp-card.no .sp-cg,.sp-card.no .sp-cv{opacity:.4}',
+    '.sp-cc{position:absolute;left:3px;top:3px;display:flex;gap:2px}.sp-cc i{font-style:normal;min-width:20px;height:20px;padding:0 4px;border-radius:10px;font:700 13px/20px var(--f-mono);text-align:center;background:#f2e9d8;color:#17131f}.sp-cc i.h{background:#ee6a55;color:#fff}.sp-cc i.z{background:#4a3f5c;color:#f2e9d8}',
+    '.sp-cc em{font-style:normal;font-size:13px;color:#cbbfd6;line-height:20px;margin-left:2px}',
+    '.sp-cg{flex:none;height:24px}.sp-cn{font-size:13px;font-weight:700;line-height:1.2;text-align:center;max-height:32px;overflow:hidden}.sp-cv{margin-top:auto;font:700 15px/1.1 var(--f-mono);color:#f6d58a;white-space:nowrap}.sp-cv.t{font:400 13px/1.15 var(--f-body);color:#cbbfd6;white-space:normal;text-align:center;max-height:30px;overflow:hidden}',
+    '.sp-no{position:absolute;left:0;right:0;bottom:0;padding:2px 0;background:#7a2f2a;color:#ffe1da;font-size:13px;font-weight:700;text-align:center;line-height:1.3}',
+    '.sp-wait{flex:none;height:112px;display:flex;align-items:center;justify-content:center;color:#ab9fb8;font-size:14px}',
+    '.sp.lock .sp-hand,.sp.lock .sp-bot,.sp.lock .sp-list,.sp.lock .sp-scroll{pointer-events:none}.sp.lock .sp-bot{opacity:.6}',
+    /* 목록 화면 */
+    '.sp-hd{flex:none;padding:10px 58px 4px 14px}.sp-hd h3{margin:0;font-family:var(--f-display);font-weight:400;font-size:21px;color:#f6d58a;line-height:1.25}.sp-hd p{margin:3px 0 0;font-size:14px;color:#d8cbe4;line-height:1.5}',
+    '.sp-gain{display:flex;gap:6px;flex-wrap:wrap;padding:2px 14px 6px}.sp-gain span{padding:3px 10px;border-radius:14px;background:#2a2238;font-size:13px;border:1px solid #4a3f5c}.sp-gain span.g{border-color:#e3ae45;color:#f6d58a}',
+    '.sp-tabs{flex:none;display:flex;gap:6px;padding:4px 10px}.sp-tabs button{flex:1;min-height:44px;border-radius:10px;border:1px solid #4a3f5c;background:#221c2e;font-size:14px;font-weight:700}.sp-tabs button.on{background:#e3ae45;color:#2a1f08;border-color:transparent}',
+    '.sp-scroll{flex:1;min-height:0;overflow-y:auto;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:4px 10px 6px;display:flex;flex-direction:column;gap:6px}.sp-scroll>*{flex:none}',
+    '.sp-row{display:flex;align-items:flex-start;gap:10px;min-height:56px;padding:8px 10px;border-radius:11px;border:1px solid #4a3f5c;border-left:4px solid var(--c,#5a4e6c);background:#221c2e;text-align:left;width:100%}.sp-row.sel{background:#33294a;border-color:#e3ae45;border-left-color:var(--c,#e3ae45);box-shadow:0 0 0 1px #e3ae45 inset}.sp-row.no{opacity:.6}.sp-row.flat{cursor:default}',
+    '.sp-ri{flex:none;width:26px;padding-top:2px}.sp-rt{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.4}.sp-rt b{font-size:15px}.sp-rt b em{font-style:normal;font-weight:400;font-size:13px;color:#cbbfd6;margin-left:6px}.sp-rt small{font-size:13px;color:#d8cbe4}.sp-rt small.u{color:#f6d58a}',
+    '.sp-rr{flex:none;font:700 14px/1.3 var(--f-mono);color:#f6d58a;text-align:right;white-space:nowrap;padding-top:2px}.sp-rr.x{color:#ff9a8a;font-family:var(--f-body);font-size:13px}',
+    '.sp-sec{font-size:13px;color:#cbbfd6;padding:6px 4px 0}',
+    '.sp-pick{display:flex;gap:10px;padding:8px;border-radius:12px;border:1px solid #4a3f5c;border-left:4px solid var(--c);background:#221c2e;text-align:left;width:100%;min-height:118px;align-items:stretch}.sp-pick.sel{background:#33294a;border-color:#e3ae45;border-left-color:var(--c);box-shadow:0 0 0 1px #e3ae45 inset}',
+    '.sp-pf{position:relative;flex:none;width:104px;border-radius:9px;overflow:hidden;background:radial-gradient(#3d3052,#1f1929)}.sp-pf img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:50% 6%}.sp-pf .sp-sil{right:0;width:100%;height:96%}',
+    '.sp-pt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;line-height:1.4}.sp-pt b{font-family:var(--f-display);font-weight:400;font-size:19px;color:var(--c)}.sp-pt span{font-size:13px;color:#d8cbe4}.sp-pt small{font-size:13px;color:#f2e9d8}',
+    '.sp-rank{display:flex;align-items:center;gap:10px;min-height:44px;padding:6px 12px;border-radius:10px;background:#221c2e;font-size:14px}.sp-rank.me{background:#3a2f52;border:1px solid #e3ae45}.sp-rank i{font:700 15px var(--f-mono);font-style:normal;width:30px;color:#cbbfd6}.sp-rank.me i{color:#f6d58a}.sp-fc{flex:none;width:44px;height:44px;border-radius:50%;overflow:hidden;background:var(--c);border:2px solid var(--c)}.sp-rank .sp-fc{flex:none}.sp-fc img{display:block;width:100%;height:100%;object-fit:cover}.sp-art.ban{flex:none;height:112px;min-height:0}.sp-art.ban .sp-chw{width:min(54%,190px)}@media (min-height:760px){.sp-art.ban{height:150px}.sp-art.ban .sp-chw{width:min(54%,230px)}}.sp-rank span{flex:1}.sp-rank b{font-variant-numeric:tabular-nums}.sp-cut{font-size:13px;color:#ff9a8a;text-align:center;border-top:1px dashed #ee6a55;padding-top:3px;margin-top:2px}',
+    '.sp-big{font-family:var(--f-display);font-size:64px;line-height:1;color:#f6d58a;text-shadow:0 2px 10px rgba(23,19,31,.9),0 0 2px rgba(23,19,31,.9)}',
+    /* 덧창 */
+    '.sp-sh{position:absolute;inset:0;z-index:20;background:rgba(15,12,21,.72);display:flex;align-items:flex-end;justify-content:center}.sp-shin{width:100%;max-width:760px;max-height:86%;display:flex;flex-direction:column;background:#1d1828;border-radius:16px 16px 0 0;border:1px solid #4a3f5c;border-bottom:none}',
+    '.sp-shh{flex:none;display:flex;align-items:center;gap:8px;padding:8px 8px 4px 14px}.sp-shh b{flex:1;font-family:var(--f-display);font-weight:400;font-size:19px;color:#f6d58a}.sp-shh .btn{min-width:64px;min-height:44px}',
+    '@media (min-width:700px){.sp-chw{width:min(58%,440px)}.sp-pf{width:150px}.sp-pick{min-height:176px}.sp-fc{width:56px;height:56px}}@media (min-width:700px) and (min-height:800px){.sp-art.ban{height:250px}.sp-art.ban .sp-chw{width:min(54%,330px)}}',
+    '@media (min-width:700px){.sp{font-size:15px}.sp-tt span,.sp-hp,.sp-sts div,.sp-bh span,.sp-scr,.sp-xr em,.sp-xr small,.sp-cc em,.sp-cv.t,.sp-no,.sp-sec,.sp-gain span,.sp-rr.x,.sp-rt b em,.sp-tp i,.sp-pt span,.sp-pt small,.sp-bst,.sp-cut,.sp-xchip small{font-size:14px}.sp-tp i{min-width:24px;height:24px;line-height:22px}.sp-card{height:128px;max-width:136px}.sp-cn{font-size:14px;max-height:36px}.sp-wait{height:128px}.sp-info{height:86px;font-size:14px}.sp-ot small,.sp-rt small,.sp-note,.sp-xchip,.sp-chip{font-size:14px}.sp-ot b,.sp-rt b{font-size:16px}}',
+    '@media (max-height:600px){.sp-card,.sp-wait{height:98px}.sp-info{height:62px}.sp-opt{min-height:48px}}',
+  ].join('');
+
+  const ART = {}; let artCb = null;
+  function art(name) {
+    let a = ART[name];
+    if (!a) { a = ART[name] = { ok: 0, src: 'assets/stageprod/' + name + '.webp' }; const im = new Image(); im.onload = () => { a.ok = 1; if (artCb) artCb(); }; im.onerror = () => { a.ok = -1; if (artCb) artCb(); }; im.src = a.src; }
+    return a;
+  }
+  const SIL = (col) => '<svg class="sp-sil" viewBox="0 0 100 150" preserveAspectRatio="xMidYMax meet"><path d="M50 16c11 0 19 9 19 21s-8 22-19 22-19-10-19-22 8-21 19-21zM14 150c0-34 12-58 36-58s36 24 36 58z" fill="' + col + '" opacity=".3"/></svg>';
+  function chArt(ci, k, cls) { const c = CH[ci]; k = k === 1 || k === true ? 'b' : k || 'a'; let a = art(c.id + '_' + k); if (a.ok < 0) a = art(c.id + (k === 'b' || k === 'resolve' ? '_b' : '_a')); return a.ok > 0 ? '<span class="sp-chw' + (/\btall\b/.test(cls || '') ? ' tall' : '') + '"><img class="sp-chi ' + (cls || '') + '" src="' + a.src + '" alt="" draggable="false"></span>' : SIL(c.col); }
+  // 작은 얼굴 그림(순위 줄 · 도감). 경쟁자는 rv0~7, 담당 인물은 <id>_face. 없으면 색 동그라미.
+  const face = (name, col) => { const a = art(name); return '<span class="sp-fc" style="--c:' + (col || '#5a4e6c') + '">' + (a.ok > 0 ? '<img src="' + a.src + '" alt="" draggable="false">' : '') + '</span>'; };
+  const EVBG = ['bg_shop', 'bg_river', 'bg_stage', 'bg_room', 'bg_night', 'bg_river', 'bg_river', 'bg_river', 'bg_wait', 'bg_night', 'bg_room', 'bg_room', 'bg_shop', 'bg_room', 'bg_river', 'bg_stage', 'bg_shop', 'bg_wait', 'bg_night', 'bg_night'];   // 외출 사건별 배경(EV와 같은 순서)
+  const bgSt = (name) => { const a = art(name); return a.ok > 0 ? 'background-image:url(' + a.src + ');' : ''; };
+  const critStrip = (cr) => '<span class="sp-cr">' + cr.map((k) => '<i style="--c:' + STC[k] + '"></i>').join('') + '</span>';
+  const TYC = { a: '#f0a4b6', m: '#8fd4c6' };
+
+  function mount(root, api) {
+    if (!document.getElementById('sp-css')) { const t = document.createElement('style'); t.id = 'sp-css'; t.textContent = CSS; document.head.appendChild(t); }
+    const el = document.createElement('div'); el.className = 'sp'; root.appendChild(el);
+    let st = null, dead = false, seen = 0, phKey = '';
+    const ui = { sel: -1, tab: 'card', sheet: null, kw: '' };
+    const can = () => !!st && api.canAct(0);
+    const sfx = (n) => { try { api.sfx(n); } catch (e) {} };
+    artCb = () => { if (!dead && st) render(); };
+
+    /* --- 공통 조각 --- */
+    function statBar(s, d) {
+      const lo = s.hp * 4 <= s.mhp;
+      return '<div class="sp-sb"><div class="sp-hp' + (lo ? ' low' : '') + '"><span>체력</span><div class="sp-bar"><i style="width:' + (100 * s.hp / s.mhp) + '%"></i></div><b class="mono">' + s.hp + '/' + s.mhp + '</b></div><div class="sp-coin">' + glyph('coin', '#e3ae45', 18) + '<b class="mono">' + s.coin + '</b></div></div>'
+        + '<div class="sp-sts">' + [0, 1, 2].map((i) => '<div style="--c:' + STC[i] + '"><span>' + STN[i] + '</span><b class="mono">' + s.st[i] + (d && d[i] ? '<em>+' + d[i] + '</em>' : '') + '</b></div>').join('') + '</div>';
+    }
+    function seasonTop(s, title) {
+      const Ln = LEN[s.len]; let pips = '';
+      for (let w = 1; w <= Ln.W; w++) pips += '<i class="' + (w < s.wk ? 'dn' : w === s.wk ? 'nw' : '') + (examWeek(s, w) >= 0 ? ' xm' : '') + '"></i>';
+      const nx = nextExam(s), left = (nx ? Ln.W : Ln.mid) - s.wk;
+      return '<div class="sp-top"><div class="sp-tt"><b>' + title + '</b><span>' + (left > 0 ? (nx ? '최종' : '중간') + ' 심사까지 ' + left + '주' : (nx ? '최종' : '중간') + ' 심사 주간') + '</span></div><div class="sp-pips">' + pips + '</div></div>';
+    }
+    function cardRow(d, o) {   // 목록의 카드 한 줄
+      o = o || {}; const c = cardOf(d);
+      return '<' + (o.a ? 'button' : 'div') + ' class="sp-row' + (o.sel ? ' sel' : '') + (o.no ? ' no' : '') + (o.a ? '' : ' flat') + '" style="--c:' + TYC[c.t] + '"' + (o.a ? ' data-a="' + o.a + '" data-i="' + o.i + '"' : '') + '><span class="sp-ri">' + glyph(c.g, TYC[c.t]) + '</span><span class="sp-rt"><b>' + cname(d) + '<em>' + TY[c.t] + ' · ' + costText(c) + (c.o ? ' · 전용' : '') + '</em></b><small>' + cardText(d) + '</small>'
+        + (o.up ? '<small class="u">강화 → ' + cardText([d[0], 1]) + (cardOf([d[0], 1]).c !== c.c ? ' (' + costText(cardOf([d[0], 1])) + ')' : '') + '</small>' : '') + '</span>' + (o.r ? '<span class="sp-rr' + (o.rx ? ' x' : '') + '">' + o.r + '</span>' : '') + '</' + (o.a ? 'button' : 'div') + '>';
+    }
+    function itemRow(id, o) {
+      o = o || {};
+      return '<' + (o.a ? 'button' : 'div') + ' class="sp-row' + (o.sel ? ' sel' : '') + (o.no ? ' no' : '') + (o.a ? '' : ' flat') + '" style="--c:#e3ae45"' + (o.a ? ' data-a="' + o.a + '" data-i="' + o.i + '"' : '') + '><span class="sp-ri">' + glyph(IT[id].g, '#e3ae45') + '</span><span class="sp-rt"><b>' + IT[id].n + '<em>물품</em></b><small>' + itemText(id) + '</small></span>' + (o.r ? '<span class="sp-rr' + (o.rx ? ' x' : '') + '">' + o.r + '</span>' : '') + '</' + (o.a ? 'button' : 'div') + '>';
+    }
+    const bot = (left, label, on, key) => '<div class="sp-bot">' + (left || '') + '<button class="btn primary sp-pri" data-a="go"' + (key === false ? '' : ' data-action="go"') + (on ? '' : ' disabled') + '>' + label + '</button></div>';
+    const deckBtns = (s) => '<button class="btn" data-a="sheet" data-i="deck">덱 ' + s.deck.length + '</button><button class="btn" data-a="sheet" data-i="items">물품 ' + s.items.length + '</button>';
+
+    /* --- 인물 고르기 --- */
+    function vPick() {
+      const rows = CH.map((c, i) => { const a = art(c.id + '_a'); return '<button class="sp-pick' + (ui.sel === i ? ' sel' : '') + '" data-a="sel" data-i="' + i + '" style="--c:' + c.col + '"><span class="sp-pf">' + (a.ok > 0 ? '<img src="' + a.src + '" alt="" draggable="false">' : SIL(c.col)) + '</span><span class="sp-pt"><b>' + c.n + '</b><span>' + c.sub + '</span><small>' + c.way + ' — ' + c.pd + '</small><small class="sp-mut">체력 ' + c.mhp + ' · 보컬 ' + c.st[0] + ' · 댄스 ' + c.st[1] + ' · 표현 ' + c.st[2] + '</small></span></button>'; }).join('');
+      return '<div class="sp-hd"><h3>담당 인물</h3><p>한 시즌을 함께할 한 사람. ' + LEN[st.len].W + '주 · 목표 「' + GOAL[st.goal].n + '」</p></div><div class="sp-scroll">' + rows + (ui.sel >= 0 ? '<div class="sp-note">' + CH[ui.sel].tip + '</div>' : '') + '</div>'
+        + bot('', ui.sel >= 0 ? CH[ui.sel].n + ' — 시작' : '인물을 고르세요', ui.sel >= 0);
+    }
+
+    /* --- 일정 --- */
+    function offerInfo(s, o) {
+      if (o.k === 'l') return { g: o.sp ? 'flame' : ['note', 'shoe', 'mask'][o.st], c: STC[o.st], t: STN[o.st] + (o.sp ? ' 특훈' : ' 레슨'), s: '목표 ' + o.tg + ' · ' + o.T + '턴' + (o.it ? ' · 클리어 시 「' + IT[o.it].n + '」' : ''), r: STN[o.st] + ' +' + o.gain };
+      if (o.k === 'rest') return { g: 'heart', c: '#7fd6c4', t: '휴식', s: s.hp >= s.mhp ? '체력이 가득 참' : '체력을 회복', r: '체력 +' + min(o.hp, s.mhp - s.hp) };
+      if (o.k === 'out') return { g: 'mask', c: '#cfa6ee', t: '외출 · ' + EV[o.ev].n, s: '둘 가운데 하나를 고름. 결과는 미리 보임', r: '' };
+      if (o.k === 'cls') return { g: 'leaf', c: '#b9e372', t: '수업', s: '카드 한 장 강화 · 체력을 쓰지 않음', r: '능력치 +' + o.n };
+      return { g: 'coin', c: '#e3ae45', t: '상점', s: '카드 · 물품 · 강화 · 제거', r: '활동비 ' + s.coin };
+    }
+    function examChip(s, xi) { const sp = examSpec(s, xi); return '<button class="sp-xchip" data-a="sheet" data-i="exam' + xi + '"><span>' + glyph('star', xi === nextExam(s) && !s.xs[xi] ? '#f6d58a' : '#8d809c', 20) + '</span><span><b>' + (xi ? '최종' : '중간') + ' · ' + sp.X.n + '</b><small>' + (s.xs[xi] ? s.xs[xi].rank + '위로 마침' : critStrip(sp.cr)) + '</small></span></button>'; }
+    function vWeek() {
+      const s = st; if (ui.sel >= s.of.length) ui.sel = -1;
+      const rows = s.of.map((o, i) => { const d = offerInfo(s, o); return '<button class="sp-opt' + (ui.sel === i ? ' sel' : '') + '" data-a="sel" data-i="' + i + '" style="--c:' + d.c + '"><span class="sp-oi">' + glyph(d.g, d.c, 26) + '</span><span class="sp-ot"><b>' + d.t + '</b><small>' + d.s + '</small></span>' + (d.r ? '<span class="sp-or">' + d.r + '</span>' : '') + '</button>'; }).join('');
+      const note = s.note ? '<div class="sp-note"><b>' + s.note[0] + '</b> — ' + s.note.slice(1).join(' · ') + '</div>' : '<div class="sp-note">' + CH[s.ch].n + ' — ' + CH[s.ch].pd + '</div>';
+      const lbl = ui.sel >= 0 ? offerInfo(s, s.of[ui.sel]).t.replace(/ · .*/, '') + ' — 이 일정으로' : '이번 주 일정을 고르세요';
+      return seasonTop(s, s.wk + '주차') + statBar(s) + '<div class="sp-art" style="' + bgSt('bg_room') + '">' + chArt(s.ch, s.hp * 4 <= s.mhp ? 'tired' : 'a') + '<div class="sp-al">' + note + examChip(s, 0) + examChip(s, 1) + '</div></div>'
+        + '<div class="sp-list">' + rows + '</div>' + bot(deckBtns(s), lbl, ui.sel >= 0 && can());
+    }
+
+    /* --- 레슨 · 심사 --- */
+    function vBattle() {
+      const s = st, bt = s.bt, ex = bt.k === 'x'; const me = can();
+      if (ui.sel >= bt.hd.length) ui.sel = -1;
+      let pips = '';
+      for (let t = 1; t <= bt.T; t++) { const k = ex ? bt.cr[min(t, bt.cr.length) - 1] : -1; const bz = ex && ((EXAMS[bt.x].gm === 'encore' && t > bt.T - 2) || (EXAMS[bt.x].gm === 'first' && t <= 2)); pips += '<i class="' + (t < bt.t ? 'dn' : t === bt.t ? 'nw' : '') + (bz ? ' bz' : '') + '"' + (ex ? ' style="--c:' + STC[k] + '"' : '') + '>' + (ex ? STN[k][0] : t) + '</i>'; }
+      let head, score, track;
+      if (ex) {
+        const X = EXAMS[bt.x]; const rv = s.rv[bt.xi].map((f) => rivalNow(bt, f, bt.t)); const rank = rankOf(bt.sc, rv); const cut = GOAL[s.goal].cut[bt.xi];
+        const srt = rv.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]); const mx = max(bt.sc, srt[0][0], 1) * 1.06;
+        const above = rank > 1 ? srt[rank - 2] : null, below = srt[rank - 1] || null;
+        head = '<div class="sp-bh"><b>' + X.n + '</b><span>' + bt.t + '/' + bt.T + '턴 · ' + STN[bt.cr[bt.t - 1]] + ' ×' + tmOf(s, bt, bt.t).toFixed(2) + '</span></div>';
+        score = '<div class="sp-scn mono">' + bt.sc + '</div><button class="sp-xr" data-a="sheet" data-i="rank"><b class="' + (rank <= cut ? 'sp-up' : 'sp-warn') + '">' + rank + '위</b><em>통과선 ' + cut + '위 안</em><small>' + (above ? (rank - 1) + '위 「' + RIVALS[s.rn[above[1]]] + '」까지 ' + (above[0] - bt.sc + 1) : below ? '2위 「' + RIVALS[s.rn[below[1]]] + '」와 ' + (bt.sc - below[0]) + ' 차' : '') + '</small></button>';
+        track = '<div class="sp-trk">' + srt.map((r, i) => '<s class="' + (i + 1 === cut ? 'cut' : '') + '" style="left:' + (100 * r[0] / mx) + '%"></s>').join('') + '<s class="me" style="left:' + (100 * bt.sc / mx) + '%"></s></div>';
+      } else {
+        const mx = bt.pf * 1.04; const left = bt.sc >= bt.tg ? '퍼펙트까지 ' + (bt.pf - bt.sc) : '클리어까지 ' + (bt.tg - bt.sc);
+        head = '<div class="sp-bh"><b>' + STN[bt.st] + (bt.o.sp ? ' 특훈' : ' 레슨') + '</b><span>' + bt.t + '/' + bt.T + '턴 · ' + STN[bt.st] + ' +' + bt.o.gain + '</span></div>';
+        score = '<div class="sp-scn mono">' + bt.sc + '</div><div class="sp-scr"><b class="' + (bt.sc >= bt.tg ? 'sp-up' : '') + '">' + (bt.sc >= bt.tg ? '클리어' : '목표 ' + bt.tg) + '</b> · 퍼펙트 ' + bt.pf + '<span>' + left + '</span></div>';
+        track = '<div class="sp-trk"><i style="width:' + min(100, 100 * bt.sc / mx) + '%"></i><u style="left:' + (100 * bt.tg / mx) + '%"></u><u class="pf" style="left:' + (100 * bt.pf / mx) + '%"></u></div>';
+      }
+      let chips = '';
+      for (const k of ['f', 'gc', 'pk', 'mo', 'ht', 'ez', 'bd']) if (bt[k] > 0) chips += '<button class="sp-chip" data-a="kw" data-i="' + k + '" style="--c:' + KW[k].c + '">' + kwv(k, bt[k]) + '</button>';
+      for (const p of bt.per) chips += '<span class="sp-chip q">턴마다 ' + KW[p[0]].n + ' +' + p[1] + '</span>';
+      if (bt.act > 1) chips += '<button class="sp-chip" data-a="kw" data-i="x" style="--c:#f2e9d8">행동 ' + bt.act + '회 남음</button>';
+      if (!chips) chips = '<span class="sp-chip q">걸린 효과 없음</span>';
+      const lo = s.hp * 4 <= s.mhp;
+      const stage = '<div class="sp-art stage" style="' + bgSt(ex ? 'bg_stage' : 'bg_room') + (ex ? '--lc:' + STC[bt.cr[bt.t - 1]] + '55' : '') + '">' + chArt(s.ch, ex ? 'resolve' : lo ? 'tired' : bt.gc > 0 || bt.sc >= bt.tg ? 'joy' : 'focus', ex ? (lo ? 'dim' : bt.gc > 0 ? 'glow' : '') : '') + '<div class="sp-chips">' + chips + '</div>'
+        + '<div class="sp-bst"><div class="sp-hp' + (lo ? ' low' : '') + '"><span>체력</span><div class="sp-bar"><i style="width:' + (100 * s.hp / s.mhp) + '%"></i></div><b class="mono">' + s.hp + '/' + s.mhp + '</b></div><button class="sp-gk sp-chip" data-a="kw" data-i="g" style="--c:#7fd6c4">' + kwv('g', bt.g) + '</button><button class="sp-chip q" data-a="sheet" data-i="pile">더미 ' + bt.dr.length + '</button></div></div>';
+      // 손패
+      let hand = '', info = '';
+      bt.hd.forEach((di, i) => {
+        const d = s.deck[di], c = cardOf(d), k = costOf(s, bt, c), why = whyNot(s, bt, i);
+        let pv = '';
+        if (!why) { const s2 = clone(s); playCard(s2, s2.bt, i); const dv = s2.bt.sc - bt.sc; pv = dv > 0 ? '<span class="sp-cv">+' + dv + '</span>' : '<span class="sp-cv t">' + plain(fxText(c.e[0], s, bt)) + '</span>'; }
+        else pv = '<span class="sp-cv t">' + plain(fxText(c.e[0])) + '</span>';
+        hand += '<button class="sp-card' + (ui.sel === i ? ' sel' : '') + (why ? ' no' : '') + '" data-a="card" data-i="' + i + '" data-action="c' + (i + 1) + '" style="--c:' + TYC[c.t] + '"><span class="sp-cc">' + (k[0] || !k[1] ? '<i class="' + (k[0] ? '' : 'z') + '">' + k[0] + '</i>' : '') + (k[1] ? '<i class="h">' + k[1] + '</i>' : '') + '<em>' + TY[c.t] + '</em></span><span class="sp-cg">' + glyph(c.g, TYC[c.t], 24) + '</span><span class="sp-cn">' + cname(d) + '</span>' + pv + (why ? '<span class="sp-no">' + why + '</span>' : '') + '</button>';
+      });
+      if (!bt.hd.length) hand = '<div class="sp-wait">손패가 없음</div>';
+      if (ui.sel >= 0) {
+        const d = s.deck[bt.hd[ui.sel]], c = cardOf(d), k = costOf(s, bt, c), why = whyNot(s, bt, ui.sel);
+        const fromG = min(bt.g, k[0]), hpc = k[0] - fromG + k[1];
+        const bt2 = Object.assign({}, bt, { fx: c.t === 'a' && bt.pa === 0 ? pas(s, 'fa') : 0 });
+        info = '<b class="n">' + cname(d) + '</b> <em>' + TY[c.t] + ' · ' + (k[0] + k[1] === 0 ? '비용 없음' : (fromG ? '기력 −' + fromG : '') + (fromG && hpc ? ' · ' : '') + (hpc ? '체력 −' + hpc : '')) + '</em>' + (why ? ' <b class="sp-warn">' + (why === '체력 부족' ? '체력 부족 — 기력과 체력을 합쳐 ' + (k[0] + k[1]) + ' 필요' : '호조 중에만 낼 수 있음') + '</b>' : '') + '<br>' + cardText(d, s, bt2);
+      } else if (ui.kw) info = '<b class="n">' + KW[ui.kw].n + '</b><br>' + KW[ui.kw].d + (KW[ui.kw].turn ? ' 턴이 끝날 때 1 줄어듦(얻은 턴에는 줄지 않음).' : '');
+      else info = me ? '<em>카드를 누르면 계산된 효과가 보임. 한 번 더 누르면 냄.' + (ex ? ' 점수 배율은 이번 턴 기준 능력치 ÷ 100.' : ' 목표의 1.6배면 퍼펙트로 바로 끝남.') + '</em>' : '<em>AI가 진행하는 중.</em>';
+      const skipH = min(s.mhp - s.hp, 2 + pas(s, 'skip')); const skipL = bt.pl === 0 ? (skipH > 0 ? '쉬어 가기 · 체력 +' + skipH : '쉬어 가기') : '턴 끝내기';
+      const ok = ui.sel >= 0 && !whyNot(s, bt, ui.sel) && me;
+      return head + '<div class="sp-tp">' + pips + '</div><div class="sp-sc">' + score + '</div>' + track + stage + '<div class="sp-info">' + info + '</div><div class="sp-hand">' + hand + '</div>'
+        + '<div class="sp-bot"><button class="btn" data-a="skip" data-action="pass"' + (me ? '' : ' disabled') + '>' + skipL + '</button><button class="btn primary sp-pri" data-a="go" data-action="go"' + (ok ? '' : ' disabled') + '>' + (ui.sel >= 0 ? (ok || !me ? '내기' : whyNot(s, bt, ui.sel)) : '카드를 고르세요') + '</button></div>';
+    }
+
+    /* --- 레슨 보상 --- */
+    function vReward() {
+      const s = st, rw = s.rw; const tab = ui.tab; let list = '', lbl = '고르세요', ok = false;
+      if (tab === 'card') { list = rw.cards.map((id, i) => cardRow([id, 0], { a: 'sel', i, sel: ui.sel === i })).join(''); if (ui.sel >= 0 && rw.cards[ui.sel]) { lbl = '「' + C[rw.cards[ui.sel]].n + '」 얻기'; ok = true; } }
+      else if (tab === 'up') { list = s.deck.map((d, i) => (d[1] ? '' : cardRow(d, { a: 'sel', i, sel: ui.sel === i, up: 1 }))).join('') || '<div class="sp-note">강화할 카드가 없음.</div>'; if (ui.sel >= 0 && s.deck[ui.sel] && !s.deck[ui.sel][1]) { lbl = '「' + C[s.deck[ui.sel][0]].n + '」 강화'; ok = true; } }
+      else { list = s.deck.length > 5 ? s.deck.map((d, i) => cardRow(d, { a: 'sel', i, sel: ui.sel === i })).join('') : '<div class="sp-note">덱이 5장이면 더 뺄 수 없음.</div>'; if (ui.sel >= 0 && s.deck[ui.sel] && s.deck.length > 5) { lbl = '「' + cname(s.deck[ui.sel]) + '」 제거'; ok = true; } }
+      const d = [0, 0, 0]; d[rw.st] = rw.g;
+      return '<div class="sp-hd"><h3>' + STN[rw.st] + (rw.sp ? ' 특훈' : ' 레슨') + ' — ' + ['목표 미달', '클리어', '퍼펙트'][rw.res] + '</h3><p>점수 ' + rw.sc + ' / 목표 ' + rw.tg + (rw.res === 0 ? ' · 능력치는 일부만 오름' : rw.res === 2 ? ' · 능력치 1.5배' : '') + '</p></div>'
+        + '<div class="sp-gain"><span class="g">' + STN[rw.st] + ' +' + rw.g + '</span><span>활동비 +' + rw.coin + '</span>' + (rw.it ? '<span class="g">물품 「' + IT[rw.it].n + '」</span>' : '') + '<span>덱 ' + s.deck.length + '장</span></div>'
+        + '<div class="sp-tabs">' + [['card', '카드 얻기'], ['up', '강화'], ['rm', '제거']].map((t) => '<button class="' + (tab === t[0] ? 'on' : '') + '" data-a="tab" data-i="' + t[0] + '">' + t[1] + '</button>').join('') + '</div>'
+        + '<div class="sp-scroll">' + list + '</div>' + bot('<button class="btn" data-a="rwskip">넘기기 · 활동비 +12</button>', lbl, ok && can());
+    }
+    function vPk() {
+      const s = st, up = s.pk.m === 'up';
+      const list = s.deck.map((d, i) => (up && d[1] ? '' : cardRow(d, { a: 'sel', i, sel: ui.sel === i, up }))).join('');
+      const ok = ui.sel >= 0 && s.deck[ui.sel] && !(up && s.deck[ui.sel][1]);
+      return '<div class="sp-hd"><h3>' + (up ? '카드 강화' : '카드 제거') + '</h3><p>' + (up ? '강화할 카드 한 장. 강화한 카드는 이름 뒤에 +가 붙음.' : '덱에서 뺄 카드 한 장. 덱이 얇을수록 좋은 카드가 자주 돌아옴.') + '</p></div><div class="sp-scroll">' + list + '</div>'
+        + bot('<button class="btn" data-a="pkskip">하지 않음</button>', ok ? '「' + cname(s.deck[ui.sel]) + '」 ' + (up ? '강화' : '제거') : '고르세요', ok && can());
+    }
+    function vEvent() {
+      const s = st, E = EV[s.ev.i];
+      const rows = E.o.map((o, i) => { const no = s.coin < evCost(o.fx); return '<button class="sp-opt' + (ui.sel === i ? ' sel' : '') + (no ? ' no' : '') + '" data-a="sel" data-i="' + i + '" style="--c:#cfa6ee"><span class="sp-ot"><b>' + o.l + '</b><small>' + evFxText(s, o.fx, s.ev) + (no ? ' <b class="sp-warn">활동비 부족</b>' : '') + '</small></span></button>'; }).join('');
+      const ok = ui.sel >= 0 && E.o[ui.sel] && s.coin >= evCost(E.o[ui.sel].fx);
+      return seasonTop(s, s.wk + '주차 · 외출') + statBar(s) + '<div class="sp-art" style="' + bgSt(EVBG[s.ev.i] || 'bg_room') + '">' + chArt(s.ch, 'a') + '<div class="sp-al"><div class="sp-note"><b>' + E.n + '</b><br>' + E.t + '</div></div></div><div class="sp-list">' + rows + '</div>'
+        + bot(deckBtns(s), ui.sel >= 0 ? (ok ? E.o[ui.sel].l : '활동비 부족') : '어떻게 할지 고르세요', ok && can());
+    }
+    function vClass() {
+      const s = st; const w = examSpec(s, nextExam(s)); const n = [0, 0, 0]; w.cr.forEach((k) => n[k]++);
+      const rows = [0, 1, 2].map((i) => '<button class="sp-opt' + (ui.sel === i ? ' sel' : '') + '" data-a="sel" data-i="' + i + '" style="--c:' + STC[i] + '"><span class="sp-oi">' + glyph(['note', 'shoe', 'mask'][i], STC[i], 26) + '</span><span class="sp-ot"><b>' + STN[i] + ' 이론</b><small>지금 ' + s.st[i] + ' · 다음 심사에서 ' + n[i] + '턴이 ' + STN[i] + ' 기준</small></span><span class="sp-or">+' + s.cl.n + '</span></button>').join('');
+      return seasonTop(s, s.wk + '주차 · 수업') + statBar(s) + '<div class="sp-art" style="' + bgSt('bg_room') + '">' + chArt(s.ch, 'focus') + '<div class="sp-al"><div class="sp-note"><b>수업</b><br>올릴 능력치 하나. 이어서 카드 한 장을 강화.</div></div></div><div class="sp-list">' + rows + '</div>'
+        + bot(deckBtns(s), ui.sel >= 0 ? STN[ui.sel] + ' +' + s.cl.n : '능력치를 고르세요', ui.sel >= 0 && can());
+    }
+    function shopList(s) {   // [{종류, 번호, html, 살 수 있음, 이름}]
+      const sh = s.sh, out = []; let n = 0;
+      const tag = (p, x, why) => ({ r: x ? '품절' : why || p + '', rx: !!(x || why), no: !!(x || why) });
+      sh.c.forEach((x, i) => { const t = tag(x.p, x.x, s.coin < x.p ? x.p + ' · 부족' : ''); out.push({ k: 'c', i, ok: !t.no, n: C[x.id].n, h: cardRow([x.id, 0], Object.assign({ a: 'sel', i: n, sel: ui.sel === n }, t)) }); n++; });
+      sh.it.forEach((x, i) => { const t = tag(x.p, x.x, s.coin < x.p ? x.p + ' · 부족' : ''); out.push({ k: 'it', i, ok: !t.no, n: IT[x.id].n, h: itemRow(x.id, Object.assign({ a: 'sel', i: n, sel: ui.sel === n }, t)) }); n++; });
+      for (const k of ['up', 'rm', 'dr']) {
+        const p = price(s, SVC[k].p); const none = k === 'up' ? !s.deck.some((d) => !d[1]) : k === 'rm' ? s.deck.length <= 5 : s.hp >= s.mhp;
+        const t = tag(p, sh[k], s.coin < p ? p + ' · 부족' : none ? (k === 'dr' ? '체력 가득' : '대상 없음') : '');
+        out.push({ k, i: 0, ok: !t.no, n: SVC[k].n, h: '<button class="sp-row' + (ui.sel === n ? ' sel' : '') + (t.no ? ' no' : '') + '" data-a="sel" data-i="' + n + '" style="--c:#7fd6c4"><span class="sp-ri">' + glyph(k === 'dr' ? 'heart' : k === 'up' ? 'spark' : 'leaf', '#7fd6c4') + '</span><span class="sp-rt"><b>' + SVC[k].n + '<em>서비스</em></b><small>' + (k === 'up' ? '덱의 카드 한 장을 골라 강화' : k === 'rm' ? '덱의 카드 한 장을 골라 뺌' : '체력 +' + SVC.dr.hp) + '</small></span><span class="sp-rr' + (t.rx ? ' x' : '') + '">' + t.r + '</span></button>' }); n++;
+      }
+      return out;
+    }
+    function vShop() {
+      const s = st, ls = shopList(s); const cur = ls[ui.sel];
+      return seasonTop(s, s.wk + '주차 · 상점') + statBar(s) + '<div class="sp-scroll"><div class="sp-sec">카드</div>' + ls.slice(0, s.sh.c.length).map((x) => x.h).join('') + '<div class="sp-sec">물품</div>' + (ls.slice(s.sh.c.length, s.sh.c.length + s.sh.it.length).map((x) => x.h).join('') || '<div class="sp-note">남은 물품이 없음.</div>') + '<div class="sp-sec">서비스</div>' + ls.slice(-3).map((x) => x.h).join('') + '</div>'
+        + '<div class="sp-bot">' + deckBtns(s) + '<button class="btn" data-a="leave"' + (can() ? '' : ' disabled') + '>나가기</button><button class="btn primary sp-pri" data-a="go" data-action="go"' + (cur && cur.ok && can() ? '' : ' disabled') + '>' + (cur ? (cur.ok ? '사기' : '살 수 없음') : '고르세요') + '</button></div>';
+    }
+    function examBody(s, xi) {
+      const sp = examSpec(s, xi), cut = GOAL[s.goal].cut[xi]; const n = [0, 0, 0]; sp.cr.forEach((k) => n[k]++);
+      return '<div class="sp-note"><b>' + sp.X.n + '</b> · ' + sp.T + '턴 · ' + (xi ? LEN[s.len].W : LEN[s.len].mid) + '주차<br>' + sp.X.d + '<br>통과선: ' + cut + '위 안(6명 중)</div>'
+        + '<div class="sp-tp" style="padding:2px 0">' + sp.cr.map((k, i) => '<i style="--c:' + STC[k] + '">' + STN[k][0] + '</i>').join('') + '</div>'
+        + [0, 1, 2].map((i) => '<div class="sp-rank" style="border-left:4px solid ' + STC[i] + '"><span>' + STN[i] + ' 기준 ' + n[i] + '턴</span><b>지금 ×' + (s.st[i] / 100).toFixed(2) + '</b></div>').join('');
+    }
+    function vExamIntro() {
+      const s = st, xi = s.xi; const rv = s.rv[xi];
+      const rows = rv.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).map((r) => '<div class="sp-rank">' + face('rv' + s.rn[r[1]]) + '<span>' + RIVALS[s.rn[r[1]]] + '</span><b class="sp-mut">예상 ' + (round(r[0] / 10) * 10) + ' 안팎</b></div>').join('');
+      return '<div class="sp-hd"><h3>' + (xi ? '최종 심사' : '중간 심사') + '</h3><p>' + CH[s.ch].n + ' · 체력 ' + s.hp + '/' + s.mhp + (s.xh ? ' (심사 전 +' + s.xh + ')' : '') + ' · 덱 ' + s.deck.length + '장</p></div>'
+        + '<div class="sp-art ban" style="' + bgSt('bg_wait') + '">' + chArt(s.ch, 'b') + '<div class="sp-al"><div class="sp-note">대기실 — 무대까지 몇 걸음.</div></div></div><div class="sp-scroll">' + examBody(s, xi) + '<div class="sp-sec">경쟁자</div>' + rows + '</div>' + bot(deckBtns(s), '무대에 오른다', can());
+    }
+    function rankRows(s, xi, my, rvNow, cut) {
+      const all = rvNow.map((v, i) => ({ n: RIVALS[s.rn[i]], v, f: face('rv' + s.rn[i]) })).concat([{ n: CH[s.ch].n, v: my, me: 1, f: face(CH[s.ch].id + '_face', CH[s.ch].col) }]).sort((a, b) => b.v - a.v || (a.me ? 1 : -1));
+      let h = ''; all.forEach((r, i) => { h += '<div class="sp-rank' + (r.me ? ' me' : '') + '"><i>' + (i + 1) + '위</i>' + r.f + '<span>' + r.n + '</span><b>' + r.v + '</b></div>'; if (i + 1 === cut && i < all.length - 1) h += '<div class="sp-cut">통과선</div>'; });
+      return h;
+    }
+    function vExamResult() {
+      const s = st, xr = s.xr, cut = GOAL[s.goal].cut[xr.xi];
+      let extra = '', b;
+      if (xr.its && xr.its.length) { extra = '<div class="sp-sec">통과 보상 — 활동비 +40 · 모든 능력치 +10 · 물품 하나를 고름</div>' + xr.its.map((id, i) => itemRow(id, { a: 'sel', i, sel: ui.sel === i })).join(''); b = bot('', ui.sel >= 0 && xr.its[ui.sel] ? '「' + IT[xr.its[ui.sel]].n + '」 받기' : '물품을 고르세요', ui.sel >= 0 && !!xr.its[ui.sel] && can()); }
+      else b = bot('', xr.xi === 1 || !xr.pass ? '시즌 마치기' : '다음 주로', can());
+      return '<div class="sp-hd"><h3>' + (xr.xi ? '최종 심사' : '중간 심사') + ' — ' + xr.rank + '위</h3><p>' + (xr.pass ? '통과선 ' + cut + '위 안에 듦.' : '통과선 ' + cut + '위에 미치지 못함.' + (xr.xi ? '' : ' 시즌은 여기까지.')) + '</p></div><div class="sp-art ban" style="' + bgSt('bg_judge') + '">' + chArt(s.ch, xr.pass ? 'b' : 'resolve', xr.pass ? '' : 'dim') + '</div><div class="sp-scroll">' + rankRows(s, xr.xi, xr.sc, s.rv[xr.xi], cut) + extra + '</div>' + b;
+    }
+    function vEnd() {
+      const s = st, r = s.res;
+      return '<div class="sp-hd"><h3>시즌 종료</h3><p>' + CH[s.ch].n + ' · 목표 「' + GOAL[s.goal].n + '」 ' + (r.win ? '달성' : '미달') + '</p></div>' + statBar(s)
+        + '<div class="sp-art stage" style="' + bgSt('bg_stage') + '">' + chArt(s.ch, 'b', 'tall ' + (r.win ? 'glow' : 'dim')) + '<div class="sp-al" style="justify-content:center"><div class="sp-big">' + r.g + '</div><div class="sp-note">' + GRADE_T[r.g] + '</div></div></div><div style="flex:none;height:12px"></div>';
+    }
+
+    /* --- 덧창(덱 · 물품 · 심사 · 순위) --- */
+    function sheetHTML() {
+      const s = st, k = ui.sheet; if (!k) return '';
+      let title = '', body = '';
+      if (k === 'deck' || k === 'pile') {
+        const idx = s.deck.map((_, i) => i);
+        if (k === 'pile' && s.bt) { const bt = s.bt; const grp = (t, a) => (a.length ? '<div class="sp-sec">' + t + ' ' + a.length + '장</div>' + a.slice().sort((x, y) => (s.deck[x][0] < s.deck[y][0] ? -1 : 1)).map((i) => cardRow(s.deck[i])).join('') : ''); title = '카드 더미'; body = '<div class="sp-note">뽑을 더미가 떨어지면 버린 카드를 섞어 다시 씀. 순서는 보이지 않음.</div>' + grp('뽑을 더미', bt.dr) + grp('버린 카드', bt.ds) + grp('이번에 다 쓴 1회 카드', bt.xh); }
+        else { title = '덱 ' + s.deck.length + '장'; body = idx.sort((x, y) => (C[s.deck[x][0]].t + s.deck[x][0] < C[s.deck[y][0]].t + s.deck[y][0] ? -1 : 1)).map((i) => cardRow(s.deck[i])).join(''); }
+      } else if (k === 'items') { title = '물품 ' + s.items.length + '개'; body = '<div class="sp-row flat" style="--c:' + CH[s.ch].col + '"><span class="sp-ri">' + glyph('star', CH[s.ch].col) + '</span><span class="sp-rt"><b>' + CH[s.ch].n + '<em>특성</em></b><small>' + CH[s.ch].pd + '</small></span></div>' + (s.items.map((id) => itemRow(id)).join('') || '<div class="sp-note">아직 물품이 없음. 특훈 클리어 · 상점 · 외출 · 중간 심사 통과로 얻음.</div>'); }
+      else if (k === 'exam0' || k === 'exam1') { const xi = +k[4]; title = xi ? '최종 심사' : '중간 심사'; body = examBody(s, xi); }
+      else if (k === 'rank' && s.bt && s.bt.k === 'x') { const bt = s.bt; title = '지금 순위 · ' + bt.t + '/' + bt.T + '턴'; body = rankRows(s, bt.xi, bt.sc, s.rv[bt.xi].map((f) => rivalNow(bt, f, bt.t)), GOAL[s.goal].cut[bt.xi]) + '<div class="sp-note">경쟁자 점수는 턴마다 올라감. 마지막 턴이 끝난 뒤의 순위가 결과.</div>'; }
+      else return '';
+      return '<div class="sp-sh" data-a="close"><div class="sp-shin"><div class="sp-shh"><b>' + title + '</b><button class="btn" data-a="close">닫기</button></div><div class="sp-scroll">' + body + '</div></div></div>';
+    }
+
+    function render() {
+      if (dead || !st) return;
+      const s = st; let h;
+      switch (s.ph) {
+        case 'pick': h = vPick(); break;
+        case 'week': h = vWeek(); break;
+        case 'bt': h = vBattle(); break;
+        case 'rw': h = vReward(); break;
+        case 'pk': h = vPk(); break;
+        case 'ev': h = vEvent(); break;
+        case 'cls': h = vClass(); break;
+        case 'shop': h = vShop(); break;
+        case 'xi': h = vExamIntro(); break;
+        case 'xr': h = vExamResult(); break;
+        default: h = vEnd();
+      }
+      const sc = el.querySelector('.sp-scroll'), top = sc ? sc.scrollTop : 0, shs = el.querySelector('.sp-sh .sp-scroll'), top2 = shs ? shs.scrollTop : 0;
+      el.className = 'sp' + (can() ? '' : ' lock');
+      el.innerHTML = '<div class="sp-in">' + h + '</div>' + sheetHTML();
+      const sc2 = el.querySelector('.sp-in .sp-scroll'); if (sc2 && top) sc2.scrollTop = top;
+      const sh2 = el.querySelector('.sp-sh .sp-scroll'); if (sh2 && top2) sh2.scrollTop = top2;
+    }
+    function pop(txt, cls) { const host = el.querySelector('.sp-art'); if (!host) return; const p = document.createElement('div'); p.className = 'sp-pop' + (cls ? ' ' + cls : ''); p.textContent = txt; host.appendChild(p); setTimeout(() => { if (p.parentNode) p.parentNode.removeChild(p); }, 950); }
+
+    /* --- 입력 --- */
+    function go() {
+      const s = st; if (!can()) return;
+      switch (s.ph) {
+        case 'pick': if (ui.sel >= 0) api.act({ t: 'ch', i: ui.sel }); break;
+        case 'week': if (ui.sel >= 0) api.act({ t: 'go', i: ui.sel }); break;
+        case 'bt': if (ui.sel >= 0 && !whyNot(s, s.bt, ui.sel)) api.act({ t: 'play', i: ui.sel }); break;
+        case 'rw': if (ui.sel >= 0) api.act({ t: 'rw', k: ui.tab, i: ui.sel }); break;
+        case 'pk': if (ui.sel >= 0) api.act({ t: 'pk', i: ui.sel }); break;
+        case 'ev': if (ui.sel >= 0) api.act({ t: 'ev', i: ui.sel }); break;
+        case 'cls': if (ui.sel >= 0) api.act({ t: 'cls', i: ui.sel }); break;
+        case 'shop': { const x = shopList(s)[ui.sel]; if (x && x.ok) api.act({ t: 'buy', k: x.k, i: x.i }); break; }
+        case 'xi': api.act({ t: 'start' }); break;
+        case 'xr': if (s.xr.its && s.xr.its.length) { if (ui.sel >= 0) api.act({ t: 'itm', i: ui.sel }); } else api.act({ t: 'next' }); break;
+      }
+    }
+    function pick(i) {   // 고르기(같은 것을 다시 누르면 실행)
+      if (!can()) return;
+      if (ui.sel === i) { go(); return; }
+      ui.sel = i; ui.kw = ''; sfx('tick'); render();
+    }
+    function onClick(e) {
+      const t = e.target.closest('[data-a]'); if (!t || !el.contains(t) || t.disabled) return;
+      const a = t.getAttribute('data-a'), iv = t.getAttribute('data-i');
+      switch (a) {
+        case 'close': if (t.classList.contains('sp-sh') && e.target !== t) return; ui.sheet = null; render(); break;
+        case 'sheet': ui.sheet = iv; sfx('click'); render(); break;
+        case 'kw': ui.kw = ui.kw === iv && ui.sel < 0 ? '' : iv; ui.sel = -1; render(); break;
+        case 'sel': case 'card': pick(+iv); break;
+        case 'tab': ui.tab = iv; ui.sel = -1; render(); break;
+        case 'go': go(); break;
+        case 'skip': if (can() && st.ph === 'bt') api.act({ t: 'skip' }); break;
+        case 'rwskip': if (can()) api.act({ t: 'rw', k: 'skip' }); break;
+        case 'pkskip': if (can()) api.act({ t: 'pk', i: -1 }); break;
+        case 'leave': if (can()) api.act({ t: 'leave' }); break;
+      }
+    }
+    el.addEventListener('click', onClick);
+    const onCancel = (e) => { if (ui.sheet) { ui.sheet = null; render(); e.preventDefault(); } else if (ui.sel >= 0 || ui.kw) { ui.sel = -1; ui.kw = ''; render(); e.preventDefault(); } };
+    window.addEventListener('lounge-cancel', onCancel);
+    const offIn = api.input && api.input.on ? api.input.on((type, id) => {
+      if (type !== 'down' || dead || !st || ui.sheet) return;
+      if (id === 'go') go();
+      else if (id === 'pass') { if (can() && st.ph === 'bt') api.act({ t: 'skip' }); }
+      else if (/^c\d$/.test(id)) { const n = +id[1] - 1; const els = el.querySelectorAll('.sp-in [data-a="sel"],.sp-in [data-a="card"]'); if (els[n]) pick(+els[n].getAttribute('data-i')); }
+    }) : null;
+
+    return {
+      update(state, prev) {
+        st = state;
+        const key = state.ph + ':' + state.wk + ':' + (state.bt ? state.bt.t : '') + ':' + (state.pk ? state.pk.m : '');
+        if (key !== phKey) { if (state.ph !== (phKey.split(':')[0])) { ui.tab = 'card'; ui.sheet = ui.sheet === 'deck' || ui.sheet === 'items' ? null : null; } ui.sel = -1; ui.kw = ''; phKey = key; }
+        else if (state.ph === 'bt' || state.ph === 'shop') ui.sel = -1;
+        render();
+        const la = state.last;
+        if (la && la.id !== seen) {
+          const first = seen === 0 && !prev; seen = la.id;
+          if (!first) {
+            if (la.t === 'play') { sfx('card'); if (la.d > 0) { pop('+' + la.d); sfx('chip'); } }
+            else if (la.rest) sfx('pop');
+            if (la.hd > 0) setTimeout(() => { if (!dead) pop('열기 +' + la.hd, 'h'); }, 180);
+            if (state.ph === 'rw' && prev && prev.ph === 'bt') sfx(state.rw.res ? 'win' : 'thud');
+            if (state.ph === 'xr' && prev && prev.ph === 'bt') sfx(state.xr.pass ? 'win' : 'lose');
+            if (la.t === 'buy' || la.t === 'rw' || la.t === 'pk') sfx('chip');
+          }
+        }
+        if (state.ph === 'end' && state.res && prev && prev.ph !== 'end' && !api.players[0].ai) { try { if (state.res.fr) api.best('fs_' + state.len, state.res.fs, { label: LEN[state.len].n + ' 시즌 최종 심사 점수', unit: '점' }); } catch (e) {} }
+      },
+      destroy() { dead = true; artCb = null; el.removeEventListener('click', onClick); window.removeEventListener('lounge-cancel', onCancel); if (offIn) offIn(); if (el.parentNode) el.parentNode.removeChild(el); },
+    };
+  }
+
+  /* ---------- 도감 · 규칙 · 등록 ---------- */
+  const RA = ['기본', '흔함', '드묾', '귀함'];
+  const cardRow = (id) => { const c = C[id]; return { icon: glyph(c.g, c.t === 'a' ? '#f0a4b6' : '#8fd4c6'), name: c.n, tag: TY[c.t] + ' · ' + RA[c.r] + ' · ' + costText(c), desc: plain(cardText([id, 0])) + ' ／ 강화: ' + plain(cardText([id, 1])) + ' (' + costText(cardOf([id, 1])) + ')' }; };
+  const CODEX = [
+    { h: '인물', p: ['담당 인물은 셋. 저마다 기본 덱의 두 장과 전용 카드 여덟 장, 고유 특성이 다름.'],
+      rows: CH.map((c) => ({ icon: '<span style="display:block;width:34px;height:34px;border-radius:50%;overflow:hidden;background:' + c.col + ';border:2px solid ' + c.col + '"><img src="assets/stageprod/' + c.id + '_face.webp" alt="" style="display:block;width:100%;height:100%;object-fit:cover" onerror="this.remove()"></span>', name: c.n, tag: c.way, desc: c.sub + ' · 특성: ' + c.pd + ' · 체력 ' + c.mhp + ' · 보컬 ' + c.st[0] + ' 댄스 ' + c.st[1] + ' 표현 ' + c.st[2] + ' · ' + c.tip })) },
+    { h: '키워드', p: ['카드와 물품에 나오는 말. 화면에는 「키워드: 수치」로 표시.'], rows: Object.keys(KW).map((k) => ({ icon: glyph('spark', KW[k].c), name: KW[k].n, tag: KW[k].turn ? '턴 수' : k === 'once' ? '카드 성질' : '수치', desc: KW[k].d + (KW[k].turn ? ' 턴이 끝날 때 1 줄어듦(얻은 턴에는 줄지 않음).' : '') })) },
+    { h: '공통 카드', p: ['누구나 얻는 카드 ' + CIDS.filter((id) => !C[id].o).length + '장. 비용은 기력에서 먼저 나가고 모자라면 체력에서 나감. 「체력 N」은 체력으로만 치름.'], rows: CIDS.filter((id) => !C[id].o).map(cardRow) },
+  ].concat(CH.map((c) => ({ h: c.n + ' 전용', p: [c.n + '에게만 나오는 카드.'], rows: CIDS.filter((id) => C[id].o === c.own).map(cardRow) })), [
+    { h: '물품', p: ['지원 물품 ' + IIDS.length + '가지. 한 번 얻으면 시즌 내내 효과가 있음. 특훈 클리어 · 상점 · 외출 · 중간 심사 통과로 얻음.'], rows: IIDS.map((id) => ({ icon: glyph(IT[id].g, '#e3ae45'), name: IT[id].n, tag: IT[id].on ? '발동' : '상시', desc: plain(itemText(id)) })) },
+    { h: '심사', p: ['시즌마다 중간 심사와 최종 심사가 하나씩 정해지고, 첫 주부터 미리 볼 수 있음. 턴마다 기준 능력치가 정해져 있고 그 능력치 ÷ 100이 점수 배율.'],
+      rows: XIDS.map((id) => { const X = EXAMS[id]; const n = [0, 0, 0]; X.pat.slice(0, 10 + X.dT).forEach((k) => n[k]++); return { icon: glyph('star', '#f6d58a'), name: X.n, tag: '최종 ' + (10 + X.dT) + '턴 · 중간 ' + (8 + X.dT) + '턴', desc: X.d + ' 최종 기준: 보컬 ' + n[0] + '턴 · 댄스 ' + n[1] + '턴 · 표현 ' + n[2] + '턴.' }; }) },
+    { h: '일정', p: ['매주 네 가지 가운데 하나를 고름. 심사 전 주에는 상점이 열림.'], rows: [
+      { icon: glyph('note', STC[0]), name: '레슨', tag: '카드 전투 6턴', desc: '목표 점수를 넘기면 클리어, 목표의 1.6배면 퍼펙트(능력치 1.5배). 끝나면 카드 얻기 · 강화 · 제거 가운데 하나.' },
+      { icon: glyph('flame', '#ff9552'), name: '특훈', tag: '카드 전투 7턴', desc: '목표 1.4배. 능력치 1.5배, 클리어하면 물품 하나. 3주차부터 가끔 나옴.' },
+      { icon: glyph('heart', '#7fd6c4'), name: '휴식', tag: '회복', desc: '최대 체력의 절반 회복.' },
+      { icon: glyph('leaf', '#b9e372'), name: '수업', tag: '능력치 + 강화', desc: '고른 능력치가 오르고 카드 한 장을 강화. 체력을 쓰지 않음.' },
+      { icon: glyph('mask', '#cfa6ee'), name: '외출', tag: '사건 ' + EV.length + '가지', desc: '둘 가운데 하나를 고름. 결과는 고르기 전에 모두 보임.' },
+      { icon: glyph('coin', '#e3ae45'), name: '상점', tag: '활동비', desc: '카드 4장 · 물품 2개 · 카드 강화 · 카드 제거 · 이온 음료(체력 +' + SVC.dr.hp + ').' }] },
+  ]);
+  const DEF = {
+    id: ID, name: '무대 프로듀서', tag: '육성 덱 카드', cat: '카드', tint: '#3d2440', time: '10–25분', mood: 'calm', ambient: false, undo: false, save: true, sidePanel: true,
+    icon: '<rect x="9" y="34" width="38" height="5" rx="2" fill="currentColor"/><path d="M12 34 L20 12 M44 34 L36 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" fill="none"/><circle cx="20" cy="11" r="3.5" fill="currentColor"/><circle cx="36" cy="11" r="3.5" fill="currentColor"/><path d="M28 16 l2.6 5.4 5.9 .8 -4.3 4.1 1 5.9 -5.2 -2.8 -5.2 2.8 1 -5.9 -4.3 -4.1 5.9 -.8z" fill="currentColor"/><rect x="14" y="42" width="28" height="3" rx="1.5" fill="currentColor" opacity=".6"/>',
+    blurb: '담당 인물 한 명과 한 시즌을 보내요. 매주 일정을 고르고, 레슨 카드로 덱을 키워 중간 심사와 최종 오디션에 올라요. 카드 ' + CIDS.length + '장 · 물품 ' + IIDS.length + '가지 · 심사 ' + XIDS.length + '종 · 사건 ' + EV.length + '가지.',
+    minPlayers: 1, maxPlayers: 1, defaultPlayers: 1, hidden: false, aiDelay: 380,
+    saveLabel: (s) => (s.ch < 0 ? '인물 고르기' : CH[s.ch].n + ' · ' + min(s.wk, LEN[s.len].W) + '/' + LEN[s.len].W + '주 · 체력 ' + s.hp),
+    options: [
+      { id: 'len', label: '길이', tip: '시즌의 주 수. 한가운데 주에 중간 심사, 마지막 주에 최종 심사가 있어요.', def: 'n', choices: [{ v: 's', label: '짧게', tip: '8주 · 10분 안팎' }, { v: 'n', label: '보통', tip: '12주 · 20분 안팎' }] },
+      { id: 'goal', label: '시즌 목표', tip: '심사에서 몇 위 안에 들어야 하는지. 경쟁자는 다섯.', def: 'b', choices: Object.keys(GOAL).map((k) => ({ v: k, label: GOAL[k].n, tip: GOAL[k].d })) },
+      { id: 'hero', label: '담당 인물', tip: '「판에서 고르기」는 시작할 때 세 사람을 보고 골라요.', def: 'pick', choices: [{ v: 'pick', label: '판에서 고르기' }, { v: 'rand', label: '무작위' }].concat(CH.map((c) => ({ v: c.id, label: c.n, tip: c.way }))) },
+    ],
+    controls: [1, 2, 3, 4, 5].map((n) => ({ id: 'c' + n, label: '손패 ' + n + ' (두 번 누르면 냄)', keys: ['Digit' + n] })).concat([{ id: 'go', label: '내기 · 확인', keys: ['Space', 'KeyE'], pad: ['a'] }, { id: 'pass', label: '쉬어 가기 · 턴 끝내기', keys: ['KeyS'], pad: ['b'] }]),
+    tutorial: [
+      { text: '담당 인물 한 명을 골라요. 세 사람은 점수를 키우는 방식이 서로 달라요.' },
+      { text: '매주 일정 하나를 골라요. 레슨은 카드 전투로 능력치를 올리고, 휴식은 체력을 채워요.' },
+      { text: '레슨에서는 턴마다 손패 한 장을 내요. 카드를 누르면 지금 상태로 계산한 점수가 보이고, 한 번 더 누르면 내요.' },
+      { text: '심사에서는 능력치가 턴별 점수 배율이 돼요. 심사 종류는 일정 화면에서 미리 볼 수 있어요.' },
+    ],
+    quick: [
+      '담당 인물과 한 시즌을 보내며 중간 심사와 최종 심사에서 목표 순위 안에 들어요.',
+      '매주 일정 하나를 골라요. 레슨에서는 턴마다 손패 한 장을 내 점수를 쌓고, 끝나면 덱을 손봐요.',
+      '심사에서는 능력치가 턴별 점수 배율이 돼요. 경쟁자 다섯과 점수로 순위를 겨뤄요.',
+    ],
+    rules: [
+      { h: '목표', p: ['시즌은 8주 또는 12주예요. 한가운데 주에 중간 심사, 마지막 주에 최종 심사가 있어요.', '두 심사에서 「시즌 목표」의 순위 안에 들면 달성이에요. 중간 심사에서 밀리면 시즌이 거기서 끝나요.', '끝나면 최종 순위로 등급(S · A · B · C · D)과 한 줄 평을 받아요.'] },
+      { h: '매주 할 일', p: ['네 가지 일정 가운데 하나를 골라요. 레슨 둘, 휴식, 그리고 외출 · 수업 · 상점 가운데 하나가 나와요.', '레슨 — 카드 전투로 그 능력치를 올려요. 카드를 내면 체력이 줄어요.', '휴식 — 체력을 회복해요. 체력은 주가 바뀌어도 저절로 차지 않아요.', '수업 — 체력을 쓰지 않고 능력치를 조금 올리고 카드 한 장을 강화해요.', '외출 — 짧은 사건에서 둘 중 하나를 골라요. 결과는 미리 다 보여요.', '상점 — 활동비로 카드 · 물품 · 강화 · 제거를 사요.'] },
+      { h: '레슨(카드 전투)', p: ['턴마다 손패 3장을 받아 한 장을 내요. 「추가 행동」을 얻으면 더 낼 수 있어요. 남은 손패는 턴이 끝나면 버려지고 다음 턴에 새로 받아요.', '어필 카드는 점수를 내고, 준비 카드는 기력이나 지속 효과를 쌓아요.', '카드 왼쪽 위 숫자가 비용이에요. 비용은 「기력」에서 먼저 나가고, 모자라면 체력에서 나가요. 붉은 숫자는 체력으로만 치르는 비용이에요.', '카드를 내지 않고 「쉬어 가기」를 누르면 체력을 2 회복하고 턴을 넘겨요.', '목표 점수를 넘기면 클리어, 목표의 1.6배에 닿으면 퍼펙트로 바로 끝나요. 퍼펙트는 능력치를 1.5배로 받아요. 목표에 못 미쳐도 조금은 올라요.', '끝나면 셋 중 하나를 해요: 새 카드 한 장 얻기 · 가진 카드 한 장 강화 · 한 장 제거. 넘기면 활동비를 조금 받아요.', '예시: 집중이 4일 때 「연속 스텝」(점수 5 ×2)을 내면 (5 + 4) × 2번 = 18점. 호조 중이면 한 번이 13점(9 × 1.5, 버림)이라 26점이에요.'] },
+      { h: '심사', p: ['심사도 같은 카드 전투예요. 다만 턴마다 기준 능력치(보컬 · 댄스 · 표현)가 정해져 있고, 그 능력치 ÷ 100이 그 턴의 점수 배율이에요. 보컬이 150이면 보컬 턴의 점수는 1.5배예요.', '경쟁자 다섯의 점수가 턴마다 함께 올라가요. 마지막 턴이 끝났을 때의 순위로 결과가 정해져요.', '심사 종류는 시즌을 시작할 때 정해지고 일정 화면에서 미리 볼 수 있어요. 어느 능력치를 키울지 거기에 맞춰요.', '심사 전에 체력을 최대치의 절반만큼 회복해요.'] },
+      { h: '키워드', p: Object.keys(KW).map((k) => '「' + KW[k].n + '」 — ' + KW[k].d).concat(['턴 수로 세는 키워드(호조 · 절정 · 여유 · 부담)는 턴이 끝날 때 1씩 줄어요. 얻은 그 턴에는 줄지 않아요.']) },
+      { h: '담당 인물', p: CH.map((c) => c.n + ' — ' + c.way + '. ' + c.pd + '.') },
+      { h: '조작', p: ['카드를 한 번 누르면 설명과 계산된 점수가 나오고, 한 번 더 누르거나 「내기」를 누르면 내요.', '낼 수 없는 카드에는 까닭(체력 부족 · 호조 필요)이 적혀 있어요.', 'PC: 숫자 1~5로 손패 고르기, 스페이스로 내기 · 확인, S로 쉬어 가기.', '판은 자동으로 저장돼요. 나갔다가 설정 화면의 「이어하기」로 돌아올 수 있어요.', 'AI 자리로 두면 쉬움 · 보통 · 어려움에 따라 스스로 한 시즌을 진행해요(구경용).'] },
+    ],
+    codex: CODEX,
+    hint(s) {
+      if (s.ph === 'bt') { const bt = s.bt; return [bt.k === 'x' ? EXAMS[bt.x].n + ' ' + bt.t + '/' + bt.T + '턴' : '레슨 ' + bt.t + '/' + bt.T + '턴 · 목표 ' + bt.tg, '손패에서 한 장을 내거나 쉬어 가요. 비용은 기력에서 먼저 나가요.', bt.k === 'x' ? '이번 턴 기준: ' + STN[bt.cr[bt.t - 1]] + ' (배율 ' + tmOf(s, bt, bt.t).toFixed(2) + ')' : '목표의 1.6배(' + bt.pf + ')면 퍼펙트로 바로 끝나요.']; }
+      if (s.ph === 'week') return ['이번 주 일정을 하나 골라요.', '체력이 낮으면 휴식, 다음 심사 기준에 맞는 능력치의 레슨이 좋아요.'];
+      return null;
+    },
+    panelInfo(s) {
+      if (s.ch < 0) return null;
+      return [{ label: '담당', value: CH[s.ch].n }, { label: '주', value: min(s.wk, LEN[s.len].W) + ' / ' + LEN[s.len].W }, { label: '체력', value: s.hp + ' / ' + s.mhp }, { label: '활동비', value: '' + s.coin },
+        { label: '보컬', value: '' + s.st[0] }, { label: '댄스', value: '' + s.st[1] }, { label: '표현', value: '' + s.st[2] }, { label: '덱', value: s.deck.length + '장' }, { label: '목표', value: GOAL[s.goal].n },
+        { label: '중간 심사', value: EXAMS[s.ex[0]].n }, { label: '최종 심사', value: EXAMS[s.ex[1]].n }];
+    },
+    init, actor, apply, ai, result, mount,
+  };
+  L.register(DEF);
+})();

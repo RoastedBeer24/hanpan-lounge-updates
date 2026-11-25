@@ -1,0 +1,421 @@
+/* 거점 수호전 (bedwar) — 떠 있는 섬에서 자원을 모아 다리를 놓고, 상대 분대의 「거점 핵」을 부수는 2~4팀 분대전(3D, 3인칭).
+   구조만 참고(섬 · 자원 생성기 · 다리 놓기 · 핵이 살아 있으면 부활). 이름 · 세계 · 그림 · 글은 모두 독자.
+
+   파일 구성
+   - 이 파일: 자료(자재 · 무기 · 방어구 · 도구 · 소모품 · 분대 강화 · 지도 틀 · 시간 단계) · 판 상태(play → done) · 결과 · 규칙 · 도감 · 표지 · L.register
+     와 가벼운 입구 화면(3D 파일 불러오기).
+   - assets/bedwar/sim.js: 세계(순수 로직 — 지도 생성 · 칸 격자 · 이동/충돌 · 다리 놓기 · 전투 · 생성기 · 보급소 · 봇 · 네트워크 묶기). node에서도 돎.
+   - assets/bedwar/view.js: 3D 화면(three.js — assets/hyperrace/lib/three.min.js 공용) · 조작 · HUD · 보급소 창 · 소리 · 온라인.
+   온라인: 세계는 호스트가 돌려 hostSend(약 10Hz, 칸 변화는 차분만). 손님은 자기 분대원 이동과 발판 놓기를 먼저 그리고(예측) 위치 · 행동을 publish, 판정은 호스트. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'bedwar';
+  const TITLE = '거점 수호전';
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  /* 글 문체: 화면 글은 짧은 명사형 · 평서(느낌표 · 이모지 아이콘 없음), 규칙은 합니다체. */
+
+  /* ======================= 자원 · 분대 ======================= */
+  const RES = [
+    { id: 'ing', nm: '주괴', col: '#d3cabb', d: '자기 섬 제련로에서 계속 나옴. 자재 · 기본 장비.' },
+    { id: 'cry', nm: '결정', col: '#62cfe0', d: '중간 섬 결정 채굴기에서 나옴. 분대 강화.' },
+    { id: 'ess', nm: '정수', col: '#b78cf2', d: '가운데 섬 정수 샘에서 나옴. 상급 장비 · 특수 물건.' },
+  ];
+  const TEAMS = [
+    { nm: '붉은 분대', sh: '붉은', col: '#d8553f' },
+    { nm: '푸른 분대', sh: '푸른', col: '#3f8ee0' },
+    { nm: '녹색 분대', sh: '녹색', col: '#55b25c' },
+    { nm: '황색 분대', sh: '황색', col: '#dcae3c' },
+  ];
+
+  /* ======================= 자재(칸) ======================= */
+  /* hp: 맨손으로 부수는 초 · tool: 맞는 도구 · res: 폭발 저항(0 약함 ~ 1, 9 = 폭발에 안 부서짐) */
+  const BLK = [null,
+    { id: 'canvas', nm: '범포 발판', hp: 1.0, tool: 'shear', res: 0.05, col: '#c9b58a', d: '가장 싼 다리 재료. 절단기에 바로 잘림.' },
+    { id: 'plank', nm: '널판', hp: 3, tool: 'axe', res: 0.25, col: '#a9753f', d: '무난한 방벽. 도끼에 약함.' },
+    { id: 'stone', nm: '석판', hp: 7, tool: 'pick', res: 0.6, col: '#8f9198', d: '단단함. 곡괭이가 있어야 빨리 부숨.' },
+    { id: 'steel', nm: '강판', hp: 16, tool: 'pick', res: 0.85, col: '#6f7f8f', d: '아주 단단함. 폭발에도 잘 버팀.' },
+    { id: 'glass', nm: '방폭 유리', hp: 2, tool: '', res: 9, col: '#9fd6d8', d: '폭발에 부서지지 않음. 손으로는 금방 깨짐.' },
+    { id: 'obsid', nm: '흑요판', hp: 45, tool: 'pick', res: 9, col: '#3a2f4a', d: '폭발에 안 부서지고 결정 곡괭이로도 몇 초가 걸림.' },
+  ];
+  const TOOL_PW = [1, 3, 5, 8];   // 도구 등급별 부수기 배수(0 = 맨손 · 맞지 않는 도구)
+
+  /* ======================= 장비 ======================= */
+  const MELEE = [
+    { nm: '훈련봉', dmg: 12, kb: 1, d: '기본 무기. 쓰러져도 늘 지님.' },
+    { nm: '철검', dmg: 17, kb: 1, d: '' },
+    { nm: '강화검', dmg: 22, kb: 1, d: '' },
+    { nm: '결정검', dmg: 28, kb: 1.1, d: '가장 강한 검.' },
+    { nm: '충격 곤봉', dmg: 14, kb: 1.9, d: '피해는 낮지만 멀리 밀쳐 냄. 다리 위에서 강함.' },
+  ];
+  const ARMOR = [
+    { nm: '방어구 없음', cut: 0 },
+    { nm: '누비 갑옷', cut: 0.18 },
+    { nm: '판금 갑옷', cut: 0.32 },
+    { nm: '결정 갑옷', cut: 0.46 },
+  ];
+  /* cd 발사 간격 · spd 탄속 · g 낙차 · use 한 발에 드는 볼트 */
+  const RANGED = [null,
+    { nm: '석궁', dmg: 20, cd: 0.9, spd: 46, g: 9, kb: 0.7, use: 1, d: '한 발씩. 멀리서 다리 위 상대를 견제.' },
+    { nm: '연발 석궁', dmg: 11, cd: 0.32, spd: 44, g: 9, kb: 0.4, use: 1, d: '빠르게 이어 쏨.' },
+    { nm: '충격포', dmg: 8, cd: 1.4, spd: 30, g: 6, kb: 2.4, use: 2, splash: 2.6, d: '맞은 자리 둘레를 크게 밀쳐 냄. 볼트 2발 소모.' },
+  ];
+  const PICK = [null, { nm: '곡괭이' }, { nm: '강철 곡괭이' }, { nm: '결정 곡괭이' }];
+  const AXE = [null, { nm: '도끼' }, { nm: '강철 도끼' }];
+
+  /* ======================= 소모품 ======================= */
+  const CONS = [
+    { id: 'tnt', nm: '폭약통', d: '던지면 붙은 자리에서 2.2초 뒤 폭발(반경 5m). 방벽을 무너뜨리고 크게 밀쳐 냄.', thr: 1 },
+    { id: 'fire', nm: '화염탄', d: '곧게 날아가 닿는 자리에서 폭발(반경 3.2m). 범포 · 널판을 태움.', thr: 1 },
+    { id: 'heal', nm: '응급 주사', d: '체력 50 회복.' },
+    { id: 'jump', nm: '도약제', d: '30초 동안 두 칸 높이를 뜀.' },
+    { id: 'haste', nm: '신속제', d: '30초 동안 이동 속도 +30%.' },
+    { id: 'cloak', nm: '은신 망토', d: '25초 동안 모습이 거의 보이지 않음. 공격하면 풀림.' },
+    { id: 'anchor', nm: '도약 닻', d: '던져서 닿은 자리로 순간 이동. 떨어지는 중에도 쓸 수 있음.', thr: 1 },
+    { id: 'wall', nm: '즉석 방벽', d: '바로 앞에 널판 벽(가로 3 · 높이 3)을 세움.' },
+    { id: 'bridge', nm: '가설교 탄', d: '보는 쪽으로 날아가며 범포 발판을 16칸까지 깖.', thr: 1 },
+    { id: 'float', nm: '부양 띠', d: '지니고 있으면 허공으로 떨어질 때 한 번 위로 솟구침(자동 소모).' },
+  ];
+  const CI = {}; CONS.forEach((c, i) => { CI[c.id] = i; });
+
+  /* ======================= 분대 강화 ======================= */
+  const UPG = [
+    { id: 'forge', nm: '제련로 증설', cost: [2, 4, 6, 8], d: ['주괴 +50%', '주괴 +100%', '주괴 +150%', '주괴 +200% · 제련로에서 결정도 조금 나옴'] },
+    { id: 'sharp', nm: '날 세우기', cost: [4], d: ['분대 근접 피해 +20%'] },
+    { id: 'plate', nm: '분대 장갑', cost: [2, 4, 7, 10], d: ['받는 피해 −6%', '받는 피해 −12%', '받는 피해 −18%', '받는 피해 −24%'] },
+    { id: 'haste', nm: '파쇄 숙련', cost: [2, 4], d: ['칸 부수기 +25%', '칸 부수기 +50%'] },
+    { id: 'guard', nm: '핵 방호장', cost: [3, 6], d: ['핵이 받는 피해 −30%', '핵이 받는 피해 −50%'] },
+    { id: 'mend', nm: '핵 수복', cost: [2], rep: 1, d: ['핵 체력을 끝까지 되돌림(여러 번 살 수 있음)'] },
+    { id: 'heal', nm: '거점 회복장', cost: [3], d: ['자기 섬에 있는 분대원 초당 체력 +4'] },
+  ];
+  /* 함정: 적이 섬에 들어오면 대기 순서대로 하나씩 발동(발동 사이 20초). 값은 대기 중인 수에 따라 1 → 2 → 3 결정 */
+  const TRAP = [
+    { id: 'alarm', nm: '경보선', d: '침입자를 15초 동안 벽 너머로 표시' },
+    { id: 'slow', nm: '점착 지뢰', d: '침입자 이동 속도 −45%(8초)' },
+    { id: 'weak', nm: '약화 장막', d: '침입자 칸 부수기 −70% · 근접 피해 −30%(10초)' },
+    { id: 'rally', nm: '집결 신호', d: '자기 섬의 분대원 12초 동안 속도 +20% · 체력 +20' },
+  ];
+  const UI = {}; UPG.forEach((u, i) => { UI[u.id] = i; });
+
+  /* ======================= 보급소 목록 ======================= */
+  /* cost: [주괴, 결정, 정수] */
+  const SHOP = [];
+  const add = (o) => { SHOP.push(o); return o; };
+  [[1, 16, 4], [2, 12, 10], [3, 12, 20], [4, 8, 36], [5, 6, 14]].forEach(([b, n, c]) => add({ id: 'b' + b, tab: 'build', k: 'blk', b, n, cost: [c, 0, 0], nm: BLK[b].nm + ' ×' + n, d: BLK[b].d }));
+  add({ id: 'b6', tab: 'build', k: 'blk', b: 6, n: 4, cost: [0, 0, 3], nm: BLK[6].nm + ' ×4', d: BLK[6].d });
+  [[2, 28], [3, 56], [4, 110]].forEach(([b, c]) => add({ id: 's' + b, tab: 'build', k: 'shell', b, cost: [c, 0, 0], nm: BLK[b].nm + ' 방호 시공', d: '핵 둘레의 빈 칸을 ' + BLK[b].nm + '으로 한 겹 채움(안쪽 겹부터, 둘째 겹은 값 2.5배).' }));
+  add({ id: 's6', tab: 'build', k: 'shell', b: 6, cost: [0, 0, 6], nm: '흑요 방호 시공', d: '핵 둘레의 빈 칸을 흑요판으로 한 겹 채움.' });
+  add({ id: 'm1', tab: 'arms', k: 'melee', t: 1, cost: [10, 0, 0], nm: MELEE[1].nm, d: '근접 피해 ' + MELEE[1].dmg });
+  add({ id: 'm2', tab: 'arms', k: 'melee', t: 2, cost: [45, 0, 0], nm: MELEE[2].nm, d: '근접 피해 ' + MELEE[2].dmg });
+  add({ id: 'm3', tab: 'arms', k: 'melee', t: 3, cost: [0, 0, 3], nm: MELEE[3].nm, d: '근접 피해 ' + MELEE[3].dmg + ' · ' + MELEE[3].d });
+  add({ id: 'm4', tab: 'arms', k: 'melee', t: 4, cost: [30, 0, 0], nm: MELEE[4].nm, d: '근접 피해 ' + MELEE[4].dmg + ' · ' + MELEE[4].d });
+  add({ id: 'r1', tab: 'arms', k: 'rng', t: 1, cost: [40, 0, 0], nm: RANGED[1].nm, d: '피해 ' + RANGED[1].dmg + ' · 볼트 6발 포함. ' + RANGED[1].d });
+  add({ id: 'r2', tab: 'arms', k: 'rng', t: 2, cost: [0, 0, 3], nm: RANGED[2].nm, d: '피해 ' + RANGED[2].dmg + ' · 볼트 12발 포함. ' + RANGED[2].d });
+  add({ id: 'r3', tab: 'arms', k: 'rng', t: 3, cost: [0, 0, 2], nm: RANGED[3].nm, d: '피해 ' + RANGED[3].dmg + ' · 볼트 6발 포함. ' + RANGED[3].d });
+  add({ id: 'am', tab: 'arms', k: 'ammo', n: 8, cost: [8, 0, 0], nm: '볼트 ×8', d: '석궁 · 충격포의 탄.' });
+  add({ id: 'a1', tab: 'gear', k: 'armor', t: 1, cost: [30, 0, 0], nm: ARMOR[1].nm, d: '받는 피해 −18%. 쓰러져도 유지.' });
+  add({ id: 'a2', tab: 'gear', k: 'armor', t: 2, cost: [80, 0, 0], nm: ARMOR[2].nm, d: '받는 피해 −32%. 쓰러져도 유지.' });
+  add({ id: 'a3', tab: 'gear', k: 'armor', t: 3, cost: [0, 0, 5], nm: ARMOR[3].nm, d: '받는 피해 −46%. 쓰러져도 유지.' });
+  add({ id: 'p1', tab: 'gear', k: 'pick', t: 1, cost: [10, 0, 0], nm: PICK[1].nm, d: '석판 · 강판 · 흑요판 부수기 3배, 핵에 주는 피해 증가.' });
+  add({ id: 'p2', tab: 'gear', k: 'pick', t: 2, cost: [30, 0, 0], nm: PICK[2].nm, d: '부수기 5배. 곡괭이가 있어야 살 수 있음.' });
+  add({ id: 'p3', tab: 'gear', k: 'pick', t: 3, cost: [70, 0, 0], nm: PICK[3].nm, d: '부수기 8배. 강철 곡괭이가 있어야 살 수 있음.' });
+  add({ id: 'x1', tab: 'gear', k: 'axe', t: 1, cost: [10, 0, 0], nm: AXE[1].nm, d: '널판 부수기 3배.' });
+  add({ id: 'x2', tab: 'gear', k: 'axe', t: 2, cost: [30, 0, 0], nm: AXE[2].nm, d: '널판 부수기 5배. 도끼가 있어야 살 수 있음.' });
+  add({ id: 'sh', tab: 'gear', k: 'shear', cost: [16, 0, 0], nm: '절단기', d: '범포 발판을 한 번에 자름(6배).' });
+  [['tnt', [36, 0, 0]], ['fire', [30, 0, 0]], ['heal', [18, 0, 0]], ['wall', [20, 0, 0]], ['jump', [0, 0, 1]], ['haste', [0, 0, 1]], ['bridge', [0, 0, 1]], ['cloak', [0, 0, 2]], ['float', [0, 0, 2]], ['anchor', [0, 0, 3]]]
+    .forEach(([c, cost]) => add({ id: 'c_' + c, tab: 'item', k: 'con', c: CI[c], cost, nm: CONS[CI[c]].nm, d: CONS[CI[c]].d }));
+  UPG.forEach((u) => add({ id: 'u_' + u.id, tab: 'team', k: 'upg', u: UI[u.id], cost: [0, u.cost[0], 0], nm: u.nm, d: u.d[0] }));
+  TRAP.forEach((t, i) => add({ id: 't_' + t.id, tab: 'team', k: 'trap', u: i, cost: [0, 1, 0], nm: '함정: ' + t.nm, d: t.d }));
+  const SI = {}; SHOP.forEach((e, i) => { SI[e.id] = i; });
+  const TABS = [['build', '자재'], ['arms', '무기'], ['gear', '방어구 · 도구'], ['item', '소모품'], ['team', '분대 강화']];
+
+  /* ======================= 지도 틀 · 길이 · 시간 단계 ======================= */
+  const MAPS = {
+    cross: { nm: '십자 군도', sub: '가운데 팔각 섬 · 대각선에 결정 섬', baseR: 23, center: 'oct', mid: 'diag', reef: 1 },
+    pin: { nm: '바람개비', sub: '십자 모양 가운데 섬 · 결정 섬이 거점 옆으로 치우침', baseR: 24, center: 'plus', mid: 'pin', reef: 1 },
+    ring: { nm: '고리 암초', sub: '가운데가 뚫린 고리 섬 · 축 위에 징검 암초', baseR: 25, center: 'ring', mid: 'diag', reef: 2 },
+    step: { nm: '징검 군도', sub: '작은 가운데 섬 · 곳곳에 징검 암초 · 거리가 멂', baseR: 27, center: 'small', mid: 'side', reef: 4 },
+  };
+  const MAP_KEYS = Object.keys(MAPS);
+  const LENS = { s: { nm: '짧게(6분)', T: 360 }, m: { nm: '보통(10분)', T: 600 }, l: { nm: '길게(14분)', T: 840 } };
+  /* f: 판 길이에 대한 비율 */
+  const PHASES = [
+    { f: 0.1, k: 'open', nm: '방호막 해제', d: '이때부터 핵이 피해를 받음' },
+    { f: 0.2, k: 'cry2', nm: '결정 채굴기 가속', d: '결정이 1.5배 빨리 나옴' },
+    { f: 0.35, k: 'ess2', nm: '정수 샘 가속', d: '정수가 1.5배 빨리 나옴' },
+    { f: 0.5, k: 'cry3', nm: '결정 채굴기 최대', d: '결정이 2.2배 빨리 나옴' },
+    { f: 0.6, k: 'ess3', nm: '정수 샘 최대', d: '정수가 2.2배 빨리 나옴' },
+    { f: 0.7, k: 'fall', nm: '핵 붕괴', d: '남은 핵이 모두 부서짐 — 더는 부활 없음' },
+    { f: 0.8, k: 'storm', nm: '소멸의 고리', d: '바깥부터 고리가 좁혀 듦 — 고리 밖은 체력이 깎임' },
+    { f: 1.0, k: 'final', nm: '최종 소멸', d: '고리가 완전히 닫힘' },
+  ];
+
+  /* ======================= 아이콘(56×56 SVG 안쪽) ======================= */
+  const svgW = (inner) => '<svg viewBox="0 0 56 56" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">' + inner + '</svg>';
+  const IC = {
+    slab: (c) => '<path d="M6 26l22-11 22 11-22 11z" fill="' + c + '"/><path d="M6 26v9l22 11v-9z" fill="' + c + '" opacity=".68"/><path d="M50 26v9L28 46v-9z" fill="' + c + '" opacity=".45"/><path d="M17 20.5l22 11M28 15L6 26" stroke="#0006" stroke-width="1.2" fill="none"/>',
+    shell: (c) => '<path d="M10 44V22l18-10 18 10v22z" fill="' + c + '" opacity=".55"/><path d="M10 22l18 10 18-10M28 32v14" stroke="' + c + '" stroke-width="2.5" fill="none"/><path d="M28 22l5 6-5 9-5-9z" fill="#f2e9d8"/>',
+    sword: (c) => '<path d="M40 6l10 0 0 10-22 22-10-10z" fill="' + c + '"/><path d="M12 30l14 14-4 4-6-6-6 8-4-4 8-6-6-6z" fill="#8a6a42"/>',
+    club: (c) => '<path d="M30 8a12 12 0 0 1 18 18L36 32 24 20z" fill="' + c + '"/><path d="M26 24l6 6-18 20-8-8z" fill="#8a6a42"/><circle cx="38" cy="14" r="2" fill="#0005"/><circle cx="44" cy="22" r="2" fill="#0005"/>',
+    xbow: (c) => '<path d="M8 20c10-12 30-12 40 0" stroke="' + c + '" stroke-width="5" fill="none"/><path d="M8 20l20 8 20-8" stroke="#ddd6c6" stroke-width="1.5" fill="none"/><rect x="25" y="14" width="6" height="36" rx="2" fill="#8a6a42"/><path d="M28 6l4 8h-8z" fill="' + c + '"/>',
+    cannon: (c) => '<rect x="8" y="20" width="34" height="16" rx="5" fill="' + c + '"/><rect x="40" y="17" width="8" height="22" rx="2" fill="' + c + '" opacity=".7"/><rect x="16" y="36" width="8" height="12" rx="2" fill="#8a6a42"/><circle cx="14" cy="28" r="3" fill="#0005"/>',
+    bolt: (c) => '<path d="M10 46L40 16" stroke="#8a6a42" stroke-width="4"/><path d="M36 10l12-2-2 12z" fill="' + c + '"/><path d="M8 40l8 8-8 2-2-2z" fill="' + c + '" opacity=".7"/><path d="M20 46L50 16" stroke="#8a6a42" stroke-width="3" opacity=".5"/>',
+    armor: (c) => '<path d="M14 10l8 4h12l8-4 8 10-8 6v22H14V26l-8-6z" fill="' + c + '"/><path d="M28 14v34" stroke="#0004" stroke-width="2"/>',
+    pick: (c) => '<path d="M8 22C20 6 40 6 50 22l-6 2C36 14 22 14 14 24z" fill="' + c + '"/><rect x="26" y="14" width="5" height="38" rx="2" fill="#8a6a42"/>',
+    axe: (c) => '<path d="M28 8c12 0 18 8 18 16-8-2-14-2-18 2z" fill="' + c + '"/><rect x="24" y="8" width="5" height="42" rx="2" fill="#8a6a42"/>',
+    shear: (c) => '<path d="M14 8l16 24M42 8L26 32" stroke="' + c + '" stroke-width="5" stroke-linecap="round"/><circle cx="20" cy="42" r="6" fill="none" stroke="#8a6a42" stroke-width="4"/><circle cx="36" cy="42" r="6" fill="none" stroke="#8a6a42" stroke-width="4"/>',
+    tnt: (c) => '<rect x="14" y="20" width="28" height="28" rx="5" fill="' + c + '"/><path d="M14 30h28M14 38h28" stroke="#0005" stroke-width="2"/><path d="M28 20c0-8 6-6 8-12" stroke="#e8dcc0" stroke-width="2.5" fill="none"/><circle cx="37" cy="7" r="3" fill="#f0b040"/>',
+    fire: (c) => '<path d="M28 6c10 12 14 18 14 26a14 14 0 0 1-28 0c0-6 4-10 6-16 2 4 4 5 5 6 0-6 1-10 3-16z" fill="' + c + '"/><path d="M28 28c4 5 6 8 6 11a6 6 0 0 1-12 0c0-3 3-6 6-11z" fill="#f6dd8a"/>',
+    vial: (c) => '<rect x="23" y="6" width="10" height="8" rx="2" fill="#bbb3a2"/><path d="M22 14h12v8l8 18a6 6 0 0 1-6 9H20a6 6 0 0 1-6-9l8-18z" fill="' + c + '"/><path d="M19 36h18" stroke="#fff6" stroke-width="3"/>',
+    cloak: (c) => '<path d="M28 6c8 0 12 6 12 12l8 30H8l8-30c0-6 4-12 12-12z" fill="' + c + '" opacity=".8"/><path d="M22 18c2-4 10-4 12 0v8H22z" fill="#0007"/>',
+    anchor: (c) => '<circle cx="28" cy="12" r="5" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M28 17v30M16 26h24" stroke="' + c + '" stroke-width="4"/><path d="M10 36c2 10 10 13 18 13s16-3 18-13" stroke="' + c + '" stroke-width="4" fill="none"/>',
+    wall: (c) => '<rect x="8" y="12" width="40" height="34" rx="2" fill="' + c + '"/><path d="M8 23h40M8 34h40M22 12v11M36 23v11M22 34v12" stroke="#0006" stroke-width="2"/>',
+    bridge: (c) => '<path d="M4 40h48" stroke="' + c + '" stroke-width="6"/><path d="M12 40v8M28 40v8M44 40v8" stroke="' + c + '" stroke-width="3" opacity=".6"/><circle cx="14" cy="20" r="6" fill="' + c + '"/><path d="M22 20h22l-6-5M44 20l-6 5" stroke="#f2e9d8" stroke-width="2.5" fill="none"/>',
+    float: (c) => '<ellipse cx="28" cy="20" rx="18" ry="12" fill="' + c + '"/><path d="M14 28l10 18h8l10-18" stroke="#ddd6c6" stroke-width="2" fill="none"/><rect x="23" y="44" width="10" height="6" rx="1" fill="#8a6a42"/>',
+    up: (c) => '<path d="M28 6l18 18H36v24H20V24H10z" fill="' + c + '"/>',
+    core: (c) => '<path d="M28 4l14 16-14 30-14-30z" fill="' + c + '"/><path d="M28 4v46M14 20h28" stroke="#fff5" stroke-width="2"/>',
+    trap: (c) => '<path d="M6 40h44" stroke="' + c + '" stroke-width="4"/><path d="M12 40l4-14 5 14 5-18 5 18 5-14 4 14" stroke="' + c + '" stroke-width="3" fill="none"/><circle cx="28" cy="12" r="5" fill="' + c + '"/>',
+    res: (c) => '<path d="M10 34l8-14h20l8 14-8 10H18z" fill="' + c + '"/><path d="M18 20l6 14h8l6-14M24 34l-6 10M32 34l6 10" stroke="#0004" stroke-width="1.5" fill="none"/>',
+  };
+  const CON_IC = { tnt: ['tnt', '#b5553f'], fire: ['fire', '#e0752e'], heal: ['vial', '#d05a5a'], jump: ['vial', '#6fbf6a'], haste: ['vial', '#e0c04a'], cloak: ['cloak', '#8f8aa8'], anchor: ['anchor', '#7fd0d8'], wall: ['wall', '#a9753f'], bridge: ['bridge', '#c9b58a'], float: ['float', '#d8d0f0'] };
+  const TIERC = ['#b9b2a2', '#c9cdd4', '#e0c66a', '#7fe0e8'];
+  function entryIcon(e) {
+    if (e.k === 'blk') return IC.slab(BLK[e.b].col);
+    if (e.k === 'shell') return IC.shell(BLK[e.b].col);
+    if (e.k === 'melee') return e.t === 4 ? IC.club('#9aa0aa') : IC.sword(TIERC[e.t]);
+    if (e.k === 'rng') return e.t === 3 ? IC.cannon('#8f9aa8') : IC.xbow(e.t === 2 ? '#7fe0e8' : '#c9cdd4');
+    if (e.k === 'ammo') return IC.bolt('#c9cdd4');
+    if (e.k === 'armor') return IC.armor(TIERC[e.t]);
+    if (e.k === 'pick') return IC.pick(TIERC[e.t]);
+    if (e.k === 'axe') return IC.axe(TIERC[e.t]);
+    if (e.k === 'shear') return IC.shear('#c9cdd4');
+    if (e.k === 'con') { const q = CON_IC[CONS[e.c].id]; return IC[q[0]](q[1]); }
+    if (e.k === 'upg') return UPG[e.u].id === 'guard' || UPG[e.u].id === 'mend' ? IC.core('#62cfe0') : IC.up('#62cfe0');
+    if (e.k === 'trap') return IC.trap('#e0a04a');
+    return '';
+  }
+
+  /* ======================= 판 상태 ======================= */
+  function teamsOf(n, T, fill) {
+    T = clamp(T | 0 || 2, 2, Math.min(4, n));
+    const tm = [];
+    if (fill === 'blk') { const per = Math.ceil(n / T); for (let i = 0; i < n; i++) tm.push(Math.min(T - 1, Math.floor(i / per))); }
+    else for (let i = 0; i < n; i++) tm.push(i % T);
+    return { T, tm };
+  }
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = Math.random;
+    const { T, tm } = teamsOf(n, +opts.teams || 2, opts.fill);
+    const map = MAPS[opts.map] ? opts.map : MAP_KEYS[Math.floor(R() * MAP_KEYS.length)];
+    return {
+      v: 1, rid: 1 + Math.floor(R() * 1e6), seed: 1 + Math.floor(R() * 2e9), n, T, tm, map, len: LENS[opts.len] ? opts.len : 'm',
+      nm: players.map((p) => String(p.name || '').slice(0, 12)), ai: players.map((p) => !!p.ai), lv: players.map((p) => (p.ai ? p.lv || 2 : 0)),
+      ph: 'play', seq: 1, res: null,
+    };
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.res) return null;
+    const r = s.res, st = r.st || [];
+    const winners = []; for (let i = 0; i < s.n; i++) if (s.tm[i] === r.win) winners.push(i);
+    const col = (k) => st.map((x) => String(x ? x[k] || 0 : 0));
+    const hl = [];
+    if (r.win >= 0) hl.push(TEAMS[r.win].nm + ' 승리 — ' + (r.why || '마지막까지 남음'));
+    if (r.time) hl.push('판 시간 ' + Math.floor(r.time / 60) + '분 ' + Math.round(r.time % 60) + '초');
+    (r.cores || []).forEach((c) => { if (c && c[1] >= 0 && hl.length < 4) hl.push(TEAMS[c[0]].sh + ' 핵 파괴: ' + (s.nm[c[1]] || '')); });
+    return {
+      winners, title: r.win >= 0 ? TEAMS[r.win].nm + ' 승리' : '무승부', text: MAPS[s.map].nm,
+      highlights: hl.slice(0, 4),
+      stats: [
+        { label: '분대', values: s.tm.map((t) => TEAMS[t].sh), best: false },
+        { label: '처치', values: col('k') },
+        { label: '쓰러짐', values: col('d'), low: true },
+        { label: '부순 핵', values: col('c') },
+        { label: '놓은 칸', values: col('p') },
+        { label: '부순 칸', values: col('b') },
+      ],
+    };
+  }
+  function hint(st, seat) {
+    if (!st) return null;
+    const o = ['거점 수호전 · ' + MAPS[st.map].nm];
+    if (seat >= 0 && st.tm) o.push('내 분대: ' + TEAMS[st.tm[seat]].nm + '. 핵이 살아 있는 동안은 쓰러져도 5초 뒤 부활.');
+    o.push('제련로(자기 섬 뒤쪽)에 서서 주괴를 모으고, 보급소(B)에서 발판과 장비를 삼.');
+    o.push('허공 쪽을 보고 「놓기」(마우스 오른쪽)를 누른 채 걸으면 발밑 앞에 발판이 이어 깔림.');
+    o.push('상대 섬으로 건너가 방벽을 부수고 핵을 때려 부숨(시작 직후에는 방호막). 핵을 잃은 분대는 더 부활하지 못함.');
+    o.push('위쪽 띠에 다음 시간 단계가 보임. 핵 붕괴 뒤에는 고리 안쪽(가운데 섬)으로.');
+    return o.slice(0, 6);
+  }
+
+  /* ======================= 규칙 · 도감 ======================= */
+  const costTxt = (c) => { const o = []; for (let i = 0; i < 3; i++) if (c[i]) o.push(RES[i].nm + ' ' + c[i]); return o.join(' · '); };
+  const RULES = [
+    { h: '목표', p: ['떠 있는 섬마다 한 분대가 자리를 잡습니다. 자기 섬의 「거점 핵」을 지키면서 다리를 놓아 건너가 상대 분대의 핵을 부숩니다.', '핵이 살아 있는 분대는 쓰러져도 5초 뒤 자기 섬에서 부활합니다. 핵이 부서진 분대는 더 부활하지 못합니다.', '마지막까지 남은 분대가 이깁니다. 2~4분대, 한 분대 1~4명. 한 기기에 한 명이고 빈자리는 AI가 채웁니다.'] },
+    { h: '자원', p: ['주괴: 자기 섬 뒤쪽 제련로에서 계속 나옵니다. 가까이 서 있으면 저절로 줍습니다. 같은 분대원이 함께 서 있으면 각자 받습니다.', '결정: 중간 섬의 결정 채굴기에서 천천히 나옵니다. 분대 강화에 씁니다.', '정수: 가운데 섬의 정수 샘에서 나옵니다. 상급 장비와 특수 물건에 씁니다. 가운데 섬은 자주 싸움터가 됩니다.', '쓰러지면 들고 있던 자원은 쓰러뜨린 상대에게 넘어가고, 자재와 소모품은 사라집니다. 무기 · 방어구 · 도구는 그대로입니다.'] },
+    { h: '보급소', p: ['자기 섬 안이면 어디서든 B(터치: 「보급」 단추)로 엽니다. 탭: ' + TABS.map((t) => t[1]).join(' · ') + '.', '살 수 없는 물건은 흐리게 보이고, 누르면 까닭(자원 부족 · 앞 단계 필요 등)이 뜹니다.', '「방호 시공」을 사면 핵 둘레의 빈 칸이 그 자재로 한 겹 채워집니다. 손으로 하나씩 놓지 않아도 됩니다.'] },
+    { h: '다리 놓기', p: ['허공 쪽으로 「놓기」(마우스 오른쪽 · 터치 「놓기」 단추)를 누른 채 걸으면 발밑 앞에 발판이 저절로 이어 깔립니다. 칸에 맞춰 놓이므로 방향만 잡으면 됩니다.', '「놓기」를 누르고 있는 동안에는 가장자리에서 발이 멈춰, 발판이 떨어져도 허공으로 걸어 나가지 않습니다.', '바닥이 있는 곳에서는 조준한 면에 칸이 놓입니다(벽 · 탑 쌓기). 뛰면서 발밑을 보고 놓으면 위로 올라갑니다.', '쓸 자재는 Q(터치: 자재 칸)로 바꿉니다. 놓인 칸은 누구나 부술 수 있습니다. 허공으로 떨어지면 쓰러집니다.'] },
+    { h: '부수기 · 핵', p: ['공격(마우스 왼쪽)을 누르고 있으면 조준한 칸이 부서집니다. 가진 도구 가운데 맞는 것이 저절로 쓰입니다.', BLK.slice(1).map((b) => b.nm + '(' + (b.tool === 'shear' ? '절단기' : b.tool === 'axe' ? '도끼' : b.tool === 'pick' ? '곡괭이' : '도구 없음') + ')').join(' · ') + '.', '핵은 가까이에서 공격으로 때립니다. 칸에 가려 있으면 닿지 않으므로 먼저 방벽을 부숩니다. 곡괭이 등급이 높을수록 핵에 주는 피해가 큽니다.', '판이 시작되고 얼마 동안(판 길이의 10%)은 핵에 방호막이 있어 피해를 받지 않습니다. 그동안 장비와 방벽을 갖춥니다.', '자기 핵이 맞으면 화면에 알림이 뜹니다. 핵은 8초 동안 맞지 않으면 천천히 회복됩니다(초당 2).'] },
+    { h: '전투', p: ['근접: 공격을 누르면 앞쪽 가까운 상대를 벱니다. 맞으면 밀려나므로 다리 위에서는 떨어뜨릴 수 있습니다.', '원거리: 석궁을 사면 2번(터치: 무기 칸)으로 바꿔 듭니다. 가운데 조준점으로 쏘고 볼트를 씁니다.', '소모품은 숫자 키(터치: 물건 칸)를 누르면 바로 쓰거나 조준점 쪽으로 던집니다.', '부활 뒤 3초 동안은 피해를 받지 않습니다. 6초 동안 맞지 않으면 체력이 조금씩 돌아옵니다.'] },
+    { h: '분대 강화 · 함정', p: UPG.map((u) => u.nm + ' — ' + u.d[u.d.length - 1]).concat(['함정은 적이 내 섬에 들어오면 산 순서대로 하나씩 발동합니다(최대 3개 대기, 발동 사이 20초): ' + TRAP.map((t) => t.nm).join(' · ') + '.']) },
+    { h: '시간 단계', p: PHASES.map((p) => Math.round(p.f * 100) + '% — ' + p.nm + ': ' + p.d).concat(['판 길이(6 · 10 · 14분)에 맞춰 단계 시각이 정해집니다. 최종 소멸 뒤에도 남아 있으면 남은 인원 · 체력으로 승패를 가립니다.']) },
+    { h: '조작', p: ['PC: 마우스를 움직이면 바로 시점 · WASD 이동 · Space 점프(한 칸 턱은 걸으면 저절로 넘음) · 왼쪽 클릭 공격/부수기 · 오른쪽 클릭 놓기 · Q 자재 바꾸기 · 1 근접 · 2 원거리 · 3~0 소모품 · B 보급소 · Tab 현황.', '터치(가로 화면): 왼쪽 막대 이동 · 오른쪽 끌기 시점 · 「공격」 · 「놓기」 · 「점프」 · 「보급」 단추, 아래 물건 줄을 눌러 고르거나 씀.', '게임패드: 왼쪽 스틱 이동 · 오른쪽 스틱 시점 · RT 공격 · LT 놓기 · A 점프 · X 보급소 · Y 자재 바꾸기. 키는 「⌨ 조작 설정」에서 바꿉니다.'] },
+    { h: 'AI', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움. 쉬움은 판단이 느리고 공격 간격이 길며 헛손질이 잦고 물건을 쓰지 않습니다. 어려움은 빠르게 장비를 갖추고 폭약 · 회복을 쓰며, 다가오는 적을 미리 맞으러 나가고 허공을 등지지 않게 돌며 싸웁니다.', 'AI마다 버릇(공세 · 욕심 · 신중함)이 판마다 달라 같은 난이도라도 움직임이 다릅니다.'] },
+    { h: '지도', p: MAP_KEYS.map((k) => MAPS[k].nm + ' — ' + MAPS[k].sub).concat(['섬 모양 · 암초 위치 · 거리는 판마다 조금씩 다릅니다. 모든 분대의 조건은 같습니다(돌려서 겹치는 배치). 세 분대일 때는 네 자리 가운데 하나가 빈 거점이 됩니다.']) },
+    { h: '그래픽 · 만든 사람', p: ['설정 화면 「그래픽 품질(이 기기)」: 낮음 · 보통 · 높음. 끊기면 낮음으로.', '섬 · 분대원 · 물건은 모두 코드로 만든 3D 형상과 결(외부 모델 · 그림 없음). 효과음은 앱 합성음. 3D 엔진: three.js (MIT). 출처: app/assets/bedwar/CREDITS.txt', '구조 참고: 섬 사이에 다리를 놓아 거점을 부수는 팀전. 이름 · 세계 · 그림 · 글은 이 게임만의 것입니다.'] },
+  ];
+  function codexData() {
+    const r = (icon, name, tag, desc) => ({ icon: svgW(icon), name, tag, desc });
+    const ent = (tab) => SHOP.filter((e) => e.tab === tab);
+    return [
+      { h: '자재', p: ['부수는 시간은 맨손 기준. 맞는 도구는 등급에 따라 ' + TOOL_PW.slice(1).join(' · ') + '배(절단기는 범포에 6배).'], rows: BLK.slice(1).map((b, i) => { const e = SHOP[SI['b' + (i + 1)]]; return r(IC.slab(b.col), b.nm, e.n + '개 · ' + costTxt(e.cost), '맨손 ' + b.hp + '초 · 도구: ' + (b.tool === 'shear' ? '절단기' : b.tool === 'axe' ? '도끼' : b.tool === 'pick' ? '곡괭이' : '없음(아무 도구 1.5배)') + ' · 폭발: ' + (b.res >= 9 ? '안 부서짐' : b.res >= 0.8 ? '바로 곁에서만' : b.res >= 0.5 ? '가까이서만' : '잘 부서짐') + '. ' + b.d); }).concat(ent('build').filter((e) => e.k === 'shell').map((e) => r(entryIcon(e), e.nm, costTxt(e.cost), e.d))) },
+      { h: '무기', p: ['근접 무기는 하나만 지닙니다(새로 사면 바뀜). 공격 간격 0.42초 · 거리 3.4m.'], rows: MELEE.map((m, i) => { const e = SHOP[SI['m' + i]]; return r(i === 4 ? IC.club('#9aa0aa') : IC.sword(TIERC[Math.min(3, i)]), m.nm, e ? costTxt(e.cost) : '기본', '피해 ' + m.dmg + ' · 밀쳐 내기 ×' + m.kb + (m.d ? ' · ' + m.d : '')); }).concat(RANGED.slice(1).map((w, i) => { const e = SHOP[SI['r' + (i + 1)]]; return r(entryIcon(e), w.nm, costTxt(e.cost), '피해 ' + w.dmg + ' · 간격 ' + w.cd + '초 · 탄속 ' + w.spd + 'm/s · ' + w.d); })).concat([r(IC.bolt('#c9cdd4'), '볼트 ×8', costTxt(SHOP[SI.am].cost), '석궁 · 충격포의 탄.')]) },
+      { h: '방어구 · 도구', p: ['방어구와 도구는 쓰러져도 유지됩니다. 분대 장갑과 더해 받는 피해는 최대 70%까지 줄어듭니다.'], rows: ent('gear').map((e) => r(entryIcon(e), e.nm, costTxt(e.cost), e.d)) },
+      { h: '소모품', p: ['숫자 키(터치: 물건 칸)로 바로 씁니다. 던지는 물건은 조준점 쪽으로 날아갑니다.'], rows: ent('item').map((e) => r(entryIcon(e), e.nm, costTxt(e.cost), e.d)) },
+      { h: '분대 강화', p: ['결정으로 삽니다. 분대 전원에게 적용되고 판이 끝날 때까지 유지됩니다.'], rows: UPG.map((u) => r(u.id === 'guard' || u.id === 'mend' ? IC.core('#62cfe0') : IC.up('#62cfe0'), u.nm, '결정 ' + u.cost.join(' → '), u.d.map((x, i) => (u.d.length > 1 ? (i + 1) + '단계: ' : '') + x).join(' / '))).concat(TRAP.map((t) => r(IC.trap('#e0a04a'), '함정: ' + t.nm, '결정 1~3', t.d + '. 대기 중인 함정 수만큼 값이 오름.'))) },
+      { h: '자원 · 시간 단계', p: ['단계 시각은 판 길이에 대한 비율입니다.'], rows: RES.map((x) => r(IC.res(x.col), x.nm, '자원', x.d)).concat(PHASES.map((p) => r(IC.up('#e3ae45'), p.nm, Math.round(p.f * 100) + '%', p.d))) },
+      { h: '지도', p: ['지도 옵션의 기본값은 무작위. 섬 모양과 암초는 판마다 새로 만들어집니다.'], rows: MAP_KEYS.map((k) => r(IC.slab('#7f9a6a'), MAPS[k].nm, '지도 틀', MAPS[k].sub)) },
+    ];
+  }
+
+  /* ======================= 표지 (640×360) ======================= */
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#1d2a44'); sky.addColorStop(0.55, '#5a6f8f'); sky.addColorStop(1, '#c9b79a');
+    g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    const isl = (x, y, s, col) => {
+      g.fillStyle = '#3b3a44'; g.beginPath(); g.moveTo(x - 60 * s, y); g.lineTo(x + 60 * s, y); g.lineTo(x + 34 * s, y + 46 * s); g.lineTo(x + 6 * s, y + 80 * s); g.lineTo(x - 30 * s, y + 50 * s); g.fill();
+      g.fillStyle = '#8c8a80'; g.fillRect(x - 62 * s, y - 7 * s, 124 * s, 9 * s);
+      g.fillStyle = col; g.beginPath(); g.moveTo(x, y - 46 * s); g.lineTo(x + 10 * s, y - 26 * s); g.lineTo(x, y - 8 * s); g.lineTo(x - 10 * s, y - 26 * s); g.fill();
+      g.fillStyle = 'rgba(255,255,255,.35)'; g.beginPath(); g.moveTo(x, y - 46 * s); g.lineTo(x + 10 * s, y - 26 * s); g.lineTo(x, y - 26 * s); g.fill();
+    };
+    isl(120, 190, 1.15, TEAMS[0].col); isl(520, 170, 0.95, TEAMS[1].col); isl(330, 120, 0.5, '#b78cf2');
+    g.fillStyle = '#c9b58a'; for (let i = 0; i < 9; i++) g.fillRect(192 + i * 26, 184 - i * 2.6, 22, 5);
+    g.fillStyle = '#16131c'; g.fillRect(398, 132, 6, 16); g.beginPath(); g.arc(401, 128, 4, 0, 7); g.fill();
+    g.fillStyle = 'rgba(12,10,16,.62)'; g.fillRect(0, h - 58, w, 58);
+    g.fillStyle = '#f2e9d8'; g.font = '30px "Black Han Sans","IBM Plex Sans KR",sans-serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 24, h - 29);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(242,233,216,.75)'; g.fillText('다리를 놓아 건너가 상대의 핵을 부수는 분대전', 210, h - 28);
+  }
+
+  /* ======================= 입구 화면 (3D 불러오기) ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '그림자 없음 · 배율 낮게 — 끊길 때', pr: 1, shadow: 0, aa: false },
+    { id: 'mid', nm: '보통', tip: '해 그림자 · 보통 배율', pr: 1.5, shadow: 2048, aa: true },
+    { id: 'high', nm: '높음', tip: '고운 그림자 · 고해상도', pr: 2, shadow: 4096, aa: true },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem('bedwar.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('bedwar.' + k, v); } catch (e) {} } };
+  function touchOnly() { try { if (L && typeof L.touchOnly === 'function') return !!L.touchOnly(); return typeof matchMedia === 'function' && matchMedia('(pointer:coarse)').matches; } catch (e) { return false; } }
+  function gfxTier() { const v = store.get('gfx', ''); if (TIERS.some((t) => t.id === v)) return v; if (L && L.debug && L.debug.noTut) return 'low'; return touchOnly() ? 'low' : 'mid'; }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  function loadCore() {
+    return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js'))
+      .then(() => (API.sim ? null : loadScript('assets/bedwar/sim.js')))
+      .then(() => (G.BEDWAR_VIEW ? null : loadScript('assets/bedwar/view.js')));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+  const CONTROLS = [
+    { id: 'up', label: '앞으로', keys: ['KeyW'], pad: ['ly-'] },
+    { id: 'down', label: '뒤로', keys: ['KeyS'], pad: ['ly+'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA'], pad: ['lx-'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD'], pad: ['lx+'] },
+    { id: 'camL', label: '시점 왼쪽(마우스 대신)', keys: ['ArrowLeft'], pad: ['rx-'] },
+    { id: 'camR', label: '시점 오른쪽', keys: ['ArrowRight'], pad: ['rx+'] },
+    { id: 'camU', label: '시점 위', keys: ['ArrowUp'], pad: ['ry-'] },
+    { id: 'camD', label: '시점 아래', keys: ['ArrowDown'], pad: ['ry+'] },
+    { id: 'atk', label: '공격 · 부수기 (마우스 왼쪽)', keys: ['KeyJ'], pad: ['rt'] },
+    { id: 'build', label: '놓기 · 다리 (마우스 오른쪽)', keys: ['KeyF', 'ShiftLeft'], pad: ['lt'] },
+    { id: 'jump', label: '점프', keys: ['Space'], pad: ['a'] },
+    { id: 'shop', label: '보급소', keys: ['KeyB', 'KeyE'], pad: ['x'] },
+    { id: 'mat', label: '자재 바꾸기 (마우스 휠)', keys: ['KeyQ'], pad: ['y'] },
+    { id: 'h1', label: '근접 무기 들기', keys: ['Digit1'], pad: ['lb'] },
+    { id: 'h2', label: '원거리 무기 들기', keys: ['Digit2'], pad: ['rb'] },
+    { id: 'i3', label: '소모품 1', keys: ['Digit3'], pad: ['up'] },
+    { id: 'i4', label: '소모품 2', keys: ['Digit4'], pad: ['right'] },
+    { id: 'i5', label: '소모품 3', keys: ['Digit5'], pad: ['down'] },
+    { id: 'i6', label: '소모품 4', keys: ['Digit6'], pad: ['left'] },
+    { id: 'i7', label: '소모품 5', keys: ['Digit7'], pad: [] },
+    { id: 'i8', label: '소모품 6', keys: ['Digit8'], pad: [] },
+    { id: 'i9', label: '소모품 7', keys: ['Digit9'], pad: [] },
+    { id: 'i0', label: '소모품 8', keys: ['Digit0'], pad: [] },
+    { id: 'score', label: '현황(누르고 있기)', keys: ['Tab'], pad: ['back'] },
+    { id: 'spec', label: '관전 대상 바꾸기', keys: ['KeyV'], pad: ['rs'] },
+  ];
+
+  const API = { ID, TITLE, RES, TEAMS, BLK, TOOL_PW, MELEE, ARMOR, RANGED, PICK, AXE, CONS, CI, UPG, UI, TRAP, SHOP, SI, TABS, MAPS, MAP_KEYS, LENS, PHASES, IC, svgW, entryIcon, costTxt, TIERS, store, gfxTier, touchOnly, clamp, teamsOf, init, result, hint };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 40%,#3a4a66,#10131c)', color: '#f2e9d8', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t1 = h('div', { style: { fontFamily: 'var(--f-display)', fontSize: '30px', letterSpacing: '2px' }, text: TITLE });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.75' }, text: '섬을 띄우는 중' });
+    const bar = h('div', { style: { width: '220px', height: '4px', borderRadius: '2px', background: 'rgba(255,240,210,.14)', overflow: 'hidden' } }, h('div', { style: { width: '8%', height: '100%', background: '#e3ae45', transition: 'width .2s' } }));
+    box.append(t1, t2, bar);
+    root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(clamp(f, 0.05, 1) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기(브라우저)에서는 3D 그래픽(WebGL)을 켤 수 없습니다.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.5, '거점을 세우는 중');
+      view = G.BEDWAR_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'); });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<path d="M4 34h18l-3 8-6 6-6-6z" fill="currentColor" opacity=".55"/><path d="M34 30h18l-3 8-6 6-6-6z" fill="currentColor" opacity=".55"/><rect x="4" y="31" width="18" height="3" fill="currentColor"/><rect x="34" y="27" width="18" height="3" fill="currentColor"/><path d="M22 32l12-3" stroke="currentColor" stroke-width="3" stroke-dasharray="4 2"/><path d="M43 8l5 8-5 10-5-10z" fill="currentColor"/><path d="M13 14l4 7-4 8-4-8z" fill="currentColor" opacity=".8"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '3D 분대전', cat: '아케이드', icon: ICON, tint: '#1f2d47',
+    blurb: '떠 있는 섬에서 자원을 모아 장비를 갖추고, 발판으로 다리를 놓아 건너가 상대 분대의 거점 핵을 부숩니다. 핵이 살아 있으면 쓰러져도 부활하고, 마지막까지 남은 분대가 승리. 2~4분대 · 2~8명.',
+    time: '6–14분', landscape: true, realtime: true, aiDelay: 0, mood: 'drums', ambient: 'wind', sidePanel: false, contextMenu: true, menuCorner: 'tr',
+    minPlayers: 2, maxPlayers: 8, defaultPlayers: 4,
+    options: [
+      { id: 'teams', label: '분대 수', tip: '인원보다 많으면 인원 수에 맞춰 줄어듦. 세 분대는 네 자리 가운데 하나가 빈 거점.', choices: [{ v: 2, label: '2분대' }, { v: 3, label: '3분대' }, { v: 4, label: '4분대' }], def: 2 },
+      { id: 'fill', label: '편 짜기', tip: '번갈아: 자리 순서대로 한 명씩 다른 분대. 앞자리끼리: 앞자리부터 같은 분대(친구와 한 편).', choices: [{ v: 'alt', label: '번갈아' }, { v: 'blk', label: '앞자리끼리 한 편' }], def: 'alt' },
+      { id: 'map', label: '지도', tip: '섬 모양 · 암초는 판마다 새로 만들어짐.', choices: [{ v: 'rnd', label: '무작위' }].concat(MAP_KEYS.map((k) => ({ v: k, label: MAPS[k].nm, tip: MAPS[k].sub }))), def: 'rnd' },
+      { id: 'len', label: '판 길이', tip: '시간 단계(핵 붕괴 · 소멸의 고리)가 이 길이에 맞춰 옴.', choices: Object.keys(LENS).map((k) => ({ v: k, label: LENS[k].nm })), def: 'm' },
+    ],
+    setupExtra(opts, ctx) {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 2px' }, text: '그래픽 품질(이 기기)' }));
+        for (const t of TIERS) wrap.append(h('button', { class: 'btn sm' + (gfxTier() === t.id ? ' primary' : ''), title: t.tip, style: { minHeight: '44px' }, text: t.nm, onclick() { store.set('gfx', t.id); draw(); } }));
+        const sv = +store.get('sens', 1);
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 10px' }, text: '시점 감도' }));
+        for (const [v, nm] of [[0.6, '낮게'], [1, '보통'], [1.5, '높게'], [2.2, '아주 높게']]) wrap.append(h('button', { class: 'btn sm' + (Math.abs(sv - v) < 0.01 ? ' primary' : ''), style: { minHeight: '44px' }, text: nm, onclick() { store.set('sens', v); draw(); } }));
+      };
+      draw(); void ctx; void opts;
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['제련로에서 주괴를 모아 보급소(B)에서 발판 · 장비를 삼', '「놓기」를 누른 채 허공 쪽으로 걸으면 다리가 이어 깔림', '상대 섬의 방벽을 부수고 핵을 때려 부숨 — 핵을 잃은 분대는 부활 없음', '마지막까지 남은 분대가 승리'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.BEDWAR = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();

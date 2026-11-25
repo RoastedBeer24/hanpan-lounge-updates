@@ -1,0 +1,808 @@
+/* 돌림판 — a spinning wheel for deciding things. People only.
+   Phase 'set': the setter writes 2–20 items (optional weight ×1–×5 each; colors are automatic).
+   Phase 'spin': flick the wheel (strength from the flick speed) or press 돌리기. apply() picks the outcome
+   deterministically from the seed in the state and the submitted speed, and stores the start angle,
+   the signed travel and the duration so every device replays the same deceleration and lands on the same
+   item. Elimination mode (option) takes the winner off the wheel for the next spin. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  const MINI = 2, MAXI = 20, ITEM_MAX = 12, MAXW = 5, HIST = 12;
+  const PALW = ['#e8574a', '#f0a03c', '#e9cf4f', '#7cc35a', '#3fb8a6', '#4c93dd', '#8a6fe0', '#d65fb0', '#c98a5b', '#5fc4e0'];
+  const MENU = ['김치찌개', '된장찌개', '짜장면', '짬뽕', '치킨', '피자', '떡볶이', '김밥', '초밥', '돈가스', '국밥', '냉면', '비빔밥', '삼겹살',
+    '파스타', '햄버거', '쌀국수', '마라탕', '칼국수', '제육볶음', '부대찌개', '샐러드', '카레', '닭갈비'];
+  const PENALTY = ['노래 한 소절', '애교 세 가지', '팔굽혀펴기 10개', '성대모사 하나', '음료 사 오기', '칭찬 세 마디', '설거지 당번',
+    '엉덩이로 이름 쓰기', '개인기 하나', '30초 춤추기', '어깨 주물러 주기', '혀 꼬이는 말 3번', '통과!'];
+  const CAFE = ['아메리카노', '카페라테', '바닐라라테', '콜드브루', '아인슈페너', '플랫화이트', '말차라테', '얼그레이', '자몽에이드', '레몬티',
+    '유자차', '캐모마일', '핫초코', '딸기스무디', '밀크티', '디카페인'];
+  const WEEKEND = ['영화관', '전시회', '한강 산책', '등산', '보드게임 카페', '맛집 탐방', '집에서 쉬기', '드라이브', '찜질방', '서점 구경',
+    '볼링', '방탈출', '노래방', '근교 당일치기', '요리해 먹기', '카페 투어', '운동', '시장 구경'];
+  const CHORE = ['설거지', '분리수거', '청소기', '빨래 개기', '장보기', '화장실 청소', '음식물 쓰레기', '이번엔 쉬기'];
+  const TALK = ['요즘 가장 빠져 있는 것', '최근에 웃겼던 일', '가 보고 싶은 여행지', '인생 영화 한 편', '어릴 적 꿈', '요즘 고민 하나',
+    '최고의 한 끼', '나만의 스트레스 해소법', '올해 이루고 싶은 것', '가장 아끼는 물건', '최근 산 것 중 최고', '숨겨진 특기'];
+
+  /* ---------- pure helpers ---------- */
+  function clean(t, n) {
+    return [...String(t == null ? '' : t).normalize('NFC').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim()].slice(0, n).join('').trim();
+  }
+  function prng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const mod = (a, n) => ((a % n) + n) % n;
+  const r1 = (x) => Math.round(x * 10) / 10;
+  const r2 = (x) => Math.round(x * 100) / 100;
+  function pick(list, n, rnd) { const a = list.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a.slice(0, n); }
+  const defItem = (k) => '항목 ' + (k + 1);
+  function colorOf(k, n) { return (n > 1 && k === n - 1 && k % PALW.length === 0) ? PALW[5] : PALW[k % PALW.length]; }
+
+  /* deceleration: dω/dt = −(A + B·ω) — dry friction plus a little drag. Closed forms keep every device identical. */
+  const B = 0.6, C = 200; // C = A / B  (deg/s)
+  const distOf = (v) => v / B - (C / B) * Math.log(1 + v / C);
+  const timeOf = (v) => Math.log(1 + v / C) / B;
+  const thetaAt = (v, t) => ((v + C) * (1 - Math.exp(-B * t))) / B - C * t;
+  function speedFor(D) { // inverse of distOf by bisection (deterministic)
+    let lo = 0, hi = 40000;
+    for (let k = 0; k < 60; k++) { const m = (lo + hi) / 2; if (distOf(m) < D) lo = m; else hi = m; }
+    return (lo + hi) / 2;
+  }
+  /* wheel-frame segments, degrees clockwise from the top at rotation 0 */
+  function segsOf(wts) {
+    const tot = wts.reduce((a, w) => a + Math.max(0, w), 0);
+    const out = []; let a = 0;
+    if (tot <= 0) return out;
+    wts.forEach((w, k) => { if (w > 1e-4) { const s = (360 * w) / tot; out.push({ k, s0: a, s1: a + s }); a += s; } });
+    if (out.length) out[out.length - 1].s1 = 360;
+    return out;
+  }
+  const weightsOf = (s, mask) => s.wt.map((w, k) => ((mask || s.on)[k] === '1' ? w : 0));
+  function itemAt(segs, ang) { const p = mod(-ang, 360); const sg = segs.find((x) => p >= x.s0 && p < x.s1); return sg ? sg.k : segs.length ? segs[segs.length - 1].k : -1; }
+  const activeOf = (s) => s.it.map((_, k) => k).filter((k) => s.on[k] === '1');
+
+  /* ---------- rules / state ---------- */
+  const setterOf = (s) => (s.hm.length ? s.hm[0] : -1);
+  function init(players, opts) {
+    opts = opts || {};
+    const hm = players.map((p, i) => (p.ai ? -1 : i)).filter((i) => i >= 0);
+    const names = hm.map((i) => clean(players[i].name, ITEM_MAX)).filter((x) => x);
+    const it = names.length >= 2 ? names : ['1', '2', '3', '4', '5', '6'];
+    return { hm, ph: 'set', it, wt: it.map(() => 1), on: '1'.repeat(it.length), el: opts.elim ? 1 : 0, who: opts.spinner === 'host' ? 'h' : 'a',
+      ang: 0, g: 0, n: 0, hs: [], seq: 0, last: null };
+  }
+  function actor(s) {
+    const se = setterOf(s);
+    if (se < 0) return null;
+    if (s.ph !== 'spin' || s.who === 'h') return se;
+    return s.hm.slice();
+  }
+  function spin(s, seat, a) {
+    const act = activeOf(s);
+    if (act.length < 2) throw new Error('nothing to spin');
+    let v = Number(a.v);
+    if (!isFinite(v) || v === 0) v = 1200;
+    const dir = v < 0 ? -1 : 1;
+    v = U.clamp(Math.abs(v), 500, 2600);
+    const r = prng((s.g + Math.imul(s.n + 1, 0x9E3779B1)) >>> 0);
+    v *= 0.9 + r() * 0.2;
+    const a0 = isFinite(Number(a.a)) && a.a !== null ? r1(mod(Number(a.a), 360)) : s.ang;
+    const segs = segsOf(weightsOf(s));
+    // the outcome: a weighted pick, then a point well inside that segment
+    const W = act.reduce((t, k) => t + s.wt[k], 0);
+    let u = r() * W, win = act[act.length - 1];
+    for (const k of act) { if (u < s.wt[k]) { win = k; break; } u -= s.wt[k]; }
+    const sg = segs.find((x) => x.k === win);
+    const tgt = sg.s0 + (sg.s1 - sg.s0) * (0.12 + 0.76 * r());
+    // travel so the pointer ends on tgt, as close as possible to what the flick would give
+    const base = mod(dir * (-tgt - a0), 360), Dn = distOf(v);
+    let D = base + 360 * Math.round((Dn - base) / 360);
+    if (D < 540) D += 360 * Math.ceil((540 - D) / 360);
+    const d = r1(dir * D);
+    const T = r2(timeOf(speedFor(Math.abs(d))));
+    const ang = r1(mod(a0 + d, 360));
+    const m = s.on;
+    s.ang = ang; s.n++;
+    s.hs.push([win, seat]); while (s.hs.length > HIST) s.hs.shift();
+    if (s.el) s.on = s.on.slice(0, win) + '0' + s.on.slice(win + 1);
+    s.seq++; s.last = { id: s.seq, k: 'spin', s: seat, a0, d, T, w: win, m };
+    return s;
+  }
+  function apply(s, seat, a) {
+    if (!a || typeof a !== 'object') throw new Error('bad action');
+    const se = setterOf(s);
+    if (a.type === 'setup') {
+      if (s.ph !== 'set' || seat !== se) throw new Error('only the setter sets up');
+      if (!Array.isArray(a.it)) throw new Error('bad items');
+      const n = a.it.length;
+      if (n < MINI || n > MAXI) throw new Error('bad size');
+      s.it = a.it.map((x, k) => clean(x, ITEM_MAX) || defItem(k));
+      s.wt = s.it.map((_, k) => { const w = Array.isArray(a.wt) ? Math.round(Number(a.wt[k])) : 1; return w >= 1 && w <= MAXW ? w : 1; });
+      s.on = '1'.repeat(n); s.hs = []; s.ph = 'spin'; s.n = 0;
+      s.g = (Math.floor(Math.random() * 0x7fffffff) | 0) || 1;
+      s.seq++; s.last = { id: s.seq, k: 'setup' };
+      return s;
+    }
+    if (a.type === 'spin') {
+      if (s.ph !== 'spin') throw new Error('not spinning');
+      if (s.who === 'h' && seat !== se) throw new Error('host only');
+      return spin(s, seat, a);
+    }
+    if (a.type === 'reset') {
+      if (s.ph !== 'spin' || seat !== se) throw new Error('only the setter');
+      if (!s.on.includes('0')) throw new Error('nothing removed');
+      s.on = '1'.repeat(s.it.length);
+      s.seq++; s.last = { id: s.seq, k: 'reset' };
+      return s;
+    }
+    if (a.type === 'edit') {
+      if (s.ph !== 'spin' || seat !== se) throw new Error('only the setter');
+      s.ph = 'set';
+      s.seq++; s.last = { id: s.seq, k: 'edit' };
+      return s;
+    }
+    throw new Error('bad action');
+  }
+  function result() { return null; } // a tool: no game over; history stays on screen
+
+  /* ---------- drawing (shared by the big wheel and the setup preview) ---------- */
+  function luma(hex) { const n = parseInt(hex.slice(1), 16); return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255; }
+  const rad = (deg) => ((deg - 90) * Math.PI) / 180;
+  function drawWheel(ctx, cx, cy, R, o) {
+    const segs = o.segs, ang = o.ang, n = o.items.length;
+    const rim = Math.max(6, R * 0.075);
+    ctx.save();
+    // shadow + wooden rim
+    ctx.shadowColor = 'rgba(0,0,0,.55)'; ctx.shadowBlur = R * 0.12; ctx.shadowOffsetY = R * 0.04;
+    ctx.beginPath(); ctx.arc(cx, cy, R + rim, 0, Math.PI * 2);
+    const wood = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R); wood.addColorStop(0, '#7a4e2b'); wood.addColorStop(0.5, '#56351c'); wood.addColorStop(1, '#3b2312');
+    ctx.fillStyle = wood; ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.clip();
+    if (!segs.length) { ctx.fillStyle = '#2e2640'; ctx.fillRect(cx - R, cy - R, 2 * R, 2 * R); }
+    segs.forEach((sg) => {
+      const c = colorOf(sg.k, n);
+      ctx.beginPath(); ctx.moveTo(cx, cy);
+      if (sg.s1 - sg.s0 >= 359.99) ctx.arc(cx, cy, R + 1, 0, Math.PI * 2);
+      else ctx.arc(cx, cy, R + 1, rad(sg.s0 + ang), rad(sg.s1 + ang));
+      ctx.closePath();
+      ctx.fillStyle = c; ctx.fill();
+      if (o.win === sg.k && o.glow) { ctx.fillStyle = 'rgba(255,250,235,' + (0.18 + 0.22 * o.glow) + ')'; ctx.fill(); }
+      else if (o.win != null && o.win >= 0 && o.dim) { ctx.fillStyle = 'rgba(15,10,22,' + 0.38 * o.dim + ')'; ctx.fill(); }
+    });
+    // soft shading: lighter centre, darker edge
+    const sh = ctx.createRadialGradient(cx, cy, R * 0.1, cx, cy, R);
+    sh.addColorStop(0, 'rgba(255,255,255,.16)'); sh.addColorStop(0.7, 'rgba(255,255,255,0)'); sh.addColorStop(1, 'rgba(0,0,0,.22)');
+    ctx.fillStyle = sh; ctx.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+    // separators
+    if (segs.length > 1) {
+      ctx.strokeStyle = 'rgba(255,248,232,.85)'; ctx.lineWidth = Math.max(1, R * 0.012);
+      segs.forEach((sg) => { const a = rad(sg.s0 + ang); ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * R, cy + Math.sin(a) * R); ctx.stroke(); });
+    }
+    // labels
+    if (o.labels !== false) {
+      segs.forEach((sg) => {
+        const span = ((sg.s1 - sg.s0) * Math.PI) / 180, mid = (sg.s0 + sg.s1) / 2 + ang;
+        const t = o.items[sg.k] || '';
+        const c = colorOf(sg.k, n);
+        const maxW = R * 0.66, maxH = Math.min(R * 0.15, span * R * 0.58 * 0.82);
+        if (maxH < 6) return;
+        let fs = Math.floor(maxH), txt = t;
+        ctx.font = '700 ' + fs + 'px "IBM Plex Sans KR", "Apple SD Gothic Neo", sans-serif';
+        while (fs > 9 && ctx.measureText(txt).width > maxW) { fs--; ctx.font = '700 ' + fs + 'px "IBM Plex Sans KR", "Apple SD Gothic Neo", sans-serif'; }
+        if (ctx.measureText(txt).width > maxW) { const ch = [...t]; while (ch.length > 1 && ctx.measureText(ch.join('') + '…').width > maxW) ch.pop(); txt = ch.join('') + '…'; }
+        // labels run along the radius; on the left half they would read upside down, so turn them half round
+        // (they then read from the rim towards the hub, still left to right). The flip happens exactly at the
+        // vertical, where both ways read the same, so a spinning wheel shows no jump.
+        const a = rad(mid), flip = Math.cos(a) < -1e-6;
+        ctx.save(); ctx.translate(cx, cy); ctx.rotate(flip ? a + Math.PI : a);
+        ctx.textAlign = flip ? 'left' : 'right'; ctx.textBaseline = 'middle';
+        ctx.fillStyle = luma(c) > 0.6 ? '#2a1a12' : '#fffaf0';
+        if (luma(c) <= 0.6) { ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = 3; }
+        ctx.fillText(txt, flip ? -R * 0.9 : R * 0.9, 0);
+        ctx.restore();
+      });
+    }
+    ctx.restore();
+    // brass pegs on the rim at every boundary
+    if (segs.length > 1 && o.pegs !== false) {
+      segs.forEach((sg) => {
+        const a = rad(sg.s0 + ang), pr = R + rim * 0.5;
+        ctx.beginPath(); ctx.arc(cx + Math.cos(a) * pr, cy + Math.sin(a) * pr, Math.max(2, rim * 0.3), 0, Math.PI * 2);
+        ctx.fillStyle = '#f2c86a'; ctx.fill(); ctx.strokeStyle = 'rgba(60,35,10,.6)'; ctx.lineWidth = 1; ctx.stroke();
+      });
+    }
+    // rim inner line
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.strokeStyle = 'rgba(30,18,8,.55)'; ctx.lineWidth = 2; ctx.stroke();
+    // hub
+    const hr = Math.max(8, R * 0.14);
+    const hub = ctx.createRadialGradient(cx - hr * 0.3, cy - hr * 0.3, hr * 0.1, cx, cy, hr);
+    hub.addColorStop(0, '#fff0c4'); hub.addColorStop(0.45, '#e3ae45'); hub.addColorStop(1, '#8a5d17');
+    ctx.save(); ctx.shadowColor = 'rgba(0,0,0,.45)'; ctx.shadowBlur = hr * 0.5;
+    ctx.beginPath(); ctx.arc(cx, cy, hr, 0, Math.PI * 2); ctx.fillStyle = hub; ctx.fill(); ctx.restore();
+    if (o.hubText) {
+      ctx.fillStyle = '#3a2405'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.font = '400 ' + Math.round(hr * 0.5) + 'px "Black Han Sans", sans-serif'; ctx.fillText(o.hubText, cx, cy + 1);
+    }
+    // pointer (brass flap pinned above the rim)
+    const pw = Math.max(7, R * 0.085), ph = Math.max(14, R * 0.17), py = cy - R - rim * 0.55;
+    ctx.save(); ctx.translate(cx, py - pw * 0.4); ctx.rotate(((o.kick || 0) * Math.PI) / 180);
+    ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
+    ctx.beginPath(); ctx.moveTo(-pw, 0); ctx.lineTo(pw, 0); ctx.lineTo(0, ph); ctx.closePath();
+    const pg = ctx.createLinearGradient(-pw, 0, pw, 0); pg.addColorStop(0, '#b07a22'); pg.addColorStop(0.5, '#ffe29a'); pg.addColorStop(1, '#b07a22');
+    ctx.fillStyle = pg; ctx.fill(); ctx.shadowColor = 'transparent'; ctx.strokeStyle = '#5a3a0c'; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, pw * 0.55, 0, Math.PI * 2); ctx.fillStyle = '#5a3a0c'; ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 0, pw * 0.3, 0, Math.PI * 2); ctx.fillStyle = '#ffe29a'; ctx.fill();
+    ctx.restore();
+  }
+
+  /* ---------- view ---------- */
+  const CSS = `
+.wh-bg{position:absolute;inset:0;background:radial-gradient(110% 70% at 50% 38%,#33233f,#120e18)}
+.wh-bg::after{content:"";position:absolute;inset:0;background:repeating-conic-gradient(from 0deg at 50% 38%,rgba(227,174,69,.035) 0 6deg,transparent 6deg 12deg)}
+.wh-wrap{word-break:keep-all;overflow-wrap:anywhere;position:absolute;inset:0;z-index:1;display:flex;flex-direction:column}
+.wh-scroll{flex:1;min-height:0;overflow-y:auto;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:10px 12px 16px;scrollbar-width:none}
+.wh-scroll::-webkit-scrollbar{display:none}
+.wh-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:14px 12px;display:flex;flex-direction:column;gap:12px;max-width:520px;margin:0 auto;box-shadow:0 18px 40px rgba(0,0,0,.4)}
+.wh-head{display:flex;align-items:center;gap:12px}
+.wh-head canvas{flex:none;width:92px;height:92px}
+.wh-head .tt{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.wh-head h3{margin:0;font-family:var(--f-display);font-weight:400;font-size:24px;line-height:1.1}
+.wh-head .sub{font-size:12px;color:var(--muted);line-height:1.4}
+.wh-rows{display:flex;flex-direction:column;gap:6px}
+.wh-row{display:grid;grid-template-columns:16px minmax(0,1fr) 58px 40px;gap:6px;align-items:center;animation:fade .18s}
+.wh-row input{min-width:0;width:100%;height:44px;box-sizing:border-box;border-radius:11px;border:1px solid var(--line);background:var(--bg);padding:0 10px;font-size:16px;outline:none;color:var(--ink)}
+.wh-row input:focus{border-color:var(--brass);box-shadow:0 0 0 3px rgba(227,174,69,.18)}
+.wh-row input::placeholder{color:rgba(171,159,184,.55)}
+.wh-row .sw{width:14px;height:14px;border-radius:4px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
+.wh-wt{appearance:none;height:44px;border-radius:11px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);cursor:pointer;touch-action:manipulation;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.05;padding:0}
+.wh-wt b{font-family:var(--f-mono);font-size:14px}
+.wh-wt span{font-family:var(--f-mono);font-size:10px;color:var(--muted)}
+.wh-wt.up{border-color:var(--brass);background:#3a2e1c}
+.wh-wt.up b{color:var(--brass)}
+.wh-wt:active{transform:scale(.94)}
+.wh-x{appearance:none;border:0;background:transparent;color:var(--muted);height:44px;width:40px;border-radius:10px;font-size:18px;cursor:pointer;touch-action:manipulation}
+.wh-x:active{background:var(--surface-2)}
+.wh-x[disabled]{opacity:.25;pointer-events:none}
+.wh-add{border-style:dashed!important;background:transparent!important}
+.wh-sec{display:flex;flex-direction:column;gap:6px}
+.wh-sec .label{letter-spacing:.06em}
+.wh-chips{display:flex;flex-wrap:wrap;gap:6px}
+.wh-chips .btn{min-height:40px}
+.wh-chips .btn.on{background:var(--brass);color:var(--brass-ink);border-color:transparent}
+.wh-nums{display:flex;flex-wrap:wrap;gap:6px;padding:8px;border-radius:12px;background:var(--bg);border:1px dashed var(--line)}
+.wh-nums .btn{min-width:44px;min-height:40px;font-family:var(--f-mono)}
+.wh-meta{font-size:12px;color:var(--muted)}
+.wh-meta b{color:var(--ink)}
+.wh-bot{flex:none;padding:6px 12px calc(10px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:8px}
+.wh-btns{display:flex;gap:8px}
+.wh-btns .btn{flex:1 1 0;min-width:0;min-height:50px;padding:8px 6px}
+.wh-btns .btn{white-space:nowrap}
+.wh-btns .btn.primary{flex:1.6 1 0;font-size:17px}
+.wh-btns .btn.wait{opacity:.55}
+.wh-btns .btn.arm{background:#3a1d1c;border-color:var(--coral);color:#ffb3a5}
+.wh-area{flex:1;min-height:0;position:relative}
+.wh-res{display:flex;align-items:center;gap:10px;min-height:56px;padding:6px 14px;border-radius:14px;background:var(--surface);border:1px solid var(--line);overflow:hidden}
+.wh-res .sw{flex:none;width:18px;height:18px;border-radius:5px}
+.wh-res .t{flex:1;min-width:0;font-family:var(--f-display);font-size:26px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wh-res .who{flex:none;font-size:12px;color:var(--muted);max-width:34%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wh-res.hint .t{font-family:var(--f-body);font-size:14px;font-weight:500;color:var(--muted);white-space:normal}
+.wh-res.hint .t b{color:var(--ink)}
+.wh-res.pop{animation:wh-pop .5s cubic-bezier(.2,1.6,.4,1);border-color:var(--brass)}
+@keyframes wh-pop{0%{transform:scale(.85)}100%{transform:none}}
+.wh-hist{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;touch-action:pan-x;align-items:center;min-height:28px}
+.wh-hist::-webkit-scrollbar{display:none}
+.wh-hist .lab{flex:none;font-size:11px;font-weight:700;color:var(--muted)}
+.wh-h{flex:none;display:inline-flex;align-items:center;gap:5px;padding:3px 9px 3px 6px;border-radius:999px;background:var(--surface);border:1px solid var(--line);font-size:12px;font-weight:700;white-space:nowrap}
+.wh-h i{font-style:normal;font-family:var(--f-mono);font-size:10px;color:var(--muted)}
+.wh-h .sw{width:10px;height:10px;border-radius:3px}
+.wh-h.new{animation:wh-pop .4s cubic-bezier(.2,1.6,.4,1);border-color:var(--brass)}
+.wh-wait{margin:auto;text-align:center;display:flex;flex-direction:column;gap:10px;align-items:center;padding:24px}
+.wh-wait h3{margin:0;font-family:var(--f-display);font-weight:400;font-size:26px}
+`;
+
+  function mount(root, api) {
+    const h = L.h;
+    const styleEl = h('style', { text: CSS });
+    const bgEl = h('div', { class: 'wh-bg' });
+    const wrap = h('div', { class: 'wh-wrap' });
+    root.append(styleEl, bgEl, wrap);
+    const spd = () => L.debug.speed || 1;
+
+    let st = null, viewMode = '', draft = null, draftKey = -1, lastSeq = -1, pending = 0;
+    let cv = null, area = null, bot = null, botSig = '';
+    let disp = 0;                 // displayed rotation (unwrapped degrees)
+    let dispW = [];               // displayed weights (animate eliminations)
+    let anim = null, coast = null, drag = null, kick = 0, lastIdx = -1, lastTick = 0, lastBuzz = 0;
+    let won = -1, wonT = 0, parts = [], dirty = true, showMask = null, armT = 0, armedKey = '';
+    let stopLoop = null;
+    const offs = [];
+
+    const me = () => { const m = api.mySeats(); return m.length ? m[0] : -1; };
+    const setter = () => (st ? setterOf(st) : -1);
+    const iAmSetter = () => setter() >= 0 && api.canAct(setter());
+    const pname = (seat) => (api.players[seat] ? api.players[seat].name : '?');
+    const canSpin = () => {
+      if (!st || st.ph !== 'spin') return false;
+      const a = L.actorsOf({ actor }, st);
+      return a.some((x) => api.canAct(x));
+    };
+    const busyNow = () => !!(anim || coast);
+
+    function arm(key, el, label, fn) {
+      if (armedKey === key) { clearTimeout(armT); armedKey = ''; fn(); return; }
+      clearTimeout(armT); armedKey = key;
+      const old = el.textContent; el.classList.add('arm'); el.textContent = label; api.buzz(10);
+      armT = setTimeout(() => { armedKey = ''; if (el.isConnected) { el.classList.remove('arm'); el.textContent = old; } }, 2600);
+    }
+
+    /* =============== setup =============== */
+    let rowsBox = null, startBtn = null, addBtn = null, scrollEl = null, presetBox = null, numBox = null, prev = null, prevCtx = null, subEl = null;
+    function makeDraft() { draft = { rows: st.it.map((t, k) => ({ t, w: st.wt[k] || 1 })), pre: null, nums: false }; }
+    function setRows(list, pre) { draft.rows = list.slice(0, MAXI).map((t) => ({ t, w: 1 })); draft.pre = pre || null; api.sfx('card'); api.buzz(8); drawRows(); }
+    function buildSetup() {
+      wrap.innerHTML = '';
+      prev = h('canvas', { width: 184, height: 184, 'aria-hidden': 'true' }); prevCtx = prev.getContext('2d');
+      subEl = h('span', { class: 'sub' });
+      rowsBox = h('div', { class: 'wh-rows' });
+      addBtn = h('button', { class: 'btn wh-add', type: 'button', text: '+ 항목 추가', onclick: addRow });
+      presetBox = h('div', { class: 'wh-chips' });
+      numBox = h('div', { class: 'wh-nums', hidden: true });
+      [2, 3, 4, 5, 6, 8, 10, 12, 16, 20].forEach((n) => numBox.append(h('button', { class: 'btn sm', type: 'button', text: String(n), onclick() {
+        draft.nums = false; numBox.hidden = true; setRows(Array.from({ length: n }, (_, k) => String(k + 1)), 'num');
+      } })));
+      const card = h('div', { class: 'wh-card' },
+        h('div', { class: 'wh-head' }, prev, h('div', { class: 'tt' }, h('h3', { text: '돌림판 만들기' }), subEl)),
+        rowsBox, addBtn,
+        h('div', { class: 'wh-sec' }, h('span', { class: 'label', text: '빠르게 채우기' }), presetBox, numBox),
+        h('div', { class: 'wh-meta', html: '당첨 제외 <b>' + (st.el ? '켜짐' : '꺼짐') + '</b>' + (api.online ? ' · 돌리는 사람 <b>' + (st.who === 'h' ? '방장만' : '아무나') + '</b>' : '') + ' <span>(게임 설정에서 바꿔요)</span>' }));
+      scrollEl = h('div', { class: 'wh-scroll' }, card);
+      startBtn = h('button', { class: 'btn primary', 'data-action': 'start', type: 'button', onclick: submitSetup });
+      bot = h('div', { class: 'wh-bot' }, h('div', { class: 'wh-btns' }, startBtn));
+      wrap.append(scrollEl, bot);
+      drawRows();
+    }
+    function drawPresets() {
+      presetBox.innerHTML = '';
+      const saved = U.store.get('wheel.last', null);
+      const chips = [
+        ['num', '숫자 1~N', () => { draft.nums = !draft.nums; numBox.hidden = !draft.nums; api.sfx('click'); }],
+        ['yn', '예/아니오', () => setRows(['예', '아니오'], 'yn')],
+        ['menu', '메뉴 추천', () => setRows(pick(MENU, 8, Math.random), 'menu')],
+        ['pen', '벌칙 모음', () => setRows(pick(PENALTY, 8, Math.random), 'pen')],
+        ['cafe', '카페 음료', () => setRows(pick(CAFE, 8, Math.random), 'cafe')],
+        ['wk', '주말 뭐 하지', () => setRows(pick(WEEKEND, 8, Math.random), 'wk')],
+        ['chore', '집안일 당번', () => setRows(CHORE.slice(), 'chore')],
+        ['talk', '대화 주제', () => setRows(pick(TALK, 8, Math.random), 'talk')],
+        ['ply', '플레이어 이름', () => {
+          const names = st.hm.map((i) => clean(pname(i), ITEM_MAX)).filter((x) => x);
+          if (names.length < 2) { api.toast('사람이 2명 이상일 때 쓸 수 있어요'); return; }
+          setRows(names, 'ply');
+        }],
+      ];
+      if (saved && Array.isArray(saved.it) && saved.it.length >= MINI) chips.push(['last', '지난 설정 (' + saved.it.length + '개)', () => {
+        draft.rows = saved.it.slice(0, MAXI).map((t, k) => ({ t: clean(t, ITEM_MAX), w: U.clamp(Math.round(Number(saved.wt && saved.wt[k]) || 1), 1, MAXW) }));
+        draft.pre = 'last'; api.sfx('card'); drawRows();
+      }]);
+      chips.forEach(([k, t, fn]) => presetBox.append(h('button', { class: 'btn sm' + (draft.pre === k || (k === 'num' && draft.nums) ? ' on' : ''), type: 'button', text: t, onclick: fn })));
+    }
+    function addRow() {
+      if (draft.rows.length >= MAXI) { api.toast('최대 ' + MAXI + '개까지예요'); return; }
+      draft.rows.push({ t: '', w: 1 }); draft.pre = null; api.sfx('click');
+      drawRows();
+      const ins = rowsBox.querySelectorAll('input'); const last = ins[ins.length - 1];
+      if (last) { try { last.focus({ preventScroll: true }); } catch (e) { last.focus(); } keepVisible(last); }
+    }
+    function drawRows() {
+      rowsBox.innerHTML = '';
+      const tot = draft.rows.reduce((a, r) => a + r.w, 0);
+      draft.rows.forEach((row, k) => {
+        const inp = h('input', { type: 'text', maxlength: ITEM_MAX, placeholder: defItem(k), autocomplete: 'off', enterkeyhint: k === draft.rows.length - 1 ? 'done' : 'next', 'aria-label': (k + 1) + '번 항목' });
+        inp.value = row.t;
+        inp.addEventListener('input', () => { row.t = inp.value; if (draft.pre) { draft.pre = null; drawPresets(); } paintPreview(); });
+        inp.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+            e.preventDefault();
+            const nx = rowsBox.querySelectorAll('input')[k + 1];
+            if (nx) { nx.focus(); keepVisible(nx); } else inp.blur();
+          }
+        });
+        inp.addEventListener('focus', () => setTimeout(() => keepVisible(inp), 280));
+        const pct = Math.round((row.w / tot) * 100);
+        const wt = h('button', { class: 'wh-wt' + (row.w > 1 ? ' up' : ''), type: 'button', 'aria-label': '가중치 ×' + row.w + ', 눌러서 바꾸기', onclick() {
+          row.w = row.w % MAXW + 1; api.sfx('tick'); api.buzz(6); drawRows();
+        } }, h('b', { text: '×' + row.w }), h('span', { text: pct + '%' }));
+        const del = h('button', { class: 'wh-x', type: 'button', text: '✕', 'aria-label': (k + 1) + '번 항목 지우기', disabled: draft.rows.length <= MINI ? true : null, onclick() {
+          if (draft.rows.length <= MINI) return;
+          draft.rows.splice(k, 1); draft.pre = null; api.sfx('click'); drawRows();
+        } });
+        rowsBox.append(h('div', { class: 'wh-row' }, h('span', { class: 'sw', style: { background: colorOf(k, draft.rows.length) } }), inp, wt, del));
+      });
+      addBtn.hidden = draft.rows.length >= MAXI;
+      startBtn.textContent = '돌림판 완성 · ' + draft.rows.length + '칸';
+      subEl.textContent = draft.rows.length + '칸 · 오른쪽 ×숫자를 누르면 그 칸이 넓어져요(당첨 확률 ↑)';
+      drawPresets(); paintPreview();
+    }
+    function paintPreview() {
+      if (!prevCtx) return;
+      const c = prevCtx; c.setTransform(1, 0, 0, 1, 0, 0); c.clearRect(0, 0, 184, 184); c.setTransform(2, 0, 0, 2, 0, 0);
+      const items = draft.rows.map((r, k) => clean(r.t, ITEM_MAX) || defItem(k));
+      drawWheel(c, 46, 49, 36, { segs: segsOf(draft.rows.map((r) => r.w)), ang: 0, items, labels: false, pegs: draft.rows.length <= 12 });
+    }
+    function keepVisible(el) {
+      if (!el || !el.isConnected || !scrollEl) return;
+      const vv = window.visualViewport;
+      const visBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+      const sr = scrollEl.getBoundingClientRect(), r = el.getBoundingClientRect();
+      const kb = vv ? Math.max(0, window.innerHeight - visBottom) : 0;
+      scrollEl.style.paddingBottom = kb ? kb + 24 + 'px' : '';
+      const bottomLimit = Math.min(sr.bottom, visBottom) - 12;
+      if (r.bottom > bottomLimit) scrollEl.scrollTop += r.bottom - bottomLimit;
+      else if (r.top < sr.top + 8) scrollEl.scrollTop -= sr.top + 8 - r.top;
+    }
+    if (window.visualViewport) {
+      const f = () => { const a = document.activeElement; if (a && scrollEl && scrollEl.contains(a)) keepVisible(a); else if (scrollEl) scrollEl.style.paddingBottom = ''; };
+      window.visualViewport.addEventListener('resize', f);
+      offs.push(() => window.visualViewport.removeEventListener('resize', f));
+    }
+    function submitSetup() {
+      if (!iAmSetter() || st.ph !== 'set') return;
+      if (pending && performance.now() - pending < 3000) return;
+      const it = draft.rows.map((r, k) => clean(r.t, ITEM_MAX) || defItem(k));
+      const wt = draft.rows.map((r) => r.w);
+      U.store.set('wheel.last', { it, wt });
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      api.sfx('whoosh'); api.buzz([12, 30, 12]);
+      pending = api.online ? performance.now() : 0;
+      if (api.online) { startBtn.textContent = '보내는 중…'; startBtn.classList.add('wait'); }
+      api.act({ type: 'setup', it, wt });
+    }
+
+    /* =============== waiting =============== */
+    function buildWait() {
+      wrap.innerHTML = '';
+      const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      s.setAttribute('viewBox', '0 0 56 56'); s.setAttribute('width', '72'); s.setAttribute('height', '72'); s.style.color = 'var(--brass)'; s.innerHTML = ICON;
+      wrap.append(h('div', { class: 'wh-wait' }, s, h('h3', { text: '돌림판 준비 중' }),
+        h('p', { class: 'note', style: { margin: 0 }, text: (setter() >= 0 ? pname(setter()) : '방장') + '님이 항목을 적고 있어요. 다 되면 바로 열려요.' })));
+    }
+
+    /* =============== spin view =============== */
+    function buildSpin() {
+      wrap.innerHTML = '';
+      area = h('div', { class: 'wh-area' });
+      bot = h('div', { class: 'wh-bot' });
+      wrap.append(area, bot);
+      cv = U.canvas(area);
+      cv.onresize = () => { dirty = true; };
+      cv.cv.addEventListener('pointerdown', onDown);
+      cv.cv.addEventListener('pointermove', onMove);
+      cv.cv.addEventListener('pointerup', onUp);
+      cv.cv.addEventListener('pointercancel', onCancel);
+      botSig = ''; dirty = true;
+    }
+    function geo() {
+      const W = cv.w, H = cv.h;
+      const R = Math.max(40, Math.min(W / 2 - 22, (H - 46) / 2 - 10));
+      return { cx: W / 2, cy: H / 2 + 14, R };
+    }
+    function targetW(mask) { return weightsOf(st, mask || showMask || st.on); }
+    function curSegs() { return segsOf(dispW); }
+
+    function draw(now) {
+      if (!cv || !st || st.ph !== 'spin') return;
+      const ctx = cv.ctx, G = geo();
+      cv.clear();
+      const glow = won >= 0 ? (now - wonT < 2600 / spd() ? 0.5 + 0.5 * Math.sin((now - wonT) / 140) : 0.6) : 0;
+      const el = (now - wonT) * spd(), dimA = won >= 0 ? U.clamp(el / 300, 0, 1) * U.clamp((3200 - el) / 600, 0, 1) : 0;
+      drawWheel(ctx, G.cx, G.cy, G.R, { segs: curSegs(), ang: disp, items: st.it, win: won, glow, dim: dimA, kick, hubText: canSpin() && !busyNow() ? '돌려' : '' });
+      if (parts.length) {
+        const dt = Math.min(0.05, (now - (draw.lt || now)) / 1000) * spd();
+        parts = parts.filter((p) => (p.life -= dt) > 0);
+        parts.forEach((p) => {
+          p.vy += 560 * dt; p.vx *= 0.99; p.x += p.vx * dt; p.y += p.vy * dt; p.a += p.va * dt;
+          ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.globalAlpha = Math.min(1, p.life * 2);
+          ctx.fillStyle = p.c; ctx.fillRect(-p.s / 2, -p.s / 4, p.s, p.s / 2); ctx.restore();
+        });
+      }
+      draw.lt = now;
+    }
+    function burst(x, y, c) {
+      for (let k = 0; k < 70; k++) {
+        const a = Math.random() * Math.PI * 2, v = 160 + Math.random() * 380;
+        parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 200, a: Math.random() * 6, va: (Math.random() - 0.5) * 14, s: 6 + Math.random() * 6, life: 1.1 + Math.random() * 0.8,
+          c: k % 3 === 0 ? '#fff4dc' : k % 3 === 1 ? c : PALW[(Math.random() * PALW.length) | 0] });
+      }
+      if (parts.length > 300) parts.splice(0, parts.length - 300);
+    }
+    function onTickCheck(now) {
+      const idx = itemAt(curSegs(), disp);
+      if (idx !== lastIdx) {
+        if (lastIdx !== -1 && (anim || coast || drag)) {
+          kick = (anim ? Math.sign(anim.d) : coast ? coast.dir : 1) * -22;
+          if (now - lastTick > 32) { api.sfx('tick'); lastTick = now; }
+          if (now - lastBuzz > 55) { api.buzz(4); lastBuzz = now; }
+        }
+        lastIdx = idx;
+      }
+    }
+
+    /* animation of a stored spin; tc = seconds already shown by a local coast */
+    function startAnim(l, tc) {
+      const v = speedFor(Math.abs(l.d));
+      const T = timeOf(v), full = thetaAt(v, T);
+      // land exactly on a0 + d (mod 360) from wherever the wheel is shown now
+      let from, d;
+      if (tc > 0) { from = coast.from; d = l.d + (mod(l.a0 - coast.from + 180, 360) - 180); }
+      else { from = disp; d = l.d + (mod(l.a0 - disp + 180, 360) - 180); }
+      anim = { from, d, v, T, full, t0: performance.now() - (tc * 1000) / spd(), w: l.w, s: l.s, id: l.id, m: l.m };
+      coast = null; won = -1; showMask = l.m; dirty = true;
+      api.setBusy(true);
+    }
+    function finishAnim(now) {
+      const a = anim; anim = null;
+      disp = mod(a.from + a.d, 360);
+      dispW = targetW(a.m); // exact geometry at the landing moment
+      kick = 0; won = a.w; wonT = now;
+      const G = geo(); burst(G.cx, G.cy - G.R - 6, colorOf(a.w, st.it.length));
+      api.sfx('win'); api.buzz([30, 50, 30]);
+      renderBot(true, true);
+      // elimination: the winner leaves the wheel after a beat
+      setTimeout(() => { showMask = null; if (st && st.el && won === a.w) won = -1; dirty = true; api.setBusy(false); }, (st.el ? 1400 : 600) / spd());
+    }
+
+    /* flick input */
+    function polar(e) { const p = cv.local(e), G = geo(); return { a: (Math.atan2(p.y - G.cy, p.x - G.cx) * 180) / Math.PI + 90, r: Math.hypot(p.x - G.cx, p.y - G.cy), G }; }
+    function onDown(e) {
+      if (!st || st.ph !== 'spin') return;
+      const p = polar(e);
+      if (p.r > p.G.R * 1.15) return;
+      if (busyNow()) return;
+      if (!canSpin()) { api.toast(st.who === 'h' ? '방장만 돌릴 수 있어요' : '구경 중이에요'); return; }
+      if (activeOf(st).length < 2) { api.toast('남은 항목이 하나뿐이에요'); return; }
+      if (pending && performance.now() - pending < 3000) return;
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
+      won = -1;
+      drag = { id: e.pointerId, last: p.a, acc: 0, hub: p.r < p.G.R * 0.2, samples: [{ t: performance.now(), a: 0 }], start: disp };
+      api.buzz(6);
+    }
+    function onMove(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      const p = polar(e);
+      if (p.r < p.G.R * 0.12) return; // too close to the centre to read an angle
+      const da = mod(p.a - drag.last + 180, 360) - 180;
+      drag.last = p.a; drag.acc += da; disp += da;
+      const now = performance.now();
+      drag.samples.push({ t: now, a: drag.acc });
+      while (drag.samples.length > 2 && now - drag.samples[0].t > 120) drag.samples.shift();
+      onTickCheck(now); dirty = true;
+    }
+    function onCancel() { drag = null; }
+    function onUp(e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      const d = drag; drag = null;
+      const now = performance.now();
+      const ss = d.samples, last = ss[ss.length - 1];
+      let s0 = ss.find((x) => now - x.t <= 120) || ss[0];
+      if (s0 === last && ss.length > 1 && now - last.t < 60) s0 = ss[ss.length - 2]; // slow frame rate: use the previous sample
+      const dt = Math.max(16, now - s0.t);
+      const w = ((d.acc - s0.a) / dt) * 1000; // deg/s
+      if (Math.abs(d.acc) < 3 && d.hub) { doSpin(); return; }
+      if (Math.abs(w) >= 300) { doSpin(w * 1.1); return; }
+      if (Math.abs(d.acc) > 10) { api.toast('휙! 더 빠르게 튕겨 주세요'); api.buzz(15); }
+    }
+    function doSpin(w) {
+      if (!canSpin() || busyNow()) return;
+      if (activeOf(st).length < 2) { api.toast('남은 항목이 하나뿐이에요'); return; }
+      if (pending && performance.now() - pending < 3000) return;
+      const v = w == null ? 1150 + Math.random() * 400 : w;
+      won = -1;
+      api.sfx('whoosh'); api.buzz(14);
+      const a = r1(mod(disp, 360));
+      if (api.online && !api.isHost) {
+        // guest: keep the wheel moving while the host computes the landing
+        const dir = v < 0 ? -1 : 1, vv = U.clamp(Math.abs(v), 500, 2600);
+        coast = { from: disp, dir, v: vv, t0: performance.now() };
+        pending = performance.now();
+        api.setBusy(true);
+      }
+      api.act({ type: 'spin', v: Math.round(v), a });
+      renderBot(true);
+    }
+
+    /* bottom bar */
+    function renderBot(force, fresh) {
+      if (!bot || viewMode !== 'spin') return;
+      const sig = [st.seq, busyNow() ? 1 : 0, won, canSpin(), iAmSetter(), pending ? 1 : 0].join('|');
+      if (!force && sig === botSig) return;
+      botSig = sig;
+      bot.innerHTML = '';
+      const act = activeOf(st), spinning = busyNow();
+      const lastSpin = st.last && st.last.k === 'spin' ? st.last : null;
+      let res;
+      if (spinning) res = h('div', { class: 'wh-res hint' }, h('span', { class: 't', html: '<b>두근두근…</b> 돌아가는 중' + (anim && api.online ? ' · ' + pname(anim.s) : '') }));
+      else if (lastSpin && st.n > 0 && (won >= 0 || !fresh)) {
+        const k = lastSpin.w;
+        res = h('div', { class: 'wh-res' + (fresh ? ' pop' : '') }, h('span', { class: 'sw', style: { background: colorOf(k, st.it.length) } }), h('span', { class: 't', text: st.it[k] }),
+          api.online ? h('span', { class: 'who', text: pname(lastSpin.s) + ' 돌림' }) : null);
+      } else if (act.length < 2) res = h('div', { class: 'wh-res hint' }, h('span', { class: 't', html: '남은 항목: <b></b>' }));
+      else res = h('div', { class: 'wh-res hint' }, h('span', { class: 't', html: canSpin() ? '판을 손가락으로 <b>휙</b> 돌리거나 <b>돌리기</b>를 눌러요' : (st.who === 'h' ? '방장이 돌려요' : '다른 사람이 돌리는 걸 기다려요') }));
+      if (act.length < 2 && !spinning && res.querySelector('b') && !(lastSpin && won >= 0)) res.querySelector('b').textContent = act.length ? st.it[act[0]] : '없음';
+      bot.append(res);
+      if (!spinning && st.hs.length >= 3) {
+        const cnt = {}; st.hs.forEach((x) => { cnt[x[0]] = (cnt[x[0]] || 0) + 1; });
+        const top = Object.keys(cnt).map(Number).sort((a, b) => cnt[b] - cnt[a])[0];
+        if (cnt[top] >= 2) bot.append(h('div', { class: 'wh-meta', style: { textAlign: 'center' } },
+          '최근 ' + st.hs.length + '번 중 가장 많이: ', h('b', { text: st.it[top] }), ' ' + cnt[top] + '번'));
+      }
+      if (st.hs.length) {
+        const list = st.hs.map((x, j) => ({ k: x[0], s: x[1], no: st.n - st.hs.length + j + 1 })).reverse();
+        const shownList = list.filter((_, j) => !(spinning && j === 0)); // don't spoil the running spin
+        if (shownList.length) bot.append(h('div', { class: 'wh-hist' }, h('span', { class: 'lab', text: '기록' }),
+          shownList.map((x, j) => h('span', { class: 'wh-h' + (fresh && j === 0 ? ' new' : '') }, h('i', { text: x.no + '' }), h('span', { class: 'sw', style: { background: colorOf(x.k, st.it.length) } }), st.it[x.k]))));
+      }
+      const row = h('div', { class: 'wh-btns' });
+      if (iAmSetter()) {
+        const ed = h('button', { class: 'btn', type: 'button', text: '항목 바꾸기' });
+        ed.onclick = () => { if (busyNow()) return; arm('edit', ed, '한 번 더 누르면 수정', () => { api.sfx('click'); api.act({ type: 'edit' }); }); };
+        row.append(ed);
+        if (st.on.includes('0')) row.append(h('button', { class: 'btn', 'data-action': 'reset', type: 'button', text: '되살리기 ' + (st.it.length - act.length), onclick() { if (busyNow()) return; api.sfx('card'); api.buzz(10); won = -1; api.act({ type: 'reset' }); } }));
+      }
+      if (canSpin()) {
+        const can = act.length >= 2 && !spinning && !pending;
+        row.append(h('button', { class: 'btn primary' + (can ? '' : ' wait'), 'data-action': 'spin', type: 'button', text: act.length < 2 ? '다 뽑았어요' : spinning ? '돌아가는 중…' : '돌리기', onclick() { doSpin(); } }));
+      }
+      if (row.childNodes.length) bot.append(row);
+    }
+
+    /* ----- state handling ----- */
+    function render(prevSt) {
+      const mode = st.ph === 'set' ? (iAmSetter() ? 'setup' : 'wait') : 'spin';
+      if (mode !== viewMode) {
+        viewMode = mode;
+        if (cv) { cv.destroy(); cv = null; }
+        area = bot = null; scrollEl = null; prevCtx = null;
+        anim = coast = drag = null; won = -1; parts = []; showMask = null; api.setBusy(false);
+        if (mode === 'setup') { makeDraft(); draftKey = st.seq; buildSetup(); }
+        else if (mode === 'wait') buildWait();
+        else { buildSpin(); disp = st.ang; dispW = targetW(st.on); lastIdx = -1; }
+      } else if (mode === 'setup' && draftKey !== st.seq) { makeDraft(); draftKey = st.seq; buildSetup(); }
+      else if (mode === 'wait') buildWait();
+      if (mode === 'spin') {
+        const l = st.last;
+        if (l && l.k === 'spin' && l.id !== lastSeq && lastSeq !== -1 && prevSt) {
+          const tc = coast ? (performance.now() - coast.t0) / 1000 * spd() : 0;
+          let useTc = 0;
+          if (coast && coast.dir === Math.sign(l.d)) {
+            // find where on the real curve the coast has reached
+            const v = speedFor(Math.abs(l.d)), T = timeOf(v), shownD = Math.abs(disp - coast.from);
+            if (shownD < Math.abs(l.d) * 0.85) { let lo = 0, hi = T; for (let k = 0; k < 40; k++) { const m = (lo + hi) / 2; if (thetaAt(v, m) < shownD) lo = m; else hi = m; } useTc = lo; }
+          }
+          if (!useTc) coast = null;
+          startAnim(l, useTc);
+          void tc;
+        } else if (l && l.k === 'reset' && l.id !== lastSeq) { won = -1; showMask = null; }
+        if (!anim && !showMask) { /* geometry follows the state */ }
+        renderBot();
+      }
+      if (st.last) lastSeq = st.last.id;
+      else lastSeq = 0;
+      dirty = true;
+    }
+
+    stopLoop = U.loop((dt, now) => {
+      if (!cv || !st || st.ph !== 'spin') return;
+      let moving = false;
+      if (anim) {
+        const t = Math.min(anim.T, ((now - anim.t0) / 1000) * spd());
+        disp = anim.from + (anim.d * thetaAt(anim.v, t)) / anim.full;
+        moving = true;
+        if (t >= anim.T) finishAnim(now);
+      } else if (coast) {
+        const t = ((now - coast.t0) / 1000) * spd(), T = timeOf(coast.v);
+        disp = coast.from + coast.dir * thetaAt(coast.v, Math.min(t, T));
+        moving = true;
+        if (t > T + 3) { coast = null; disp = st.ang; pending = 0; api.setBusy(false); renderBot(true); }
+      }
+      // displayed weights glide to their targets (eliminations shrink away)
+      const tw = targetW();
+      if (dispW.length !== tw.length) dispW = tw.slice();
+      let wMoving = false;
+      for (let k = 0; k < tw.length; k++) {
+        const df = tw[k] - dispW[k];
+        if (Math.abs(df) > 0.002) { dispW[k] += df * Math.min(1, dt * 7 * spd()); wMoving = true; } else dispW[k] = tw[k];
+      }
+      if (kick) { kick *= Math.pow(0.0009, dt); if (Math.abs(kick) < 0.3) kick = 0; }
+      if (moving || drag) onTickCheck(now);
+      if (dirty || moving || wMoving || kick || parts.length || (won >= 0 && now - wonT < 3300 / spd()) || drag) { dirty = false; draw(now); }
+    });
+
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prevSt) {
+        st = next;
+        if (prevSt && prevSt !== next && prevSt.seq !== next.seq) pending = 0;
+        if (pending && performance.now() - pending > 4000) pending = 0;
+        const l = st.last;
+        if (l && l.id !== lastSeq && lastSeq !== -1 && prevSt && prevSt !== next) {
+          if (l.k === 'setup' && api.online && !iAmSetter()) { api.sfx('card'); api.toast('돌림판이 준비됐어요!'); }
+          else if (l.k === 'edit' && api.online && !iAmSetter()) api.toast('방장이 항목을 고치는 중이에요');
+          else if (l.k === 'reset') api.toast('뽑힌 항목을 모두 되살렸어요');
+        }
+        render(prevSt && prevSt !== next ? prevSt : null);
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true);
+        if (stopLoop) stopLoop();
+        clearTimeout(armT);
+        offs.forEach((f) => f());
+        if (cv) cv.destroy();
+        api.setBusy(false);
+        styleEl.remove(); bgEl.remove(); wrap.remove();
+      },
+    };
+  }
+
+  const ICON = '<circle cx="28" cy="31" r="20" fill="none" stroke="currentColor" stroke-width="3.5"/><path d="M28 31V11M28 31l17.3 10M28 31l-17.3 10" stroke="currentColor" stroke-width="2.5"/><path d="M28 31L45.3 21A20 20 0 0 0 28 11z" fill="currentColor" opacity=".55"/><path d="M28 31L10.7 41A20 20 0 0 0 28 51z" fill="currentColor" opacity=".55"/><circle cx="28" cy="31" r="4" fill="currentColor"/><path d="M22 3h12l-6 10z" fill="currentColor"/>';
+
+  L.register({
+    id: 'wheel', name: '돌림판', tag: '정하기 도구', cat: '파티', noAI: true,
+    icon: ICON, tint: '#8a4a12',
+    blurb: '항목을 적고 판을 손가락으로 휙 돌려요. 똑딱똑딱 바늘이 멈춘 곳이 당첨! 메뉴·벌칙·순서 정하기에.',
+    quick: [
+      '돌림판에 넣을 항목(메뉴 · 벌칙 · 이름 …)을 2~20개 적고 「돌림판 완성」을 눌러요.',
+      '판을 손가락으로 휙 튕기거나 「돌리기」를 누르면 돌다가 멈춰요. 위쪽 바늘이 가리키는 칸이 당첨!',
+      '이기고 지는 게임이 아니라 정하기 도구예요. 칸이 넓을수록(가중치) 잘 걸려요.',
+    ],
+    tutorial: [
+      { text: '돌림판은 메뉴 · 벌칙 · 순서를 재미있게 정하는 도구예요. 점수나 승패는 없어요.' },
+      { text: '항목을 2~20개 적어요. 오른쪽 ×숫자를 누르면 가중치(×1~×5)가 바뀌어 그 칸이 넓어지고 잘 걸려요. 「빠르게 채우기」도 있어요.' },
+      { text: '다 적었으면 「돌림판 완성」. 판을 손가락으로 휙 튕기거나 「돌리기」를 누르면 돌아요.' },
+      { text: '판이 멈추면 바늘이 가리킨 칸이 당첨! 결과는 아래 「기록」에 쌓여요.' },
+    ],
+    rules: [
+      { h: '목표', p: [
+        '메뉴 · 벌칙 · 순서 · 당번을 재미있게 정하는 도구예요. 점수나 승패는 없어요.',
+        '사람이 쓰는 도구라 AI 자리는 아무것도 하지 않아요.'] },
+      { h: '준비 — 항목 적기', p: [
+        '① 항목을 2개부터 20개까지 적어요. 색은 자동으로 칠해져요. 비워 두면 「항목 N」이 돼요.',
+        '② 항목 오른쪽 ×숫자를 누르면 가중치가 ×1~×5로 바뀌어요. 가중치만큼 칸이 넓어지고 당첨 확률도 그만큼 커져요(×숫자 아래 작은 %가 확률이에요).',
+        '③ 빠르게 채우기: 숫자 1~N · 예/아니오 · 메뉴 추천 · 벌칙 모음 · 카페 음료 · 주말 뭐 하지 · 집안일 당번 · 대화 주제 · 플레이어 이름 · 지난 설정.',
+        '④ 다 적었으면 아래 「돌림판 완성」을 눌러요.'] },
+      { h: '할 일 — 돌리기', p: [
+        '판을 손가락으로 휙 튕기면 튕긴 빠르기만큼 세게 돌아요. 너무 느리면 돌지 않아요(「더 빠르게 튕겨 주세요」가 떠요).',
+        '「돌리기」 버튼이나 가운데 「돌려」를 눌러도 돼요.',
+        '판은 점점 느려지다 멈춰요. 칸을 지날 때마다 바늘이 똑딱거려요.'] },
+      { h: '결과', p: [
+        '멈췄을 때 위쪽 바늘이 가리키는 칸이 당첨이에요.',
+        '결과는 아래 기록에 쌓여요(최근 12번). 세 번 이상 돌리면 그중 가장 많이 나온 항목도 보여 줘요.'] },
+      { h: '특수 규칙 — 당첨 항목 제외', p: [
+        '게임 설정에서 「당첨 항목 제외하고 다시 돌리기」를 켜면, 당첨된 항목은 판에서 빠지고 남은 항목으로 다시 돌려요. 순서 정하기에 좋아요.',
+        '하나만 남으면 더 돌릴 수 없어요. 「되살리기」로 빠진 항목을 모두 되돌릴 수 있어요.'] },
+      { h: '각자 폰으로 (온라인)', p: [
+        '방장이 항목을 적고, 모두 같은 돌림판을 봐요. 한 번 돌리면 모든 폰에서 똑같이 돌고 똑같은 칸에 멈춰요.',
+        '돌리는 사람 「아무나」(기본): 누구든 돌릴 수 있어요. 「방장만」: 방장만 돌리고 나머지는 구경해요.',
+        '항목 바꾸기와 되살리기는 방장만 할 수 있어요.'] },
+      { h: '예시', p: [
+        '점심 메뉴: 「메뉴 추천」으로 채우고, 짜장면은 ×2로 넓혀요(남들보다 2배 잘 걸려요).',
+        '판을 휙! → 똑딱똑딱… 바늘이 「김밥」에서 멈췄어요. 오늘 점심은 김밥!',
+        '발표 순서: 이름을 적고 「당첨 항목 제외」를 켜서 돌릴 때마다 한 명씩 빠지게 해요.'] },
+    ],
+    options: [
+      { id: 'elim', label: '당첨 항목 제외하고 다시 돌리기', tip: '켜면 뽑힌 항목은 빼고 남은 것으로 다시 돌려요.', choices: [{ v: 0, label: '끄기' }, { v: 1, label: '켜기' }], def: 0 },
+      { id: 'spinner', label: '돌리는 사람 (온라인)', tip: '온라인에서 누가 돌림판을 돌릴 수 있는지.', choices: [{ v: 'any', label: '아무나' }, { v: 'host', label: '방장만' }], def: 'any' },
+    ],
+    controls: [
+      { id: 'spin', label: '돌리기', keys: ['Space', 'Enter'], pad: ['a'] },
+      { id: 'start', label: '시작(항목 확정)', keys: ['Enter'], pad: ['start'] },
+      { id: 'reset', label: '되살리기', keys: ['KeyR'], pad: ['x'] },
+    ],
+    minPlayers: 1, maxPlayers: 6, defaultPlayers: 1, aiDelay: 300,
+    init, actor, apply, result, mount,
+    ai: () => null,
+    aiDelayFor: () => -1,
+    _t: { segsOf, itemAt, weightsOf, distOf, timeOf, thetaAt, speedFor, activeOf, clean, prng, MAXI, MINI },
+  });
+})();

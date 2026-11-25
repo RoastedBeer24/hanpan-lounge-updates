@@ -1,0 +1,824 @@
+/* 농구 슛 대결 — 3점 슛 콘테스트식 차례제 슈팅.
+   결정적 고정 스텝 3D 물리(중력·백스핀·림 토러스/백보드/바닥 충돌·그물 감속): apply가 끝까지 시뮬레이션해
+   골 여부를 정하고, 뷰는 last.sh(반올림한 발사 벡터)로 같은 Sim을 재생한다(+ − × ÷ √ 만 사용).
+   단위: 미터·초. 원점 = 림 중심 바로 아래 바닥, z 위쪽, y = 림에서 코트 쪽(슈터 쪽 +). */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* invisible box over a canvas region so the first-play tutorial (sel) can spotlight it.
+     set(x, y, w, h) in stage px; set(null) takes it out of the DOM (the tutorial then shows no ring). */
+  function tutSpot(root, cls) {
+    const e = L.h('div', { class: 'tut-spot ' + cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none', left: '0px', top: '0px', width: '0px', height: '0px' } });
+    let key = '';
+    const set = (x, y, w, h) => {
+      if (x == null || !(w > 0 && h > 0)) { if (e.parentNode) e.remove(); key = ''; return; }
+      if (!e.parentNode) root.append(e);
+      const v = [x, y, w, h].map(Math.round), k = v.join(',');
+      if (k === key) return; key = k;
+      Object.assign(e.style, { left: v[0] + 'px', top: v[1] + 'px', width: v[2] + 'px', height: v[3] + 'px' });
+    };
+    set.el = e;
+    return set;
+  }
+  const DEG = Math.PI / 180;
+
+  /* ---------- geometry ---------- */
+  const GR = 9.81, BR = 0.12, RR = 0.2286, RT = 0.009, RH = 3.05;
+  const BBY = -(RR + 0.151), BBX = 0.915, BBZ0 = 2.9, BBZ1 = 3.95;
+  const DT = 1 / 400, MAXT = 6;
+  const REL_Z = 2.35, REL_F = 0.3, TH = 52 * DEG, W0 = 13; // release height / forward offset, launch angle, backspin rad/s
+  const SPOTS = [
+    { n: '왼쪽 코너', a: 78, d: 6.7 }, { n: '왼쪽 45°', a: 40, d: 6.75 }, { n: '정면', a: 0, d: 6.75 },
+    { n: '오른쪽 45°', a: -40, d: 6.75 }, { n: '오른쪽 코너', a: -78, d: 6.7 }, { n: '자유투 라인', a: 0, d: 4.19 },
+  ];
+  const FT = 5, TOP = 2, WY = -6.5, SX = 11;
+  function spotPos(i) { const s = SPOTS[i]; return { x: s.d * Math.sin(s.a * DEG), y: s.d * Math.cos(s.a * DEG) }; }
+  /* launch speed that drops the ball through the rim centre (no drag → exact parabola) */
+  function vIdeal(i) {
+    const R = SPOTS[i].d - REL_F, dh = RH - REL_Z, c = Math.cos(TH);
+    return Math.sqrt(GR * R * R / (2 * c * c * (R * Math.tan(TH) - dh)));
+  }
+  const r4 = (v) => Math.round(v * 10000) / 10000;
+  /* shot vector [x,y,z,vx,vy,vz,wx,wy]; a = aim offset in degrees (+ = right on screen), v = speed m/s */
+  function makeShot(sp, a, v) {
+    const S = spotPos(sp), d = Math.hypot(S.x, S.y), ux = -S.x / d, uy = -S.y / d;
+    const c = Math.cos(a * DEG), s = Math.sin(a * DEG);
+    const rx = uy, ry = -ux; // screen right
+    const dx = ux * c + rx * s, dy = uy * c + ry * s;
+    const hv = v * Math.cos(TH), vz = v * Math.sin(TH);
+    return [S.x + ux * REL_F, S.y + uy * REL_F, REL_Z, dx * hv, dy * hv, vz, dy * W0, -dx * W0].map(r4);
+  }
+
+  /* ---------- deterministic simulation ---------- */
+  function Sim(sh) {
+    this.p = [sh[0], sh[1], sh[2]]; this.v = [sh[3], sh[4], sh[5]]; this.w = [sh[6], sh[7], 0];
+    this.t = 0; this.n = 0; this.made = 0; this.madeT = -1; this.dec = -1; this.done = false;
+    this.rim = 0; this.board = 0; this.floor = 0;
+  }
+  /* impulse at a contact with normal n (pointing from surface to ball centre); spin-aware friction */
+  function contact(s, nx, ny, nz, e, mu) {
+    const v = s.v, w = s.w;
+    const vn = v[0] * nx + v[1] * ny + v[2] * nz;
+    if (vn >= 0) return 0;
+    const rx = -BR * nx, ry = -BR * ny, rz = -BR * nz;
+    const cx = v[0] + (w[1] * rz - w[2] * ry), cy = v[1] + (w[2] * rx - w[0] * rz), cz = v[2] + (w[0] * ry - w[1] * rx);
+    const jn = -(1 + e) * vn;
+    v[0] += jn * nx; v[1] += jn * ny; v[2] += jn * nz;
+    const cn = cx * nx + cy * ny + cz * nz;
+    const tx = cx - cn * nx, ty = cy - cn * ny, tz = cz - cn * nz, ts = Math.sqrt(tx * tx + ty * ty + tz * tz);
+    if (ts > 1e-9) {
+      let jt = ts / 2.5; if (jt > mu * jn) jt = mu * jn; // hollow shell: I = 2/3 m r²
+      const dx = -jt * tx / ts, dy = -jt * ty / ts, dz = -jt * tz / ts;
+      v[0] += dx; v[1] += dy; v[2] += dz;
+      const k = 1.5 / (BR * BR);
+      w[0] += (ry * dz - rz * dy) * k; w[1] += (rz * dx - rx * dz) * k; w[2] += (rx * dy - ry * dx) * k;
+    }
+    return -vn;
+  }
+  Sim.prototype.step = function () {
+    const p = this.p, v = this.v;
+    const z0 = p[2];
+    v[2] -= GR * DT;
+    p[0] += v[0] * DT; p[1] += v[1] * DT; p[2] += v[2] * DT;
+    this.t += DT; this.n++;
+    // rim (torus): closest point on the ring
+    const rho = Math.sqrt(p[0] * p[0] + p[1] * p[1]);
+    let qx = RR, qy = 0;
+    if (rho > 1e-9) { qx = p[0] * RR / rho; qy = p[1] * RR / rho; }
+    let dx = p[0] - qx, dy = p[1] - qy, dz = p[2] - RH;
+    let d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d < BR + RT && d > 1e-9) {
+      dx /= d; dy /= d; dz /= d;
+      p[0] = qx + dx * (BR + RT); p[1] = qy + dy * (BR + RT); p[2] = RH + dz * (BR + RT);
+      if (contact(this, dx, dy, dz, 0.56, 0.3) > 0.35) this.rim++;
+    }
+    // backboard face
+    if (p[1] - BR < BBY && p[1] > BBY - 0.3 && p[0] > -BBX - 0.05 && p[0] < BBX + 0.05 && p[2] > BBZ0 - 0.05 && p[2] < BBZ1 + 0.05) {
+      p[1] = BBY + BR;
+      if (contact(this, 0, 1, 0, 0.62, 0.25) > 0.35) this.board++;
+    }
+    // through the hoop (centre crosses the rim plane inside the ring, going down)
+    if (!this.made && z0 >= RH && p[2] < RH && v[2] < 0 && rho < RR) { this.made = 1; this.madeT = this.t; }
+    // net: slows the ball and centres it
+    if (this.made && p[2] < RH && p[2] > RH - 0.48 && rho < RR + 0.05) {
+      const k = 1 - 7 * DT;
+      v[0] *= k; v[1] *= k; v[2] *= 1 - 1.6 * DT;
+      p[0] -= p[0] * 3 * DT; p[1] -= p[1] * 3 * DT;
+    }
+    // floor
+    if (p[2] < BR) {
+      p[2] = BR;
+      if (contact(this, 0, 0, 1, 0.74, 0.5) > 0.4) this.floor++;
+    }
+    if (this.dec < 0) {
+      if (this.made) this.dec = this.t;
+      else if (v[2] < 0 && p[2] < RH - 0.55) this.dec = this.t;
+    }
+    if (this.dec >= 0 && this.t - this.dec > 1.1) this.done = true;
+    if (this.t >= MAXT) { this.done = true; if (this.dec < 0) this.dec = this.t; }
+  };
+  Sim.prototype.run = function () { while (!this.done) this.step(); return this; };
+  function simulate(sh) { return new Sim(sh).run(); }
+
+  /* ---------- rules ---------- */
+  const MODES = { spot: { R: 5, B: 5 }, ft: { R: 2, B: 5 }, quick: { R: 5, B: 2 } };
+  function init(players, opts) {
+    const n = players.length, md = MODES[opts && opts.mode] ? opts.mode : 'spot';
+    return { n, md, R: MODES[md].R, B: MODES[md].B, t: 0, k: 0, b: 0, h: players.map(() => ''), ph: 'p',
+      sd: null, sq: 0, sh: null, sr: 0, nm: players.map((p) => String(p.name || '').slice(0, 10)), seq: 0, last: null };
+  }
+  function actor(s) { return s.ph === 'e' ? null : s.ph === 'sd' ? s.sd[s.sq] : s.t; }
+  function curSpot(s) { if (s.md === 'ft') return FT; if (s.ph === 'sd') return TOP; return s.k; }
+  function isMoney(s) { return s.md === 'spot' && s.ph === 'p' && s.b === s.B - 1; }
+  function pts(str) { let t = 0; for (const c of str) t += c === 'o' ? 1 : c === 'O' ? 2 : 0; return t; }
+  function scores(s) { return s.h.map(pts); }
+  function apply(s, seat, a) {
+    if (actor(s) !== seat) throw new Error('not your turn');
+    if (!a || a.type !== 'shot' || typeof a.a !== 'number' || typeof a.v !== 'number' || !isFinite(a.a) || !isFinite(a.v)) throw new Error('bad shot');
+    const sp = curSpot(s), money = isMoney(s);
+    const sh = makeShot(sp, U.clamp(a.a, -25, 25), U.clamp(a.v, 3, 14));
+    const sim = simulate(sh);
+    const made = sim.made;
+    const ev = made ? (sim.board ? 'B' : sim.rim ? 'R' : 'W') : (sim.rim || sim.board ? 'M' : 'A');
+    const p = made ? (money ? 2 : 1) : 0;
+    s.seq++;
+    s.last = { id: s.seq, s: seat, sp, sh, m: made, $: money ? 1 : 0, p, ev };
+    if (s.ph === 'sd') {
+      s.sh[seat] += made ? 'o' : 'x';
+      s.sq++;
+      if (s.sq >= s.sd.length) { // round over
+        s.sq = 0; s.sr++;
+        const mk = s.sd.filter((i) => s.sh[i].slice(-1) === 'o');
+        if (mk.length && mk.length < s.sd.length) s.sd = mk;
+        if (s.sd.length === 1 || s.sr >= 15) s.ph = 'e';
+      }
+      return s;
+    }
+    s.h[seat] += made ? (money ? 'O' : 'o') : (money ? 'X' : 'x');
+    s.b++;
+    if (s.b >= s.B) {
+      s.b = 0; s.t++;
+      if (s.t >= s.n) {
+        s.t = 0; s.k++;
+        if (s.k >= s.R) {
+          const sc = scores(s), best = Math.max(...sc), tied = [];
+          sc.forEach((v, i) => { if (v === best) tied.push(i); });
+          if (s.n > 1 && tied.length > 1) { s.ph = 'sd'; s.sd = tied; s.sq = 0; s.sr = 0; s.sh = s.h.map(() => ''); }
+          else s.ph = 'e';
+        }
+      }
+    }
+    return s;
+  }
+  function result(s) {
+    const r = result0(s);
+    if (r) try {
+      const P = s.h.map((x, i) => i), mk = (i) => s.h[i].replace(/[xX]/g, '').length;
+      const run = (i) => { let b = 0, c = 0; for (const ch of s.h[i]) { c = ch === 'o' || ch === 'O' ? c + 1 : 0; if (c > b) b = c; } return b; };
+      r.stats = [
+        { label: '성공 / 시도', values: P.map((i) => mk(i) + ' / ' + s.h[i].length) },
+        { label: '성공률', values: P.map((i) => s.h[i].length ? Math.round(mk(i) * 100 / s.h[i].length) + '%' : '-') },
+        { label: '최장 연속 성공', values: P.map((i) => String(run(i))) },
+      ];
+      if (s.md === 'spot') r.stats.push({ label: '머니볼 성공', values: P.map((i) => String((s.h[i].match(/O/g) || []).length)) });
+    } catch (e) {}
+    return r;
+  }
+  function result0(s) {
+    if (s.ph !== 'e') return null;
+    const sc = scores(s), best = Math.max(...sc);
+    const winners = s.sd ? s.sd.slice() : sc.map((v, i) => (v === best ? i : -1)).filter((i) => i >= 0);
+    const max = s.R * s.B + (s.md === 'spot' ? s.R : 0);
+    const ord = sc.map((v, i) => i).sort((a, b) => sc[b] - sc[a] || a - b);
+    const lines = ord.map((i) => (s.nm[i] || (i + 1) + '번') + ' · ' + sc[i] + '점' + (s.sd && s.sh[i] ? ' (서든데스 ' + s.sh[i].replace(/o/g, '○').replace(/x/g, '×') + ')' : ''));
+    if (s.n === 1) return { winners: [0], title: sc[0] + ' / ' + max + '점', text: '슛 ' + s.h[0].replace(/[oO]/g, '').length + '개 놓침 · 성공 ' + s.h[0].replace(/[xX]/g, '').length + '개' };
+    return { winners, title: winners.length > 1 ? '공동 우승' : undefined, text: (s.sd ? (winners.length > 1 ? '서든데스에서도 끝까지 동점이었어요.\n' : '동점이라 서든데스로 가렸어요.\n') : '') + lines.join('\n') };
+  }
+
+  /* ---------- AI & human shot model ---------- */
+  function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+  const LVN = { 1: { a: 1.05, v: 0.0095 }, 2: { a: 0.7, v: 0.0062 }, 3: { a: 0.42, v: 0.0038 } };
+  function ai(s, seat, lv) {
+    const sp = curSpot(s), N = LVN[lv] || LVN[2];
+    return { type: 'shot', a: Math.round((gauss() * N.a) * 1000) / 1000, v: Math.round(vIdeal(sp) * (1 + gauss() * N.v) * 10000) / 10000 };
+  }
+  /* swipe → shot with a gentle assist: a near-straight swipe of about the right length is straightened/evened out */
+  const SWEET = 0.1, ANG_DEAD = 4;
+  function assistLen(q) { const e = q - 1, m = Math.abs(e); return Math.sign(e) * Math.max(0, m - SWEET) * 0.32 + e * 0.02; }
+  function assistAng(a) { const m = Math.abs(a); return Math.sign(a) * Math.max(0, m - ANG_DEAD) * 0.4 + a * 0.03; }
+  const HUMAN_NOISE = { a: 0.3, v: 0.0035 };
+  function swipeShot(sp, q, ang, noise) {
+    const nz = noise ? HUMAN_NOISE : { a: 0, v: 0 };
+    return { type: 'shot', a: Math.round((assistAng(ang) + gauss() * nz.a) * 1000) / 1000, v: Math.round(vIdeal(sp) * (1 + assistLen(q) + gauss() * nz.v) * 10000) / 10000 };
+  }
+
+  /* ---------- view ---------- */
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const top = L.h('div', { class: 'hud top bb-top', style: { gap: '6px', flexWrap: 'nowrap', padding: '8px 10px', alignItems: 'stretch' } });
+    root.append(top);
+    // invisible boxes over the ball / power gauge / hoop for the first-play tutorial spotlight
+    const spBall = tutSpot(root, 'bb-ball'), spGauge = tutSpot(root, 'bb-gauge'), spHoop = tutSpot(root, 'bb-hoop');
+    let st = null, hud = null, sim = null, simAcc = 0, lift = 0, animL = null, decShown = false, shownId = 0;
+    let pan = 0, time = 0, ptr = null, hintFlash = 0, flash = null, waitSeq = -1, waitUntil = 0, finTimer = 0, animTimer = 0;
+    let need = [], rimSeen = 0, boardSeen = 0, floorSeen = 0, netWave = 0, roll = 0, phase = 'idle', fast = false;
+    const tries = {}; // shots taken per human seat on this phone (aim hint on the first ones)
+    const V = { W: 1, H: 1, F: 500, yh: 0, C: { x: 0, y: 8, z: 1.7 }, f: { x: 0, y: -1 }, r: { x: -1, y: 0 }, sp: -1, topH: 84 };
+    const color = (i) => (api.players[i] ? api.players[i].color : '#e3ae45');
+    const crowd = []; { let sd = 7; const rnd = () => { sd = (sd * 16807) % 2147483647; return sd / 2147483647; };
+      for (let i = 0; i < 900; i++) crowd.push({ w: i % 3, x: -22 + rnd() * 44, z: 1.5 + rnd() * 6,  c: ['#4a3556', '#2f2740', '#56402f', '#334058', '#5e4a2a'][Math.floor(rnd() * 5)], k: 0.8 + rnd() * 0.5 }); }
+
+    function setBusy(b) { api.setBusy(b); }
+    function camFor(sp) {
+      const S = spotPos(sp), d = Math.hypot(S.x, S.y), ux = -S.x / d, uy = -S.y / d;
+      V.sp = sp; V.S = S; V.u = { x: ux, y: uy };
+      V.f = { x: ux, y: uy }; V.r = { x: uy, y: -ux };
+      V.C = { x: S.x - ux * 2.6, y: S.y - uy * 2.6, z: 1.7 };
+      const W = cv.w, H = cv.h;
+      V.W = W; V.H = H;
+      // fit the whole flight: the apex sits just under the status pill, the ball rests near the bottom
+      // rim a third of the way down, ball near the bottom; the camera tilts up to follow a high arc
+      const dh = d + 2.6, rimY = V.topH + (H - V.topH) * 0.3, restY = H - U.clamp(H * 0.2, 112, 160);
+      V.F = (restY - rimY) / (0.4 / 2.85 + 1.35 / dh);
+      V.yh = rimY + V.F * 1.35 / dh;
+      V.restY = restY;
+    }
+    function P(x, y, z) {
+      const dx = x - V.C.x, dy = y - V.C.y, dz = z - V.C.z;
+      const dep = dx * V.f.x + dy * V.f.y;
+      if (dep < 0.15) return null;
+      return [V.W / 2 + V.F * (dx * V.r.x + dy * V.r.y) / dep, V.yh + pan - V.F * dz / dep, V.F / dep];
+    }
+    function depthOf(x, y) { return (x - V.C.x) * V.f.x + (y - V.C.y) * V.f.y; }
+    /* polygon (world points) clipped against the near plane, then projected */
+    function poly(pts, fill, stroke, lw) {
+      const NEAR = 0.2, out = [];
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        const da = depthOf(a[0], a[1]), db = depthOf(b[0], b[1]);
+        if (da >= NEAR) out.push(a);
+        if ((da >= NEAR) !== (db >= NEAR)) { const t = (NEAR - da) / (db - da); out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]); }
+      }
+      if (out.length < 3) return;
+      ctx.beginPath();
+      out.forEach((q, i) => { const s = P(q[0], q[1], q[2]) || P(q[0], q[1] + 0, q[2]); if (!s) return; i ? ctx.lineTo(s[0], s[1]) : ctx.moveTo(s[0], s[1]); });
+      ctx.closePath();
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw || 1; ctx.stroke(); }
+    }
+    /* floor line strip (z = 0) with perspective width */
+    function fline(pts, wm, col) {
+      ctx.strokeStyle = col; ctx.lineCap = 'round';
+      for (let i = 0; i + 1 < pts.length; i++) {
+        let a = pts[i], b = pts[i + 1];
+        let da = depthOf(a[0], a[1]), db = depthOf(b[0], b[1]);
+        if (da < 0.3 && db < 0.3) continue;
+        if (da < 0.3) { const t = (0.3 - da) / (db - da); a = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
+        else if (db < 0.3) { const t = (0.3 - db) / (da - db); b = [b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t]; }
+        const pa = P(a[0], a[1], 0), pb = P(b[0], b[1], 0);
+        if (!pa || !pb) continue;
+        ctx.lineWidth = Math.max(0.6, wm * (pa[2] + pb[2]) / 2);
+        ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+      }
+    }
+    const arc = (cx, cy, r, a0, a1, n) => { const o = []; for (let i = 0; i <= n; i++) { const t = a0 + (a1 - a0) * i / n; o.push([cx + r * Math.sin(t), cy + r * Math.cos(t)]); } return o; };
+
+    function drawCourt() {
+      const W = V.W, H = V.H;
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, '#0f0b15'); bg.addColorStop(1, '#1d1626');
+      ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+      // floor
+      const fg = ctx.createLinearGradient(0, V.yh + pan, 0, H);
+      fg.addColorStop(0, '#6e4526'); fg.addColorStop(0.35, '#a8703f'); fg.addColorStop(1, '#c58d55');
+      poly([[-SX, WY, 0], [SX, WY, 0], [SX, 22, 0], [-SX, 22, 0]], fg);
+      // planks
+      for (let x = -7.5; x <= 7.5; x += 0.6) fline([[x, WY], [x, 14]], 0.012, 'rgba(60,30,10,.22)');
+      // paint + lines
+      poly([[-2.45, -1.575, 0], [2.45, -1.575, 0], [2.45, 4.225, 0], [-2.45, 4.225, 0]], 'rgba(107,40,58,.62)');
+      const LC = 'rgba(250,240,220,.85)', LW = 0.05;
+      fline([[-7.5, -1.575], [7.5, -1.575]], LW, LC);
+      fline([[-7.5, -1.575], [-7.5, 14]], LW, LC); fline([[7.5, -1.575], [7.5, 14]], LW, LC);
+      fline([[-2.45, -1.575], [-2.45, 4.225], [2.45, 4.225], [2.45, -1.575]], LW, LC);
+      fline(arc(0, 4.225, 1.8, -Math.PI / 2, Math.PI / 2, 24), LW, LC);
+      fline(arc(0, 0, 1.25, -Math.PI / 2, Math.PI / 2, 18), LW, LC);
+      const ca = Math.asin(6.6 / 6.75), cy = Math.sqrt(6.75 * 6.75 - 6.6 * 6.6);
+      fline([[-6.6, -1.575], [-6.6, cy]], LW, LC); fline([[6.6, -1.575], [6.6, cy]], LW, LC);
+      fline(arc(0, 0, 6.75, -ca, ca, 60), LW, LC);
+      // shooting spots
+      const cur = V.sp;
+      SPOTS.forEach((s, i) => {
+        if (i === FT && st && st.md !== 'ft') return;
+        if (i !== FT && st && st.md === 'ft') return;
+        const q = spotPos(i), on = i === cur;
+        const pts = []; for (let k = 0; k < 16; k++) { const t = k / 16 * Math.PI * 2; pts.push([q.x + 0.32 * Math.cos(t), q.y + 0.32 * Math.sin(t), 0]); }
+        poly(pts, on ? 'rgba(227,174,69,.55)' : 'rgba(23,19,31,.35)', on ? '#e3ae45' : 'rgba(250,240,220,.5)', 1.5);
+      });
+      // end wall with crowd + banner
+      poly([[-SX, WY, 0], [SX, WY, 0], [SX, WY, 22], [-SX, WY, 22]], '#1a1322');
+      poly([[-SX, WY, 0], [-SX, 22, 0], [-SX, 22, 22], [-SX, WY, 22]], '#18121f');
+      poly([[SX, WY, 0], [SX, 22, 0], [SX, 22, 22], [SX, WY, 22]], '#18121f');
+      for (const c of crowd) {
+        const wx = c.w === 0 ? c.x : c.w === 1 ? -SX - 0.1 : SX + 0.1, wy = c.w === 0 ? WY - 0.1 : 6 + c.x * 0.6;
+        const q = P(wx, wy, c.z); if (!q || q[2] > 140) continue;
+        ctx.fillStyle = c.c; ctx.beginPath(); ctx.arc(q[0], q[1], Math.max(1, 0.13 * c.k * q[2]), 0, 7); ctx.fill();
+      }
+      // arena lights
+      const lg = ctx.createRadialGradient(V.W / 2, 0, 0, V.W / 2, 0, V.W * 0.9);
+      lg.addColorStop(0, 'rgba(255,236,190,.10)'); lg.addColorStop(1, 'rgba(255,236,190,0)');
+      ctx.fillStyle = lg; ctx.fillRect(0, 0, V.W, V.yh);
+      poly([[-9, WY + 0.02, 0], [9, WY + 0.02, 0], [9, WY + 0.02, 0.9], [-9, WY + 0.02, 0.9]], '#3b2450');
+      poly([[-9, WY + 0.03, 0.86], [9, WY + 0.03, 0.86], [9, WY + 0.03, 0.92], [-9, WY + 0.03, 0.92]], '#e3ae45');
+      for (const bx of [-5, 0, 5]) {
+        const q = P(bx, WY + 0.04, 0.45);
+        if (!q || q[2] > 140) continue;
+        ctx.font = '400 ' + Math.max(6, Math.round(0.42 * q[2])) + 'px "Black Han Sans", sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = 'rgba(242,233,216,.82)';
+        ctx.fillText('한판 라운지', q[0], q[1]);
+      }
+      // stanchion
+      const b0 = P(0, -2.75, 0), b1 = P(0, -2.75, 3.35), b2 = P(0, BBY - 0.06, 3.35);
+      if (b0 && b1) {
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(b0[0], b0[1], 0.6 * b0[2], 0.12 * b0[2], 0, 0, 7); ctx.fill();
+        ctx.strokeStyle = '#2b2236'; ctx.lineWidth = Math.max(3, 0.18 * b0[2]); ctx.lineCap = 'butt';
+        ctx.beginPath(); ctx.moveTo(b0[0], b0[1]); ctx.lineTo(b1[0], b1[1]); ctx.stroke();
+        if (b2) { ctx.lineWidth = Math.max(2, 0.1 * b1[2]); ctx.beginPath(); ctx.moveTo(b1[0], b1[1]); ctx.lineTo(b2[0], b2[1]); ctx.stroke(); }
+        ctx.fillStyle = '#e3ae45'; const pb = P(0, -2.75, 0.9);
+        if (pb) { ctx.fillStyle = '#5b2a3a'; ctx.fillRect(pb[0] - 0.22 * pb[2], pb[1], 0.44 * pb[2], b0[1] - pb[1]); }
+      }
+    }
+    function drawBoard() {
+      poly([[-BBX, BBY, BBZ0], [BBX, BBY, BBZ0], [BBX, BBY, BBZ1], [-BBX, BBY, BBZ1]], 'rgba(205,225,245,.2)', 'rgba(250,250,250,.92)', 0);
+      const c = P(0, BBY, RH);
+      const lw = c ? Math.max(1.4, 0.05 * c[2]) : 2;
+      poly([[-BBX, BBY, BBZ0], [BBX, BBY, BBZ0], [BBX, BBY, BBZ1], [-BBX, BBY, BBZ1]], null, 'rgba(250,250,250,.92)', lw);
+      poly([[-0.295, BBY, RH], [0.295, BBY, RH], [0.295, BBY, RH + 0.45], [-0.295, BBY, RH + 0.45]], null, 'rgba(250,250,250,.9)', lw * 0.9);
+      // glass sheen
+      const a = P(-BBX, BBY, BBZ1), b = P(BBX * 0.1, BBY, BBZ0);
+      if (a && b) { ctx.fillStyle = 'rgba(255,255,255,.06)'; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(a[0] + (b[0] - a[0]) * 0.5, a[1]); ctx.lineTo(b[0] - (b[0] - a[0]) * 0.3, b[1]); ctx.lineTo(a[0], b[1]); ctx.closePath(); ctx.fill(); }
+      // bracket
+      const k0 = P(0, BBY, RH - 0.02), k1 = P(0, -RR, RH - 0.02);
+      if (k0 && k1) { ctx.strokeStyle = '#8a3a14'; ctx.lineWidth = Math.max(2, 0.05 * k1[2]); ctx.beginPath(); ctx.moveTo(k0[0], k0[1]); ctx.lineTo(k1[0], k1[1]); ctx.stroke(); }
+    }
+    function rimPts() { const o = []; for (let i = 0; i < 40; i++) { const t = i / 40 * Math.PI * 2; o.push([RR * Math.cos(t), RR * Math.sin(t)]); } return o; }
+    const RIM = rimPts();
+    function drawRim(front) {
+      const cd = depthOf(0, 0);
+      ctx.strokeStyle = '#e8622a'; ctx.lineCap = 'round';
+      for (let i = 0; i < RIM.length; i++) {
+        const a = RIM[i], b = RIM[(i + 1) % RIM.length];
+        const m = depthOf((a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+        if ((m < cd) !== front) continue;
+        const pa = P(a[0], a[1], RH), pb = P(b[0], b[1], RH);
+        if (!pa || !pb) continue;
+        ctx.lineWidth = Math.max(1.6, 0.022 * pa[2]);
+        ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+      }
+    }
+    const NZ = [0, -0.13, -0.27, -0.41], NR = [RR, 0.2, 0.168, 0.14], NN = 12;
+    function drawNet(ball) {
+      const pts = NZ.map((z, k) => {
+        const row = [];
+        for (let i = 0; i < NN; i++) {
+          const t = (i + (k % 2) * 0.5) / NN * Math.PI * 2;
+          let x = NR[k] * Math.cos(t), y = NR[k] * Math.sin(t), zz = RH + z;
+          if (k > 0) {
+            const wv = netWave * Math.sin(time * 18 + i * 0.7 + k) * 0.025 * k;
+            x += wv * Math.cos(t); y += wv * Math.sin(t); zz -= netWave * 0.05 * k * (0.6 + 0.4 * Math.sin(time * 12 + k));
+            if (ball) { // push strands out of the ball
+              const dx = x - ball[0], dy = y - ball[1], dz = zz - ball[2], d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+              if (d < BR * 1.08 && d > 1e-6) { const f = BR * 1.08 / d; x = ball[0] + dx * f; y = ball[1] + dy * f; zz = ball[2] + dz * f; }
+            }
+          }
+          row.push(P(x, y, zz));
+        }
+        return row;
+      });
+      ctx.strokeStyle = 'rgba(245,240,232,.82)'; ctx.lineCap = 'round';
+      for (let k = 0; k + 1 < pts.length; k++) {
+        for (let i = 0; i < NN; i++) {
+          const a = pts[k][i], b = pts[k + 1][i], c = pts[k + 1][(i + (k % 2 ? 1 : NN - 1)) % NN];
+          if (!a || !b || !c) continue;
+          ctx.lineWidth = Math.max(0.7, 0.008 * a[2]);
+          ctx.beginPath(); ctx.moveTo(b[0], b[1]); ctx.lineTo(a[0], a[1]); ctx.lineTo(c[0], c[1]); ctx.stroke();
+        }
+      }
+    }
+    /* basketball with seams rotating about the screen-horizontal axis */
+    const SEAMS = (() => {
+      const s = [];
+      const mk = (f) => { const o = []; for (let i = 0; i <= 28; i++) o.push(f(i / 28 * Math.PI * 2)); s.push(o); };
+      mk((t) => [0, Math.cos(t), Math.sin(t)]);
+      mk((t) => [Math.cos(t), 0, Math.sin(t)]);
+      mk((t) => [0.72 * Math.cos(t), 0.69, 0.72 * Math.sin(t)]);
+      mk((t) => [0.72 * Math.cos(t), -0.69, 0.72 * Math.sin(t)]);
+      return s;
+    })();
+    function drawBall(x, y, z, rot) {
+      const c = P(x, y, z); if (!c) return null;
+      const r = BR * c[2];
+      const sh = P(x, y, 0);
+      if (sh) { const a = U.clamp(0.45 - z * 0.08, 0.08, 0.45); ctx.fillStyle = 'rgba(0,0,0,' + a + ')'; ctx.beginPath(); ctx.ellipse(sh[0], sh[1], BR * sh[2] * 1.1, BR * sh[2] * 0.35, 0, 0, 7); ctx.fill(); }
+      const g = ctx.createRadialGradient(c[0] - r * 0.35, c[1] - r * 0.4, r * 0.1, c[0], c[1], r);
+      g.addColorStop(0, '#f6a35e'); g.addColorStop(0.55, '#d8641f'); g.addColorStop(1, '#7a300c');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c[0], c[1], r, 0, 7); ctx.fill();
+      const cs = Math.cos(rot), sn = Math.sin(rot);
+      ctx.strokeStyle = 'rgba(35,14,4,.85)'; ctx.lineWidth = Math.max(0.8, r * 0.07); ctx.lineCap = 'round';
+      for (const seam of SEAMS) {
+        let pen = false; ctx.beginPath();
+        for (const q of seam) {
+          const yy = q[1] * cs - q[2] * sn, zz = q[1] * sn + q[2] * cs; // rotate about x (screen horizontal)
+          if (zz < 0) { pen = false; continue; }
+          const sx = c[0] + q[0] * r * 0.97, sy = c[1] + yy * r * 0.97;
+          if (pen) ctx.lineTo(sx, sy); else { ctx.moveTo(sx, sy); pen = true; }
+        }
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(c[0], c[1], r, 0, 7); ctx.stroke();
+      return c;
+    }
+    function restBall() { return { x: V.S.x + V.u.x * 0.25, y: V.S.y + V.u.y * 0.25, z: 1.3 }; }
+
+    function humanTurn() {
+      if (!st || sim) return false;
+      const a = actor(st);
+      if (a == null || !api.canAct(a)) return false;
+      return !(st.seq === waitSeq && performance.now() < waitUntil);
+    }
+    function lenIdeal() { return U.clamp(V.H * 0.27, 140, 230) * vIdeal(V.sp) / vIdeal(TOP); }
+    function curSwipe() {
+      if (!ptr) return null;
+      const dx = ptr.x - ptr.sx, dy = ptr.y - ptr.sy;
+      if (Math.hypot(dx, dy) < 34 || dy > -20) return { cancel: true };
+      const len = -dy;
+      return { q: len / lenIdeal(), ang: Math.atan2(dx, -dy) / DEG };
+    }
+
+    function draw() {
+      cv.clear();
+      if (!st || !V.S) return;
+      drawCourt();
+      drawBoard();
+      drawRim(false);
+      let bp = null, inNet = false, front = false;
+      if (sim) {
+        bp = sim.p;
+        if (lift < 1) { const R = restBall(), k = lift * lift * (3 - 2 * lift); bp = [U.lerp(R.x, sim.p0[0], k), U.lerp(R.y, sim.p0[1], k), U.lerp(R.z, sim.p0[2], k)]; }
+        const rho = Math.hypot(bp[0], bp[1]);
+        inNet = rho < RR + BR && bp[2] < RH + 0.15 && bp[2] > RH - 0.55;
+        front = !inNet && depthOf(bp[0], bp[1]) < depthOf(0, 0) - RR;
+      }
+      if (bp && !front) drawBall(bp[0], bp[1], bp[2], roll);
+      drawNet(inNet ? bp : null);
+      drawRim(true);
+      if (bp && front) drawBall(bp[0], bp[1], bp[2], roll);
+      { const q = P(0, 0, RH); if (q) { const w = RR * q[2] + 30; spHoop(q[0] - w, q[1] - 0.9 * q[2] - 10, w * 2, 0.9 * q[2] + 0.6 * q[2] + 20); } else spHoop(null); }
+      spBall(null); spGauge(null);
+      if (!sim) drawIdle();
+      else if (!fast) { ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '600 12px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = 'rgba(171,159,184,.85)'; ctx.fillText('화면을 누르면 빨리 감기', V.W / 2, V.H - 18); }
+      drawFlash();
+      drawStatus();
+    }
+    function drawIdle() {
+      const a = actor(st);
+      if (a == null) return;
+      const R = restBall();
+      const human = humanTurn();
+      // aim preview (first shots): dotted arc of a clean swipe
+      const sw = human ? curSwipe() : null;
+      if (human && ptr && sw && !sw.cancel && (tries[a] || 0) < 3) {
+        const s2 = new Sim(makeShot(V.sp, assistAng(sw.ang), vIdeal(V.sp) * (1 + assistLen(sw.q))));
+        for (let i = 0; i < 520 && !s2.done; i++) {
+          s2.step();
+          if (i % 14 === 0) { const q = P(s2.p[0], s2.p[1], s2.p[2]); if (q && q[1] > V.topH + 40) { ctx.fillStyle = 'rgba(255,233,176,.75)'; ctx.beginPath(); ctx.arc(q[0], q[1], Math.max(1.6, 0.03 * q[2]), 0, 7); ctx.fill(); } }
+          if (s2.dec >= 0) break;
+        }
+      }
+      let bx = R.x, by = R.y, bz = R.z;
+      const c = P(bx, by, bz);
+      if (human && ptr && c) { // ball follows the finger a little
+        const k = 0.25 / c[2];
+        bx += V.r.x * (ptr.x - ptr.sx) * k; by += V.r.y * (ptr.x - ptr.sx) * k; bz += -(ptr.y - ptr.sy) * k * 0.4;
+      }
+      const bc = drawBall(bx, by, bz, roll);
+      if (!bc) return;
+      if (!human) {
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '700 14px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#ab9fb8';
+        const p = api.players[a];
+        ctx.fillText(p ? p.name + (p.ai ? ' 슛 준비…' : ' 차례') : '', V.W / 2, V.H - 22);
+        return;
+      }
+      V.ball = { x: bc[0], y: bc[1], r: BR * bc[2] };
+      const Li = lenIdeal();
+      // power gauge beside the ball: the green band is where to let go
+      const gx = Math.min(V.W - 26, bc[0] + BR * bc[2] + 34), gy0 = ptr ? ptr.sy : bc[1], gh = Li * 1.35;
+      { const r = BR * bc[2] + 12; spBall(bc[0] - r, bc[1] - r, 2 * r, 2 * r); spGauge(gx - 14, gy0 - gh - 20, 28, gh + 26); }
+      const y1 = gy0 - Li * (1 - SWEET), y2 = gy0 - Li * (1 + SWEET);
+      ctx.fillStyle = 'rgba(23,19,31,.7)'; rr(gx - 7, gy0 - gh, 14, gh, 7); ctx.fill();
+      ctx.fillStyle = 'rgba(95,211,160,.85)'; ctx.fillRect(gx - 7, y2, 14, y1 - y2);
+      if (ptr) {
+        const len = Math.max(0, ptr.sy - ptr.y), q = len / Li;
+        const ok = Math.abs(q - 1) <= SWEET;
+        ctx.fillStyle = ok ? '#5fd3a0' : q > 1 ? '#ee6a55' : '#e3ae45';
+        const fy = Math.max(gy0 - gh, gy0 - len);
+        rr(gx - 4, fy, 8, gy0 - fy, 4); ctx.fill();
+        // swipe trail
+        ctx.strokeStyle = ok ? 'rgba(95,211,160,.75)' : 'rgba(242,233,216,.55)'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(ptr.sx, ptr.sy); ctx.lineTo(ptr.x, ptr.y); ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(242,233,216,.4)'; ctx.lineWidth = 1; rr(gx - 7, gy0 - gh, 14, gh, 7); ctx.stroke();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '700 10px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#5fd3a0';
+      ctx.fillText('놓기', gx, y2 - 9);
+      // hint
+      const first = (tries[a] || 0) < 3;
+      if (!ptr) {
+        // chevrons + ghost finger on the first shots
+        ctx.strokeStyle = 'rgba(227,174,69,' + (0.4 + 0.3 * Math.sin(time * 4)) + ')'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+        for (let i = 0; i < 2; i++) { const yy = bc[1] - BR * bc[2] - 12 - i * 9 + Math.sin(time * 4) * 2; ctx.beginPath(); ctx.moveTo(bc[0] - 8, yy); ctx.lineTo(bc[0], yy - 6); ctx.lineTo(bc[0] + 8, yy); ctx.stroke(); }
+        if (first) {
+          const t = (time % 1.6) / 1.6, e = Math.min(1, t / 0.7);
+          const gyy = bc[1] - Li * e * e * (3 - 2 * e);
+          ctx.globalAlpha = t < 0.85 ? 0.9 : Math.max(0, 1 - (t - 0.85) / 0.15);
+          ctx.fillStyle = 'rgba(255,248,230,.9)'; ctx.beginPath(); ctx.arc(bc[0], gyy, 11, 0, 7); ctx.fill();
+          ctx.strokeStyle = 'rgba(23,19,31,.5)'; ctx.lineWidth = 2; ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      }
+      ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      let hint, col = '#ab9fb8';
+      if (!ptr) { hint = hintFlash > 0 ? '공을 잡고 위로 쓸어 올리세요' : first ? '공을 위로 쓸어 올려 초록 구간에서 놓기' : '위로 쓸어 올려 슛 · 초록 구간에서 놓기'; if (hintFlash > 0) col = '#ee6a55'; }
+      else if (sw && sw.cancel) { hint = '여기서 놓으면 취소'; col = '#ee6a55'; }
+      else if (Math.abs(sw.ang) > ANG_DEAD) { hint = (sw.ang > 0 ? '오른쪽' : '왼쪽') + '으로 휘었어요 · 곧게 위로'; col = '#e3ae45'; }
+      else if (Math.abs(sw.q - 1) <= SWEET) { hint = '좋아요 · 지금 놓기'; col = '#5fd3a0'; }
+      else hint = sw.q < 1 ? '조금 더 길게' : '너무 길어요 · 살짝 내리기';
+      const hw = ctx.measureText(hint).width + 24;
+      ctx.fillStyle = 'rgba(18,14,24,.78)'; rr(V.W / 2 - hw / 2, V.H - 27, hw, 24, 12); ctx.fill();
+      ctx.fillStyle = col; ctx.textAlign = 'center';
+      ctx.fillText(hint, V.W / 2, V.H - 14.5);
+    }
+    function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+    function drawStatus() {
+      const s = hud || st;
+      if (!s || s.ph === 'e') return;
+      const sp = sim && animL ? animL.sp : curSpot(s);
+      let t;
+      if (s.ph === 'sd') t = '서든데스 ' + (s.sr + 1) + '라운드 · ' + SPOTS[sp].n;
+      else t = (s.md === 'ft' ? '자유투 ' : '랙 ') + (s.k + 1) + '/' + s.R + ' · ' + SPOTS[sp].n + ' · ' + (s.b + 1) + '/' + s.B + '구';
+      const money = sim && animL ? animL.$ : isMoney(s);
+      ctx.font = '700 12px "IBM Plex Sans KR", sans-serif';
+      const tw = ctx.measureText(t).width + (money ? 62 : 0) + 22;
+      const x0 = V.W / 2 - tw / 2, y0 = V.topH + 6;
+      ctx.fillStyle = 'rgba(18,14,24,.78)'; rr(x0, y0, tw, 24, 12); ctx.fill();
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#f2e9d8';
+      ctx.fillText(t, x0 + 11, y0 + 12.5);
+      if (money) {
+        const mx = x0 + tw - 62;
+        ctx.fillStyle = '#e3ae45'; rr(mx, y0 + 4, 54, 16, 8); ctx.fill();
+        ctx.fillStyle = '#2a1d05'; ctx.font = '700 11px "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('머니볼 ×2', mx + 27, y0 + 12.5);
+      }
+    }
+    function drawFlash() {
+      if (!flash) return;
+      const k = (performance.now() - flash.t0) / (1200 / Math.sqrt(L.debug.speed));
+      if (k >= 1) { flash = null; return; }
+      ctx.globalAlpha = k < 0.12 ? k / 0.12 : 1 - Math.max(0, (k - 0.65) / 0.35);
+      const y = V.topH + (V.H - V.topH) * 0.56, sc = 1 + (1 - Math.min(1, k * 4)) * 0.2;
+      ctx.font = '400 ' + Math.round(30 * sc) + 'px "Black Han Sans", "IBM Plex Sans KR", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(23,19,31,.85)'; ctx.strokeText(flash.text, V.W / 2, y);
+      ctx.fillStyle = flash.c; ctx.fillText(flash.text, V.W / 2, y);
+      if (flash.sub) { ctx.font = '700 14px "IBM Plex Sans KR", sans-serif'; ctx.lineWidth = 4; ctx.strokeText(flash.sub, V.W / 2, y + 28); ctx.fillStyle = '#f2e9d8'; ctx.fillText(flash.sub, V.W / 2, y + 28); }
+      ctx.globalAlpha = 1;
+    }
+
+    /* ---- HUD ---- */
+    let hudKey = '';
+    function renderTop() {
+      const s = hud || st;
+      if (!s) return;
+      const cur = sim && animL ? animL.s : actor(s);
+      const key = JSON.stringify([s.h, s.sh, s.sd, cur, s.ph, s.k]);
+      if (key === hudKey) return;
+      hudKey = key;
+      top.innerHTML = '';
+      const sc = scores(s);
+      for (let i = 0; i < s.n; i++) {
+        const p = api.players[i] || { name: '', color: '#fff' }, on = cur === i;
+        const out = s.ph !== 'p' && s.sd && !s.sd.includes(i);
+        // current rack balls
+        const seg = s.ph === 'sd' ? (s.sh[i] || '') : '';
+        let row;
+        if (s.ph === 'sd' && s.sd.includes(i)) row = L.h('div', { class: 'mono', style: { fontSize: '11px', color: 'var(--coral)', lineHeight: 1, whiteSpace: 'nowrap', overflow: 'hidden' }, text: 'SD ' + seg.replace(/o/g, '●').replace(/x/g, '○') });
+        else if (s.ph === 'p') {
+          const done = s.h[i].length - Math.min(s.h[i].length, s.k * s.B);
+          const rack = s.h[i].slice(s.h[i].length - done);
+          const show = on || done > 0 ? rack : s.h[i].slice(Math.max(0, (s.k - 1) * s.B), s.k * s.B);
+          const dots = [];
+          for (let j = 0; j < s.B; j++) {
+            const c = show[j], money = s.md === 'spot' && j === s.B - 1;
+            dots.push(L.h('span', { style: { width: '8px', height: '8px', borderRadius: '50%', flex: 'none', display: 'inline-block',
+              background: c === 'o' || c === 'O' ? p.color : 'transparent', border: '1.5px solid ' + (money ? '#e3ae45' : c ? 'rgba(242,233,216,.55)' : 'rgba(242,233,216,.25)'),
+              opacity: c === 'x' || c === 'X' ? 0.55 : 1 } }));
+          }
+          row = L.h('div', { style: { display: 'flex', gap: '2px', alignItems: 'center', minHeight: '10px', opacity: on || done > 0 ? 1 : 0.5 } }, dots);
+        } else row = L.h('div', { class: 'muted', style: { fontSize: '11px', lineHeight: 1 }, text: out ? '탈락' : '' });
+        top.append(L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, padding: '6px 8px', display: 'flex', flexDirection: 'column', gap: '4px', opacity: on || cur == null ? 1 : 0.65, borderColor: on ? p.color : '', boxShadow: on ? '0 0 0 1px ' + p.color + ' inset' : '' } },
+          L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', fontWeight: 700, minWidth: 0 } },
+            L.h('span', { class: 'dot', style: { '--c': p.color, flex: 'none' } }),
+            L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, text: p.name })),
+          L.h('div', { class: 'mono', style: { fontSize: s.n > 3 ? '22px' : '26px', fontWeight: 600, lineHeight: 1 }, text: String(sc[i]) }),
+          row));
+      }
+      requestAnimationFrame(() => { const h = top.getBoundingClientRect().height; if (h && Math.abs(h + 4 - V.topH) > 1) { V.topH = h + 4; if (V.sp >= 0) camFor(V.sp); } });
+    }
+
+    /* ---- animation ---- */
+    const EVT = { W: ['스위시!', '#5fd3a0'], R: ['골!', '#f2e9d8'], B: ['뱅크슛!', '#5bb3e6'], A: ['에어볼', '#ab9fb8'], M: ['노골', '#ab9fb8'] };
+    function startAnim(l, prev) {
+      clearTimeout(finTimer); clearTimeout(animTimer);
+      hud = prev || st;
+      camFor(l.sp);
+      sim = new Sim(l.sh); sim.p0 = l.sh.slice(0, 3); simAcc = 0; lift = 0; animL = l; decShown = false; phase = 'fly'; fast = false;
+      rimSeen = 0; boardSeen = 0; floorSeen = 0;
+      setBusy(true);
+      api.sfx('whoosh');
+      // how far the camera must tilt up at each moment so the ball stays below the status pill
+      const tr = new Sim(l.sh); need = [];
+      while (!tr.done) { for (let i = 0; i < 8 && !tr.done; i++) tr.step(); const q = P(tr.p[0], tr.p[1], tr.p[2]); need.push(q ? Math.max(0, V.topH + 56 - (q[1] - pan)) : 0); }
+      const dur = tr.t + 0.2;
+      animTimer = setTimeout(() => { if (animL === l) { if (!decShown) decide(); endAnim(); } }, (dur / L.debug.speed) * 1000 + 3000);
+      hudKey = ''; renderTop();
+    }
+    function decide() {
+      decShown = true;
+      const l = animL;
+      const e = EVT[l.ev] || EVT.M;
+      let text = e[0], c = e[1], sub = null;
+      if (l.m && l.$) { text = '머니볼!'; c = '#e3ae45'; sub = '+2점'; }
+      else if (l.m) sub = '+1점';
+      flash = { text, c, sub, t0: performance.now() };
+      if (l.m) { api.sfx(l.$ ? 'win' : 'pop'); api.buzz(l.$ ? 35 : 20); netWave = 1; } else api.sfx('lose');
+      hud = st; hudKey = ''; renderTop();
+    }
+    function endAnim() {
+      clearTimeout(animTimer); clearTimeout(finTimer);
+      sim = null; animL = null; phase = 'idle';
+      if (st) camFor(curSpot(st));
+      hud = null; hudKey = ''; renderTop();
+      setBusy(false);
+    }
+    const stopLoop = U.loop((dt) => {
+      time += dt;
+      if (hintFlash > 0) hintFlash -= dt;
+      netWave = Math.max(0, netWave - dt * 1.4);
+      if (sim) {
+        const ff = fast ? 3 : 1;
+        if (lift < 1) lift = Math.min(1, lift + dt * L.debug.speed * ff / 0.14);
+        else if (!sim.done) {
+          simAcc += dt * L.debug.speed * ff;
+          let n = 0;
+          while (simAcc >= DT && !sim.done && n < 6000) { sim.step(); simAcc -= DT; n++; }
+          const sp = Math.hypot(sim.w[0], sim.w[1], sim.w[2]);
+          roll += sp * dt * L.debug.speed * 0.5 * Math.sign(-(sim.w[0] * V.r.x + sim.w[1] * V.r.y) || 1);
+          if (sim.rim > rimSeen) { rimSeen = sim.rim; api.sfx('hit'); api.buzz(12); }
+          if (sim.board > boardSeen) { boardSeen = sim.board; api.sfx('thud'); }
+          if (sim.floor > floorSeen) { floorSeen = sim.floor; api.sfx('bounce'); }
+          if (sim.made && sim.t - sim.madeT < 0.05) netWave = Math.max(netWave, 0.9);
+          if (!decShown && sim.dec >= 0) decide();
+          if (sim.done) { const me = animL; finTimer = setTimeout(() => { if (animL === me) endAnim(); }, (fast ? 120 : 350) / L.debug.speed); }
+        }
+        // camera tilt: keep the ball on screen
+        const i0 = Math.floor(sim.n / 8); let want = 0;
+        for (let i = i0; i < Math.min(need.length, i0 + 45); i++) want = Math.max(want, need[i]);
+        pan += (want - pan) * Math.min(1, dt * 7 * Math.max(1, L.debug.speed * 0.5));
+      } else pan += (0 - pan) * Math.min(1, dt * 6);
+      draw();
+    });
+
+    /* ---- input: swipe up from the ball ---- */
+    const el = cv.cv;
+    function onDown(ev) {
+      flash = null; // 알림은 누르면 바로 걷힘
+      if (sim && ev.isPrimary) { fast = true; return; } // tap during a shot: fast-forward
+      if (!ev.isPrimary || !humanTurn() || !V.ball) return;
+      const p = cv.local(ev);
+      if (Math.hypot(p.x - V.ball.x, p.y - V.ball.y) > Math.max(64, V.ball.r * 1.7)) { if (p.y > V.H * 0.55) { hintFlash = 1.6; api.sfx('click'); } return; }
+      try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+      ptr = { id: ev.pointerId, sx: p.x, sy: p.y, x: p.x, y: p.y, hist: [{ t: performance.now(), x: p.x, y: p.y }] };
+      api.sfx('tick'); api.buzz(8);
+      ev.preventDefault();
+    }
+    let wasOk = false;
+    function onMove(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      const p = cv.local(ev);
+      ptr.x = p.x; ptr.y = p.y;
+      ptr.hist.push({ t: performance.now(), x: p.x, y: p.y });
+      if (ptr.hist.length > 60) ptr.hist.shift();
+      const sw = curSwipe();
+      const ok = !!sw && !sw.cancel && Math.abs(sw.q - 1) <= SWEET;
+      if (ok !== wasOk) { wasOk = ok; if (ok) { api.buzz(10); api.sfx('tick'); } }
+    }
+    function onUp(ev) {
+      if (!ptr || ev.pointerId !== ptr.id) return;
+      const g = ptr; ptr = null; wasOk = false;
+      if (ev.type === 'pointercancel' || !humanTurn()) return;
+      const p = cv.local(ev), now = performance.now();
+      g.x = p.x; g.y = p.y; g.hist.push({ t: now, x: p.x, y: p.y });
+      const back = Math.hypot(g.x - g.sx, g.y - g.sy) < 34 || g.y - g.sy > -20;
+      if (back) { if (g.hist.length < 4) hintFlash = 1.6; api.sfx('click'); return; }
+      // the furthest-up point of the last 150 ms (a flick's end and the thumb lifting don't shorten the shot)
+      let best = g.hist[g.hist.length - 1];
+      for (let i = g.hist.length - 1; i >= 0 && now - g.hist[i].t <= 150; i--) if (g.hist[i].y < best.y) best = g.hist[i];
+      const dx = best.x - g.sx, dy = best.y - g.sy;
+      const a = actor(st);
+      const act = swipeShot(V.sp, -dy / lenIdeal(), Math.atan2(dx, -dy) / DEG, true);
+      tries[a] = (tries[a] || 0) + 1;
+      waitSeq = st.seq; waitUntil = now + 2500;
+      api.buzz(18);
+      api.act(act);
+    }
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+    cv.onresize = () => { if (V.sp >= 0) camFor(V.sp); };
+
+    return {
+      update(next, prev) {
+        st = next;
+        if (prev && prev !== next && next.ph === 'e' && prev.ph !== 'e') {
+          const sc = scores(next), lb = { spot: '스팟 슛', ft: '자유투 10개', quick: '빠른 대결' }[next.md] || next.md;
+          api.mySeats().forEach((i) => { if (sc[i] != null && api.best('sc_' + next.md, sc[i], { label: lb + ' 최고', unit: '점' })) api.toast('🏆 새 최고 기록! ' + sc[i] + '점'); });
+        }
+        const l = next.last;
+        if (l && l.id !== shownId && prev && prev !== next) {
+          if (sim) endAnim();
+          shownId = l.id;
+          startAnim(l, prev);
+        } else {
+          shownId = l ? l.id : 0;
+          if (!sim) camFor(next.ph === 'e' && l ? l.sp : curSpot(next));
+        }
+        if (!humanTurn()) ptr = null;
+        hudKey = ''; renderTop();
+      },
+      destroy() {
+        stopLoop(); clearTimeout(finTimer); clearTimeout(animTimer);
+        el.removeEventListener('pointerdown', onDown); el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', onUp); el.removeEventListener('pointercancel', onUp);
+        cv.destroy(); top.remove(); [spBall, spGauge, spHoop].forEach((f) => f.el.remove());
+        api.setBusy(false);
+      },
+    };
+  }
+
+  L.register({
+    id: 'basketball', name: '농구 슛 대결', tag: '3점 슛 콘테스트', cat: '스포츠',
+    blurb: '차례대로 정해진 자리에서 공을 쏴 가장 많이 넣으면 승리. 스팟 슛은 5곳×5개, 각 랙의 마지막 머니볼은 2점. 동점이면 서든데스.',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 2, hidden: false, aiDelay: 750,
+    tint: '#6a3412',
+    icon: '<circle cx="24" cy="32" r="16" fill="currentColor"/><path d="M8 32h32M24 16v32M12.5 21c5 4 5 18 0 22M35.5 21c-5 4-5 18 0 22" fill="none" stroke="#6a3412" stroke-width="2.4"/><path d="M34 10h18" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/><path d="M36 12l3 9h8l3-9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
+    options: [
+      { id: 'mode', label: '방식', tip: '슛 대결 방식.', choices: [{ v: 'spot', label: '스팟 슛 (5스팟×5)', tip: '5곳에서 5개씩, 마지막 머니볼은 2점.' }, { v: 'ft', label: '자유투 10개', tip: '자유투 라인에서 10개.' }, { v: 'quick', label: '빠른 대결 (공 10개)', tip: '공 10개로 빠르게 한 판.' }], def: 'spot' },
+    ],
+    quick: [
+      '차례대로 정해진 자리에서 슛을 쏴서, 점수가 가장 높은 사람이 이겨요.',
+      '내 차례: 아래쪽 공을 잡고 위로 쓸어 올렸다 놓아요. 쓸어 올린 길이 = 힘, 방향 = 좌우 조준.',
+      '스팟 슛은 5자리 × 5개, 자리마다 마지막 공(머니볼)은 2점. 동점이면 서든데스!',
+    ],
+    rules: [
+      { h: '목표', p: ['차례대로 슛을 쏴서 점수가 가장 높은 사람이 이겨요. 혼자 하면 최고 점수에 도전해요.'] },
+      { h: '차례에 할 일', p: ['① 한 사람이 한 랙(같은 자리의 공 묶음)을 다 쏴요.',
+        '② 다 쏘면 다음 사람 차례예요.',
+        '③ 모두 끝나면 점수를 비교해요.'] },
+      { h: '방식 (설정에서 골라요)', p: ['스팟 슛 (5스팟×5, 기본): 3점 라인의 왼쪽 코너 → 왼쪽 45° → 정면 → 오른쪽 45° → 오른쪽 코너 순서로, 한 자리에 5개씩 모두 25개. 각 자리의 마지막 공은 머니볼이라 넣으면 2점(최대 30점).',
+        '자유투 10개: 자유투 라인에서 5개씩 두 번, 1개 1점.',
+        '빠른 대결 (공 10개): 다섯 자리에서 2개씩, 1개 1점.'] },
+      { h: '조작 (손가락)', p: ['① 아래쪽 공을 손가락으로 누르세요.',
+        '② 누른 채로 위로 쓸어 올리세요. 쓸어 올린 길이가 힘이에요.',
+        '③ 공 옆 막대의 초록 구간(「놓기」)에서 손을 떼면 딱 맞는 힘이에요. 짧으면 앞 림, 길면 뒤 림이나 백보드에 맞아요.',
+        '④ 쓸어 올린 방향이 좌우 조준이에요. 곧게 위로 올리면 림 정면으로 가요.',
+        '거의 곧은 슛과 거의 맞는 길이는 살짝 보정돼서 잘 들어가요.',
+        '처음 몇 번은 예상 궤적(점선)이 보여요. 공 근처로 되돌아와서 떼면 취소예요.',
+        '공이 날아가는 동안 화면을 누르면 빨리 감기(AI 슛도).'] },
+      { h: '점수·승리', p: ['넣은 공 1개 = 1점, 머니볼(스팟 슛에서 자리마다 마지막 공) = 2점.',
+        '모두 다 쏜 뒤 점수가 가장 높은 사람이 이겨요.',
+        '동점이면 서든데스: 동점인 사람끼리 한 개씩 쏴서, 누군가 넣고 누군가 놓치면 넣은 사람만 남아요. 한 명이 남을 때까지 계속해요(최대 15라운드). 서든데스는 정면(자유투 방식이면 자유투 라인)에서 쏴요.'] },
+      { h: '예시', p: ['스팟 슛 첫 자리(왼쪽 코너): 1·2·4번째 공 성공, 3번째 실패, 마지막 머니볼 성공 → 1 + 1 + 1 + 2 = 5점.',
+        '다섯 자리를 다 돌고 나 18점, 친구 18점 → 서든데스! 정면에서 한 개씩: 나는 넣고 친구는 놓침 → 내가 승리.'] },
+      { h: '물리', p: ['공은 중력으로 포물선을 그리고 백스핀이 걸려 있어, 림·백보드에 맞으면 부드럽게 튀어요. 림 안쪽을 굴러 들어가거나 백보드를 맞고 들어가기도 해요.',
+        '림에 안 닿고 깨끗이 들어가면 스위시, 아무 데도 안 닿고 빗나가면 에어볼이에요.'] },
+      { h: 'AI', p: ['AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(성공률 약 35% · 55% · 75%).'] },
+    ],
+    tutorial: [
+      { sel: '.bb-hoop', text: '이 림에 공을 넣어요. 차례대로 정해진 자리에서 쏘고, 점수가 가장 높은 사람이 이겨요.' },
+      { sel: '.bb-ball', text: '슛: 이 공을 누른 채 위로 쓸어 올렸다 떼요. 곧게 올리면 림 정면, 비스듬히 올리면 그쪽으로 가요.' },
+      { sel: '.bb-gauge', text: '쓸어 올린 길이가 힘이에요. 손가락이 이 막대의 초록 구간(「놓기」)에 왔을 때 떼면 딱 맞아요. 짧으면 앞 림, 길면 뒤 림!' },
+      { sel: '.bb-top', text: '위에 각자 점수가 나와요. 스팟 슛은 자리마다 5개, 마지막 공(머니볼)은 2점! 공 근처로 되돌아와 떼면 취소예요.' },
+    ],
+    init, actor, apply, ai, result, mount,
+    _sim: { Sim, simulate, makeShot, vIdeal, spotPos, swipeShot, assistLen, assistAng, scores, SPOTS, LVN, HUMAN_NOISE },
+  });
+})();

@@ -1,0 +1,2167 @@
+/* 탱크 미로 대전 — realtime top-down maze tank duel (2–4). Shells bounce off the maze walls; one hit destroys a tank
+   (your own bounced shell too). Last tank standing wins the round, first to 3 (or 5) round wins takes the match.
+   Mazes: generated each round from a seed (symmetric, fair corner spawns) or one of a few hand-made layouts.
+   Host-authoritative fixed-step sim (1/120 s); guests publish stick/key input + fire/special counters, receive ~20 Hz
+   snapshots, predict their own tank and re-simulate shells locally between snapshots. One person per phone. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* ======================= engine (pure, node-testable) ======================= */
+  const H = 1 / 120;
+  const CS = 40, WT = 5, TR = 7.5, SR = 2.2, PR = 1.7, MR = 3, BM = 16;
+  /* tank handling: top speed, reverse, turn rate (rad/s); speed / turn ramp up and down (units/s², rad/s²) so the tank
+     feels weighty but stops quickly when you let go */
+  const TSPD = 38, TBACK = 27, TURN = 2.9, ACC = 110, DEC = 190, WACC = 20, WDEC = 55, SGAIN = 12;
+  const SSPD = 72, SLIFE = 6, SMAX = 5, FIRE_CD = 0.35;
+  const PSPD = 118, PLIFE = 1.5, PN = 7, PSPREAD = 0.4;
+  const MSPD = 56, MLIFE = 10, MTURN = 2.5, MDELAY = 0.55;
+  const LZ_B = 6, LZ_LEN = 1100;
+  const MINE_ARM = 1.2, MINE_R = 8, MINE_BOOM = 26, MINE_LIFE = 25;
+  const SHIELD_T = 8;
+  const COUNT = 3, END_T = 2.6, LAST_T = 0.3, CAP_T = 100, PU_FIRST = 5, PU_EVERY = 7, PU_MAX = 2;
+  const PU = {
+    L: { nm: '레이저', ch: '레', col: '#ff5470' },
+    S: { nm: '산탄', ch: '산', col: '#ffb35c' },
+    M: { nm: '유도탄', ch: '유', col: '#c9a0ff' },
+    N: { nm: '지뢰', ch: '지', col: '#e3ae45' },
+    D: { nm: '방패', ch: '방', col: '#7fe3ff' },
+    R: { nm: '반사탄', ch: '반', col: '#7be0b0' },
+    P: { nm: '관통탄', ch: '관', col: '#ff8a3c' },
+    K: { nm: '연막탄', ch: '연', col: '#b9b2c6' },
+  };
+  const PU_KEYS = 'LSMNDRPK', SPK = 'LSMNRPK', SKK = 'spmbarqok';
+  /* ammo items: r = ricochet (fast, bounces off cracked walls too, up to RB_MAX bounces, never hurts its owner),
+     q = piercing (goes through one cracked wall or one tank, then flies on as o), k = smoke grenade (bursts into a cloud) */
+  const RSPD = 108, RB_MAX = 10, QSPD = 92, QR = 2.7, KSPD = 62, KFUSE = 0.85, SMK_R = 30, SMK_T = 7;
+  /* tank classes (picked before the match): speed / turn multipliers, hit points, hull radius, reload, shells in the air,
+     main-gun shell kind ('s' normal, 'b' big heavy shell, 'a' arcing artillery shell) */
+  const CLS = [
+    { id: 'L', nm: '경전차', sub: '빠르고 작아요. 한 방에 부서져요', spd: 1.12, turn: 1.15, hp: 1, r: 6.8, cd: 0.33, smax: 3, sk: 's', ab: 1, col: '#8fd17a' },
+    { id: 'H', nm: '중전차', sub: '느리지만 두 방을 버텨요. 큰 포탄은 한 방', spd: 0.86, turn: 0.95, hp: 2, r: 8.7, cd: 0.55, smax: 3, sk: 'b', ab: 0.82, col: '#e3ae45' },
+    { id: 'A', nm: '자주포', sub: '벽 너머로 곡사 포격. 가까운 적은 못 맞혀요', spd: 0.92, turn: 0.95, hp: 1, r: 7.3, cd: 0.9, smax: 3, sk: 'a', ab: 1, col: '#c9a0ff' },
+  ];
+  const clsOf = (c) => CLS[c && c.ci >= 0 && c.ci < 3 ? c.ci : 0];
+  const BR = 3.4, BSPD = 64;                       // heavy shell radius / speed
+  const ART_T0 = 0.38, ART_K = 280, ART_MIN = 42, ART_MAX = 200, ART_BOOM = 15, ART_CONE = 0.5; // artillery flight time (T0 + range/K), range, blast
+  const artT = (r) => ART_T0 + r / ART_K;
+  const artTv = (s) => ART_T0 / Math.max(0.2, 1 - Math.hypot(s.vx, s.vy) / ART_K); // same flight time, from the shell's speed
+  const CRACK_HP = 3;                              // hits a cracked wall takes before it breaks
+  const fin = (v) => typeof v === 'number' && isFinite(v);
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const r2 = (v) => Math.round(v * 100) / 100;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const wrapA = (a) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
+  function prng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  /* ----- mazes: h[j*C+i] = wall on horizontal grid line j over column i; v[j*(C+1)+i] = wall on vertical line i over row j ----- */
+  function emptyMaze(C, R) {
+    const M = { C, R, h: new Array((R + 1) * C).fill(0), v: new Array((C + 1) * R).fill(0) };
+    for (let i = 0; i < C; i++) { M.h[i] = 1; M.h[R * C + i] = 1; }
+    for (let j = 0; j < R; j++) { M.v[j * (C + 1)] = 1; M.v[j * (C + 1) + C] = 1; }
+    M.k = new Array((R + 1) * C + (C + 1) * R).fill(0);
+    return M;
+  }
+  /* an edge's images under the map symmetry (2 = half turn, 4 = both mirrors). Edge id: h index, or (R+1)*C + v index */
+  function edgeImgs(C, R, e, sym) {
+    const HV = (R + 1) * C, out = [e];
+    if (e < HV) {
+      const j = Math.floor(e / C), i = e % C;
+      out.push((R - j) * C + (C - 1 - i));
+      if (sym >= 4) { out.push(j * C + (C - 1 - i)); out.push((R - j) * C + i); }
+    } else {
+      const q = e - HV, j = Math.floor(q / (C + 1)), i = q % (C + 1);
+      out.push(HV + (R - 1 - j) * (C + 1) + (C - i));
+      if (sym >= 4) { out.push(HV + j * (C + 1) + (C - i)); out.push(HV + (R - 1 - j) * (C + 1) + i); }
+    }
+    return out.filter((x, k) => out.indexOf(x) === k);
+  }
+  /* no straight line of fire between two start corners: add symmetric wall pieces across such lines (keeping every cell
+     reachable), preferring pieces near the middle of the line */
+  function blockSpawnLOS(W, sym) {
+    const { C, R, M } = W, HV = (R + 1) * C;
+    const get = (e) => (e < HV ? M.h[e] : M.v[e - HV]);
+    const set = (e, v) => { if (e < HV) M.h[e] = v; else M.v[e - HV] = v; };
+    const conn = () => { const D = bfs(W, 0, null); for (let k = 0; k < D.length; k++) if (D[k] < 0) return false; return true; };
+    const reconnect = (o) => { // open one symmetric wall between the cut-off part and the rest
+      const D = bfs(W, 0, null);
+      for (let j = 0; j < R; j++) for (let i = 0; i < C; i++) {
+        const c = j * C + i; if (D[c] >= 0) continue;
+        const es = [];
+        if (i < C - 1 && D[c + 1] >= 0) es.push(HV + j * (C + 1) + i + 1);
+        if (i > 0 && D[c - 1] >= 0) es.push(HV + j * (C + 1) + i);
+        if (j < R - 1 && D[c + C] >= 0) es.push((j + 1) * C + i);
+        if (j > 0 && D[c - C] >= 0) es.push(j * C + i);
+        for (const e of es) {
+          if (o.includes(e)) continue;
+          const oo = edgeImgs(C, R, e, sym).filter((x) => get(x) && !o.includes(x));
+          oo.forEach((x) => set(x, 0));
+          if (conn()) return true;
+          oo.forEach((x) => set(x, 1));
+        }
+      }
+      return false;
+    };
+    const sp = spawnCells(W, W.mk > 0 ? 4 : W.n);
+    for (let it = 0; it < 8; it++) {
+      buildRects(W);
+      let pair = null;
+      for (let a = 0; a < sp.length && !pair; a++) for (let b = a + 1; b < sp.length && !pair; b++) {
+        const pa = cellXY(W, sp[a]), pb = cellXY(W, sp[b]);
+        if (clearLine(W, pa[0], pa[1], pb[0], pb[1], SR)) pair = [pa, pb];
+      }
+      if (!pair) return;
+      // open edges crossed by the line, ordered from its middle outward
+      const cand = [];
+      let prev = cellIdx(W, pair[0][0], pair[0][1]);
+      const L = Math.hypot(pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]);
+      for (let d = 2; d < L; d += 2) {
+        const u = d / L, c = cellIdx(W, pair[0][0] + (pair[1][0] - pair[0][0]) * u, pair[0][1] + (pair[1][1] - pair[0][1]) * u);
+        if (c === prev) continue;
+        const ia = prev % C, ja = (prev / C) | 0, ib = c % C, jb = (c / C) | 0;
+        if (ja === jb && Math.abs(ia - ib) === 1) cand.push([HV + ja * (C + 1) + Math.max(ia, ib), Math.abs(u - 0.5)]);
+        else if (ia === ib && Math.abs(ja - jb) === 1) cand.push([Math.max(ja, jb) * C + ia, Math.abs(u - 0.5)]);
+        prev = c;
+      }
+      cand.sort((x, y) => x[1] - y[1]);
+      let done = false;
+      for (const cc of cand) {
+        const o = edgeImgs(C, R, cc[0], sym).filter((e) => !get(e));
+        if (!o.length) continue;
+        o.forEach((e) => set(e, 1));
+        if (conn() || reconnect(o)) { done = true; break; }
+        o.forEach((e) => set(e, 0));
+      }
+      if (!done) { buildRects(W); return; }
+    }
+    buildRects(W);
+  }
+  function spawnCells(W, n) {
+    const cs = [0, W.C * W.R - 1, W.C - 1, (W.R - 1) * W.C];
+    return cs.slice(0, Math.max(2, Math.min(4, n)));
+  }
+  /* hand-made layouts (7×9): segments [x0,y0,x1,y1] on grid lines for the top-left quarter, mirrored both ways */
+  /* cr: cracked (breakable) wall pieces, same notation and mirroring (a centre piece may be given as a half span) */
+  const FIXED = [
+    { nm: '기둥 광장', sub: '탁 트인 광장에 기둥 몇 개', seg: [[3, 0, 3, 1], [1, 1, 2, 1], [1, 1, 1, 2], [3, 2, 4, 2], [2, 3, 2, 4], [3, 4, 4, 4], [0, 4, 1, 4]], cr: [[1, 2, 1, 3], [2, 2, 2, 3]] },
+    { nm: '쌍둥이 복도', sub: '긴 벽이 만든 세 갈래 길', seg: [[3, 0, 3, 1], [2, 1, 2, 4], [0, 2, 1, 2], [1, 3, 2, 3], [3, 3, 3, 4]], cr: [[2, 2, 2, 3], [3, 2, 3, 3]] },
+    { nm: '네 개의 방', sub: '방 네 개와 가운데 복도', seg: [[0, 4, 1, 4], [3, 0, 3, 1], [3, 3, 3, 4], [1, 2, 1, 3]], cr: [[1, 4, 2, 4], [3, 2, 3, 3]] },
+    { nm: '요새', sub: '가운데 요새를 둘러싼 싸움', seg: [[2, 3, 3, 3], [2, 3, 2, 4], [0, 2, 1, 2], [2, 0, 2, 1], [1, 4, 2, 4]], cr: [[3, 3, 3.5, 3]] },
+    { nm: '부서진 성벽', sub: '금 간 벽이 줄지어 선 성벽 길', seg: [[1, 1, 3, 1], [3, 1, 3, 2], [0, 3, 1, 3], [2, 3, 2, 4]], cr: [[1, 1, 1, 3], [1, 3, 2, 3], [3, 2, 3, 4]] },
+    { nm: '유리 미로', sub: '절반이 금 간 벽인 좁은 미로', seg: [[1, 0, 1, 1], [2, 1, 3, 1], [0, 2, 1, 2], [2, 2, 2, 3], [3, 3, 3, 4]], cr: [[3, 1, 3, 2], [1, 2, 2, 2], [1, 3, 1, 4], [2, 4, 3, 4], [3, 2, 4, 2]] },
+  ];
+  function buildFixed(k) {
+    const F = FIXED[k], C = 7, R = 9, M = emptyMaze(C, R), HV = (R + 1) * C;
+    const put = (list, crack) => { for (const s of list || []) for (let mx = 0; mx < 2; mx++) for (let my = 0; my < 2; my++) {
+      let x0 = s[0], y0 = s[1], x1 = s[2], y1 = s[3];
+      if (mx) { x0 = C - x0; x1 = C - x1; }
+      if (my) { y0 = R - y0; y1 = R - y1; }
+      if (y0 === y1) { for (let i = Math.floor(Math.min(x0, x1)); i < Math.ceil(Math.max(x0, x1)); i++) { M.h[y0 * C + i] = 1; if (crack) M.k[y0 * C + i] = CRACK_HP; } }
+      else { for (let j = Math.floor(Math.min(y0, y1)); j < Math.ceil(Math.max(y0, y1)); j++) { M.v[j * (C + 1) + x0] = 1; if (crack) M.k[HV + j * (C + 1) + x0] = CRACK_HP; } }
+    } };
+    put(F.seg, false); put(F.cr, true);
+    return M;
+  }
+  /* generated mazes: turn some inner wall orbits into cracked walls (symmetric, never the outer frame) */
+  function crackMaze(M, sd, sym) {
+    const rnd = prng((sd ^ 0x27d4eb2f) >>> 0), C = M.C, R = M.R, HV = (R + 1) * C, seen = new Set();
+    for (let j = 1; j < R; j++) for (let i = 0; i < C; i++) {
+      const e = j * C + i; if (!M.h[e] || seen.has(e)) continue;
+      const o = edgeImgs(C, R, e, sym); o.forEach((x) => seen.add(x));
+      if (rnd() < 0.2) for (const x of o) M.k[x] = CRACK_HP;
+    }
+    for (let j = 0; j < R; j++) for (let i = 1; i < C; i++) {
+      const e = HV + j * (C + 1) + i; if (!M.v[e - HV] || seen.has(e)) continue;
+      const o = edgeImgs(C, R, e, sym); o.forEach((x) => seen.add(x));
+      if (rnd() < 0.2) for (const x of o) M.k[x] = CRACK_HP;
+    }
+  }
+  /* generated maze: Kruskal over symmetry orbits of wall edges (180° turn for 2 players, both mirrors for 3–4), then a few
+     extra openings (never a fully open 2×2 block). Same seed → same maze on every device. */
+  function genMaze(sd, n) {
+    const rnd = prng((sd ^ 0x5bd1e995) >>> 0);
+    const SZ = [[6, 8], [7, 9], [8, 10]], z = SZ[Math.floor(rnd() * 3)], C = z[0], R = z[1];
+    const M = emptyMaze(C, R), HV = (R + 1) * C;
+    const get = (e) => (e < HV ? M.h[e] : M.v[e - HV]);
+    const set = (e, v) => { if (e < HV) M.h[e] = v; else M.v[e - HV] = v; };
+    const ids = [];
+    for (let j = 1; j < R; j++) for (let i = 0; i < C; i++) ids.push(j * C + i);
+    for (let j = 0; j < R; j++) for (let i = 1; i < C; i++) ids.push(HV + j * (C + 1) + i);
+    for (const e of ids) set(e, 1);
+    const imgs = (e) => edgeImgs(C, R, e, n >= 3 ? 4 : 2);
+    const seen = new Set(), orbits = [];
+    for (const e of ids) { if (seen.has(e)) continue; const o = imgs(e); o.forEach((x) => seen.add(x)); orbits.push(o); }
+    for (let k = orbits.length - 1; k > 0; k--) { const r = Math.floor(rnd() * (k + 1)); const t = orbits[k]; orbits[k] = orbits[r]; orbits[r] = t; }
+    const par = []; for (let k = 0; k < C * R; k++) par.push(k);
+    const find = (x) => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    const cellsOf = (e) => {
+      if (e < HV) { const j = Math.floor(e / C), i = e % C; return [(j - 1) * C + i, j * C + i]; }
+      const q = e - HV, j = Math.floor(q / (C + 1)), i = q % (C + 1); return [j * C + i - 1, j * C + i];
+    };
+    for (const o of orbits) {
+      if (!o.some((e) => { const c = cellsOf(e); return find(c[0]) !== find(c[1]); })) continue;
+      for (const e of o) { set(e, 0); const c = cellsOf(e); par[find(c[0])] = find(c[1]); }
+    }
+    const openBlock = (a, b) => { // 2×2 block with top-left cell (a, b) has no inner wall at all
+      if (a < 0 || b < 0 || a + 1 >= C || b + 1 >= R) return false;
+      return !M.v[b * (C + 1) + a + 1] && !M.v[(b + 1) * (C + 1) + a + 1] && !M.h[(b + 1) * C + a] && !M.h[(b + 1) * C + a + 1];
+    };
+    const badAt = (e) => {
+      if (e < HV) { const j = Math.floor(e / C), i = e % C; return openBlock(i - 1, j - 1) || openBlock(i, j - 1); }
+      const q = e - HV, j = Math.floor(q / (C + 1)), i = q % (C + 1); return openBlock(i - 1, j - 1) || openBlock(i - 1, j);
+    };
+    for (const o of orbits) {
+      if (!get(o[0]) || rnd() > 0.34) continue;
+      for (const e of o) set(e, 0);
+      if (o.some(badAt)) for (const e of o) set(e, 1);
+    }
+    return M;
+  }
+
+  /* ----- world geometry: merged wall boxes + per-cell buckets ----- */
+  function buildRects(W) {
+    const { C, R, M, ox, oy } = W, out = [], hw = WT / 2, HV = (R + 1) * C, rk = [], K = M.k || [];
+    const solidH = (e) => M.h[e] && !K[e], solidV = (q) => M.v[q] && !K[HV + q];
+    for (let j = 0; j <= R; j++) for (let i = 0; i < C;) {
+      if (!solidH(j * C + i)) { i++; continue; }
+      let i1 = i; while (i1 < C && solidH(j * C + i1)) i1++;
+      out.push(ox + i * CS - hw, oy + j * CS - hw, ox + i1 * CS + hw, oy + j * CS + hw); rk.push(-1); i = i1;
+    }
+    for (let i = 0; i <= C; i++) for (let j = 0; j < R;) {
+      if (!solidV(j * (C + 1) + i)) { j++; continue; }
+      let j1 = j; while (j1 < R && solidV(j1 * (C + 1) + i)) j1++;
+      out.push(ox + i * CS - hw, oy + j * CS - hw, ox + i * CS + hw, oy + j1 * CS + hw); rk.push(-1); j = j1;
+    }
+    // cracked pieces: one box each between the posts, plus a post at each end so corners stay closed
+    const posts = new Set();
+    for (let j = 0; j <= R; j++) for (let i = 0; i < C; i++) { const e = j * C + i; if (M.h[e] && K[e]) { out.push(ox + i * CS + hw, oy + j * CS - hw, ox + (i + 1) * CS - hw, oy + j * CS + hw); rk.push(e); posts.add(j * (C + 1) + i); posts.add(j * (C + 1) + i + 1); } }
+    for (let j = 0; j < R; j++) for (let i = 0; i <= C; i++) { const q = j * (C + 1) + i; if (M.v[q] && K[HV + q]) { out.push(ox + i * CS - hw, oy + j * CS + hw, ox + i * CS + hw, oy + (j + 1) * CS - hw); rk.push(HV + q); posts.add(j * (C + 1) + i); posts.add((j + 1) * (C + 1) + i); } }
+    for (const p of posts) { const j = Math.floor(p / (C + 1)), i = p % (C + 1), x = ox + i * CS, y = oy + j * CS; out.push(x - hw, y - hw, x + hw, y + hw); rk.push(-1); }
+    W.rects = out; W.nr = out.length / 4; W.rk = rk; W.bk = [];
+    for (let j = 0; j < R; j++) for (let i = 0; i < C; i++) {
+      const bx0 = ox + i * CS - BM, by0 = oy + j * CS - BM, bx1 = ox + (i + 1) * CS + BM, by1 = oy + (j + 1) * CS + BM, l = [];
+      for (let k = 0; k < W.nr; k++) { const q = k * 4; if (out[q] < bx1 && out[q + 2] > bx0 && out[q + 1] < by1 && out[q + 3] > by0) l.push(k); }
+      W.bk.push(l);
+    }
+  }
+  const cellIdx = (W, x, y) => clamp(Math.floor((y - W.oy) / CS), 0, W.R - 1) * W.C + clamp(Math.floor((x - W.ox) / CS), 0, W.C - 1);
+  const cellXY = (W, c) => [W.ox + ((c % W.C) + 0.5) * CS, W.oy + (Math.floor(c / W.C) + 0.5) * CS];
+  const bucket = (W, x, y) => W.bk[cellIdx(W, x, y)];
+
+  /* swept point (radius r) vs wall boxes. Sets HT (0..1 along d) and HA (1 = x face, 2 = y face, 3 = corner) */
+  let HT = 0, HA = 0, HK = -1, TRC = 0;
+  function cast(W, px, py, dx, dy, r, list) {
+    const Rr = W.rects, N = list ? list.length : W.nr;
+    let best = 2, ax = 0, hk = -1;
+    const mx = dx > 1e-12 || dx < -1e-12, my = dy > 1e-12 || dy < -1e-12;
+    for (let q = 0; q < N; q++) {
+      const k = (list ? list[q] : q) * 4;
+      const x0 = Rr[k] - r, y0 = Rr[k + 1] - r, x1 = Rr[k + 2] + r, y1 = Rr[k + 3] + r;
+      let tn = -1e9, tf = 1e9, a = 0;
+      if (mx) { let t0 = (x0 - px) / dx, t1 = (x1 - px) / dx; if (t0 > t1) { const t = t0; t0 = t1; t1 = t; } tn = t0; tf = t1; a = 1; }
+      else if (px <= x0 || px >= x1) continue;
+      if (my) {
+        let t0 = (y0 - py) / dy, t1 = (y1 - py) / dy; if (t0 > t1) { const t = t0; t0 = t1; t1 = t; }
+        if (t0 > tn + 1e-9) { tn = t0; a = 2; } else if (t0 > tn - 1e-9) a = 3;
+        if (t1 < tf) tf = t1;
+      } else if (py <= y0 || py >= y1) continue;
+      if (tn > tf || tn < 0 || tf <= 1e-9 || tn >= best) continue;
+      best = tn; ax = a; hk = k >> 2;
+    }
+    if (best > 1) return false;
+    HT = best; HA = ax; HK = hk; return true;
+  }
+  const clearLine = (W, x0, y0, x1, y1, r) => !cast(W, x0, y0, x1 - x0, y1 - y0, r, null);
+  function insideWall(W, x, y, r) {
+    const Rr = W.rects;
+    for (const k0 of bucket(W, x, y)) { const k = k0 * 4; if (x > Rr[k] - r && x < Rr[k + 2] + r && y > Rr[k + 1] - r && y < Rr[k + 3] + r) return true; }
+    return false;
+  }
+  /* bouncing ray (laser, aim line, AI): fills out[] with x,y points, returns the point count */
+  function traceRay(W, x, y, a, maxB, maxLen, r, out, stopCrack) {
+    let dx = Math.cos(a), dy = Math.sin(a), rem = maxLen, n = 0;
+    out[n++] = x; out[n++] = y;
+    TRC = 0;
+    for (let b = 0; b <= maxB && rem > 0.01; b++) {
+      if (!cast(W, x, y, dx * rem, dy * rem, r, null)) { x += dx * rem; y += dy * rem; out[n++] = x; out[n++] = y; break; }
+      const t = HT, ax = HA, e = W.rk ? W.rk[HK] : -1;
+      x += dx * rem * t; y += dy * rem * t; rem -= rem * t;
+      out[n++] = x; out[n++] = y;
+      if (stopCrack && e >= 0) { TRC = 1; break; } // a shell is spent on a cracked wall
+      if (ax & 1) { dx = -dx; x += Math.sign(dx) * 1e-3; }
+      if (ax & 2) { dy = -dy; y += Math.sign(dy) * 1e-3; }
+    }
+    return n / 2;
+  }
+  /* first entry of segment a→b into circle (cx, cy, r): param 0..1, or −1 */
+  function segCircle(ax, ay, bx, by, cx, cy, r) {
+    const dx = bx - ax, dy = by - ay, fx = ax - cx, fy = ay - cy;
+    const A = dx * dx + dy * dy, B = 2 * (fx * dx + fy * dy), Cc = fx * fx + fy * fy - r * r;
+    if (Cc <= 0) return 0;
+    if (A < 1e-12) return -1;
+    const D = B * B - 4 * A * Cc;
+    if (D < 0) return -1;
+    const t = (-B - Math.sqrt(D)) / (2 * A);
+    return t >= 0 && t <= 1 ? t : -1;
+  }
+
+  /* ----- maze graph ----- */
+  /* thru = treat cracked walls as open (for planning a way through by breaking them) */
+  function bfs(W, start, blk, thru) {
+    const C = W.C, R = W.R, M = W.M, N = C * R, D = new Int16Array(N).fill(-1), q = new Int16Array(N), HV = (R + 1) * C, K = M.k;
+    if (start < 0 || start >= N) return D;
+    const vo = (x) => !M.v[x] || (thru && K[HV + x] > 0), ho = (x) => !M.h[x] || (thru && K[x] > 0);
+    let hd = 0, tl = 0; D[start] = 0; q[tl++] = start;
+    while (hd < tl) {
+      const c = q[hd++], i = c % C, j = (c / C) | 0, d = D[c] + 1;
+      const go = (nn) => { if (D[nn] < 0 && !(blk && blk[nn])) { D[nn] = d; q[tl++] = nn; } };
+      if (i < C - 1 && vo(j * (C + 1) + i + 1)) go(c + 1);
+      if (i > 0 && vo(j * (C + 1) + i)) go(c - 1);
+      if (j < R - 1 && ho((j + 1) * C + i)) go(c + C);
+      if (j > 0 && ho(j * C + i)) go(c - C);
+    }
+    return D;
+  }
+  /* next cell toward D's origin; NXE = the wall edge crossed (only set when it is a cracked wall, with thru) */
+  let NXE = -1;
+  function nextCell(W, D, c, thru) {
+    const C = W.C, M = W.M, i = c % C, j = (c / C) | 0, HV = (W.R + 1) * C, K = M.k;
+    NXE = -1;
+    if (D[c] <= 0) return -1;
+    const ok = (nn) => D[nn] >= 0 && D[nn] < D[c];
+    const vo = (x) => !M.v[x] || (thru && K[HV + x] > 0), ho = (x) => !M.h[x] || (thru && K[x] > 0);
+    const pick = (nn, e, isV) => { if (isV ? M.v[e] : M.h[e]) NXE = isV ? HV + e : e; return nn; };
+    if (i < C - 1 && vo(j * (C + 1) + i + 1) && ok(c + 1)) return pick(c + 1, j * (C + 1) + i + 1, true);
+    if (i > 0 && vo(j * (C + 1) + i) && ok(c - 1)) return pick(c - 1, j * (C + 1) + i, true);
+    if (j < W.R - 1 && ho((j + 1) * C + i) && ok(c + C)) return pick(c + C, (j + 1) * C + i, false);
+    if (j > 0 && ho(j * C + i) && ok(c - C)) return pick(c - C, j * C + i, false);
+    return -1;
+  }
+
+  /* ----- world ----- */
+  function spawnAngle(W, i, j) {
+    const C = W.C, R = W.R, M = W.M, dn = j < R / 2, rt = i < C / 2;
+    const vOpen = dn ? (j < R - 1 && !M.h[(j + 1) * C + i]) : (j > 0 && !M.h[j * C + i]);
+    const hOpen = rt ? (i < C - 1 && !M.v[j * (C + 1) + i + 1]) : (i > 0 && !M.v[j * (C + 1) + i]);
+    if (vOpen) return dn ? Math.PI / 2 : -Math.PI / 2;
+    if (hOpen) return rt ? 0 : Math.PI;
+    return dn ? Math.PI / 2 : -Math.PI / 2;
+  }
+  function newWorld(mk, sd, n, rd, cls, tm) {
+    const fixed = mk > 0 && mk <= FIXED.length;
+    const M = fixed ? buildFixed(mk - 1) : genMaze(sd, n);
+    if (!fixed) crackMaze(M, sd, n >= 3 ? 4 : 2);
+    const W = { mk: fixed ? mk : 0, sd, n, C: M.C, R: M.R, M, ox: -M.C * CS / 2, oy: -M.R * CS / 2, t: 0, tanks: [], shells: [], mines: [], pu: [], puT: PU_FIRST, tm: Array.isArray(tm) && tm.length === n ? tm.slice() : null, foc: {}, fx: [], fxq: 0, over: false, sq: 0, wv: 0 };
+    blockSpawnLOS(W, fixed || n >= 3 ? 4 : 2);
+    W.cl = []; for (let e = 0; e < M.k.length; e++) if (M.k[e] > 0) W.cl.push(e);
+    const corners = [[0, 0], [W.C - 1, W.R - 1], [W.C - 1, 0], [0, W.R - 1]];
+    for (let s = 0; s < n; s++) {
+      const cc = corners[(s + Math.max(0, (rd | 0) - 1)) % n], p = cellXY(W, cc[1] * W.C + cc[0]);
+      const ci = cls && cls[s] >= 0 && cls[s] < CLS.length ? cls[s] | 0 : 0, K = CLS[ci];
+      W.tanks.push({ seat: s, ci, hp: K.hp, r: K.r, x: p[0], y: p[1], a: spawnAngle(W, cc[0], cc[1]), v: 0, w: 0, alive: true, cd: 0, sp: '', sh: 0, fq: null, sq: null, by: -1 });
+    }
+    return W;
+  }
+  /* team mode: a and b are different tanks on the same team (team shells never hurt allies) */
+  const ally = (W, a, b) => !!(W.tm && a >= 0 && b >= 0 && a !== b && W.tm[a] === W.tm[b]);
+  /* a cracked wall piece takes damage; at 0 it is gone for good */
+  function hitWall(W, e, dmg, hooks) {
+    const M = W.M; if (!(M.k[e] > 0)) return;
+    M.k[e] = Math.max(0, M.k[e] - dmg);
+    if (!M.k[e]) { const HV = (W.R + 1) * W.C; if (e < HV) M.h[e] = 0; else M.v[e - HV] = 0; buildRects(W); }
+    W.wv++;
+    emit(W, hooks, 'w', e, M.k[e]);
+  }
+  /* centre of a wall edge */
+  function edgeXY(W, e) {
+    const C = W.C, HV = (W.R + 1) * C;
+    if (e < HV) { const j = Math.floor(e / C), i = e % C; return [W.ox + (i + 0.5) * CS, W.oy + j * CS]; }
+    const q = e - HV, j = Math.floor(q / (C + 1)), i = q % (C + 1); return [W.ox + i * CS, W.oy + (j + 0.5) * CS];
+  }
+  /* artillery: the shell lands where the aim line passes the enemy it points at (within a cone), else at max range */
+  function artRange(W, c) {
+    const ca = Math.cos(c.a), sa = Math.sin(c.a);
+    let best = ART_MAX, bang = ART_CONE;
+    for (const e of W.tanks) {
+      if (!e.alive || e === c || ally(W, c.seat, e.seat)) continue;
+      const dx = e.x - c.x, dy = e.y - c.y, pr = dx * ca + dy * sa, pp = Math.abs(-dx * sa + dy * ca), an = Math.atan2(pp, pr);
+      if (pr < ART_MIN * 0.7 || pr > ART_MAX + 25 || an >= bang) continue;
+      bang = an; best = pr;
+    }
+    let r = clamp(best, ART_MIN, ART_MAX);
+    const hx = W.C * CS / 2 - 4, hy = W.R * CS / 2 - 4; // stay on the table
+    for (let k = 0; k < 20; k++) { const x = c.x + ca * r, y = c.y + sa * r; if (Math.abs(x) <= hx && Math.abs(y) <= hy) break; r = Math.max(ART_MIN, r - 10); }
+    return r;
+  }
+  function emit(W, hooks, code, a, b, c, d, e) {
+    W.fxq++;
+    W.fx.push([W.fxq, code, a, b, c, d, e]);
+    if (W.fx.length > 12) W.fx.shift();
+    if (hooks && hooks.fx) hooks.fx(code, a, b, c, d, e);
+  }
+  function pushOut(W, c) {
+    const Rr = W.rects;
+    for (let it = 0; it < 2; it++) {
+      for (const k0 of bucket(W, c.x, c.y)) {
+        const k = k0 * 4, x0 = Rr[k], y0 = Rr[k + 1], x1 = Rr[k + 2], y1 = Rr[k + 3];
+        const qx = clamp(c.x, x0, x1), qy = clamp(c.y, y0, y1), dx = c.x - qx, dy = c.y - qy, d2 = dx * dx + dy * dy;
+        const TRc = c.r || TR;
+        if (d2 >= TRc * TRc) continue;
+        if (d2 > 1e-10) { const d = Math.sqrt(d2), p = TRc - d; c.x += dx / d * p; c.y += dy / d * p; }
+        else { // centre inside the box: leave by the nearest face
+          const l = c.x - x0, r = x1 - c.x, u = c.y - y0, b = y1 - c.y, m = Math.min(l, r, u, b);
+          if (m === l) c.x = x0 - TRc; else if (m === r) c.x = x1 + TRc; else if (m === u) c.y = y0 - TRc; else c.y = y1 + TRc;
+        }
+      }
+    }
+    const hx = W.C * CS / 2 - WT / 2 - (c.r || TR), hy = W.R * CS / 2 - WT / 2 - (c.r || TR);
+    c.x = clamp(c.x, -hx, hx); c.y = clamp(c.y, -hy, hy);
+  }
+  const NOIN = {};
+  /* inp: {m:'s', x, y} stick (turn toward + drive) or {m:'k', v (−1..1 forward), t (−1..1 turn)}; fc/sc fire counters */
+  function stepTank(W, c, inp, h) {
+    if (!c.alive) return;
+    if (c.cd > 0) c.cd -= h;
+    if (c.sh > 0) c.sh -= h;
+    const i = inp || NOIN, K = clsOf(c), TU = TURN * K.turn;
+    let v = 0, w = 0;
+    if (i.m === 'k') {
+      w = clamp(+i.t || 0, -1, 1) * TU;
+      const f = clamp(+i.v || 0, -1, 1); v = f >= 0 ? f * TSPD * K.spd : f * TBACK * K.spd;
+    } else {
+      const x = clamp(+i.x || 0, -1, 1), y = clamp(+i.y || 0, -1, 1), m = Math.min(1, Math.hypot(x, y));
+      if (m > 0.12) {
+        const d = wrapA(Math.atan2(y, x) - c.a);
+        w = clamp(d * SGAIN, -TU, TU); // eases in on the stick direction, no overshoot
+        v = m * TSPD * K.spd * clamp((Math.cos(d) - 0.3) / 0.7, 0, 1);
+      }
+    }
+    // ramp toward the wanted speed / turn: speeding up is gentle, slowing down (or reversing) is quicker
+    const cw = c.w || 0, wu = Math.abs(w) > Math.abs(cw) && w * cw >= 0 ? WACC : WDEC;
+    c.w = cw + clamp(w - cw, -wu * h, wu * h);
+    if (c.w) c.a = wrapA(c.a + c.w * h);
+    const cv0 = c.v || 0, vu = Math.abs(v) > Math.abs(cv0) && v * cv0 >= 0 ? ACC : DEC;
+    c.v = cv0 + clamp(v - cv0, -vu * h, vu * h);
+    if (c.v) { c.x += Math.cos(c.a) * c.v * h; c.y += Math.sin(c.a) * c.v * h; pushOut(W, c); }
+  }
+  function tankBump(W) {
+    const ts = W.tanks;
+    for (let i = 0; i < ts.length; i++) {
+      const a = ts[i]; if (!a.alive) continue;
+      for (let j = i + 1; j < ts.length; j++) {
+        const b = ts[j]; if (!b.alive) continue;
+        let dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+        const rr = (a.r || TR) + (b.r || TR);
+        if (d >= rr) continue;
+        if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
+        const p = (rr - d) / 2;
+        a.x -= dx / d * p; a.y -= dy / d * p; b.x += dx / d * p; b.y += dy / d * p;
+        pushOut(W, a); pushOut(W, b);
+      }
+    }
+  }
+  const radOf = (s) => (s.k === 'p' ? PR : s.k === 'm' ? MR : s.k === 'b' ? BR : s.k === 'q' || s.k === 'o' ? QR : s.k === 'k' ? 2.6 : SR);
+  const spdOf = (k) => (k === 'p' ? PSPD : k === 'm' ? MSPD : k === 'b' ? BSPD : k === 'r' ? RSPD : k === 'q' || k === 'o' ? QSPD : k === 'k' ? KSPD : SSPD);
+  const lifeOf = (k) => (k === 'p' ? PLIFE : k === 'm' ? MLIFE : k === 'a' ? 9 : k === 'k' ? KFUSE : k === 'r' ? 4.5 : SLIFE);
+  const dmgOf = (k) => (k === 'b' || k === 'm' || k === 'q' || k === 'o' ? 2 : 1);
+  function smokeAt(W, x, y, hooks) {
+    if (!W.smk) W.smk = [];
+    W.smk.push({ x: r1(x), y: r1(y), t: 0 }); if (W.smk.length > 6) W.smk.shift();
+    emit(W, hooks, 'k', r1(x), r1(y));
+  }
+  /* inside a smoke cloud: hidden from others' eyes and from AI aim */
+  function inSmoke(W, x, y, pad) { if (W.smk) for (const m of W.smk) if (Math.hypot(m.x - x, m.y - y) < SMK_R * Math.min(1, m.t * 4 + 0.3) - (pad || 0)) return true; return false; }
+  /* host = this device applies wall damage (a shell that hits a cracked wall is spent either way) */
+  function moveShell(W, s, h, hooks, host) {
+    let rem = h, g = 0;
+    const r = radOf(s);
+    while (rem > 1e-9 && g++ < 4) {
+      const dx = s.vx * rem, dy = s.vy * rem;
+      if (!cast(W, s.x, s.y, dx, dy, r, bucket(W, s.x, s.y))) { s.x += dx; s.y += dy; return; }
+      const t = HT, ax = HA, e = W.rk ? W.rk[HK] : -1;
+      s.x += dx * t; s.y += dy * t; rem -= rem * t;
+      if (s.k === 'k') { s.dead = 1; if (host) smokeAt(W, s.x, s.y, hooks); return; }
+      if (e >= 0 && s.k === 'q') { // piercing: break the cracked wall and fly on
+        if (host) hitWall(W, e, 9, hooks);
+        s.k = 'o'; s.x += s.vx * 1e-3; s.y += s.vy * 1e-3;
+        if (!host) { // guest: open it locally so the shell passes until the snapshot confirms
+          const HV = (W.R + 1) * W.C; W.M.k[e] = 0; if (e < HV) W.M.h[e] = 0; else W.M.v[e - HV] = 0; buildRects(W);
+        }
+        continue;
+      }
+      if (e >= 0 && s.k !== 'r') { s.dead = 1; if (host) hitWall(W, e, dmgOf(s.k), hooks); else if (hooks && hooks.fizzle) hooks.fizzle(s); return; }
+      if (s.k === 'r' && (s.nb = (s.nb || 0) + 1) > RB_MAX) { s.dead = 1; if (hooks && hooks.fizzle) hooks.fizzle(s); return; }
+      if (ax & 1) { s.vx = -s.vx; s.x += Math.sign(s.vx) * 1e-4; }
+      if (ax & 2) { s.vy = -s.vy; s.y += Math.sign(s.vy) * 1e-4; }
+      s.bt = s.t;
+      if (hooks && hooks.bounce) hooks.bounce(s);
+    }
+  }
+  function shellsOf(W, seat) { let n = 0; for (const s of W.shells) if (s.o === seat && (s.k === 's' || s.k === 'b' || s.k === 'a')) n++; return n; }
+  function spawnShell(W, c, ang, k, hooks) {
+    const sp = spdOf(k);
+    const s = { id: ++W.sq, x: c.x, y: c.y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, o: c.seat, k, t: 0, arm: 0, bt: 0 };
+    moveShell(W, s, ((c.r || TR) + 3) / sp, hooks, true); // from the hull centre out of the muzzle (bounces back if the muzzle is in a wall)
+    s.bt = 0;
+    if (!s.dead) W.shells.push(s);
+    return s;
+  }
+  function fire(W, c, hooks) {
+    if (!c.alive || c.cd > 0) return 0;
+    const K = clsOf(c);
+    if (shellsOf(W, c.seat) >= K.smax) { if (hooks && hooks.empty) hooks.empty(c); return -1; }
+    if (K.sk === 'a') {
+      const r = artRange(W, c);
+      W.shells.push({ id: ++W.sq, x: c.x, y: c.y, vx: Math.cos(c.a) * r / artT(r), vy: Math.sin(c.a) * r / artT(r), o: c.seat, k: 'a', t: 0, arm: 1, bt: 0, T: artT(r) });
+    } else spawnShell(W, c, c.a, K.sk, hooks);
+    c.cd = K.cd;
+    emit(W, hooks, 'f', c.seat, K.sk === 'a' ? 5 : K.sk === 'b' ? 4 : 0, r1(c.x), r1(c.y), r2(c.a));
+    return 1;
+  }
+  function artBoom(W, s, hooks) {
+    emit(W, hooks, 'b', r1(s.x), r1(s.y), s.o, 1);
+    for (const c of W.tanks) { if (!c.alive) continue; const d = Math.hypot(c.x - s.x, c.y - s.y); if (d < ART_BOOM * clsOf(c).ab + (c.r || TR) * 0.5) hurt(W, c, s.o, hooks, 1); }
+    for (const e of W.cl) if (W.M.k[e] > 0) { const p = edgeXY(W, e); if (Math.hypot(p[0] - s.x, p[1] - s.y) < ART_BOOM + 6) hitWall(W, e, 2, hooks); }
+    for (const q of W.mines.slice()) if (Math.hypot(q.x - s.x, q.y - s.y) < ART_BOOM) boom(W, q, hooks);
+  }
+  function hurt(W, c, by, hooks, dmg) {
+    if (!c.alive || ally(W, by, c.seat)) return false;
+    if (c.sh > 0) { c.sh = 0; emit(W, hooks, 's', c.seat, r1(c.x), r1(c.y)); return false; }
+    if (c.inv > W.t) return false;
+    c.hp = (c.hp == null ? 1 : c.hp) - (dmg || 1);
+    if (c.hp > 0) { c.inv = W.t + 0.3; emit(W, hooks, 'h', c.seat, by, r1(c.x), r1(c.y), c.hp); return false; }
+    c.hp = 0; c.alive = false; c.by = by; c.v = 0; c.w = 0;
+    emit(W, hooks, 'x', c.seat, by, r1(c.x), r1(c.y), r2(c.a));
+    return true;
+  }
+  const TB = new Float64Array(64);
+  function laserPath(W, x, y, a, out) { return traceRay(W, x, y, a, LZ_B, LZ_LEN, 0.6, out); }
+  function laser(W, c, hooks) {
+    const n = laserPath(W, c.x, c.y, c.a, TB);
+    let cum = 0, hitL = -1, hitT = null;
+    for (let k = 0; k < n - 1; k++) {
+      const ax = TB[2 * k], ay = TB[2 * k + 1], bx = TB[2 * k + 2], by = TB[2 * k + 3], sl = Math.hypot(bx - ax, by - ay);
+      for (const q of W.tanks) {
+        if (!q.alive || (q === c && k === 0) || ally(W, c.seat, q.seat)) continue;
+        const u = segCircle(ax, ay, bx, by, q.x, q.y, q.r || TR);
+        if (u >= 0 && (hitL < 0 || cum + u * sl < hitL)) { hitL = cum + u * sl; hitT = q; }
+      }
+      if (hitL >= 0) break;
+      cum += sl;
+    }
+    emit(W, hooks, 'l', c.seat, r1(c.x), r1(c.y), r2(c.a), Math.round(hitL >= 0 ? hitL : cum + 1));
+    if (hitT) hurt(W, hitT, c.seat, hooks, 2);
+  }
+  function special(W, c, hooks) {
+    if (!c.alive || !c.sp || c.cd > 0) return 0;
+    const k = c.sp;
+    c.sp = ''; c.cd = FIRE_CD;
+    if (k === 'L') laser(W, c, hooks);
+    else if (k === 'S') { for (let i = 0; i < PN; i++) spawnShell(W, c, c.a + (i / (PN - 1) - 0.5) * 2 * PSPREAD, 'p', hooks); emit(W, hooks, 'f', c.seat, 1, r1(c.x), r1(c.y), r2(c.a)); }
+    else if (k === 'M') { spawnShell(W, c, c.a, 'm', hooks); emit(W, hooks, 'f', c.seat, 2, r1(c.x), r1(c.y), r2(c.a)); }
+    else if (k === 'R' || k === 'P' || k === 'K') { spawnShell(W, c, c.a, k === 'R' ? 'r' : k === 'P' ? 'q' : 'k', hooks); emit(W, hooks, 'f', c.seat, k === 'R' ? 6 : k === 'P' ? 7 : 8, r1(c.x), r1(c.y), r2(c.a)); }
+    else if (k === 'N') {
+      let x = c.x - Math.cos(c.a) * ((c.r || TR) + 3), y = c.y - Math.sin(c.a) * ((c.r || TR) + 3);
+      if (insideWall(W, x, y, 4)) { x = c.x; y = c.y; }
+      W.mines.push({ x: r1(x), y: r1(y), o: c.seat, t: 0, lf: 0 });
+      emit(W, hooks, 'f', c.seat, 3, r1(x), r1(y), r2(c.a));
+    }
+    return 1;
+  }
+  /* homing missile: after a short straight run it follows the maze toward the nearest enemy */
+  function steerMissile(W, s, h) {
+    s.rt = (s.rt || 0) - h;
+    if (s.rt <= 0) {
+      s.rt = 0.15;
+      const ci = cellIdx(W, s.x, s.y), D = bfs(W, ci, null);
+      let best = null, bd = 1e9;
+      for (const c of W.tanks) {
+        if (!c.alive || c.seat === s.o || ally(W, s.o, c.seat)) continue;
+        const d = D[cellIdx(W, c.x, c.y)], dd = (d < 0 ? 99 : d) * CS + Math.hypot(c.x - s.x, c.y - s.y) * 0.01;
+        if (dd < bd) { bd = dd; best = c; }
+      }
+      s.gx = null;
+      if (best) {
+        const tc = cellIdx(W, best.x, best.y);
+        if (tc === ci || clearLine(W, s.x, s.y, best.x, best.y, MR + 1)) { s.gx = best.x; s.gy = best.y; }
+        else {
+          const Dt = bfs(W, tc, null), nx = nextCell(W, Dt, ci);
+          if (nx < 0) { s.gx = best.x; s.gy = best.y; }
+          else {
+            const n2 = nextCell(W, Dt, nx), p2 = n2 >= 0 ? cellXY(W, n2) : null;
+            const p = p2 && clearLine(W, s.x, s.y, p2[0], p2[1], MR + 1) ? p2 : cellXY(W, nx);
+            s.gx = p[0]; s.gy = p[1];
+          }
+        }
+      }
+    }
+    if (s.gx == null) return;
+    const want = Math.atan2(s.gy - s.y, s.gx - s.x), cur = Math.atan2(s.vy, s.vx), d = wrapA(want - cur), na = cur + clamp(d, -MTURN * h, MTURN * h);
+    s.vx = Math.cos(na) * MSPD; s.vy = Math.sin(na) * MSPD;
+  }
+  function boom(W, m, hooks) {
+    const i = W.mines.indexOf(m); if (i < 0) return;
+    W.mines.splice(i, 1);
+    emit(W, hooks, 'b', r1(m.x), r1(m.y), m.o, 0);
+    for (const c of W.tanks) if (c.alive && Math.hypot(c.x - m.x, c.y - m.y) < MINE_BOOM + (c.r || TR) * 0.4 && clearLine(W, m.x, m.y, c.x, c.y, 0)) hurt(W, c, m.o, hooks, 2);
+    for (const e of W.cl) if (W.M.k[e] > 0) { const p = edgeXY(W, e); if (Math.hypot(p[0] - m.x, p[1] - m.y) < MINE_BOOM) hitWall(W, e, 3, hooks); }
+    for (const q of W.mines.slice()) if (Math.hypot(q.x - m.x, q.y - m.y) < MINE_BOOM) boom(W, q, hooks);
+  }
+  function stepShells(W, h, hooks, host) {
+    const sh = W.shells;
+    for (let k = sh.length - 1; k >= 0; k--) {
+      const s = sh[k];
+      if (!s) continue;
+      s.t += h;
+      if (s.k === 'a') { // arcing shell: flies over everything, bursts where it lands
+        s.x += s.vx * h; s.y += s.vy * h;
+        if (s.T == null) s.T = artTv(s);
+        if (s.t >= s.T) { sh.splice(k, 1); if (host && !W.over) artBoom(W, s, hooks); else if (hooks && hooks.fizzle) hooks.fizzle(s); }
+        continue;
+      }
+      if (s.t >= lifeOf(s.k) || Math.abs(s.x) > W.C * CS || Math.abs(s.y) > W.R * CS) { sh.splice(k, 1); if (s.k === 'k' && host) smokeAt(W, s.x, s.y, hooks); else if (hooks && hooks.fizzle) hooks.fizzle(s); continue; }
+      if (s.k === 'm' && s.t > MDELAY) steerMissile(W, s, h);
+      moveShell(W, s, h, hooks, host);
+      if (s.dead) { const i = sh.indexOf(s); if (i >= 0) sh.splice(i, 1); continue; }
+      const r = radOf(s);
+      const o = W.tanks[s.o];
+      if (!s.arm && (!o || !o.alive || Math.hypot(o.x - s.x, o.y - s.y) > (o.r || TR) + r + 0.5)) s.arm = 1;
+      if (W.over) continue;
+      let gone = false;
+      for (const c of W.tanks) {
+        if (!c.alive || (c.seat === s.o && (!s.arm || s.k === 'r' || s.k === 'k')) || c.seat === s.pt || ally(W, s.o, c.seat)) continue;
+        const dx = c.x - s.x, dy = c.y - s.y, rr = (c.r || TR) + r;
+        if (dx * dx + dy * dy >= rr * rr) continue;
+        if (s.k === 'k') { gone = true; if (host) smokeAt(W, s.x, s.y, hooks); break; }
+        if (s.k === 'q') { s.k = 'o'; s.pt = c.seat; if (host) hurt(W, c, s.o, hooks, dmgOf('q')); break; } // through one tank
+        gone = true;
+        if (host) hurt(W, c, s.o, hooks, dmgOf(s.k));
+        break;
+      }
+      if (!gone && host) for (const m of W.mines) {
+        if (Math.hypot(m.x - s.x, m.y - s.y) < r + 4) { gone = true; boom(W, m, hooks); break; }
+      }
+      if (gone) { const i = sh.indexOf(s); if (i >= 0) sh.splice(i, 1); }
+    }
+  }
+  function stepMines(W, h, hooks, host) {
+    for (let k = W.mines.length - 1; k >= 0; k--) {
+      const m = W.mines[k];
+      if (!m) continue;
+      m.t += h;
+      const o = W.tanks[m.o];
+      if (!m.lf && (!o || !o.alive || Math.hypot(o.x - m.x, o.y - m.y) > MINE_R + TR + 3)) m.lf = 1;
+      if (m.t > MINE_LIFE) { W.mines.splice(k, 1); continue; }
+      if (!host || W.over || m.t < MINE_ARM) continue;
+      for (const c of W.tanks) {
+        if (!c.alive || (c.seat === m.o && !m.lf)) continue;
+        if (Math.hypot(c.x - m.x, c.y - m.y) < MINE_R + (c.r || TR) * 0.5) { boom(W, m, hooks); break; }
+      }
+    }
+  }
+  function pickups(W, hooks) {
+    for (let k = W.pu.length - 1; k >= 0; k--) {
+      const p = W.pu[k];
+      for (const c of W.tanks) {
+        if (!c.alive || Math.hypot(c.x - p.x, c.y - p.y) > (c.r || TR) + 6) continue;
+        if (p.k === 'D') c.sh = SHIELD_T;
+        else if (!c.sp) c.sp = p.k;
+        else continue;
+        W.pu.splice(k, 1);
+        emit(W, hooks, 'p', c.seat, PU_KEYS.indexOf(p.k), r1(p.x), r1(p.y));
+        break;
+      }
+    }
+  }
+  /* host only (Math.random): a crate now and then */
+  function maybePowerup(W, dt, hooks) {
+    W.puT -= dt;
+    if (W.puT > 0) return;
+    W.puT = PU_EVERY;
+    if (W.pu.length >= PU_MAX) return;
+    for (let tries = 0; tries < 24; tries++) {
+      const p = cellXY(W, Math.floor(Math.random() * W.C * W.R));
+      if (W.tanks.some((c) => c.alive && Math.hypot(c.x - p[0], c.y - p[1]) < CS * 1.6)) continue;
+      if (W.pu.some((q) => Math.hypot(q.x - p[0], q.y - p[1]) < 5) || W.mines.some((q) => Math.hypot(q.x - p[0], q.y - p[1]) < CS * 0.6)) continue;
+      const k = PU_KEYS[Math.floor(Math.random() * PU_KEYS.length)];
+      W.pu.push({ x: r1(p[0]), y: r1(p[1]), k });
+      emit(W, hooks, 'u', r1(p[0]), r1(p[1]), PU_KEYS.indexOf(k));
+      return;
+    }
+  }
+  /* one fixed step. host = this device decides hits / pick-ups (guests only move shells) */
+  function stepWorld(W, inputs, hooks, host) {
+    W.t += H;
+    for (const c of W.tanks) {
+      const i = W.over ? null : inputs && inputs[c.seat];
+      stepTank(W, c, i, H);
+      if (!host || !i || !c.alive || W.over) continue;
+      const fc = i.fc | 0, sc = i.sc | 0;
+      if (c.fq == null) c.fq = fc;
+      else if (fc !== c.fq && c.cd <= 0) { c.fq = fc; fire(W, c, hooks); } // a press during the cooldown waits for it
+      if (c.sq == null) c.sq = sc;
+      else if (sc !== c.sq && c.cd <= 0) { c.sq = sc; special(W, c, hooks); }
+    }
+    tankBump(W);
+    if (W.smk) for (let k = W.smk.length - 1; k >= 0; k--) if ((W.smk[k].t += H) > SMK_T) W.smk.splice(k, 1);
+    stepShells(W, H, hooks, host);
+    stepMines(W, H, hooks, host);
+    if (host && !W.over) pickups(W, hooks);
+  }
+
+  /* ======================= AI ======================= */
+  const AIC = {
+    /* rate = think interval (s), dodge = chance to check incoming shells per think, margin = gap (units) that triggers a
+       dodge, gap = min time between shots, B = wall bounces it plans, horizon = planned shot flight time (s) */
+    1: { rate: 0.3, noise: 0.13, B: 0, dodge: 0.15, margin: 4, gap: 1.4, lead: 0, safe: 1, strict: 0, tol: 0.1, N: 0, seek: 0.35, wild: 0.12, mineAvoid: 0, horizon: 2.4 },
+    2: { rate: 0.14, noise: 0.1, B: 1, dodge: 0.8, margin: 5, gap: 1.0, lead: 0.5, safe: 1, strict: 0, tol: 0.05, N: 48, seek: 1, wild: 0, mineAvoid: 1, horizon: 2.6 },
+    3: { rate: 0.08, noise: 0.01, B: 3, dodge: 1, margin: 5, gap: 0.4, lead: 1, safe: 1, strict: 1, tol: 0.035, N: 72, seek: 1, wild: 0, mineAvoid: 1, horizon: 3.4 },
+  };
+  const AT = new Float64Array(64);
+  /* length along the shot until it hits an enemy, or Infinity (miss / hits me first) */
+  function shotEval(W, c, ang, C, en, maxB, maxLen, spd, laserMode) {
+    const sr = laserMode ? 0.6 : clsOf(c).sk === 'b' ? BR : SR;
+    const n = traceRay(W, c.x, c.y, ang, maxB, maxLen, sr, AT, !laserMode);
+    let cum = 0, best = Infinity, self = Infinity;
+    const hitR0 = laserMode ? -0.5 : sr - 1.5;
+    for (let k = 0; k < n - 1; k++) {
+      const ax = AT[2 * k], ay = AT[2 * k + 1], bx = AT[2 * k + 2], by = AT[2 * k + 3], sl = Math.hypot(bx - ax, by - ay);
+      if (sl < 1e-6) continue;
+      const ux = (bx - ax) / sl, uy = (by - ay) / sl;
+      if (best === Infinity) for (const e of en) {
+        let ex = e.x, ey = e.y, pr = clamp((ex - ax) * ux + (ey - ay) * uy, 0, sl);
+        if (C.lead && !laserMode && e.v) { const tt = (cum + pr) / spd; ex += Math.cos(e.a) * e.v * tt * C.lead; ey += Math.sin(e.a) * e.v * tt * C.lead; pr = clamp((ex - ax) * ux + (ey - ay) * uy, 0, sl); }
+        const d = Math.hypot(ex - (ax + ux * pr), ey - (ay + uy * pr)), hitR = (e.r || TR) + hitR0;
+        if (d < hitR) { const L = cum + pr - Math.sqrt(Math.max(0, hitR * hitR - d * d)); if (L < best) best = L; }
+      }
+      if ((C.safe || laserMode) && k > 0) {
+        const pr = clamp((c.x - ax) * ux + (c.y - ay) * uy, 0, sl), d = Math.hypot(c.x - (ax + ux * pr), c.y - (ay + uy * pr));
+        if (d < (c.r || TR) + sr + 3 && cum + pr < self) self = cum + pr;
+      }
+      if (best < Infinity && !C.strict) break;
+      cum += sl;
+    }
+    if (best === Infinity || self < best) return Infinity;
+    if (C.strict && !laserMode && self < Infinity && best / spd > 0.5) return Infinity; // a miss would come back at me
+    return best;
+  }
+  function canFire(W, c) { return c.alive && c.cd <= 0 && shellsOf(W, c.seat) < clsOf(c).smax; }
+  function findShot(W, c, C, en, mem, laserMode) {
+    const ss = spdOf(clsOf(c).sk), maxB = laserMode ? LZ_B : C.B, maxLen = laserMode ? LZ_LEN : ss * C.horizon, spd = laserMode ? 1e6 : ss;
+    let bestA = null, bestS = Infinity;
+    const tryA = (ang) => {
+      const L = shotEval(W, c, ang, C, en, maxB, maxLen, spd, laserMode);
+      if (L === Infinity) return;
+      const s = L / (laserMode ? 1e4 : spd) + Math.abs(wrapA(ang - c.a)) / (TURN * clsOf(c).turn) * 1.2;
+      if (s < bestS) { bestS = s; bestA = ang; }
+    };
+    tryA(c.a);
+    for (const e of en) tryA(Math.atan2(e.y - c.y, e.x - c.x));
+    const N = laserMode ? Math.max(C.N, 24) : C.N, jit = Math.random() * Math.PI * 2 / Math.max(1, N);
+    for (let k = 0; k < N; k++) tryA(k / N * Math.PI * 2 + jit);
+    return bestA;
+  }
+  /* nearby shells sampled every 1/30 s over the next ~1 s (bounces included) */
+  function threats(W, c) {
+    const out = [];
+    for (const s of W.shells) {
+      if (ally(W, s.o, c.seat)) continue;
+      if (s.k === 'a') { // arcing shell: only its landing burst matters
+        const sT = s.T || artTv(s), kl = Math.round((sT - s.t) * 30), lx = s.x + s.vx * (sT - s.t), ly = s.y + s.vy * (sT - s.t);
+        if (kl > 30 || Math.hypot(lx - c.x, ly - c.y) > ART_BOOM + 60) continue;
+        const smp = [ART_BOOM + 2];
+        for (let q = 0; q <= Math.min(30, kl + 2); q++) { if (q >= kl - 1) smp.push(lx, ly); else smp.push(1e6, 1e6); }
+        out.push(smp); continue;
+      }
+      if (s.o === c.seat && !s.arm) continue;
+      const sp = Math.hypot(s.vx, s.vy), d0 = Math.hypot(s.x - c.x, s.y - c.y);
+      if (d0 > sp * 1.05 + 30) continue;
+      const n = traceRay(W, s.x, s.y, Math.atan2(s.vy, s.vx), 3, Math.min(sp * 1.0, sp * Math.max(0, lifeOf(s.k) - s.t)), radOf(s), AT);
+      const smp = [radOf(s)], step = sp / 30;
+      let k = 0, used = 0;
+      for (let q = 0; q <= 30 && n > 1; q++) {
+        const want = step * q;
+        let sl = Math.hypot(AT[2 * k + 2] - AT[2 * k], AT[2 * k + 3] - AT[2 * k + 1]);
+        while (want - used > sl && k < n - 2) { used += sl; k++; sl = Math.hypot(AT[2 * k + 2] - AT[2 * k], AT[2 * k + 3] - AT[2 * k + 1]); }
+        if (want - used > sl + 0.01) break; // the shell's path (or life) ends here
+        const u = sl > 0 ? clamp((want - used) / sl, 0, 1) : 0;
+        smp.push(AT[2 * k] + (AT[2 * k + 2] - AT[2 * k]) * u, AT[2 * k + 1] + (AT[2 * k + 3] - AT[2 * k + 1]) * u);
+      }
+      if (smp.length > 2) out.push(smp);
+    }
+    return out;
+  }
+  const GHOST = { seat: -1, x: 0, y: 0, a: 0, v: 0, w: 0, alive: true, cd: 0, sh: 0 };
+  const CANDS = [[1, 0], [1, -1], [1, 1], [-1, 0], [-1, -1], [-1, 1], [0, -1], [0, 1], [0, 0], [0.5, -1], [0.5, 1]];
+  const GIN = { m: 'k', v: 0, t: 0 };
+  /* smallest gap between my hull and any of the shells if I hold (v, t) for the next 1 s */
+  function clearance(W, c, v, t, th) {
+    GHOST.x = c.x; GHOST.y = c.y; GHOST.a = c.a; GHOST.v = c.v || 0; GHOST.w = c.w || 0; GHOST.alive = true; GHOST.ci = c.ci; GHOST.r = c.r; GIN.v = v; GIN.t = t;
+    let clear = 1e9;
+    for (let k = 0; k <= 30; k++) {
+      if (k) stepTank(W, GHOST, GIN, 1 / 30);
+      for (const smp of th) { if (2 * k + 2 >= smp.length) continue; const d = Math.hypot(GHOST.x - smp[2 * k + 1], GHOST.y - smp[2 * k + 2]) - smp[0] - (c.r || TR); if (d < clear) clear = d; }
+    }
+    return clear;
+  }
+  function dodgeMove(W, c, th) {
+    let best = null, bs = -1e9;
+    for (const cd of CANDS) {
+      const s = Math.min(clearance(W, c, cd[0], cd[1], th), 30) + (cd[0] ? 0.4 : 0);
+      if (s > bs) { bs = s; best = cd; }
+    }
+    return [best, bs];
+  }
+  function aiThink(W, c, mem, lv, dt) {
+    const inp = mem.inp || (mem.inp = { m: 'k', v: 0, t: 0, x: 0, y: 0, fc: 0, sc: 0 });
+    if (!c.alive || W.over) { inp.v = 0; inp.t = 0; return inp; }
+    const C = AIC[lv] || AIC[2];
+    mem.t = (mem.t || 0) - dt;
+    if (mem.t <= 0) { mem.t = C.rate * (0.8 + Math.random() * 0.4); think(W, c, mem, C, lv); }
+    if (mem.dodgeT > W.t) { inp.v = mem.dv; inp.t = mem.dtn; return inp; }
+    if (mem.backT > W.t) { inp.v = -1; inp.t = mem.bt; return inp; }
+    if (mem.aim != null) {
+      const d = wrapA(mem.aim + (mem.noff || 0) - c.a);
+      inp.t = clamp(d * 3.2, -1, 1); inp.v = 0;
+      const k = mem.aimK || 'f';
+      if (Math.abs(d) < C.tol && c.cd <= 0) {
+        if (k === 'f' || k === 'w') { if (canFire(W, c) && W.t - (mem.lf == null ? -9 : mem.lf) > (k === 'w' ? 0.25 : C.gap)) { inp.fc = (inp.fc + 1) % 1000; mem.lf = W.t; mem.aim = null; } }
+        else if (c.sp) { inp.sc = (inp.sc + 1) % 1000; mem.aim = null; mem.lf = W.t; }
+        else mem.aim = null;
+      }
+      return inp;
+    }
+    if (mem.gx != null) {
+      const d = wrapA(Math.atan2(mem.gy - c.y, mem.gx - c.x) - c.a);
+      inp.t = clamp(d * 3.2, -1, 1); inp.v = Math.abs(d) < 0.4 ? 1 : Math.abs(d) < 1.0 ? 0.3 : 0;
+    } else { inp.v = 0; inp.t = 0; }
+    return inp;
+  }
+  function think(W, c, mem, C, lv) {
+    const en0 = W.tanks.filter((o) => o.alive && o !== c && !ally(W, c.seat, o.seat));
+    const inp = mem.inp;
+    if (!en0.length) { mem.aim = null; mem.gx = null; return; }
+    const en = en0.filter((o) => !inSmoke(W, o.x, o.y, 4)); // can't aim at a tank hidden in smoke
+    // 1) incoming shells
+    if (C.dodge && Math.random() < C.dodge) {
+      const th = threats(W, c);
+      if (th.length) {
+        const cur = mem.aim != null ? clearance(W, c, 0, clamp(wrapA(mem.aim - c.a) * 3.2, -1, 1), th) : clearance(W, c, inp.v, inp.t, th);
+        if (cur < C.margin) {
+          const m = dodgeMove(W, c, th);
+          if (m[1] > cur + 0.5) { mem.dv = m[0][0]; mem.dtn = m[0][1]; mem.dodgeT = W.t + 0.2; mem.aim = null; return; }
+        }
+      }
+    }
+    // 2) stuck against something while driving
+    if (mem.gx != null && mem.aim == null) {
+      if (!mem.p0) mem.p0 = [c.x, c.y, W.t];
+      else if (W.t - mem.p0[2] > 0.9) {
+        if (Math.hypot(c.x - mem.p0[0], c.y - mem.p0[1]) < 2) { mem.backT = W.t + 0.35; mem.bt = Math.random() < 0.5 ? -1 : 1; }
+        mem.p0 = [c.x, c.y, W.t];
+      }
+    } else mem.p0 = null;
+    // 3) keep a still-valid plan (stops flip-flopping between angles)
+    if (mem.aim != null && W.t < (mem.aimUntil || 0)) {
+      const k = mem.aimK || 'f';
+      const ss = spdOf(clsOf(c).sk);
+      const ok = k === 'f' ? (clsOf(c).sk === 'a' ? artOk(W, c, mem.aim, en) : shotEval(W, c, mem.aim, C, en, C.B, ss * C.horizon, ss, false) < Infinity)
+        : k === 'L' ? shotEval(W, c, mem.aim, C, en, LZ_B, LZ_LEN, 1e6, true) < Infinity : true;
+      if (ok) return;
+    }
+    mem.aim = null;
+    const setAim = (a, k, noise) => { mem.aim = a; mem.aimK = k; mem.noff = noise ? (Math.random() + Math.random() + Math.random() - 1.5) * C.noise * 1.4 : 0; mem.aimUntil = W.t + 1.2; };
+    // 4) special weapons
+    if (c.sp && c.cd <= 0) {
+      const sp = c.sp;
+      if (sp === 'N') {
+        const D = bfs(W, cellIdx(W, c.x, c.y), null);
+        const far = en.every((e) => { const d = D[cellIdx(W, e.x, e.y)]; return d < 0 || d >= 2; });
+        if (lv === 1 || (far && Math.abs(c.v) > 10)) { inp.sc = (inp.sc + 1) % 1000; return; }
+      } else if (sp === 'L') {
+        const a = lv === 1 ? (shotEval(W, c, c.a, C, en, LZ_B, LZ_LEN, 1e6, true) < Infinity ? c.a : null) : findShot(W, c, C, en, mem, true);
+        if (a != null) { setAim(a, 'L', false); return; }
+        if (lv === 1 && Math.random() < 0.05) { inp.sc = (inp.sc + 1) % 1000; return; }
+      } else if (sp === 'S') {
+        for (const e of en) {
+          const d = Math.hypot(e.x - c.x, e.y - c.y);
+          if (d < 105 && clearLine(W, c.x, c.y, e.x, e.y, 1)) { setAim(Math.atan2(e.y - c.y, e.x - c.x), 'S', true); return; }
+        }
+      } else if (sp === 'R') { // ricochet: plan a bank shot with extra bounces (safe for me)
+        const C2 = Object.assign({}, C, { B: Math.max(2, C.B + 1), N: Math.max(C.N, 12) });
+        let a = null;
+        for (const e of en) if (clearLine(W, c.x, c.y, e.x, e.y, SR)) { a = Math.atan2(e.y - c.y, e.x - c.x); break; }
+        if (a == null && lv >= 2) { const ss = RSPD, tryOne = (g) => shotEval(W, c, g, C2, en, C2.B, ss * 2.5, ss, false) < Infinity; for (let k = 0; k < C2.N && a == null; k++) { const g = k / C2.N * Math.PI * 2; if (tryOne(g)) a = g; } }
+        if (a != null) { setAim(a, 'R', lv === 1); return; }
+      } else if (sp === 'P') { // piercing: straight at someone, through one cracked wall if need be
+        for (const e of en) {
+          const d = Math.hypot(e.x - c.x, e.y - c.y);
+          if (d > 260) continue;
+          const n = traceRay(W, c.x, c.y, Math.atan2(e.y - c.y, e.x - c.x), 0, d, QR, TB, true);
+          const clear = clearLine(W, c.x, c.y, e.x, e.y, QR), viaCrack = lv >= 2 && TRC && n === 2;
+          if (clear || viaCrack) { setAim(Math.atan2(e.y - c.y, e.x - c.x), 'P', lv === 1); return; }
+        }
+      } else if (sp === 'K') { // smoke: when someone has me in plain sight and close, cover up
+        const seen = en0.some((e) => Math.hypot(e.x - c.x, e.y - c.y) < 130 && clearLine(W, c.x, c.y, e.x, e.y, SR));
+        if ((seen && !inSmoke(W, c.x, c.y, 0)) || (lv === 1 && Math.random() < 0.04)) { inp.sc = (inp.sc + 1) % 1000; return; }
+      } else if (sp === 'M') {
+        const close = en.some((e) => Math.hypot(e.x - c.x, e.y - c.y) < 55);
+        if (!close && clearLine(W, c.x, c.y, c.x + Math.cos(c.a) * 30, c.y + Math.sin(c.a) * 30, MR)) { inp.sc = (inp.sc + 1) % 1000; return; }
+      }
+    }
+    const K = clsOf(c);
+    // 5) main gun
+    if (K.sk === 'a' && canFire(W, c) && W.t - (mem.lf == null ? -9 : mem.lf) > (lv >= 3 ? C.gap * 0.6 : C.gap * 1.3)) {
+      // artillery: lob at whoever is in range, leading a moving target by the flight time
+      let a = null, bd = 1e9;
+      for (const e of en) {
+        const ft = artT(Math.hypot(e.x - c.x, e.y - c.y)), ex = e.x + Math.cos(e.a) * (e.v || 0) * ft * C.lead, ey = e.y + Math.sin(e.a) * (e.v || 0) * ft * C.lead, d = Math.hypot(ex - c.x, ey - c.y);
+        if (d < ART_MIN + 6 || d > ART_MAX + 8) continue;
+        if (lv === 1 && !clearLine(W, c.x, c.y, e.x, e.y, 0) && Math.random() < 0.6) continue;
+        const sc = d + Math.abs(wrapA(Math.atan2(ey - c.y, ex - c.x) - c.a)) * 60;
+        if (sc < bd) { bd = sc; a = Math.atan2(ey - c.y, ex - c.x); }
+      }
+      if (a != null) { setAim(a, 'f', true); mem.noff *= lv >= 3 ? 0.6 : 2.2; return; }
+    } else if (K.sk !== 'a' && canFire(W, c) && W.t - (mem.lf == null ? -9 : mem.lf) > C.gap) {
+      let a = null;
+      if (C.N) a = findShot(W, c, C, en, mem, false);
+      else { // 쉬움: only straight shots at someone in plain sight
+        for (const e of en) if (clearLine(W, c.x, c.y, e.x, e.y, SR)) { a = Math.atan2(e.y - c.y, e.x - c.x); break; }
+        if (a == null && Math.random() < C.wild && W.t - (mem.lf == null ? -9 : mem.lf) > 2.5 && clearLine(W, c.x, c.y, c.x + Math.cos(c.a) * 70, c.y + Math.sin(c.a) * 70, SR)) a = c.a;
+      }
+      if (a != null) {
+        if (lv >= 3 && Math.abs(wrapA(a - c.a)) < C.tol) { inp.fc = (inp.fc + 1) % 1000; mem.lf = W.t; return; }
+        setAim(a, 'f', true); return;
+      }
+    }
+    // 6) where to drive
+    let blk = null;
+    if (C.mineAvoid && W.mines.length) { blk = new Uint8Array(W.C * W.R); for (const m of W.mines) blk[cellIdx(W, m.x, m.y)] = 1; }
+    const myC = cellIdx(W, c.x, c.y);
+    if (blk) blk[myC] = 0;
+    const D = bfs(W, myC, blk);
+    // 어려움: 장전 중인데 적 시야에 노출돼 있으면 가까운 엄폐 칸(적이 못 보는 칸)으로 물러난다
+    if (lv >= 3 && !canFire(W, c)) {
+      const seers = en0.filter((e) => Math.hypot(e.x - c.x, e.y - c.y) < 320 && clearLine(W, c.x, c.y, e.x, e.y, SR));
+      if (seers.length) {
+        let bc = -1, bs = 1e9;
+        for (let q = 0; q < D.length; q++) {
+          if (D[q] < 1 || D[q] > 2 || (blk && blk[q])) continue;
+          const p = cellXY(W, q);
+          if (seers.some((e) => clearLine(W, p[0], p[1], e.x, e.y, SR))) continue;
+          if (D[q] < bs) { bs = D[q]; bc = q; }
+        }
+        if (bc >= 0) { const nx0 = nextCell(W, bfs(W, bc, blk), myC), p = cellXY(W, nx0 >= 0 ? nx0 : bc); mem.gx = p[0]; mem.gy = p[1]; return; }
+      }
+    }
+    let tgt = null, td = 1e9;
+    const tmk = W.tm ? W.tm[c.seat] : -1, foc = tmk >= 0 ? W.foc[tmk] : -1;
+    for (const e of en0) { const d = D[cellIdx(W, e.x, e.y)], dd = (d < 0 ? 500 + Math.hypot(e.x - c.x, e.y - c.y) / CS : d) - (e.seat === foc ? 3 : 0); if (dd < td) { td = dd; tgt = e; } }
+    if (tmk >= 0) W.foc[tmk] = tgt.seat; // teammates gang up on the same enemy
+    let goal = cellIdx(W, tgt.x, tgt.y), gp = [tgt.x, tgt.y];
+    const ed = Math.hypot(tgt.x - c.x, tgt.y - c.y);
+    if (K.sk === 'a' && lv >= 2) {
+      // artillery keeps its distance: back off when someone gets close, hold when the target is in range
+      if (ed < ART_MIN + 40) {
+        const De = bfs(W, cellIdx(W, tgt.x, tgt.y), null);
+        let bc = -1, bs = -1e9;
+        for (let q = 0; q < D.length; q++) { if (D[q] < 0 || D[q] > 4 || (blk && blk[q])) continue; const p = cellXY(W, q), s2 = Math.hypot(p[0] - tgt.x, p[1] - tgt.y) + (De[q] < 0 ? 99 : De[q]) * 12 - D[q] * 6; if (s2 > bs) { bs = s2; bc = q; } }
+        if (bc >= 0) { goal = bc; gp = cellXY(W, bc); }
+      } else if (ed < ART_MAX - 20) { mem.gx = null; return; }
+    }
+    // 성향: 공격형은 곧장 밀고 들어가고, 수비형은 벽 뒤(시야 밖)에 붙어 기다리고, 도박형은 아이템을 쫓는다
+    const sty = mem.sty || 'bal';
+    if (sty === 'def' && ed < 240 && !clearLine(W, c.x, c.y, tgt.x, tgt.y, SR) && Math.random() < 0.6) { mem.gx = null; return; }
+    if (sty === 'def' && ed < 90 && clearLine(W, c.x, c.y, tgt.x, tgt.y, SR) && Math.random() < 0.5) { mem.backT = W.t + 0.3; mem.bt = Math.random() < 0.5 ? -1 : 1; return; }
+    if (lv === 1 && !(sty === 'agg' && Math.random() < 0.7)) {
+      if (mem.wc == null || W.t > (mem.wT || 0) || mem.wc === myC) {
+        mem.wc = Math.random() < 0.45 ? goal : Math.floor(Math.random() * W.C * W.R); mem.wT = W.t + 4;
+      }
+      goal = mem.wc; gp = cellXY(W, goal);
+    }
+    if (sty !== 'agg' && Math.random() < (sty === 'gamble' ? Math.max(0.85, C.seek) : C.seek) && W.pu.length) {
+      let bp = null, bd = 1e9;
+      for (const p of W.pu) {
+        if (p.k !== 'D' && c.sp) continue;
+        const d = D[cellIdx(W, p.x, p.y)];
+        if (d >= 0 && d < bd) { bd = d; bp = p; }
+      }
+      if (bp && bd <= td + 1) { goal = cellIdx(W, bp.x, bp.y); gp = [bp.x, bp.y]; }
+    }
+    if (blk) blk[goal] = 0;
+    if (goal === myC) { mem.gx = gp[0]; mem.gy = gp[1]; return; }
+    const Dg = bfs(W, goal, blk);
+    // a much shorter way through cracked walls? drive that way and shoot the wall down when next to it
+    if (lv >= 2 && K.sk !== 'a' && W.cl.length) {
+      const Dt = bfs(W, goal, blk, true), dn = Dg[myC] < 0 ? 99 : Dg[myC];
+      if (Dt[myC] >= 0 && Dt[myC] + 2 < dn) {
+        const nt = nextCell(W, Dt, myC, true);
+        if (nt >= 0 && NXE >= 0) {
+          const p = edgeXY(W, NXE), a = Math.atan2(p[1] - c.y, p[0] - c.x);
+          if (canFire(W, c)) { setAim(a, 'w', false); return; }
+          mem.gx = null; return;
+        }
+        if (nt >= 0) { const p = cellXY(W, nt); mem.gx = p[0]; mem.gy = p[1]; return; }
+      }
+    }
+    const nx = nextCell(W, Dg, myC);
+    if (nx < 0) { mem.gx = gp[0]; mem.gy = gp[1]; return; }
+    const n2 = nextCell(W, Dg, nx), p2 = n2 >= 0 ? cellXY(W, n2) : n2 === -1 && nx === goal ? gp : null;
+    const p = p2 && clearLine(W, c.x, c.y, p2[0], p2[1], TR) ? p2 : cellXY(W, nx);
+    mem.gx = p[0]; mem.gy = p[1];
+  }
+
+  /* artillery plan still good: someone within the cone and range of that heading */
+  function artOk(W, c, a, en) {
+    for (const e of en) {
+      const dx = e.x - c.x, dy = e.y - c.y, d = Math.hypot(dx, dy);
+      if (d >= ART_MIN && d <= ART_MAX + 20 && Math.abs(wrapA(Math.atan2(dy, dx) - a)) < ART_CONE) return true;
+    }
+    return false;
+  }
+
+  /* ======================= pure game interface ======================= */
+  function pickMap(mp, prev) {
+    if (mp >= 0) return Math.min(mp, FIXED.length);
+    if (Math.random() < 0.5) return 0;
+    let k = 1 + Math.floor(Math.random() * FIXED.length);
+    if (k === prev) k = 1 + (k % FIXED.length);
+    return k;
+  }
+  function init(players, opts) {
+    const o = opts || {}, n = players.length;
+    const mp = typeof o.map === 'number' && o.map >= -1 && o.map <= FIXED.length ? o.map : -1;
+    // tank classes: AI seats (and everyone with 「모두 무작위」) get a random one, people pick theirs before round 1
+    const rnd = o.pick === 0;
+    const cls = players.map((p) => (rnd || (p && p.ai) ? U.rand(CLS.length) : -1));
+    return {
+      rid: 1 + U.rand(99999), n, nm: players.map((p) => String((p && p.name) || '').slice(0, 10)),
+      tm: o.mode === 1 && n >= 4 && n % 2 === 0 ? players.map((_, i) => i % 2) : null,
+      need: o.rounds === 5 ? 5 : 3, mp, it: o.items === 0 ? 0 : 1, cls,
+      ph: cls.every((v) => v >= 0) ? 'count' : 'pick', rd: 1, sd: 1 + U.rand(2147483646), mk: pickMap(mp, -1), wins: Array(n).fill(0), rw: -1, res: null,
+    };
+  }
+  /* winner = surviving seat (team mode: every seat of its team scores) */
+  function roundOver(s, winner, tl) {
+    const n = Object.assign({}, s, { wins: (s.wins || []).slice(), ph: 'end', rw: winner });
+    if (tl) n.tl = { k: tl.k.slice(), f: tl.f.slice(), p: tl.p.slice() };
+    if (winner >= 0) for (let i = 0; i < n.n; i++) if (i === winner || (s.tm && s.tm[i] === s.tm[winner])) n.wins[i] = (n.wins[i] | 0) + 1;
+    return n;
+  }
+  function nextRound(s) {
+    const mx = Math.max(...s.wins);
+    if (mx >= s.need || s.rd >= s.need * s.n + 4) {
+      const order = s.wins.map((v, i) => [i, v]).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+      return Object.assign({}, s, { ph: 'done', res: order });
+    }
+    return Object.assign({}, s, { rd: s.rd + 1, sd: 1 + U.rand(2147483646), mk: pickMap(s.mp, s.mk), ph: 'count', rw: -1 });
+  }
+  const TEAMN = ['붉은 팀', '푸른 팀'], TEAMC = [['#ee6a55', '#f5a48c'], ['#4f9ff0', '#93c8f8']];
+  function mapName(mk) { return mk > 0 && FIXED[mk - 1] ? FIXED[mk - 1].nm : '새 미로'; }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !Array.isArray(s.res) || !s.res.length) return null;
+    const nm = (i) => (s.nm && s.nm[i]) || (i + 1) + '번';
+    const top = s.res[0][1], winners = s.res.filter((r) => r[1] === top).map((r) => r[0]);
+    let lines = s.res.map((r, k) => (k + 1) + '위  ' + nm(r[0]) + '  ' + r[1] + '승');
+    const mode = (s.tm ? '팀전 · ' : '') + (s.mp < 0 ? '무작위 맵' : mapName(s.mp));
+    if (s.tm) lines = [0, 1].map((t) => TEAMN[t] + '  ' + (s.wins[t] | 0) + '승  (' + s.tm.map((v, i) => v === t ? nm(i) : null).filter((x) => x).join(', ') + ')');
+    const tl = s.tl || {}, col = (a, f) => Array.from({ length: s.n }, (_, i) => f((Array.isArray(a) ? a[i] : 0) | 0, i));
+    const stats = [{ label: '전차', values: col(s.cls, (v) => (CLS[v] || CLS[0]).nm) }, { label: '라운드 승', values: col(s.wins, (v) => v + '승') }, { label: '처치', values: col(tl.k, (v) => v + '대') },
+      { label: '발사', values: col(tl.f, (v) => v + '발') }, { label: '처치당 발사', values: col(tl.f, (v, i) => { const k = (Array.isArray(tl.k) ? tl.k[i] : 0) | 0; return k ? (v / k).toFixed(1) + '발' : '-'; }) },
+      { label: '아이템', values: col(tl.p, (v) => v + '개') }];
+    return { stats, winners, title: s.tm && winners.length && winners.every((i) => s.tm[i] === s.tm[winners[0]]) ? TEAMN[s.tm[winners[0]]] + ' 우승!' : winners.length === 1 ? nm(winners[0]) + ' 우승!' : '공동 우승', text: mode + ' · ' + s.need + '승 먼저\n' + lines.join('\n') };
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const CSS = `.tk-chip{position:absolute;right:8px;top:4px;z-index:6;appearance:none;border:1px solid rgba(242,233,216,.2);background:rgba(23,19,31,.86);color:var(--ink,#f2e9d8);border-radius:12px;min-height:44px;min-width:44px;padding:4px 11px;font:700 12px/1.2 "IBM Plex Sans KR",system-ui,sans-serif;cursor:pointer;touch-action:manipulation;user-select:none;-webkit-user-select:none}
+.tk-chip b{color:var(--brass,#e3ae45)}
+.tk-chip:active{transform:scale(.96)}
+.tk-pick{position:absolute;inset:52px 0 0 0;z-index:7;display:flex;flex-direction:column;align-items:center;gap:8px;padding:10px 14px 14px;background:rgba(15,12,21,.9);overflow-y:auto;font-family:"IBM Plex Sans KR",system-ui,sans-serif;color:#f2e9d8}
+.tk-pick h3{margin:2px 0 0;font:400 22px/1.2 "Black Han Sans","Apple SD Gothic Neo",sans-serif;color:#e3ae45}
+.tk-pick .tk-ps{font-size:12.5px;color:#cfc3dc;text-align:center;min-height:17px}
+.tk-pick button{appearance:none;width:100%;max-width:360px;min-height:76px;border-radius:14px;border:2px solid rgba(242,233,216,.18);background:#231d30;color:#f2e9d8;display:flex;gap:12px;align-items:center;padding:8px 12px;text-align:left;cursor:pointer;touch-action:manipulation;font:inherit}
+.tk-pick button:active{transform:scale(.98)}
+.tk-pick button.on{border-color:#e3ae45;background:#3a2f22;box-shadow:0 0 0 2px rgba(227,174,69,.35)}
+.tk-pick button canvas{flex:0 0 52px;width:52px;height:52px}
+.tk-pick b{display:block;font:400 18px/1.2 "Black Han Sans","Apple SD Gothic Neo",sans-serif}
+.tk-pick small{display:block;font-size:12px;color:#cfc3dc;margin-top:2px;line-height:1.35}
+.tk-pick i{display:block;font-style:normal;font:600 11px/1.3 "IBM Plex Mono",ui-monospace,monospace;color:#ab9fb8;margin-top:3px;letter-spacing:.2px}`;
+  const KC = () => { const v = L.ui && L.ui.ctlScale ? +L.ui.ctlScale() : 1; return v > 0 ? v : 1; };
+  const STICK_R0 = 46, TOPH = 52, FR = 9;
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS });
+    root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    let st = null, key = null, W = null, phase = 'wait', cd = 0, endT = 0, lastT = 0, acc = 0, lay = null, hintT = 0, goT = 0, endA = 0, shake = 0, lastSfx = 0, chipW = 0;
+    const cfg = { aim: 1 };
+    try { const c = JSON.parse(localStorage.getItem('lounge.tanks.cfg') || 'null'); if (c && (c.aim === 0 || c.aim === 1)) cfg.aim = c.aim; } catch (e) {}
+    const P0 = (s) => api.players[s] || { name: '?', color: '#888', ai: true };
+    const P = (s) => (st && st.tm ? Object.assign({}, P0(s), { color: TEAMC[st.tm[s]][s >> 1 & 1] }) : P0(s)); // team mode: team colours
+    const name = (s) => (st && st.nm && st.nm[s]) || P(s).name || (s + 1) + '번';
+    const host = () => !api.online || api.isHost;
+    const mine = () => api.mySeats().slice(0, 1);
+    const isMine = (s) => mine().includes(s);
+    const simHere = (s) => { const p = api.players[s]; if (!p) return false; if (!api.online) return true; if (api.isHost) return !!p.ai || !!p.local; return !p.ai && !!p.local; };
+    const autoSeat = (s) => { const p = api.players[s]; if (!p) return false; if (p.ai) return true; return !api.online && p.local && !isMine(s); };
+    let aiMem = [], inputs = {}, parts = [], floats = [], rings = [], beams = [], vis = [];
+    const locIn = {};
+    let pubT = 0, hsQ = 0, inQ = 0, lastSig = '', inT = 0, snaps = [], lastQ = -1, lastFx = 0, rtt = 0.15;
+    const sendT = {}, iqOf = {}, remIn = {};
+    let groundCv = null, wallCv = null, gctx = null;
+    const TBV = new Float64Array(64);
+    let wallV = 0, pickT = 0, myPick = -1, pbar = null, pkForce = false;
+
+    function curKey() { return st ? st.rid + '.' + st.rd : null; }
+    function startRound() {
+      W = newWorld(st.mk, st.sd, st.n, st.rd, st.cls, st.tm);
+      wallV = 0;
+      aiMem = W.tanks.map(() => ({}));
+      inputs = {}; parts = []; floats = []; rings = []; beams = []; snaps = []; lastQ = -1; lastFx = 0; acc = 0; lastT = 0;
+      vis = W.tanks.map((c) => ({ px: c.x, py: c.y, pa: c.a, tl: 0, tr: 0, sx: c.x, sy: c.y, fl: 0, rc: 0, dead: false }));
+      for (const s of mine()) { const o = locIn[s]; locIn[s] = { m: 's', x: 0, y: 0, v: 0, t: 0, fc: o ? o.fc : 0, sc: o ? o.sc : 0 }; }
+      phase = st.ph === 'play' ? 'play' : 'count';
+      cd = COUNT; endT = END_T;
+      if (st.rd === 1 && mine().length) hintT = 6;
+      W.over = st.ph === 'end' || st.ph === 'done';
+      layout();
+    }
+
+    /* ----- layout: the whole maze on screen, a control band at the bottom ----- */
+    function layout() {
+      const w = cv.w, h = cv.h, bot = mine().length ? (KC() > 1.1 ? Math.round(42 + 144 * KC()) : Math.round(132 * Math.max(0.85, KC()))) : 14;
+      const ww = (W ? W.C : 7) * CS + FR * 2, wh = (W ? W.R : 9) * CS + FR * 2;
+      const s = Math.max(0.4, Math.min((w - 10) / ww, (h - TOPH - bot - 6) / wh));
+      lay = { s, cx: w / 2, cy: TOPH + 3 + (h - TOPH - bot - 6) / 2, ww, wh, bot };
+      syncChip();
+      buildStatic();
+    }
+    cv.onresize = layout;
+    const onCtl = () => { layout(); }; window.addEventListener('lounge-ctl', onCtl);
+    const X = (x) => lay.cx + x * lay.s, Y = (y) => lay.cy + y * lay.s;
+
+    /* ----- static layers: felt floor (+ tread marks) and the wooden walls ----- */
+    function hash(a, b) { let h = (Math.imul(a | 0, 0x9E3779B1) ^ Math.imul((b | 0) + 0x632BE5AB, 0x85EBCA77)) >>> 0; h ^= h >>> 16; h = Math.imul(h, 0x7feb352d) >>> 0; h ^= h >>> 15; return h >>> 0; }
+    function buildStatic() {
+      if (!W || !lay) return;
+      const k = lay.s * cv.dpr, pw = Math.max(1, Math.ceil(lay.ww * k)), ph = Math.max(1, Math.ceil(lay.wh * k));
+      groundCv = document.createElement('canvas'); groundCv.width = pw; groundCv.height = ph;
+      wallCv = document.createElement('canvas'); wallCv.width = pw; wallCv.height = ph;
+      gctx = groundCv.getContext('2d');
+      const tf = (g) => g.setTransform(k, 0, 0, k, lay.ww / 2 * k, lay.wh / 2 * k);
+      tf(gctx);
+      const g = gctx, hw = W.C * CS / 2, hh = W.R * CS / 2;
+      // table rail
+      rrect(g, -hw - FR, -hh - FR, (hw + FR) * 2, (hh + FR) * 2, 7);
+      const rg = g.createLinearGradient(0, -hh - FR, 0, hh + FR); rg.addColorStop(0, '#6e4a2c'); rg.addColorStop(1, '#4a2f1b'); g.fillStyle = rg; g.fill();
+      g.lineWidth = 1; g.strokeStyle = 'rgba(227,174,69,.55)'; rrect(g, -hw - FR + 1.5, -hh - FR + 1.5, (hw + FR) * 2 - 3, (hh + FR) * 2 - 3, 6); g.stroke();
+      // felt
+      const fg = g.createRadialGradient(0, 0, 10, 0, 0, Math.hypot(hw, hh)); fg.addColorStop(0, '#2c5a4b'); fg.addColorStop(1, '#1c4236');
+      g.fillStyle = fg; g.fillRect(-hw - 1, -hh - 1, hw * 2 + 2, hh * 2 + 2);
+      for (let i = 0; i < W.C * W.R * 14; i++) { const a = hash(i, 7), b = hash(i, 13); g.fillStyle = (a & 1) ? 'rgba(255,255,255,.035)' : 'rgba(0,0,0,.07)'; g.fillRect(-hw + (a % 1000) / 1000 * hw * 2, -hh + (b % 1000) / 1000 * hh * 2, 0.8, 0.8); }
+      g.strokeStyle = 'rgba(242,233,216,.045)'; g.lineWidth = 0.5; g.beginPath();
+      for (let i = 1; i < W.C; i++) { g.moveTo(-hw + i * CS, -hh); g.lineTo(-hw + i * CS, hh); }
+      for (let j = 1; j < W.R; j++) { g.moveTo(-hw, -hh + j * CS); g.lineTo(hw, -hh + j * CS); }
+      g.stroke();
+      // corner spawn pads
+      for (const cc of [[0, 0], [W.C - 1, W.R - 1], [W.C - 1, 0], [0, W.R - 1]].slice(0, Math.max(2, W.n))) {
+        const p = cellXY(W, cc[1] * W.C + cc[0]);
+        g.beginPath(); g.arc(p[0], p[1], 13, 0, 7); g.strokeStyle = 'rgba(242,233,216,.08)'; g.lineWidth = 1.2; g.setLineDash([3, 3]); g.stroke(); g.setLineDash([]);
+      }
+      drawWalls();
+    }
+    function drawWalls() {
+      if (!wallCv || !lay) return;
+      const k = lay.s * cv.dpr;
+      const wg = wallCv.getContext('2d');
+      wg.setTransform(1, 0, 0, 1, 0, 0); wg.clearRect(0, 0, wallCv.width, wallCv.height);
+      wg.setTransform(k, 0, 0, k, lay.ww / 2 * k, lay.wh / 2 * k);
+      wallV = W.wv;
+      const Rr = W.rects, RK = W.rk || [];
+      wg.fillStyle = 'rgba(5,10,8,.45)';
+      for (let q = 0; q < W.nr; q++) { const i = q * 4; wg.fillRect(Rr[i] + 1.3, Rr[i + 1] + 2.2, Rr[i + 2] - Rr[i], Rr[i + 3] - Rr[i + 1]); }
+      for (let q = 0; q < W.nr; q++) {
+        const i = q * 4, x0 = Rr[i], y0 = Rr[i + 1], x1 = Rr[i + 2], y1 = Rr[i + 3], horiz = x1 - x0 > y1 - y0;
+        if (RK[q] >= 0) { // cracked stone piece: paler, more cracks as it takes hits
+          const hp = W.M.k[RK[q]] | 0, dmg = CRACK_HP - hp;
+          wg.fillStyle = dmg >= 2 ? '#7d7468' : dmg === 1 ? '#958b7c' : '#aaa08e'; wg.fillRect(x0, y0, x1 - x0, y1 - y0);
+          wg.fillStyle = 'rgba(255,255,255,.18)'; if (horiz) wg.fillRect(x0, y0, x1 - x0, 1.1); else wg.fillRect(x0, y0, 1.1, y1 - y0);
+          wg.strokeStyle = 'rgba(30,22,16,.85)'; wg.lineWidth = 0.55; wg.beginPath();
+          const L0 = horiz ? x1 - x0 : y1 - y0, nC = 2 + dmg * 2;
+          for (let c = 0; c < nC; c++) {
+            const u = (hash(q * 7 + c, RK[q]) % 1000) / 1000, along = L0 * (0.12 + 0.76 * u), zig = (hash(c, RK[q] + 3) % 100) / 100 - 0.5;
+            if (horiz) { wg.moveTo(x0 + along, y0); wg.lineTo(x0 + along + zig * 3, (y0 + y1) / 2); wg.lineTo(x0 + along - zig * 2, y1); }
+            else { wg.moveTo(x0, y0 + along); wg.lineTo((x0 + x1) / 2, y0 + along + zig * 3); wg.lineTo(x1, y0 + along - zig * 2); }
+          }
+          wg.stroke();
+          wg.strokeStyle = 'rgba(30,22,16,.7)'; wg.lineWidth = 0.5; wg.strokeRect(x0 + 0.25, y0 + 0.25, x1 - x0 - 0.5, y1 - y0 - 0.5);
+          continue;
+        }
+        const lg = horiz ? wg.createLinearGradient(0, y0, 0, y1) : wg.createLinearGradient(x0, 0, x1, 0);
+        lg.addColorStop(0, '#c49460'); lg.addColorStop(0.45, '#9a6c40'); lg.addColorStop(1, '#6a4526');
+        wg.fillStyle = lg; wg.fillRect(x0, y0, x1 - x0, y1 - y0);
+        wg.strokeStyle = 'rgba(40,22,10,.55)'; wg.lineWidth = 0.35;
+        wg.beginPath();
+        if (horiz) { for (let gx = x0 + 6 + (hash(q, 3) % 9); gx < x1 - 2; gx += 11 + (hash(q, gx | 0) % 9)) { wg.moveTo(gx, y0 + 0.6); wg.lineTo(gx + 2.5, y1 - 0.6); } }
+        else { for (let gy = y0 + 6 + (hash(q, 5) % 9); gy < y1 - 2; gy += 11 + (hash(q, gy | 0) % 9)) { wg.moveTo(x0 + 0.6, gy); wg.lineTo(x1 - 0.6, gy + 2.5); } }
+        wg.stroke();
+        wg.strokeStyle = 'rgba(30,16,6,.8)'; wg.lineWidth = 0.5; wg.strokeRect(x0 + 0.25, y0 + 0.25, x1 - x0 - 0.5, y1 - y0 - 0.5);
+      }
+      // brass studs where walls meet
+      const M = W.M, C = W.C, R = W.R;
+      for (let j = 0; j <= R; j++) for (let i = 0; i <= C; i++) {
+        const hl = i > 0 && M.h[j * C + i - 1], hr = i < C && M.h[j * C + i], vu = j > 0 && M.v[(j - 1) * (C + 1) + i], vd = j < R && M.v[j * (C + 1) + i];
+        const cnt = (hl ? 1 : 0) + (hr ? 1 : 0) + (vu ? 1 : 0) + (vd ? 1 : 0);
+        if (!cnt || (cnt === 2 && ((hl && hr) || (vu && vd)))) continue;
+        const x = W.ox + i * CS, y = W.oy + j * CS;
+        wg.beginPath(); wg.arc(x, y, 1.6, 0, 7); wg.fillStyle = '#e3ae45'; wg.fill();
+        wg.beginPath(); wg.arc(x - 0.4, y - 0.4, 0.6, 0, 7); wg.fillStyle = '#fff3cf'; wg.fill();
+      }
+    }
+    function stampTreads(c, v) {
+      if (!gctx) return;
+      gctx.save(); gctx.translate(c.x, c.y); gctx.rotate(c.a);
+      gctx.fillStyle = 'rgba(6,18,14,.2)';
+      gctx.fillRect(-1.2, -7.1, 2.2, 3.4); gctx.fillRect(-1.2, 3.7, 2.2, 3.4);
+      gctx.restore();
+      void v;
+    }
+    function scorch(x, y) {
+      if (!gctx) return;
+      const rg = gctx.createRadialGradient(x, y, 1, x, y, 15); rg.addColorStop(0, 'rgba(8,6,6,.6)'); rg.addColorStop(0.6, 'rgba(10,8,8,.3)'); rg.addColorStop(1, 'rgba(10,8,8,0)');
+      gctx.fillStyle = rg; gctx.beginPath(); gctx.arc(x, y, 15, 0, 7); gctx.fill();
+      gctx.strokeStyle = 'rgba(8,6,6,.35)'; gctx.lineWidth = 0.8; gctx.beginPath();
+      for (let i = 0; i < 9; i++) { const a = i * 0.7 + Math.random() * 0.4, r0 = 5, r1v = 11 + Math.random() * 7; gctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); gctx.lineTo(x + Math.cos(a) * r1v, y + Math.sin(a) * r1v); }
+      gctx.stroke();
+    }
+
+    /* ----- input ----- */
+    const ptrs = new Map();
+    function fireBtn() { const r = 42 * KC(); return { x: cv.w - r - 16, y: cv.h - r - 22, r }; }
+    function specBtn() { const k = KC(), r = Math.max(23, 30 * k); if (k > 1.1) { const f = fireBtn(); return { x: f.x - 4, y: f.y - f.r - r - 12, r }; } return { x: cv.w - 42 * k * 2 - 16 - 14 - r, y: cv.h - r - 34 * Math.min(1, k), r }; }
+    function refresh() {
+      for (const s of mine()) {
+        const I = locIn[s] || (locIn[s] = { m: 's', x: 0, y: 0, v: 0, t: 0, fc: 0, sc: 0 });
+        I.m = 's'; I.x = 0; I.y = 0; I.v = 0; I.t = 0;
+        let stick = false;
+        for (const p of ptrs.values()) {
+          if (p.seat !== s || p.kind !== 'stick') continue;
+          const dx = p.x - p.ax, dy = p.y - p.ay, d = Math.hypot(dx, dy);
+          stick = true;
+          if (d > 6) { const m = Math.min(1, d / (STICK_R0 * KC())); I.x = r2(dx / d * m); I.y = r2(dy / d * m); }
+        }
+        if (!stick && api.input) {
+          let v = 0, t = 0;
+          try { v = api.input.axis('down', 'up'); t = api.input.axis('left', 'right'); } catch (e) {}
+          if (v || t) { I.m = 'k'; I.v = r2(v); I.t = r2(t); }
+        }
+      }
+    }
+    function myTank() { const m = mine(); return m.length && W ? W.tanks[m[0]] : null; }
+    function pressFire() {
+      const s = mine()[0], I = s != null ? locIn[s] : null, c = myTank();
+      if (!I || !c || !W || phase !== 'play' || W.over) return;
+      if (!c.alive) { api.buzz(4); return; }
+      if (shellsOf(W, s) >= clsOf(c).smax) { api.buzz(4); sfx('click', 60); return; }
+      I.fc = ((I.fc | 0) + 1) % 1000; api.buzz(12); pubT = 0; inT = 0;
+    }
+    function pressSpec() {
+      const s = mine()[0], I = s != null ? locIn[s] : null, c = myTank();
+      if (!I || !c || !W || phase !== 'play' || W.over) return;
+      if (!c.alive || !c.sp) { api.buzz(4); return; }
+      I.sc = ((I.sc | 0) + 1) % 1000; api.buzz(18); pubT = 0; inT = 0;
+    }
+    function onDown(e) {
+      const p = cv.local(e), seat = mine()[0];
+      if (seat == null || !W) return;
+      e.preventDefault();
+      if (p.y < TOPH) return;
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      hintT = Math.min(hintT, 1.2);
+      const sb = specBtn();
+      if (Math.hypot(p.x - sb.x, p.y - sb.y) < sb.r + 8) { ptrs.set(e.pointerId, { seat, kind: 'spec', x: p.x, y: p.y }); pressSpec(); refresh(); return; }
+      if (p.x >= cv.w / 2) { ptrs.set(e.pointerId, { seat, kind: 'fire', x: p.x, y: p.y }); pressFire(); refresh(); return; }
+      for (const [id, q] of ptrs) if (q.seat === seat && q.kind === 'stick') ptrs.delete(id);
+      ptrs.set(e.pointerId, { seat, kind: 'stick', ax: p.x, ay: p.y, x: p.x, y: p.y });
+      refresh();
+    }
+    function onMove(e) {
+      const q = ptrs.get(e.pointerId);
+      if (!q) return;
+      const p = cv.local(e);
+      q.x = p.x; q.y = p.y;
+      if (q.kind === 'stick') {
+        const d = Math.hypot(q.x - q.ax, q.y - q.ay);
+        if (d > (STICK_R0 * KC()) * 1.3) { const k = (STICK_R0 * KC()) * 1.3 / d; q.ax = q.x - (q.x - q.ax) * k; q.ay = q.y - (q.y - q.ay) * k; } // the base follows the thumb
+      }
+      refresh();
+    }
+    function onUp(e) { if (ptrs.delete(e.pointerId)) refresh(); }
+    const releaseAll = () => { ptrs.clear(); refresh(); };
+    const noCtx = (e) => e.preventDefault();
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', onUp);
+    cv.cv.addEventListener('lostpointercapture', onUp);
+    cv.cv.addEventListener('contextmenu', noCtx);
+    window.addEventListener('blur', releaseAll);
+    let offInput = null;
+    try { if (api.input && api.input.on) offInput = api.input.on((type, id) => { if (type !== 'down') return; hintT = Math.min(hintT, 1.2); if (id === 'fire') pressFire(); else if (id === 'special') pressSpec(); }); } catch (e) { offInput = null; }
+
+    const chip = L.h('button', { class: 'tk-chip', type: 'button', 'aria-label': '조준선 켜고 끄기', onclick() { api.sfx('click'); cfg.aim = cfg.aim ? 0 : 1; try { localStorage.setItem('lounge.tanks.cfg', JSON.stringify(cfg)); } catch (e) {} syncChip(); } });
+    chip.addEventListener('pointerdown', (e) => e.stopPropagation());
+    root.appendChild(chip);
+    function syncChip() {
+      chip.innerHTML = '';
+      chip.append('조준선 ', L.h('b', { text: cfg.aim ? '켬' : '끔' }));
+      chip.hidden = !mine().length || !st || st.ph === 'done';
+      chipW = chip.hidden ? 0 : (chip.getBoundingClientRect().width || 84);
+    }
+
+    /* ----- class pick (before round 1) ----- */
+    let pickEl = null, pickSig = '';
+    function syncPick() {
+      const s = mine()[0], show = !!(st && st.ph === 'pick' && s != null);
+      if (!show) { if (pickEl) pickEl.hidden = true; return; }
+      if (!pickEl) {
+        pickEl = L.h('div', { class: 'tk-pick' });
+        pickEl.addEventListener('pointerdown', (e) => e.stopPropagation());
+        root.appendChild(pickEl);
+      }
+      pickEl.hidden = false;
+      const chosen = st.cls && st.cls[s] >= 0 ? st.cls[s] : myPick;
+      const waiting = (st.cls || []).map((v, i) => (v >= 0 || (i === s && myPick >= 0) ? null : name(i))).filter(Boolean);
+      const sig = chosen + '|' + waiting.join(',');
+      if (sig === pickSig) return;
+      pickSig = sig;
+      pickEl.innerHTML = '';
+      pickEl.appendChild(L.h('h3', { text: '전차 고르기' }));
+      pickEl.appendChild(L.h('div', { class: 'tk-ps', text: chosen >= 0 ? (waiting.length ? '다른 사람을 기다려요: ' + waiting.join(', ') : '곧 시작해요!') : '이번 경기에 탈 전차를 골라요 (경기 내내 그대로)' }));
+      const dots = (n, m) => '●'.repeat(n) + '○'.repeat(m - n);
+      const stat = ['속도 ' + dots(3, 3) + '  체력 ' + dots(1, 2) + '\n튕기는 포탄 3발 · 빠른 장전', '속도 ' + dots(1, 3) + '  체력 ' + dots(2, 2) + '\n큰 포탄 3발(2 피해) · 폭발에 강함', '속도 ' + dots(2, 3) + '  체력 ' + dots(1, 2) + '\n곡사 3발 · 벽 너머 · 최소 사거리'];
+      CLS.forEach((K, i) => {
+        const icon = document.createElement('canvas'); icon.width = 104; icon.height = 104;
+        const g = icon.getContext('2d'); g.scale(104 / 52, 104 / 52); g.translate(26, 26); g.scale(2.3, 2.3);
+        drawTank(g, 0, 0, -Math.PI / 2, P(s).color, null, 0, i);
+        const b = L.h('button', { type: 'button', class: chosen === i ? 'on' : '', onclick() {
+          if (!st || st.ph !== 'pick') return;
+          myPick = i; pickSig = ''; api.sfx('click'); api.buzz(12); inT = 0; syncPick();
+        } });
+        const tx = L.h('div', {});
+        tx.appendChild(L.h('b', { text: K.nm + (chosen === i ? '  ✓' : '') }));
+        tx.appendChild(L.h('small', { text: K.sub }));
+        const st2 = L.h('i', {}); stat[i].split('\n').forEach((ln, j) => { if (j) st2.appendChild(L.h('br', {})); st2.appendChild(document.createTextNode(ln)); });
+        tx.appendChild(st2);
+        b.appendChild(icon); b.appendChild(tx);
+        pickEl.appendChild(b);
+      });
+    }
+
+    /* ----- feedback ----- */
+    function sfx(n, gap) { const t = performance.now(); if (t - lastSfx < (gap || 50)) return; lastSfx = t; api.sfx(n); }
+    function puff(x, y, col, n, sp, life, kind, sz) {
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * 6.283, v = sp * (0.25 + Math.random());
+        parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, t: (life || 0.5) * (0.6 + Math.random() * 0.6), T: life || 0.5, c: col, k: kind || 0, sz: sz || 1, r: Math.random() * 6, w: (Math.random() - 0.5) * 14 });
+      }
+      if (parts.length > 420) parts.splice(0, parts.length - 420);
+    }
+    let tally = null, tallyRid = null; // result stats (host only, all rounds)
+    function count(k, seat) {
+      if (!host() || !st || !(seat >= 0 && seat < st.n)) return;
+      if (tallyRid !== st.rid) { tallyRid = st.rid; tally = { k: [], f: [], p: [] }; for (let i = 0; i < st.n; i++) { tally.k.push(0); tally.f.push(0); tally.p.push(0); } }
+      tally[k][seat]++;
+    }
+    function onFx(code, a, b, c, d, e) {
+      if (code === 'f' && b !== 3) count('f', a); else if (code === 'x' && b >= 0 && b !== a) count('k', b); else if (code === 'p') count('p', a);
+      if (code === 'f') { // shot: a seat, b kind (0 shell, 1 shotgun, 2 missile, 3 mine, 4 heavy shell, 5 artillery), c/d pos, e angle
+        const v = vis[a]; if (v) { v.fl = 0.09; v.rc = b === 4 || b === 5 ? 0.2 : 0.12; }
+        const tr = (W && W.tanks[a] && W.tanks[a].r) || TR, mx = c + Math.cos(e) * (tr + 4), my = d + Math.sin(e) * (tr + 4);
+        if (b === 3) { sfx('click', 40); if (isMine(a)) api.buzz(12); return; }
+        puff(mx, my, 'rgba(230,225,215,.55)', b === 5 ? 7 : 3, b === 5 ? 22 : 14, 0.45, 2, b === 5 ? 2 : 1.4);
+        puff(mx, my, '#ffd27a', b === 1 || b === 4 ? 7 : 3, 60, 0.18, 0, 1);
+        if (b === 2 || b === 5) sfx('whoosh', 40); else sfx(b === 1 || b === 4 ? 'thud' : 'hit', 40);
+        if (b === 4 && isMine(a)) shake = Math.min(1, shake + 0.15);
+        if (isMine(a)) api.buzz(b === 1 || b === 4 ? 25 : 10);
+      } else if (code === 'h') { // damaged, still running: a seat, b by, c/d pos, e hp left
+        boomFx(c, d, P(a).color, false);
+        sfx('hit', 20); shake = Math.min(1, shake + (isMine(a) ? 0.5 : 0.2));
+        if (isMine(a)) api.buzz(70); else if (b >= 0 && isMine(b)) api.buzz(30);
+        addFloat(c, d - 12, '명중! 남은 체력 ' + e, '#ffb35c', 1.2);
+      } else if (code === 'w') { // cracked wall hit: a edge, b hp left
+        if (!W) return;
+        const p = edgeXY(W, a);
+        puff(p[0], p[1], '#b9ae9a', b ? 6 : 16, b ? 40 : 75, b ? 0.35 : 0.6, 1, 1);
+        puff(p[0], p[1], 'rgba(160,150,135,.6)', b ? 3 : 8, 25, 0.9, 2, 2);
+        sfx(b ? 'tick' : 'thud', 30);
+        if (!b) { shake = Math.min(1, shake + 0.2); addFloat(p[0], p[1] - 8, '벽 부서짐!', '#cfc3dc', 1); }
+        if (W.wv !== wallV) drawWalls();
+      } else if (code === 'x') { // destroyed: a seat, b by, c/d pos
+        const col = P(a).color;
+        boomFx(c, d, col, true);
+        scorch(c, d);
+        const v = vis[a]; if (v) v.dead = true;
+        if (isMine(a)) { api.sfx('lose'); api.buzz(140); shake = 1; }
+        else if (b >= 0 && isMine(b)) { sfx('thud', 20); api.buzz(45); shake = Math.min(1, shake + 0.5); }
+        else { sfx('thud', 20); shake = Math.min(1, shake + 0.35); }
+        addFloat(c, d - 12, b === a ? name(a) + ' 자폭!' : b >= 0 ? name(b) + ' → ' + name(a) : name(a) + ' 격파!', b >= 0 && b !== a ? P(b).color : col, 1.8);
+      } else if (code === 's') {
+        rings.push({ x: b, y: c, r0: 8, r1: 20, t: 0.35, T: 0.35, col: PU.D.col });
+        puff(b, c, PU.D.col, 10, 70, 0.35);
+        sfx('bounce', 30); if (isMine(a)) api.buzz(40);
+        addFloat(b, c - 12, '방패!', PU.D.col, 1);
+      } else if (code === 'l') { // laser: a seat, b/c origin, d angle, e length
+        const n = laserPath(W, b, c, d, TBV), pts = [];
+        let rem = e;
+        for (let k = 0; k < n; k++) {
+          const x = TBV[2 * k], y = TBV[2 * k + 1];
+          if (k > 0) { const px = pts[pts.length - 2], py = pts[pts.length - 1], sl = Math.hypot(x - px, y - py); if (sl >= rem) { const u = rem / (sl || 1); pts.push(px + (x - px) * u, py + (y - py) * u); break; } rem -= sl; }
+          pts.push(x, y);
+        }
+        beams.push({ pts, t: 0.45, T: 0.45, col: P(a).color });
+        const v = vis[a]; if (v) { v.fl = 0.12; v.rc = 0.15; }
+        sfx('whoosh', 20); shake = Math.min(1, shake + 0.25); if (isMine(a)) api.buzz(30);
+        for (let k = 2; k < pts.length - 2; k += 2) puff(pts[k], pts[k + 1], '#ffd0d8', 3, 40, 0.3);
+      } else if (code === 'p') { // pick-up: a seat, b kind idx, c/d pos
+        const k = PU_KEYS[b] || 'D', I = PU[k];
+        rings.push({ x: c, y: d, r0: 4, r1: 18, t: 0.3, T: 0.3, col: I.col });
+        addFloat(c, d - 10, I.nm + '!', I.col, 1.2);
+        sfx('chip', 30); if (isMine(a)) { api.buzz(22); }
+      } else if (code === 'k') { // smoke burst: a/b pos
+        puff(a, b, 'rgba(200,194,210,.7)', 14, 26, 0.9, 2, 3); sfx('whoosh', 30);
+      } else if (code === 'b') { // mine (d 0) or artillery burst (d 1): a/b pos, c owner
+        boomFx(a, b, d ? P(c).color : PU.N.col, false);
+        rings.push({ x: a, y: b, r0: 4, r1: d ? ART_BOOM + 3 : MINE_BOOM, t: 0.35, T: 0.35, col: '#ffb35c' });
+        scorch(a, b); sfx('thud', 20); shake = Math.min(1, shake + 0.45);
+      } else if (code === 'u') { // crate appears
+        rings.push({ x: a, y: b, r0: 14, r1: 4, t: 0.4, T: 0.4, col: (PU[PU_KEYS[c]] || PU.D).col });
+        sfx('pop', 60);
+      }
+    }
+    function addFloat(x, y, text, col, T) { // stack labels that pop up at the same spot
+      for (const f of floats) if (Math.abs(f.x - x) < 40 && Math.abs(f.y - y) < 9 && f.t > f.T - 0.6) y = f.y - 11;
+      floats.push({ x, y, text, col, t: T, T });
+    }
+    function boomFx(x, y, col, big) {
+      rings.push({ x, y, r0: 3, r1: big ? 30 : 22, t: 0.32, T: 0.32, col: '#fff3cf' });
+      puff(x, y, '#ffd27a', big ? 18 : 12, 120, 0.4, 0, 1.2);
+      puff(x, y, '#ff7a3d', big ? 14 : 10, 90, 0.5, 0, 1.4);
+      puff(x, y, 'rgba(60,52,58,.7)', big ? 10 : 6, 30, 1.1, 2, 2.4);
+      if (big) { puff(x, y, col, 10, 95, 0.9, 1, 1.4); parts.push({ x, y, vx: (Math.random() - 0.5) * 60, vy: (Math.random() - 0.5) * 60, t: 0.9, T: 0.9, c: col, k: 3, sz: 1, r: 0, w: (Math.random() - 0.5) * 18 }); }
+    }
+    const hooks = {
+      fx: onFx,
+      bounce(s) { if (s.k !== 'p' && Math.random() < 0.6) puff(s.x, s.y, '#fff3cf', 2, 30, 0.18); if (isMine(s.o) && s.k === 's') sfx('tick', 110); },
+      empty(c) { void c; },
+    };
+
+    /* ----- host: round flow ----- */
+    function hostFlow(dt) {
+      if (!host() || !st || !W) return;
+      if (st.ph === 'pick') { // class pick: AI already chose; people pick without a time limit (방장 「지금 시작」·나간 자리 → 무작위)
+        const force = pkForce; pkForce = false;
+        const cls = (st.cls || []).slice();
+        let ch = false;
+        for (let s = 0; s < st.n; s++) {
+          if (cls[s] >= 0) continue;
+          const p = api.players[s];
+          let v = -1;
+          if (isMine(s) && myPick >= 0) v = myPick;
+          else if (!p || p.ai || (L.debug && L.debug.autoplay) || force) v = U.rand(CLS.length);
+          else if (api.online && remPick[s] >= 0) v = remPick[s];
+          if (v >= 0) { cls[s] = v; ch = true; }
+        }
+        if (cls.every((v) => v >= 0)) api.setState(Object.assign({}, st, { cls, ph: 'count' }));
+        else if (ch) api.setState(Object.assign({}, st, { cls }));
+        return;
+      }
+      if (st.ph === 'count' && phase === 'play') { api.setState(Object.assign({}, st, { ph: 'play' })); return; }
+      if (st.ph === 'play') {
+        const alive = W.tanks.filter((c) => c.alive), teams = st.tm ? new Set(alive.map((c) => st.tm[c.seat])).size : alive.length;
+        if (teams <= 1) { lastT += dt; if (lastT >= LAST_T) { lastT = -1e9; api.setState(roundOver(st, teams === 1 ? alive[0].seat : -1, tallyRid === st.rid ? tally : null)); } }
+        else if (W.t > CAP_T) api.setState(roundOver(st, -1, tallyRid === st.rid ? tally : null));
+      } else if (st.ph === 'end') {
+        endT -= dt;
+        if (endT <= 0) { endT = 1e9; api.setState(nextRound(st)); }
+      }
+    }
+
+    /* ----- online ----- */
+    const remPick = {};
+    function pollHost() {
+      if (!api.online || !api.isHost || !W) return;
+      let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+      if (!rem || typeof rem !== 'object') return;
+      for (const k in rem) {
+        const s = +k, o = rem[k];
+        if (o && o.k === 'pk' + st.rid && s >= 0 && s < st.n && o.pk >= 0 && o.pk < CLS.length) { remPick[s] = o.pk | 0; continue; }
+        if (!(s >= 0 && s < W.tanks.length) || simHere(s) || !o || o.k !== key) continue;
+        remIn[s] = { m: o.m === 'k' ? 'k' : 's', x: clamp(+o.x || 0, -1, 1), y: clamp(+o.y || 0, -1, 1), v: clamp(+o.v || 0, -1, 1), t: clamp(+o.t || 0, -1, 1), fc: o.fc | 0, sc: o.sc | 0 };
+        if (fin(o.q)) iqOf[s] = o.q;
+      }
+    }
+    function encode() {
+      const T = W.tanks.map((c) => [r1(c.x), r1(c.y), r2(c.a), c.alive ? 1 : 0, c.sp ? SPK.indexOf(c.sp) + 1 : 0, r1(Math.max(0, c.sh)), Math.round(c.v || 0), c.hp | 0]);
+      const S = [], sh = W.shells.length > 40 ? W.shells.slice(-40) : W.shells;
+      for (const s of sh) S.push(r1(s.x), r1(s.y), Math.round(s.vx), Math.round(s.vy), s.o, SKK.indexOf(s.k), r2(s.t), s.arm ? 1 : 0);
+      const M = []; for (const m of W.mines) M.push(m.x, m.y, m.o, r1(m.t), m.lf ? 1 : 0);
+      const Pu = []; for (const p of W.pu) Pu.push(p.x, p.y, PU_KEYS.indexOf(p.k));
+      return { k: key, q: hsQ, t: r2(W.t), T, S, M, P: Pu, K: (W.smk || []).map((m) => [m.x, m.y, r2(m.t)]), B: W.cl.map((e) => W.M.k[e] | 0), fx: W.fx.slice(-8), iq: Object.assign({}, iqOf) };
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !W) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || typeof hs !== 'object' || hs.k !== key || hs.q === lastQ || !Array.isArray(hs.T)) return;
+      lastQ = hs.q;
+      if (fin(hs.t)) W.t = hs.t;
+      if (Array.isArray(hs.fx)) for (const e of hs.fx) if (Array.isArray(e) && e[0] > lastFx) { lastFx = e[0]; try { onFx(e[1], e[2], e[3], e[4], e[5], e[6]); } catch (er) {} }
+      const lag = Math.min(0.2, rtt / 2);
+      hs.T.forEach((a, i) => {
+        const c = W.tanks[i];
+        if (!c || !Array.isArray(a)) return;
+        c.alive = !!(a[3] & 1); c.sp = SPK[(a[4] | 0) - 1] || ''; c.sh = +a[5] || 0; c.v = +a[6] || 0; if (a[7] != null) c.hp = a[7] | 0;
+        if (!isMine(i)) return;
+        if (hs.iq && fin(hs.iq[i]) && sendT[hs.iq[i]]) { const sm = (now - sendT[hs.iq[i]]) / 1000; if (sm > 0 && sm < 2) rtt = rtt * 0.85 + sm * 0.15; }
+        const tx = a[0] + Math.cos(a[2]) * c.v * lag, ty = a[1] + Math.sin(a[2]) * c.v * lag;
+        if (!c.alive || Math.hypot(tx - c.x, ty - c.y) > 30) { c.x = tx; c.y = ty; c.a = a[2]; }
+        else { c.x += (tx - c.x) * 0.3; c.y += (ty - c.y) * 0.3; if (Math.abs(wrapA(a[2] - c.a)) > 0.6) c.a = a[2]; }
+      });
+      if (Array.isArray(hs.B) && hs.B.length === W.cl.length) { // cracked walls: damage / broken
+        let ch = false;
+        hs.B.forEach((hp, i) => {
+          const e = W.cl[i]; hp = hp | 0;
+          if (hp === (W.M.k[e] | 0)) return;
+          W.M.k[e] = hp; ch = true;
+          if (!hp) { const HV = (W.R + 1) * W.C; if (e < HV) W.M.h[e] = 0; else W.M.v[e - HV] = 0; }
+        });
+        if (ch) { buildRects(W); W.wv++; drawWalls(); }
+      }
+      const S = Array.isArray(hs.S) ? hs.S : [];
+      W.shells = [];
+      for (let i = 0; i + 7 < S.length; i += 8) W.shells.push({ x: +S[i], y: +S[i + 1], vx: +S[i + 2], vy: +S[i + 3], o: S[i + 4] | 0, k: SKK[S[i + 5]] || 's', t: +S[i + 6] || 0, arm: S[i + 7] ? 1 : 0, bt: -1, id: 0 });
+      let k = lag * SPD(); while (k > 1e-6) { const hh = Math.min(H * 2, k); stepShells(W, hh, null, false); k -= hh; }
+      const Mi = Array.isArray(hs.M) ? hs.M : []; W.mines = [];
+      for (let i = 0; i + 4 < Mi.length; i += 5) W.mines.push({ x: +Mi[i], y: +Mi[i + 1], o: Mi[i + 2] | 0, t: +Mi[i + 3] || 0, lf: Mi[i + 4] ? 1 : 0 });
+      W.smk = Array.isArray(hs.K) ? hs.K.filter(Array.isArray).map((m) => ({ x: +m[0] || 0, y: +m[1] || 0, t: +m[2] || 0 })) : [];
+      const Pp = Array.isArray(hs.P) ? hs.P : []; W.pu = [];
+      for (let i = 0; i + 2 < Pp.length; i += 3) W.pu.push({ x: +Pp[i], y: +Pp[i + 1], k: PU_KEYS[Pp[i + 2]] || 'D' });
+      snaps.push({ at: now, T: hs.T }); if (snaps.length > 4) snaps.shift();
+    }
+    function interpOthers(now) {
+      if (host() || !snaps.length || !W) return;
+      const rt = now - 100;
+      let A = null, B = snaps[snaps.length - 1], k = 1;
+      for (let i = snaps.length - 1; i > 0; i--) if (snaps[i - 1].at <= rt) { A = snaps[i - 1]; B = snaps[i]; break; }
+      if (A) k = clamp((rt - A.at) / Math.max(1, B.at - A.at), 0, 1.25);
+      W.tanks.forEach((c, s) => {
+        if (isMine(s)) return;
+        const b = B.T[s], a = A ? A.T[s] : null;
+        if (!Array.isArray(b)) return;
+        if (a && Array.isArray(a) && Math.hypot(b[0] - a[0], b[1] - a[1]) < 60) { c.x = a[0] + (b[0] - a[0]) * k; c.y = a[1] + (b[1] - a[1]) * k; c.a = a[2] + wrapA(b[2] - a[2]) * k; }
+        else { c.x = b[0]; c.y = b[1]; c.a = b[2]; }
+      });
+    }
+    function publish(rdt, now) {
+      if (!api.online || !W) return;
+      pubT -= rdt; inT -= rdt;
+      try {
+        if (api.isHost) {
+          if (pubT > 0) return;
+          pubT = 1 / 20;
+          hsQ = (hsQ + 1) % 100000;
+          let o = encode();
+          if (JSON.stringify(o).length > 2600) { o.S = o.S.slice(-160); o.fx = o.fx.slice(-4); }
+          api.net.hostSend(o);
+        } else {
+          const s = mine()[0];
+          if (s == null) return;
+          const I = locIn[s]; if (!I) return;
+          if (st.ph === 'pick') { if (myPick >= 0 && inT <= 0) { inT = 0.3; api.net.publish({ k: 'pk' + st.rid, pk: myPick }); } return; }
+          const sig = [I.m, I.x, I.y, I.v, I.t, I.fc, I.sc].join('|');
+          if (sig === lastSig && inT > 0) return;
+          lastSig = sig; inT = 0.15;
+          inQ = (inQ + 1) % 100000; sendT[inQ] = now; delete sendT[(inQ + 99900) % 100000];
+          api.net.publish({ k: key, q: inQ, m: I.m, x: I.x, y: I.y, v: I.v, t: I.t, fc: I.fc | 0, sc: I.sc | 0 });
+        }
+      } catch (e) {}
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      if (!st) return;
+      const dt = rdt * SPD();
+      if (st.ph === 'pick') { syncPick(); if (host()) { pollHost(); hostFlow(dt); } publish(rdt, now); return; }
+      if (W && phase === 'count') {
+        const a = Math.ceil(cd); cd -= dt; const b = Math.ceil(cd);
+        if (b !== a && b > 0) api.sfx('tick');
+        if (cd <= 0 && (host() || st.ph === 'play')) { phase = 'play'; goT = 0.7; api.sfx('pop'); api.buzz(20); }
+      }
+      if (hintT > 0 && phase === 'play') hintT -= rdt;
+      if (st && st.ph === 'pick') { if (!pbar) pbar = api.pickBar({ picked: (i) => !!(st && st.cls && st.cls[i] >= 0) || (isMine(i) && myPick >= 0), onForce: () => { pkForce = true; } }); }
+      else if (pbar) { pbar.destroy(); pbar = null; }
+      refresh();
+      const auto = L.debug && L.debug.autoplay;
+      if (host()) {
+        pollHost();
+        if (W && phase === 'play' && (st.ph === 'play' || st.ph === 'count' || st.ph === 'end')) {
+          W.over = st.ph === 'end';
+          W.tanks.forEach((c, i) => {
+            const p = api.players[i]; if (!p) return;
+            if (aiMem[i] && aiMem[i].sty == null) aiMem[i].sty = (p.ai && L.aiStyle && L.aiStyle(i)) || 'bal';
+            if (simHere(i)) inputs[i] = autoSeat(i) || auto ? aiThink(W, c, aiMem[i], p.ai ? (p.lv || 2) : 2, dt) : locIn[i];
+            else inputs[i] = remIn[i];
+          });
+          acc += Math.min(dt, 0.25);
+          let n = 0;
+          while (acc >= H && n < 120) { stepWorld(W, inputs, hooks, true); acc -= H; n++; }
+          if (st.ph === 'play' && st.it) maybePowerup(W, dt, hooks);
+        }
+        hostFlow(dt);
+      } else if (W) {
+        pollGuest(now);
+        if (phase === 'play' && (st.ph === 'play' || st.ph === 'end')) {
+          W.t += dt;
+          const s = mine()[0], c = s != null ? W.tanks[s] : null;
+          if (c && c.alive && st.ph === 'play') {
+            if (auto) { const I = aiThink(W, c, aiMem[s] || (aiMem[s] = {}), 2, dt), Lc = locIn[s]; if (Lc) { Lc.m = 'k'; Lc.v = I.v; Lc.t = I.t; Lc.fc = I.fc; Lc.sc = I.sc; } }
+            let k = Math.min(dt, 0.1); while (k > 1e-6) { const hh = Math.min(H * 2, k); stepTank(W, c, locIn[s], hh); k -= hh; }
+          }
+          let k = Math.min(dt, 0.1); while (k > 1e-6) { const hh = Math.min(H * 2, k); stepShells(W, hh, hooks, false); stepMines(W, hh, null, false); k -= hh; }
+        }
+        interpOthers(now);
+      }
+      // per-tank visuals: tread phase, tread marks, missile smoke
+      if (W) W.tanks.forEach((c, i) => {
+        const v = vis[i]; if (!v) return;
+        if (c.alive) {
+          const dx = c.x - v.px, dy = c.y - v.py, fwd = dx * Math.cos(c.a) + dy * Math.sin(c.a), da = wrapA(c.a - v.pa);
+          if (Math.abs(fwd) < 20) { v.tl += fwd - da * 5.3; v.tr += fwd + da * 5.3; }
+          if (Math.hypot(c.x - v.sx, c.y - v.sy) > 2.6 || Math.abs(da) > 0.25) { stampTreads(c, v); v.sx = c.x; v.sy = c.y; }
+          v.dead = false;
+        }
+        v.px = c.x; v.py = c.y; v.pa = c.a;
+        if (v.fl > 0) v.fl -= rdt;
+        if (v.rc > 0) v.rc -= rdt;
+      });
+      if (W) for (const s of W.shells) if (s.k === 'm' && Math.random() < 0.7) parts.push({ x: s.x - s.vx * 0.04, y: s.y - s.vy * 0.04, vx: (Math.random() - 0.5) * 8, vy: (Math.random() - 0.5) * 8, t: 0.5, T: 0.5, c: 'rgba(210,205,215,.55)', k: 2, sz: 1.1, r: 0, w: 0 });
+      for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.t -= rdt; p.x += p.vx * rdt; p.y += p.vy * rdt; const f = p.k === 2 ? 0.96 : 0.9; p.vx *= f; p.vy *= f; p.r += p.w * rdt; if (p.t <= 0) parts.splice(i, 1); }
+      for (let i = floats.length - 1; i >= 0; i--) { floats[i].t -= rdt; if (floats[i].t <= 0) floats.splice(i, 1); }
+      for (let i = rings.length - 1; i >= 0; i--) { rings[i].t -= rdt; if (rings[i].t <= 0) rings.splice(i, 1); }
+      for (let i = beams.length - 1; i >= 0; i--) { beams[i].t -= rdt; if (beams[i].t <= 0) beams.splice(i, 1); }
+      shake = Math.max(0, shake - rdt * 3);
+      if (goT > 0) goT -= rdt;
+      if (st.ph === 'end') endA = Math.min(1, endA + rdt * 5); else endA = 0;
+      publish(rdt, now);
+    }
+
+    /* ----- drawing ----- */
+    function txt(t, x, y, col, font, al) {
+      ctx.font = font; ctx.textAlign = al || 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(16,12,22,.88)'; ctx.lineJoin = 'round'; ctx.strokeText(t, x, y); ctx.fillStyle = col; ctx.fillText(t, x, y);
+    }
+    function drawTank(g, x, y, a, col, v, now, ci) {
+      g.save(); g.translate(x, y); g.rotate(a);
+      ci = ci | 0;
+      const sc = (CLS[ci] || CLS[0]).r / TR; if (sc !== 1) g.scale(sc, sc);
+      g.fillStyle = 'rgba(0,0,0,.32)'; rrect(g, -7.2 + 1.1, -7.3 + 1.9, 14.4, 14.6, 3); g.fill();
+      for (let sd = -1; sd <= 1; sd += 2) {
+        const ty = sd * 5.3, ph = v ? (sd < 0 ? v.tl : v.tr) : 0;
+        g.fillStyle = '#272230'; rrect(g, -7.3, ty - 2.05, 14.6, 4.1, 1.8); g.fill();
+        g.strokeStyle = 'rgba(170,160,182,.55)'; g.lineWidth = 0.6; g.beginPath();
+        const off = ((ph % 2.4) + 2.4) % 2.4;
+        for (let u = -7 + off; u < 7.1; u += 2.4) { g.moveTo(u, ty - 1.6); g.lineTo(u, ty + 1.6); }
+        g.stroke();
+      }
+      rrect(g, -6, -4.1, 12, 8.2, 2.2); g.fillStyle = col; g.fill();
+      g.lineWidth = 0.8; g.strokeStyle = 'rgba(18,12,26,.9)'; g.stroke();
+      g.fillStyle = 'rgba(255,255,255,.26)'; rrect(g, -5.3, -3.5, 10.6, 2, 1); g.fill();
+      g.fillStyle = 'rgba(0,0,0,.22)'; g.fillRect(-5.4, 2.1, 10.8, 1.3);
+      g.fillStyle = 'rgba(18,12,26,.45)'; for (let k = 0; k < 3; k++) g.fillRect(-5.2 + k * 1.2, -1.6, 0.6, 3.2);
+      const rc = v && v.rc > 0 ? (v.rc / 0.12) * 2 : 0;
+      if (ci === 1) { // heavy: side skirts, thick barrel with a muzzle brake, square turret
+        g.fillStyle = shade(col, -0.3); g.fillRect(-7, -4.6, 14, 1.1); g.fillRect(-7, 3.5, 14, 1.1);
+        g.fillStyle = shade(col, -0.42); rrect(g, 1 - rc, -1.7, 10, 3.4, 0.9); g.fill(); g.strokeStyle = 'rgba(18,12,26,.9)'; g.lineWidth = 0.6; g.stroke();
+        g.fillStyle = '#272230'; g.fillRect(9.4 - rc, -2.3, 2.4, 4.6);
+        rrect(g, -4.6, -3.6, 8, 7.2, 1.6); g.fillStyle = shade(col, -0.16); g.fill(); g.lineWidth = 0.8; g.strokeStyle = 'rgba(18,12,26,.9)'; g.stroke();
+        g.fillStyle = 'rgba(255,255,255,.3)'; g.fillRect(-3.8, -2.8, 3, 1.4);
+      } else if (ci === 2) { // artillery: short wide mortar tube raised on a base plate
+        g.fillStyle = shade(col, -0.5); rrect(g, -3.5, -3.5, 7, 7, 1); g.fill();
+        g.fillStyle = shade(col, -0.42); rrect(g, 0 - rc * 0.5, -2.2, 7.5, 4.4, 1.6); g.fill(); g.strokeStyle = 'rgba(18,12,26,.9)'; g.lineWidth = 0.6; g.stroke();
+        g.beginPath(); g.ellipse(7.4 - rc * 0.5, 0, 1.4, 2.6, 0, 0, 7); g.fillStyle = '#17131f'; g.fill(); g.strokeStyle = shade(col, -0.2); g.lineWidth = 0.6; g.stroke();
+        g.beginPath(); g.arc(-1.4, 0, 2.6, 0, 7); g.fillStyle = shade(col, -0.16); g.fill(); g.lineWidth = 0.7; g.strokeStyle = 'rgba(18,12,26,.9)'; g.stroke();
+      } else { // light: slim long barrel, small round turret
+        g.fillStyle = shade(col, -0.42); rrect(g, 1 - rc, -0.95, 11.2, 1.9, 0.8); g.fill(); g.strokeStyle = 'rgba(18,12,26,.9)'; g.lineWidth = 0.6; g.stroke();
+        g.fillStyle = '#272230'; g.fillRect(10.6 - rc, -1.25, 1.6, 2.5);
+        g.beginPath(); g.arc(-0.4, 0, 3.4, 0, 7); g.fillStyle = shade(col, -0.16); g.fill(); g.lineWidth = 0.8; g.strokeStyle = 'rgba(18,12,26,.9)'; g.stroke();
+        g.beginPath(); g.arc(-1.2, -0.9, 1.3, 0, 7); g.fillStyle = 'rgba(255,255,255,.33)'; g.fill();
+      }
+      if (v && v.fl > 0) { // muzzle flash
+        const k = v.fl / 0.09;
+        g.globalAlpha = Math.min(1, k);
+        g.fillStyle = '#ffe9a8'; g.beginPath();
+        for (let i = 0; i < 10; i++) { const an = (i / 10) * Math.PI * 2, r = i % 2 ? 1.8 : 4.6 * (0.7 + 0.3 * k); g.lineTo(13.5 + Math.cos(an) * r * 1.3, Math.sin(an) * r); }
+        g.closePath(); g.fill();
+        g.beginPath(); g.arc(13, 0, 1.8, 0, 7); g.fillStyle = '#ffffff'; g.fill();
+        g.globalAlpha = 1;
+      }
+      g.restore();
+      void now;
+    }
+    function drawWorld(now) {
+      const me = mine()[0];
+      // mines
+      for (const m of W.mines) {
+        const armed = m.t >= MINE_ARM, col = P(m.o).color;
+        ctx.beginPath(); ctx.arc(m.x + 0.6, m.y + 1, 4.4, 0, 7); ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fill();
+        ctx.beginPath(); ctx.arc(m.x, m.y, 4.4, 0, 7); ctx.fillStyle = '#2e2836'; ctx.fill(); ctx.lineWidth = 1.1; ctx.strokeStyle = col; ctx.stroke();
+        for (let k = 0; k < 4; k++) { const an = k * Math.PI / 2 + 0.6; ctx.fillStyle = '#6b6276'; ctx.fillRect(m.x + Math.cos(an) * 4.6 - 0.7, m.y + Math.sin(an) * 4.6 - 0.7, 1.4, 1.4); }
+        const blink = armed ? (Math.sin(now / 110) > 0 ? 1 : 0.25) : 0.35;
+        ctx.beginPath(); ctx.arc(m.x, m.y, 1.5, 0, 7); ctx.fillStyle = armed ? 'rgba(255,70,80,' + blink + ')' : 'rgba(227,174,69,.6)'; ctx.fill();
+        if (armed && blink > 0.5) { ctx.beginPath(); ctx.arc(m.x, m.y, 3.2, 0, 7); ctx.fillStyle = 'rgba(255,70,80,.25)'; ctx.fill(); }
+      }
+      // crates
+      for (const p of W.pu) {
+        const I = PU[p.k] || PU.D, b = 1 + 0.07 * Math.sin(now / 230 + p.x * 0.1);
+        ctx.save(); ctx.translate(p.x, p.y); ctx.scale(b, b);
+        ctx.beginPath(); ctx.arc(0, 0, 10.5, 0, 7); ctx.fillStyle = hexA(I.col, 0.16 + 0.08 * Math.sin(now / 180)); ctx.fill();
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; rrect(ctx, -6 + 0.8, -6 + 1.4, 12, 12, 2.2); ctx.fill();
+        rrect(ctx, -6, -6, 12, 12, 2.2); ctx.fillStyle = '#a77b4d'; ctx.fill(); ctx.lineWidth = 0.8; ctx.strokeStyle = '#4a2f1b'; ctx.stroke();
+        ctx.strokeStyle = 'rgba(74,47,27,.6)'; ctx.lineWidth = 0.6; ctx.beginPath(); ctx.moveTo(-6, -2); ctx.lineTo(6, -2); ctx.moveTo(-6, 2.2); ctx.lineTo(6, 2.2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(0, 0, 4.6, 0, 7); ctx.fillStyle = I.col; ctx.fill(); ctx.lineWidth = 0.7; ctx.strokeStyle = 'rgba(18,12,26,.8)'; ctx.stroke();
+        ctx.font = '6.4px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#17131f'; ctx.fillText(I.ch, 0, 0.4);
+        ctx.restore();
+      }
+      // laser sights (everyone holding a laser) and my aim line
+      for (const c of W.tanks) {
+        if (!c.alive || c.sp !== 'L' || inSmoke(W, c.x, c.y, 0)) continue;
+        const n = laserPath(W, c.x, c.y, c.a, TBV);
+        ctx.save(); ctx.setLineDash([2, 3]); ctx.lineWidth = isMine(c.seat) ? 1.1 : 0.8; ctx.strokeStyle = isMine(c.seat) ? 'rgba(255,84,112,.85)' : 'rgba(255,84,112,.35)';
+        ctx.beginPath(); ctx.moveTo(TBV[0] + Math.cos(c.a) * (TR + 4), TBV[1] + Math.sin(c.a) * (TR + 4));
+        for (let k = 1; k < n; k++) ctx.lineTo(TBV[2 * k], TBV[2 * k + 1]);
+        ctx.stroke(); ctx.restore();
+      }
+      // artillery landing warnings (everyone sees where a lob will burst)
+      for (const s of W.shells) {
+        if (s.k !== 'a') continue;
+        const sT = s.T || artTv(s), rem = Math.max(0, sT - s.t), lx = s.x + s.vx * rem, ly = s.y + s.vy * rem, u = clamp(s.t / sT, 0, 1);
+        ctx.save(); ctx.setLineDash([3, 2.5]); ctx.lineDashOffset = -(now / 30) % 5.5;
+        ctx.beginPath(); ctx.arc(lx, ly, ART_BOOM * (0.55 + 0.45 * u), 0, 7); ctx.strokeStyle = hexA(P(s.o).color, 0.45 + 0.45 * u); ctx.lineWidth = 1; ctx.stroke();
+        ctx.setLineDash([]); ctx.beginPath(); ctx.arc(lx, ly, ART_BOOM, 0, 7); ctx.fillStyle = 'rgba(255,90,70,' + (0.05 + 0.13 * u) + ')'; ctx.fill();
+        ctx.restore();
+      }
+      if (me != null && cfg.aim && W.tanks[me] && W.tanks[me].alive && W.tanks[me].sp !== 'L' && st.ph !== 'end' && st.ph !== 'done' && clsOf(W.tanks[me]).sk === 'a') {
+        // artillery: dotted lob to the auto-ranged landing point and the blast circle
+        const c = W.tanks[me], col = P(me).color, r = artRange(W, c), lx = c.x + Math.cos(c.a) * r, ly = c.y + Math.sin(c.a) * r, pk = 8 + r * 0.12;
+        ctx.save(); ctx.setLineDash([2, 3]); ctx.lineDashOffset = -(now / 40) % 5; ctx.strokeStyle = hexA(col, 0.45); ctx.lineWidth = 1;
+        ctx.beginPath(); for (let k = 0; k <= 16; k++) { const u = k / 16, x = c.x + (lx - c.x) * u, y = c.y + (ly - c.y) * u - 4 * pk * u * (1 - u); if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y); } ctx.stroke();
+        ctx.setLineDash([]); ctx.beginPath(); ctx.arc(lx, ly, ART_BOOM, 0, 7); ctx.strokeStyle = hexA(col, 0.7); ctx.lineWidth = 1.1; ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(lx - 4, ly); ctx.lineTo(lx + 4, ly); ctx.moveTo(lx, ly - 4); ctx.lineTo(lx, ly + 4); ctx.stroke();
+        ctx.beginPath(); ctx.arc(c.x, c.y, ART_MIN, 0, 7); ctx.strokeStyle = 'rgba(242,233,216,.1)'; ctx.setLineDash([1.5, 4]); ctx.stroke();
+        ctx.restore();
+      } else if (me != null && cfg.aim && W.tanks[me] && W.tanks[me].alive && W.tanks[me].sp !== 'L' && st.ph !== 'end' && st.ph !== 'done' && !inSmoke(W, W.tanks[me].x, W.tanks[me].y, 0)) {
+        const c = W.tanks[me], n = traceRay(W, c.x, c.y, c.a, 1, 300, clsOf(c).sk === 'b' ? BR : SR, TBV, true), col = P(me).color;
+        ctx.save(); ctx.lineCap = 'round';
+        let used = 0;
+        for (let k = 0; k < n - 1; k++) {
+          let ax = TBV[2 * k], ay = TBV[2 * k + 1];
+          const bx = TBV[2 * k + 2], by = TBV[2 * k + 3], sl = Math.hypot(bx - ax, by - ay);
+          if (k === 0) { const u = Math.min(1, ((c.r || TR) + 5) / (sl || 1)); ax += (bx - ax) * u; ay += (by - ay) * u; }
+          let ex = bx, ey = by;
+          if (k === 1) { const lim = 70; if (sl > lim) { ex = ax + (bx - ax) * lim / sl; ey = ay + (by - ay) * lim / sl; } }
+          ctx.setLineDash([2.5, 3.5]); ctx.lineDashOffset = -(now / 40) % 6;
+          ctx.strokeStyle = hexA(col, k === 0 ? 0.6 : 0.32); ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ex, ey); ctx.stroke();
+          if (k === 0 && n > 2) { ctx.setLineDash([]); ctx.beginPath(); ctx.arc(bx, by, 1.6, 0, 7); ctx.fillStyle = hexA(col, 0.75); ctx.fill(); }
+          used += sl;
+        }
+        void used;
+        ctx.restore();
+      }
+      // shells
+      for (const s of W.shells) {
+        const col = P(s.o).color;
+        if (s.k === 'm') {
+          const an = Math.atan2(s.vy, s.vx);
+          ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(an);
+          ctx.fillStyle = 'rgba(255,170,80,' + (0.6 + Math.random() * 0.4) + ')'; ctx.beginPath(); ctx.moveTo(-4, -1.2); ctx.lineTo(-7 - Math.random() * 2, 0); ctx.lineTo(-4, 1.2); ctx.fill();
+          ctx.fillStyle = shade(col, -0.3); ctx.beginPath(); ctx.moveTo(-4, -2.6); ctx.lineTo(-2, -1); ctx.lineTo(-2, 1); ctx.lineTo(-4, 2.6); ctx.fill();
+          rrect(ctx, -4.2, -1.5, 8, 3, 1.4); ctx.fillStyle = col; ctx.fill(); ctx.lineWidth = 0.6; ctx.strokeStyle = 'rgba(18,12,26,.9)'; ctx.stroke();
+          ctx.beginPath(); ctx.arc(3.6, 0, 1.4, 0, 7); ctx.fillStyle = '#fbf3df'; ctx.fill();
+          ctx.restore();
+          continue;
+        }
+        if (s.k === 'a') { // lob: shadow on the floor, shell up in the air
+          const sT = s.T || artTv(s), u = clamp(s.t / sT, 0, 1), pk = 8 + Math.hypot(s.vx, s.vy) * sT * 0.12, hy = 4 * pk * u * (1 - u);
+          ctx.beginPath(); ctx.ellipse(s.x, s.y, 2.6, 1.8, 0, 0, 7); ctx.fillStyle = 'rgba(0,0,0,' + (0.2 + 0.2 * u) + ')'; ctx.fill();
+          ctx.beginPath(); ctx.arc(s.x, s.y - hy, 2.6 + hy * 0.06, 0, 7); ctx.fillStyle = '#3a3344'; ctx.fill(); ctx.lineWidth = 0.8; ctx.strokeStyle = col; ctx.stroke();
+          continue;
+        }
+        if (s.k === 'k') { ctx.beginPath(); ctx.arc(s.x, s.y, 2.6, 0, 7); ctx.fillStyle = '#9a93a8'; ctx.fill(); ctx.lineWidth = 0.7; ctx.strokeStyle = col; ctx.stroke(); if (Math.random() < 0.5) puff(s.x, s.y, 'rgba(200,194,210,.5)', 1, 6, 0.4, 2, 1); continue; }
+        const r = radOf(s), tl = Math.min(0.045, Math.max(0, s.t - (s.bt > 0 ? s.bt : 0)));
+        if (tl > 0.004) { ctx.strokeStyle = hexA(col, 0.5); ctx.lineWidth = r * 1.3; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(s.x - s.vx * tl, s.y - s.vy * tl); ctx.lineTo(s.x, s.y); ctx.stroke(); }
+        ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, 7); ctx.fillStyle = s.k === 'p' ? '#ffe2b8' : s.k === 'r' ? '#a8f5cf' : s.k === 'q' ? '#ff9a52' : s.k === 'o' ? '#d9a27a' : '#fbf3df'; ctx.fill();
+        ctx.lineWidth = 0.6; ctx.strokeStyle = 'rgba(18,12,26,.9)'; ctx.stroke();
+      }
+      // tanks
+      W.tanks.forEach((c, i) => {
+        if (!c.alive) return;
+        const col = P(i).color;
+        if (phase === 'count' && isMine(i)) { ctx.beginPath(); ctx.arc(c.x, c.y, 12 + 2 * Math.sin(now / 150), 0, 7); ctx.strokeStyle = hexA(col, 0.8); ctx.lineWidth = 1.4; ctx.stroke(); }
+        const flick = c.inv > W.t && Math.sin(now / 35) > 0;
+        if (flick) ctx.globalAlpha = 0.55;
+        drawTank(ctx, c.x, c.y, c.a, col, vis[i], now, c.ci);
+        ctx.globalAlpha = 1;
+        const mh = clsOf(c).hp;
+        if (mh > 1) { // hit points
+          for (let k = 0; k < mh; k++) { ctx.beginPath(); ctx.arc(c.x - (mh - 1) * 2.2 + k * 4.4, c.y + (c.r || TR) + 4, 1.5, 0, 7); ctx.fillStyle = k < c.hp ? '#8fd17a' : 'rgba(40,30,40,.8)'; ctx.fill(); ctx.lineWidth = 0.4; ctx.strokeStyle = 'rgba(18,12,26,.9)'; ctx.stroke(); }
+          if (c.hp < mh && Math.random() < 0.25) parts.push({ x: c.x, y: c.y, vx: (Math.random() - 0.5) * 6, vy: -6 - Math.random() * 6, t: 0.8, T: 0.8, c: 'rgba(70,64,72,.55)', k: 2, sz: 1, r: 0, w: 0 });
+        }
+        if (c.sh > 0) {
+          const pulse = 0.5 + 0.2 * Math.sin(now / 90), fade = c.sh < 1.5 ? (Math.sin(now / 60) > 0 ? 1 : 0.35) : 1;
+          ctx.beginPath(); ctx.arc(c.x, c.y, 11.5, 0, 7); ctx.fillStyle = 'rgba(127,227,255,' + (0.12 * fade) + ')'; ctx.fill();
+          ctx.lineWidth = 1.2; ctx.strokeStyle = 'rgba(127,227,255,' + (pulse * fade) + ')'; ctx.stroke();
+          ctx.beginPath(); ctx.arc(c.x, c.y, 13.2, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * clamp(c.sh / SHIELD_T, 0, 1)); ctx.strokeStyle = 'rgba(127,227,255,.6)'; ctx.lineWidth = 0.8; ctx.stroke();
+        }
+        if (c.sp && PU[c.sp]) {
+          const I = PU[c.sp], bx = c.x + 8, by = c.y - 9;
+          ctx.beginPath(); ctx.arc(bx, by, 3.6, 0, 7); ctx.fillStyle = I.col; ctx.fill(); ctx.lineWidth = 0.6; ctx.strokeStyle = 'rgba(18,12,26,.9)'; ctx.stroke();
+          ctx.font = '4.8px ' + DISP; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#17131f'; ctx.fillText(I.ch, bx, by + 0.3);
+        }
+      });
+      // smoke clouds (cover tanks inside)
+      if (W.smk) for (const m of W.smk) {
+        const grow = Math.min(1, m.t * 4 + 0.3), fade = clamp((SMK_T - m.t) / 1.2, 0, 1), R0 = SMK_R * grow;
+        ctx.save(); ctx.globalAlpha = 0.92 * fade;
+        for (let q = 0; q < 7; q++) {
+          const an = q * 0.9 + m.x * 0.05 + now / 2600 * (q % 2 ? 1 : -1), d = q ? R0 * 0.45 : 0;
+          const gx = m.x + Math.cos(an) * d, gy = m.y + Math.sin(an) * d, rr = R0 * (q ? 0.62 : 0.8);
+          const gr = ctx.createRadialGradient(gx, gy, rr * 0.2, gx, gy, rr);
+          gr.addColorStop(0, 'rgba(178,172,190,1)'); gr.addColorStop(0.7, 'rgba(150,144,164,.85)'); gr.addColorStop(1, 'rgba(150,144,164,0)');
+          ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(gx, gy, rr, 0, 7); ctx.fill();
+        }
+        ctx.restore();
+      }
+      // laser beams
+      for (const b of beams) {
+        const k = b.t / b.T;
+        ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.beginPath(); ctx.moveTo(b.pts[0], b.pts[1]); for (let i = 2; i < b.pts.length; i += 2) ctx.lineTo(b.pts[i], b.pts[i + 1]);
+        ctx.strokeStyle = 'rgba(255,84,112,' + (0.55 * k) + ')'; ctx.lineWidth = 4.5 * k + 1; ctx.stroke();
+        ctx.strokeStyle = hexA(b.col, 0.8 * k); ctx.lineWidth = 2 * k + 0.5; ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,245,245,' + k + ')'; ctx.lineWidth = 0.9; ctx.stroke();
+        ctx.restore();
+      }
+      // particles
+      for (const p of parts) {
+        const k = clamp(p.t / p.T, 0, 1);
+        if (p.k === 2) { ctx.globalAlpha = k * 0.8; ctx.beginPath(); ctx.arc(p.x, p.y, p.sz * (2.6 - k * 1.4), 0, 7); ctx.fillStyle = p.c; ctx.fill(); }
+        else if (p.k === 1) { ctx.globalAlpha = Math.min(1, k * 1.5); ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.r); ctx.fillStyle = p.c; ctx.fillRect(-1.6, -1, 3.2, 2); ctx.restore(); }
+        else if (p.k === 3) { ctx.globalAlpha = Math.min(1, k * 1.5); ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.r); ctx.beginPath(); ctx.arc(0, 0, 3.6, 0, 7); ctx.fillStyle = shade(p.c, -0.2); ctx.fill(); ctx.fillStyle = '#272230'; ctx.fillRect(1, -1, 7, 2); ctx.restore(); }
+        else { ctx.globalAlpha = k; ctx.fillStyle = p.c; ctx.fillRect(p.x - 0.8 * p.sz, p.y - 0.8 * p.sz, 1.6 * p.sz, 1.6 * p.sz); }
+      }
+      ctx.globalAlpha = 1;
+      for (const r of rings) {
+        const k = 1 - r.t / r.T;
+        ctx.beginPath(); ctx.arc(r.x, r.y, r.r0 + (r.r1 - r.r0) * k, 0, 7); ctx.strokeStyle = hexA(r.col, 0.85 * (1 - k)); ctx.lineWidth = 2 * (1 - k) + 0.5; ctx.stroke();
+      }
+    }
+    function drawStrip() {
+      const n = st.n, need = st.need, avail = cv.w - 16 - (chipW ? chipW + 8 : 0);
+      ctx.font = '700 13px ' + MONO;
+      const lab = 'R' + st.rd, labW = ctx.measureText(lab).width + 16;
+      let per = 24 + need * 8 + 8, pips = true;
+      if (labW + n * per + 8 > avail) { pips = false; per = 46; }
+      const bw = Math.min(avail, labW + n * per + 8), x0 = 8, y0 = 4, bh = 44;
+      rrect(ctx, x0, y0, bw, bh, 12); ctx.fillStyle = 'rgba(23,19,31,.88)'; ctx.fill(); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(227,174,69,.28)'; ctx.stroke();
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#e3ae45'; ctx.fillText(lab, x0 + 10, y0 + bh / 2);
+      let x = x0 + labW;
+      for (let s = 0; s < n; s++) {
+        const c = W && W.tanks[s], dead = c && !c.alive && st.ph !== 'count', col = P(s).color, cy = y0 + bh / 2;
+        ctx.globalAlpha = dead ? 0.38 : 1;
+        ctx.save(); ctx.translate(x + 10, cy); ctx.scale(0.95, 0.95); drawTank(ctx, 0, 0, -Math.PI / 2, col, null, 0, st.cls ? st.cls[s] : 0); ctx.restore();
+        if (pips) for (let k = 0; k < need; k++) { ctx.beginPath(); ctx.arc(x + 25 + k * 8, cy, 3, 0, 7); ctx.fillStyle = st.wins[s] > k ? col : 'rgba(242,233,216,.16)'; ctx.fill(); }
+        else { ctx.font = '700 15px ' + MONO; ctx.textAlign = 'left'; ctx.fillStyle = col; ctx.fillText(String(st.wins[s] | 0), x + 22, cy + 1); }
+        if (isMine(s)) { ctx.fillStyle = '#e3ae45'; ctx.fillRect(x + 2, y0 + bh - 6, per - 10, 2); }
+        x += per;
+      }
+      ctx.globalAlpha = 1;
+    }
+    function draw(now) {
+      cv.clear();
+      const w = cv.w, h = cv.h;
+      ctx.fillStyle = '#17131f'; ctx.fillRect(0, 0, w, h);
+      if (!st || !W) return;
+      if (!lay || !groundCv) layout();
+      const sh = shake > 0.02 ? shake * (L.fx ? L.fx() : 1) : 0, ox = sh ? (Math.random() - 0.5) * sh * 6 : 0, oy = sh ? (Math.random() - 0.5) * sh * 6 : 0;
+      const bx = X(-lay.ww / 2) + ox, by = Y(-lay.wh / 2) + oy, bw = lay.ww * lay.s, bh = lay.wh * lay.s;
+      ctx.save(); ctx.shadowColor = 'rgba(0,0,0,.5)'; ctx.shadowBlur = 16; ctx.shadowOffsetY = 6; ctx.fillStyle = '#3a2616'; rrect(ctx, bx, by, bw, bh, 7 * lay.s); ctx.fill(); ctx.restore();
+      ctx.drawImage(groundCv, bx, by, bw, bh);
+      ctx.drawImage(wallCv, bx, by, bw, bh);
+      ctx.save(); ctx.translate(lay.cx + ox, lay.cy + oy); ctx.scale(lay.s, lay.s);
+      drawWorld(now);
+      ctx.restore();
+      // world-space labels at screen size
+      for (const f of floats) { ctx.globalAlpha = Math.min(1, f.t / 0.4); txt(f.text, X(f.x), Y(f.y) - (1 - f.t / f.T) * 16, f.col, '700 12px ' + FONT); }
+      ctx.globalAlpha = 1;
+      if (phase === 'count') W.tanks.forEach((c, i) => { if (c.alive) txt(isMine(i) ? '나' : name(i), X(c.x), Y(c.y) - 14 * lay.s - 8, P(i).color, '700 11px ' + FONT); });
+      drawHud(now);
+    }
+    function drawHud(now) {
+      const w = cv.w, h = cv.h, m = mine();
+      drawStrip();
+      if (st.ph !== 'done') for (const s of m) drawControls(s, now);
+      const midY = lay.cy;
+      if (st.ph === 'pick' && !(m.length && pickEl && !pickEl.hidden)) {
+        txt('전차를 고르는 중…', w / 2, midY, '#e3ae45', '22px ' + DISP);
+        return;
+      }
+      if (phase === 'count' && st.ph === 'count') {
+        txt('라운드 ' + st.rd + ' · ' + mapName(st.mk), w / 2, midY - 52, '#f2e9d8', '20px ' + DISP);
+        txt(String(Math.max(1, Math.ceil(cd))), w / 2, midY, '#e3ae45', '64px ' + DISP);
+        if (st.rd > 1 || st.mk > 0) txt(st.mk > 0 ? FIXED[st.mk - 1].sub : '라운드마다 새로 만든 미로', w / 2, midY + 46, '#cfc3dc', '600 12.5px ' + FONT);
+      }
+      if (goT > 0 && st.ph === 'play') {
+        const k = goT / 0.7;
+        ctx.globalAlpha = Math.min(1, k * 2);
+        txt('출발!', w / 2, midY, '#e3ae45', Math.round(44 + (1 - k) * 18) + 'px ' + DISP);
+        ctx.globalAlpha = 1;
+      }
+      if (st.ph === 'end') {
+        const ek = 1 - Math.pow(1 - endA, 3);
+        ctx.save(); ctx.globalAlpha = ek; ctx.translate(w / 2, midY); ctx.scale(0.85 + 0.15 * ek, 0.85 + 0.15 * ek); ctx.translate(-w / 2, -midY);
+        const t = st.rw >= 0 ? (st.tm ? TEAMN[st.tm[st.rw]] : name(st.rw)) + ' 라운드 승리!' : '무승부 · 모두 격파';
+        rrect(ctx, 16, midY - 30, w - 32, 60, 14); ctx.fillStyle = 'rgba(23,19,31,.82)'; ctx.fill();
+        txt(t, w / 2, midY - 8, st.rw >= 0 ? P(st.rw).color : '#f2e9d8', '22px ' + DISP);
+        let sub = st.need + '승 먼저 · ' + (st.tm ? TEAMN[0] + ' ' + st.wins[0] + ' : ' + st.wins[1] + ' ' + TEAMN[1] : st.wins.map((v, i) => name(i) + ' ' + v).join(' · '));
+        ctx.font = '600 11.5px ' + FONT;
+        if (ctx.measureText(sub).width > w - 44) sub = st.need + '승 먼저 · ' + st.wins.join(' : ');
+        txt(sub, w / 2, midY + 16, '#cfc3dc', '600 11.5px ' + FONT);
+        ctx.restore();
+      }
+      if (st.ph === 'play' && W.t > CAP_T - 10 && W.t < CAP_T) txt('시간 종료 ' + Math.ceil(CAP_T - W.t) + '초 전', w / 2, TOPH + 22, '#ee6a55', '17px ' + DISP);
+      if (hintT > 0 && m.length && phase === 'play' && st.ph === 'play' && W.tanks[m[0]] && W.tanks[m[0]].alive) {
+        ctx.globalAlpha = Math.min(1, hintT);
+        const ck = clsOf(W.tanks[m[0]]).sk;
+        const t1 = '왼쪽을 끌면 그쪽으로 달려요', t2 = ck === 'a' ? '오른쪽을 누르면 포격 · 벽 너머 조준점에 떨어져요' : ck === 'b' ? '오른쪽을 누르면 큰 포탄 · 금 간 벽도 잘 부숴요' : '오른쪽을 누르면 발사 · 포탄은 벽에 튕겨요';
+        ctx.font = '600 12.5px ' + FONT;
+        const bw2 = Math.min(w - 16, Math.max(ctx.measureText(t1).width, ctx.measureText(t2).width) + 26), y0 = lay.cy - 24;
+        rrect(ctx, (w - bw2) / 2, y0, bw2, 48, 13); ctx.fillStyle = 'rgba(23,19,31,.8)'; ctx.fill();
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#f2e9d8'; ctx.fillText(t1, w / 2, y0 + 15); ctx.fillStyle = '#e3ae45'; ctx.fillText(t2, w / 2, y0 + 33);
+        ctx.globalAlpha = 1;
+      }
+    }
+    function drawControls(s, now) {
+      const w = cv.w, h = cv.h, c = W.tanks[s], col = P(s).color, dead = !c || !c.alive;
+      ctx.save();
+      ctx.globalAlpha = dead ? 0.3 : 1;
+      let fP = false, sP = false; for (const p of ptrs.values()) if (p.seat === s) { if (p.kind === 'fire') fP = true; if (p.kind === 'spec') sP = true; }
+      // special
+      const sb = specBtn(), has = c && c.sp && PU[c.sp];
+      ctx.beginPath(); ctx.arc(sb.x, sb.y, sb.r * (sP ? 0.92 : 1), 0, 7); ctx.fillStyle = has ? hexA(PU[c.sp].col, 0.9) : 'rgba(46,38,64,.85)'; ctx.fill();
+      ctx.lineWidth = 2.5; ctx.strokeStyle = has ? '#fff3cf' : 'rgba(242,233,216,.22)'; ctx.stroke();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (has) { ctx.font = '700 12px ' + FONT; ctx.fillStyle = '#17131f'; ctx.fillText(PU[c.sp].nm, sb.x, sb.y - 5); ctx.font = '600 9.5px ' + FONT; ctx.fillText('특수', sb.x, sb.y + 9); }
+      else { ctx.font = '600 10.5px ' + FONT; ctx.fillStyle = '#ab9fb8'; ctx.fillText('특수', sb.x, sb.y - 6); ctx.fillText('없음', sb.x, sb.y + 8); }
+      // fire
+      const fb = fireBtn(), K = clsOf(c), ammo = c ? K.smax - shellsOf(W, s) : 0, reload = c && c.alive && c.cd > 0 ? clamp(c.cd / K.cd, 0, 1) : 0;
+      if (fP) { ctx.beginPath(); ctx.arc(fb.x, fb.y, fb.r + 7, 0, 7); ctx.strokeStyle = hexA(col, 0.5); ctx.lineWidth = 3; ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(fb.x, fb.y, fb.r * (fP ? 0.93 : 1), 0, 7); ctx.fillStyle = hexA(col, ammo > 0 ? (fP ? 0.98 : 0.78) : 0.35); ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = '#fff3cf'; ctx.stroke();
+      if (reload > 0) { ctx.beginPath(); ctx.arc(fb.x, fb.y, fb.r + 3.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (1 - reload)); ctx.strokeStyle = 'rgba(255,243,207,.75)'; ctx.lineWidth = 3; ctx.stroke(); }
+      ctx.font = Math.round(19 * Math.min(1.25, KC())) + 'px ' + DISP; ctx.fillStyle = '#17131f'; ctx.fillText(K.sk === 'a' ? '포격' : K.sk === 'b' ? '대포' : '발사', fb.x, fb.y - 3);
+      for (let k = 0; k < K.smax; k++) { ctx.beginPath(); ctx.arc(fb.x - (K.smax - 1) * 4 + k * 8, fb.y + 15, 2.6, 0, 7); ctx.fillStyle = k < ammo ? '#17131f' : 'rgba(23,19,31,.25)'; ctx.fill(); }
+      L.ui.drawKeyBadge(ctx, fb.x + fb.r * 0.95, fb.y + fb.r * 0.95, L.ui.keyLabel('tanks', 'fire'));
+      L.ui.drawKeyBadge(ctx, sb.x + sb.r + 6, sb.y + sb.r + 4, L.ui.keyLabel('tanks', 'special'));
+      // stick
+      let q = null; for (const p of ptrs.values()) if (p.seat === s && p.kind === 'stick') q = p;
+      const ax = q ? q.ax : 22 + (STICK_R0 * KC()) + 6, ay = q ? q.ay : h - (STICK_R0 * KC()) - 30;
+      ctx.globalAlpha = (dead ? 0.3 : 1) * (q ? 0.95 : 0.55);
+      ctx.beginPath(); ctx.arc(ax, ay, (STICK_R0 * KC()), 0, 7); ctx.fillStyle = 'rgba(23,19,31,.55)'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(242,233,216,.35)'; ctx.stroke();
+      let kx = ax, ky = ay;
+      if (q) { const dx = q.x - q.ax, dy = q.y - q.ay, d = Math.hypot(dx, dy), mm = Math.min(d, (STICK_R0 * KC())); if (d > 0) { kx = ax + dx / d * mm; ky = ay + dy / d * mm; } }
+      ctx.beginPath(); ctx.arc(kx, ky, 20 * KC(), 0, 7); ctx.fillStyle = hexA(col, 0.9); ctx.fill(); ctx.strokeStyle = '#f2e9d8'; ctx.lineWidth = 2; ctx.stroke();
+      if (!q) { ctx.font = '600 11px ' + FONT; ctx.fillStyle = 'rgba(242,233,216,.9)'; ctx.fillText('이동', ax, ay - (STICK_R0 * KC()) - 10); }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      if (dead && st.ph === 'play') txt('격파됨 · 관전 중', w / 2, h - lay.bot + 22, '#ee6a55', '17px ' + DISP);
+      void now;
+    }
+
+    const stopLoop = U.loop((rdt, now) => {
+      try { frame(rdt, now); } catch (e) { console.error(e); }
+      try { draw(now); } catch (e) { console.error(e); }
+    });
+
+    return {
+      update(next) {
+        if (!next) return;
+        const prev = st;
+        st = next;
+        const k = curKey();
+        if (k !== key) { key = k; startRound(); }
+        else if (prev && prev.ph === 'pick' && st.ph !== 'pick') startRound();
+        if (st.ph !== 'pick' && myPick >= 0 && prev && prev.rid !== st.rid) myPick = -1;
+        syncPick();
+        if (st.ph === 'play' && phase === 'count' && !host()) { phase = 'play'; cd = 0; goT = 0.7; api.sfx('pop'); }
+        if (W) W.over = st.ph === 'end' || st.ph === 'done';
+        if (st.ph === 'end' && (!prev || prev.ph !== 'end')) {
+          endT = END_T;
+          if (st.rw >= 0 && isMine(st.rw)) { api.sfx('win'); api.buzz(60); } else api.sfx('chip');
+        }
+        syncChip();
+      },
+      destroy() {
+        if (pbar) pbar.destroy();
+        stopLoop();
+        cv.cv.removeEventListener('pointerdown', onDown);
+        cv.cv.removeEventListener('pointermove', onMove);
+        cv.cv.removeEventListener('pointerup', onUp);
+        cv.cv.removeEventListener('pointercancel', onUp);
+        cv.cv.removeEventListener('lostpointercapture', onUp);
+        cv.cv.removeEventListener('contextmenu', noCtx);
+        window.removeEventListener('blur', releaseAll);
+        window.removeEventListener('lounge-ctl', onCtl);
+        try { if (offInput) offInput(); } catch (e) {}
+        chip.remove(); if (pickEl) pickEl.remove(); styleEl.remove(); cv.destroy();
+      },
+      _dbg: () => ({ W, st, phase, locIn, cfg, lay, ptrs, X, Y, pressFire, pressSpec, aiMem }),
+    };
+  }
+
+  /* ---------- helpers ---------- */
+  function rrect(c, x, y, w, h, r) { c.beginPath(); if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h); }
+  function hexA(hex, a) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return 'rgba(220,220,220,' + a + ')';
+    const n = parseInt(m[1], 16);
+    return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+  }
+  function shade(hex, k) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    const f = (c) => Math.round(k >= 0 ? c + (255 - c) * k : c * (1 + k));
+    return 'rgb(' + f(n >> 16) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  L.register({
+    id: 'tanks', name: '탱크 미로 대전', tag: '실시간 미로 포격전', cat: '아케이드',
+    blurb: '미로 속 장난감 탱크 대결! 벽에 튕기는 포탄으로 상대를 맞히고 끝까지 살아남으면 라운드 승리. 친구와는 온라인·LAN 방으로.',
+    tint: '#2e4a2c',
+    icon: '<rect x="5" y="14" width="27" height="6" rx="3" fill="currentColor"/><rect x="5" y="36" width="27" height="6" rx="3" fill="currentColor"/><rect x="8" y="19" width="21" height="18" rx="4" fill="none" stroke="currentColor" stroke-width="3"/><circle cx="18" cy="28" r="5" fill="currentColor"/><path d="M21 28h17" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M51 4v48" stroke="currentColor" stroke-width="4"/><path d="M40 28L48 18L40 8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-dasharray="3 3"/><circle cx="40" cy="8" r="2.8" fill="currentColor"/>',
+    minPlayers: 2, maxPlayers: 4, defaultPlayers: 3, hidden: false, realtime: true, aiDelay: 0,
+    options: [
+      { id: 'rounds', label: '승리 조건', choices: [{ v: 3, label: '3승 먼저' }, { v: 5, label: '5승 먼저' }], def: 3 },
+      { id: 'map', label: '맵', choices: [{ v: -1, label: '무작위' }, { v: 0, label: '새 미로' }].concat(FIXED.map((f, i) => ({ v: i + 1, label: f.nm }))), def: -1 },
+      { id: 'mode', label: '모드', tip: '대결 방식.', choices: [{ v: 0, label: '개인전', tip: '모두가 적.' }, { v: 1, label: '팀전 2:2', tip: '2명씩 두 팀.' }], def: 0 },
+      { id: 'items', label: '아이템', choices: [{ v: 1, label: '켜기' }, { v: 0, label: '끄기' }], def: 1 },
+      { id: 'pick', label: '전차', tip: '전차 종류를 직접 고를지, 모두 무작위로 할지.', choices: [{ v: 1, label: '직접 고르기' }, { v: 0, label: '모두 무작위' }], def: 1 },
+    ],
+    controls: [
+      { id: 'up', label: '전진', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '후진', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'left', label: '왼쪽으로 돌기', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '오른쪽으로 돌기', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'fire', label: '발사', keys: ['Space', 'KeyJ'], pad: ['a', 'rt'] },
+      { id: 'special', label: '특수 무기', keys: ['KeyK', 'ShiftLeft', 'KeyE'], pad: ['b', 'x', 'lt'] },
+    ],
+    quick: [
+      '미로 속 탱크 대결! 시작 전에 경전차·중전차·자주포 중 하나를 골라요.',
+      '화면 왼쪽을 끌면 그쪽으로 달리고, 오른쪽을 누르면 발사. 포탄은 벽에 튕겨요 — 내 포탄에 나도 맞아요!',
+      '마지막까지 살아남으면 라운드 승리. 3승(또는 5승)을 먼저 하면 우승.',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '미로 속 장난감 탱크 대결이에요. 경전차·자주포는 한 방, 중전차는 두 방이면 부서져요.',
+        '마지막까지 살아남은 탱크가 라운드 승리. 먼저 3승(또는 5승)한 사람이 우승이에요.',
+      ] },
+      { h: '조작 (터치)', p: [
+        '이동: 화면 왼쪽 아무 데나 엄지를 대고 끌면 조이스틱이 생겨요. 미는 방향으로 탱크가 돌아서 달려가요. 살짝만 밀면 천천히 움직여요.',
+        '탱크는 묵직해서 천천히 속도를 올리고, 손을 떼면 금방 멈춰요.',
+        '발사: 화면 오른쪽 아무 데나 톡. 발사 버튼의 점이 남은 포탄 수예요.',
+        '특수 무기: 동그란 「특수」 버튼. 주운 특수 무기를 써요.',
+        '점선 조준선은 포탄이 처음 튕기는 곳까지 보여 줘요. 오른쪽 위 「조준선」 칩으로 켜고 꺼요(이 폰에 기억돼요).',
+        'PC 키보드·게임패드: ↑↓(W·S) 전진·후진, ←→(A·D) 돌기, 스페이스·J·Ⓐ 발사, K·Shift·E·Ⓑ 특수 무기. 키는 「⌨ 조작 설정」에서 바꿔요.',
+      ] },
+      { h: '전차 3종 (경기 시작 전에 고르기)', p: [
+        '경전차: 가장 빠르고 작아요. 체력 1. 벽에 튕기는 포탄을 빠르게 쏴요(한 번에 3발).',
+        '중전차: 느리고 크지만 체력 2(두 번 맞아야 부서짐). 큰 포탄은 2 피해라 경전차·자주포는 한 방, 금 간 벽도 잘 부숴요. 두꺼운 장갑이라 포격 폭발이 조금 덜 닿아요.',
+        '자주포: 체력 1. 포탄이 벽 위로 날아가 조준점에 떨어져 터져요(폭발 범위 안 모두 1 피해, 나도 포함). 조준점 거리는 자동: 포신 방향 근처에 상대가 있으면 그 거리, 없으면 최대 거리. 너무 가까운(점선 원 안) 상대는 못 맞혀요.',
+        '포격이 떨어질 곳에는 빨간 원이 미리 보여요. 원 밖으로 피하세요!',
+        '서로 물고 물려요: 경전차는 빨리 파고들어 자주포를, 자주포는 느린 중전차를, 중전차는 튼튼함으로 경전차를 상대하기 좋아요.',
+        '설정 「전차」를 「모두 무작위」로 하면 모두 무작위로 정해져요. AI는 언제나 무작위로 골라요. 모두 고를 때까지 기다리고, 방장은 「지금 시작」으로 안 고른 사람을 무작위로 정할 수 있어요.',
+      ] },
+      { h: '금 간 벽', p: [
+        '회색 돌벽은 금 간 벽이에요. 포탄이 튕기지 않고 부딪혀 사라지며 벽에 금이 더 가요.',
+        '보통 포탄 1, 큰 포탄·유도탄 2, 포격 폭발 2, 지뢰 3만큼 깎여요. 3만큼 깎이면 부서져 길이 열려요(그 라운드 동안).',
+        '새 미로에도 금 간 벽이 섞여 나와요. AI도 지름길이면 벽을 부수고 와요.',
+      ] },
+      { h: '승리 · 라운드', p: [
+        '마지막 남은 탱크도 0.3초 안에 같이 부서지면 무승부 라운드(점수 없음).',
+        '라운드가 100초를 넘기면 무승부로 끝나요.',
+        '점수는 라운드 승리 수뿐이에요. 몇 대를 부쉈는지는 세지 않아요.',
+      ] },
+      { h: '포탄', p: [
+        '포탄은 벽에 여러 번 튕기다가 6초 뒤 사라져요(금 간 벽에 부딪히면 바로 사라짐). 탱크보다 두 배쯤 빨라서, 멀리서 날아오는 건 보고 피할 수 있어요.',
+        '내 포탄에 나도 맞아요! 튕겨 돌아오는 포탄을 조심하세요.',
+        '한 탱크가 한꺼번에 날릴 수 있는 포탄은 3발이에요(발사 버튼의 점). 쏜 포탄이 사라지면 다시 쏠 수 있어요. 버튼 둘레의 밝은 띠는 장전 중 표시예요.',
+      ] },
+      { h: '아이템 5종', p: [
+        '아이템을 켜면 약 7초마다 미로에 상자가 나타나요(한 번에 2개까지). 지나가면 주워요.',
+        '특수 무기는 하나만 들 수 있어요. 들고 있으면 다른 무기 상자는 안 주워져요(방패는 언제나 주워져요).',
+        '「레」 레이저: 벽에 6번까지 튕기는 광선을 바로 쏴요. 들고 있는 동안 빨간 조준선이 모두에게 보여요.',
+        '「산」 산탄: 작은 포탄 7발을 부채꼴로 흩뿌려요. 멀리는 못 가요.',
+        '「유」 유도탄: 잠깐 곧게 날아간 뒤 미로 길을 따라 가장 가까운 상대를 쫓아가요. 10초 뒤 사라져요.',
+        '「지」 지뢰: 탱크 뒤에 놓아요. 1초 뒤 빨간 불이 깜빡이며 켜지고, 탱크가 밟으면 터져요. 내가 멀어진 뒤엔 나도 터져요. 포탄으로 맞혀 터뜨릴 수도 있어요.',
+        '「방」 방패: 주우면 바로 켜져서 8초 동안 한 번 막아 줘요.',
+        '「반」 반사탄: 빠른 포탄이 금 간 벽에도 부서지지 않고 튕겨요. 10번까지 튕기고, 쏜 나에게는 맞지 않아요.',
+        '「관」 관통탄: 금 간 벽 하나를 단번에 부수거나 탱크 하나를 뚫고 계속 날아가요. 2 피해.',
+        '「연」 연막탄: 벽이나 탱크에 닿으면(또는 잠시 뒤) 연기 구름이 7초 동안 퍼져요. 구름 속 탱크는 안 보이고, 조준선과 AI 조준도 막혀요.',
+        '레이저·유도탄·지뢰·관통탄은 2 피해라 중전차도 한 방이에요. 산탄 한 알은 1 피해.',
+      ] },
+      { h: '팀전', p: [
+        '설정 「모드」를 「팀전 2:2」로 하면 4명이 두 팀(붉은 팀·푸른 팀)으로 나뉘어요. 4명일 때만 팀전이 되고, 다른 인원이면 개인전이에요.',
+        '탱크 색이 팀 색이에요. 같은 팀은 같은 쪽(위쪽 두 모서리 또는 아래쪽 두 모서리)에서 출발해요.',
+        '같은 팀의 포탄·레이저·지뢰·포격은 아군에게 피해가 없고 그냥 지나가요(튕겨 돌아온 내 포탄도 아군은 통과). 단, 내 포탄에 나 자신은 여전히 맞아요.',
+        '상대 팀이 모두 부서지면 라운드 승리, 점수는 팀 전체가 함께 얻어요. 먼저 3승(또는 5승)한 팀이 우승.',
+        'AI는 아군을 노리지 않고, 같은 팀 AI끼리 같은 적을 함께 노려요.',
+      ] },
+      { h: '맵', p: [
+        '새 미로: 라운드마다 새로 만든 미로예요. 출발 자리끼리 공평하도록 대칭으로 만들어요.',
+        '고정 맵: 기둥 광장(탁 트임), 쌍둥이 복도(긴 벽 세 갈래), 네 개의 방(방과 복도), 요새(가운데 요새), 부서진 성벽(금 간 벽 줄), 유리 미로(절반이 금 간 벽).',
+        '무작위(기본): 라운드마다 새 미로나 고정 맵 중 하나가 나와요.',
+        '출발 자리는 네 모서리이고, 라운드마다 돌아가며 바뀌어요.',
+      ] },
+      { h: '팁', p: [
+        '벽 모서리 뒤에서 벽에 한 번 튕겨 쏘면 숨은 상대도 맞힐 수 있어요. 조준선으로 튕기는 곳을 확인해요.',
+        '좁은 복도에서 앞벽에 바로 쏘면 포탄이 나에게 되돌아와요!',
+        '3발을 한꺼번에 다 쏘면 한동안 못 쏴요. 한 발은 아껴 두세요.',
+        '자주포를 만나면 가까이 붙어요. 자주포는 바로 앞의 적을 못 맞혀요.',
+      ] },
+      { h: '함께 하기', p: [
+        '한 폰에서는 한 명만 조종해요. 혼자 하면 나머지 자리는 AI 탱크예요.',
+        '친구와는 온라인·LAN 방으로 각자 폰에서 한 대씩. 포탄과 명중 판정은 호스트 폰이 계산해요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움: 쉬움은 돌아다니며 대충 쏘고, 보통은 길을 찾아와 한 번 튕기는 샷도 쓰고, 어려움은 두세 번 튕기는 샷을 계산하고 날아오는 포탄을 피하며, 장전 중에 적에게 노출되면 벽 뒤로 물러났다가 다시 나와요.',
+      ] },
+    ],
+    codex: [
+      { h: '전차', p: ['경기 시작 전에 하나를 골라 경기 내내 타요.'], rows: CLS.map((K) => ({ icon: K.sk === 'a' ? '🎯' : K.sk === 'b' ? '🛡️' : '💨', name: K.nm, tag: '체력 ' + K.hp, desc: K.sub + ' · 속도 ' + Math.round(K.spd * 100) + '% · 포탄 ' + K.smax + '발 · 장전 ' + K.cd + '초' + (K.sk === 'a' ? ' · 사거리 ' + ART_MIN + '~' + ART_MAX + ' · 폭발 반경 ' + ART_BOOM : K.sk === 'b' ? ' · 큰 포탄 2 피해' : ' · 포탄 1 피해') })) },
+      { h: '아이템', p: ['상자를 지나가면 주워요. 특수 무기는 하나만.'], rows: PU_KEYS.split('').map((k) => ({ icon: PU[k].ch, name: PU[k].nm, tag: k === 'D' ? '방어' : '특수 무기', desc: ({ L: '벽에 6번 튕기는 광선 · 2 피해', S: '작은 포탄 7발 부채꼴 · 한 알 1 피해', M: '미로 길을 따라 쫓아감 · 2 피해 · 10초', N: '1초 뒤 켜짐 · 2 피해 · 금 간 벽 3', D: SHIELD_T + '초 동안 한 번 막음', R: '빠른 포탄 · 금 간 벽에도 튕김 · ' + RB_MAX + '번까지 · 내게는 안 맞음 · 1 피해', P: '금 간 벽 하나를 부수거나 탱크 하나를 뚫고 계속 날아감 · 2 피해', K: '벽·탱크에 닿거나 잠시 뒤 터져 ' + SMK_T + '초 연막 · 안은 안 보이고 조준선·AI 조준도 막힘' })[k] })) },
+      { h: '맵', p: ['무작위(기본)면 라운드마다 새 미로나 고정 맵이 나와요. 회색 돌벽은 부서지는 금 간 벽.'], rows: [{ icon: '🧭', name: '새 미로', tag: '생성', desc: '라운드마다 새로 · 대칭 · 금 간 벽 섞임' }].concat(FIXED.map((f) => ({ icon: '🗺️', name: f.nm, tag: '고정', desc: f.sub + ' · 금 간 벽 ' + (f.cr || []).length + '줄' }))) },
+    ],
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result, mount,
+    _t: { CLS, ART_MIN, ART_MAX, hitWall, artRange, edgeXY, FIXED, PU, PU_KEYS, genMaze, buildFixed, newWorld, stepWorld, stepTank, stepShells, fire, special, aiThink, maybePowerup, bfs, nextCell, cellIdx, cellXY, traceRay, cast, shellsOf, insideWall, roundOver, nextRound, pickMap, laserPath, H, CS, TR, SR, SMAX, CAP_T, LAST_T },
+  });
+})();

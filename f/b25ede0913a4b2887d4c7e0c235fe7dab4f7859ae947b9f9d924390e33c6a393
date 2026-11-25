@@ -1,0 +1,993 @@
+/* 거점 수호전 — 세계 시뮬(순수 로직, node에서도 돎). games/bedwar.js의 자료(G.BEDWAR)를 쓰고 BEDWAR.sim으로 붙는다.
+   칸 격자 72×72×22(가로 2m · 높이 1m). 바닥 층 iy=GY(윗면 y=0). 칸 값: 0 빔 · 1~6 놓는 자재 · 9 포장 · 10 석조 · 11 기둥 · 12 핵.
+   호스트: worldStep(전부). 손님: guestStep(자기 분대원 이동 · 발판 예측만) + applyHost. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const D = G.BEDWAR; if (!D) return;
+  const S = {};
+  const NX = 72, NZ = 72, NY = 22, CS = 2, G0 = 8, GY = 7, NC = NX * NZ * NY, C0 = NX / 2;
+  const DT = 1 / 30, HW = 0.38, PH = 1.75, EYE = 1.5, SPD = 5.6, GRAV = 24, JV = 8.3, REACH = 5.4, MREACH = 3.4, SW_CD = 0.42;
+  const BASE_R = 15, RESPAWN = 5;
+  const clamp = D.clamp, BLK = D.BLK, CI = D.CI, UI = D.UI;
+  const idx = (x, y, z) => (y * NZ + z) * NX + x;
+  const cX = (x) => Math.floor(x / CS) + C0, cY = (y) => Math.floor(y + G0 + 1e-6), cZ = (z) => Math.floor(z / CS) + C0;
+  const wX = (cx) => (cx - C0 + 0.5) * CS, wY = (iy) => iy - G0;
+  const iX = (i) => i % NX, iZ = (i) => Math.floor(i / NX) % NZ, iY = (i) => Math.floor(i / (NX * NZ));
+  const inB = (x, y, z) => x >= 0 && x < NX && z >= 0 && z < NZ && y >= 0 && y < NY;
+  function prng(seed) { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const angD = (a, b) => { let d = (a - b) % (Math.PI * 2); if (d > Math.PI) d -= Math.PI * 2; if (d < -Math.PI) d += Math.PI * 2; return d; };
+
+  /* ======================= 지도 ======================= */
+  function genMap(mapId, seed, T) {
+    const def = D.MAPS[mapId] || D.MAPS.cross, R = prng(seed * 7 + 13), g = new Uint8Array(NC), prot = new Uint8Array(NC);
+    const plats = [], raised = [], kindAt = new Int8Array(NX * NZ).fill(-1);
+    const rot = (k, cx, cz) => { for (let i = 0; i < k; i++) { const t = cx; cx = NX - 1 - cz; cz = t; } return [cx, cz]; };
+    const put = (cx, cz, kind, slot) => { if (cx < 2 || cz < 2 || cx > NX - 3 || cz > NZ - 3) return; const q = cz * NX + cx; if (kindAt[q] >= 0) return; kindAt[q] = kind; g[idx(cx, GY, cz)] = 9; plats.push([cx, cz, kind, slot]); };
+    const rise = (cx, cz, h, id) => { if (kindAt[cz * NX + cx] < 0) return; for (let y = 0; y < h; y++) { const i = idx(cx, G0 + y, cz); if (!g[i]) { g[i] = id; raised.push([cx, G0 + y, cz, id]); } } };
+    const sym = (fn) => { for (let k = 0; k < 4; k++) fn(k); };
+    const baseR = def.baseR + Math.floor(R() * 2), bcx = C0 - baseR, bcz = C0;
+    /* 거점 섬(구역 0 = 서쪽, 가운데 쪽 = +x). 네 번 돌려 찍음 */
+    const a0 = 5, a1 = 4, bb = 4, nb = 1 + Math.floor(R() * 2), nf = 1 + Math.floor(R() * 2), pier = 1 + Math.floor(R() * 2), sg = R() < 0.5 ? -1 : 1;
+    const baseCells = [];
+    for (let u = -a0; u <= a1 + pier; u++) for (let v = -bb; v <= bb; v++) {
+      if (u > a1) { if (Math.abs(v) > 1) continue; }
+      else if ((u + a0) + (bb - Math.abs(v)) < nb || (a1 - u) + (bb - Math.abs(v)) < nf) continue;
+      baseCells.push([bcx + u, bcz + v]);
+    }
+    const F = { core: [bcx + 2, bcz], gen: [bcx - 4, bcz], spawn: [bcx - 2, bcz], shop: [bcx - 1, bcz + sg * 3], ctr: [bcx, bcz], pil: [[bcx - 5, bcz - 2], [bcx - 5, bcz + 2]] };
+    sym((k) => { for (const c of baseCells) { const p = rot(k, c[0], c[1]); put(p[0], p[1], 0, k); } });
+    /* 가운데 섬 */
+    const cen = def.center, cr = cen === 'oct' ? 5 + (R() < 0.5 ? 1 : 0) : 0;
+    for (let cx = C0 - 9; cx < C0 + 9; cx++) for (let cz = C0 - 9; cz < C0 + 9; cz++) {
+      const dx = Math.abs(cx - C0 + 0.5), dz = Math.abs(cz - C0 + 0.5), mx = Math.max(dx, dz), sm = dx + dz;
+      let ok = false;
+      if (cen === 'oct') ok = mx < cr && sm < cr * 1.45;
+      else if (cen === 'plus') ok = (dx < 2 && dz < 8) || (dz < 2 && dx < 8) || mx < 3.5;
+      else if (cen === 'ring') ok = mx > 3 && mx < 7.5 && sm < 11;
+      else ok = mx < 3.5 && sm < 5.2;
+      if (ok) put(cx, cz, 2, -1);
+    }
+    const eOff = cen === 'oct' ? 3 : cen === 'plus' ? 6 : cen === 'ring' ? 6 : 2;
+    const essCells = [], cryCells = [];
+    sym((k) => essCells.push(rot(k, C0 - eOff, C0)));
+    if (cen === 'oct' || cen === 'plus') { for (let x = C0 - 1; x <= C0; x++) for (let z = C0 - 1; z <= C0; z++) rise(x, z, 1, 10); }
+    { const px = C0 - eOff - 1, pz = C0 - 2; sym((k) => { const p = rot(k, px, pz); if (!essCells.some((e) => e[0] === p[0] && e[1] === p[1])) rise(p[0], p[1], 3, 11); }); }
+    /* 결정 섬 */
+    let mc;
+    if (def.mid === 'diag') { const dd = 13 + Math.floor(R() * 3); mc = [C0 - dd, C0 - dd]; }
+    else if (def.mid === 'pin') mc = [bcx + 3 + Math.floor(R() * 3), C0 - 11 - Math.floor(R() * 3)];
+    else mc = [C0 - Math.floor(baseR / 2) - 3, C0 - 1];
+    const mh = def.mid === 'side' ? 1 : 2, mn = 1;
+    const midCells = [];
+    for (let u = -mh; u <= mh; u++) for (let v = -mh; v <= mh; v++) { if (mh > 1 && Math.abs(u) + Math.abs(v) > 2 * mh - mn) continue; midCells.push([mc[0] + u, mc[1] + v]); }
+    sym((k) => { for (const c of midCells) { const p = rot(k, c[0], c[1]); put(p[0], p[1], 1, k); } cryCells.push(rot(k, mc[0], mc[1])); });
+    if (mh > 1) { const wv = R() < 0.5 ? -1 : 1; sym((k) => { for (const o of [[-mh, wv], [-mh, 0]]) { const p = rot(k, mc[0] + o[0], mc[1] + o[1]); rise(p[0], p[1], 1, 10); } }); }
+    /* 징검 암초 */
+    for (let i = 0; i < def.reef; i++) {
+      const rr = 9 + R() * (baseR - 16), aa = Math.PI + (R() - 0.5) * 1.3, rx = Math.round(C0 + Math.cos(aa) * rr), rz = Math.round(C0 + Math.sin(aa) * rr), w2 = R() < 0.5 ? 1 : 2;
+      sym((k) => { for (let u = 0; u < 2; u++) for (let v = 0; v < w2; v++) { const p = rot(k, rx + u, rz + v); put(p[0], p[1], 3, -1); } });
+    }
+    /* 분대 자리: 2분대 = 마주 보는 두 자리, 3분대 = 네 자리 가운데 셋, 4분대 = 전부 */
+    const o = Math.floor(R() * 4); let slots = T === 2 ? [o, (o + 2) % 4] : T === 3 ? [o, (o + 1) % 4, (o + 2) % 4] : [o, (o + 1) % 4, (o + 2) % 4, (o + 3) % 4];
+    for (let i = slots.length - 1; i > 0; i--) { const j = Math.floor(R() * (i + 1)), q = slots[i]; slots[i] = slots[j]; slots[j] = q; }
+    const bases = [], gens = [];
+    const addGen = (k, c, t) => { gens.push({ k, cx: c[0], cz: c[1], x: wX(c[0]), z: wX(c[1]), t }); for (let y = 0; y < 3; y++) prot[idx(c[0], G0 + y, c[1])] = 1; };
+    for (let k = 0; k < 4; k++) {
+      const t = slots.indexOf(k), f = {}; for (const key of ['core', 'gen', 'spawn', 'shop', 'ctr']) f[key] = rot(k, F[key][0], F[key][1]);
+      const dx = Math.sign(C0 - 0.5 - f.ctr[0]) * (Math.abs(C0 - 0.5 - f.ctr[0]) > Math.abs(C0 - 0.5 - f.ctr[1]) ? 1 : 0), dz = dx ? 0 : Math.sign(C0 - 0.5 - f.ctr[1]);
+      const b = { slot: k, t, core: f.core, gen: f.gen, shop: f.shop, sp: f.spawn, cx: wX(f.core[0]), cz: wX(f.core[1]), x: wX(f.ctr[0]), z: wX(f.ctr[1]), sx: wX(f.spawn[0]), sz: wX(f.spawn[1]), yaw: Math.atan2(dx, dz), dir: [dx, dz] };
+      bases.push(b);
+      for (const p of F.pil) { const q = rot(k, p[0], p[1]); rise(q[0], q[1], 3, 11); }
+      if (t >= 0) {
+        g[idx(f.core[0], G0, f.core[1])] = 12; g[idx(f.core[0], G0 + 1, f.core[1])] = 12;
+        rise(f.shop[0], f.shop[1], 2, 10);
+        addGen(0, f.gen, t);
+        for (let y = 0; y < 3; y++) prot[idx(f.spawn[0], G0 + y, f.spawn[1])] = 1;
+      } else addGen(1, f.gen, -1);
+    }
+    for (const c of cryCells) addGen(1, c, -1);
+    for (const c of essCells) addGen(2, c, -1);
+    return { g, prot, plats, raised, bases, gens, slots, def, mapId, R0: (baseR + 12) * CS, rMin: cen === 'ring' ? 12 : 9, baseR };
+  }
+
+  /* ======================= 세계 ======================= */
+  function makeWorld(st, o) {
+    const M = genMap(st.map, st.seed, st.T);
+    M.g0 = M.g.slice();
+    const W = { st, M, g: M.g, host: !!(o && o.host), t: 0, T: D.LENS[st.len].T, R: prng((st.seed ^ 0x5bd1e995) >>> 0), chars: [], tm: [], gens: [], pj: [], tnt: [], ev: [], evSeq: 1, log: [], logSeq: 0, gseq: 0, chg: [], touched: new Set(), pend: new Map(), evOut: [], ph: 0, over: null, cores: [], stormR: M.R0, pjId: 1, note: null, needSync: false, pathN: 0 };
+    for (let t = 0; t < st.T; t++) { const b = M.bases[M.slots[t]]; W.tm.push({ t, b, core: 100, up: D.UPG.map(() => 0), traps: [], trapCd: 0, intrT: -99, hitT: -99, out: 0, acc2: 0 }); }
+    W.gens = M.gens.map((q) => ({ k: q.k, x: q.x, z: q.z, cx: q.cx, cz: q.cz, t: q.t, stock: 0, acc: q.k === 0 ? 0 : 0.5, slow: q.k === 1 && M.bases.some((b) => b.t < 0 && b.gen[0] === q.cx && b.gen[1] === q.cz) }));
+    for (let s = 0; s < st.n; s++) {
+      const t = st.tm[s], b = W.tm[t].b, k = W.chars.filter((c) => c.t === t).length;
+      const c = { s, t, ai: !!st.ai[s], lv: st.lv[s] || 2, here: true, x: 0, y: 0, z: 0, ox: 0, oy: 0, oz: 0, vx: 0, vy: 0, vz: 0, yaw: b.yaw, pit: 0, gr: 1, al: 1, hp: 100, r: [0, 0, 0], b: [0, 0, 0, 0, 0, 0, 0], sb: 1, ml: 0, ar: 0, rg: 0, am: 0, pk: 0, ax: 0, sh: 0, it: D.CONS.map(() => 0), hand: 0,
+        swT: 0, swN: 0, fcd: 0, ucd: 0, plT: 0, bkI: -1, bkP: 0, hitT: 0, inv: 3, regenT: 0, rsT: 0, out: 0, kbT: 0, coy: 0, jcd: 0, bld: 0, atk: 0, fx: { haste: 0, jump: 0, cloak: 0, slow: 0, weak: 0, rally: 0, mark: 0 }, last: { s: -1, t: -99 }, st: { k: 0, d: 0, c: 0, p: 0, b: 0 }, k, A: null, snap: null, tpT: 0, rin: null, lastSw: -9 };
+      spawnAt(W, c);
+      W.chars.push(c);
+    }
+    return W;
+  }
+  function spawnAt(W, c) {
+    const b = W.tm[c.t].b, off = [[0, 0], [0, 1], [0, -1], [-1, 0]][c.k % 4], px = -b.dir[1], pz = b.dir[0];
+    c.x = b.sx + (px * off[1] + b.dir[0] * off[0]) * 1.1; c.z = b.sz + (pz * off[1] + b.dir[1] * off[0]) * 1.1; c.y = 0.02;
+    c.ox = c.x; c.oy = c.y; c.oz = c.z; c.vx = c.vy = c.vz = 0; c.yaw = b.yaw; c.pit = 0; c.gr = 1; c.kbT = 0;
+  }
+  const ev = (W, a) => { a.unshift(W.evSeq++); a.push(W.t); W.ev.push(a); if (W.ev.length > 90) W.ev.splice(0, 30); };
+  const solid = (W, cx, iy, cz) => (inB(cx, iy, cz) ? W.g[idx(cx, iy, cz)] : 0);
+  function setCell(W, i, id) {
+    if (W.g[i] === id) return;
+    W.g[i] = id; W.chg.push(i); W.touched.add(i);
+    if (W.host) { W.logSeq++; W.log.push([W.logSeq, i, id, W.t]); }
+  }
+  function hitBox(W, x, y, z) {
+    const x0 = cX(x - HW), x1 = cX(x + HW), z0 = cZ(z - HW), z1 = cZ(z + HW), y0 = cY(y + 0.02), y1 = cY(y + PH);
+    for (let iy = y0; iy <= y1; iy++) for (let cz = z0; cz <= z1; cz++) for (let cx = x0; cx <= x1; cx++) if (solid(W, cx, iy, cz)) return true;
+    return false;
+  }
+  function supported(W, x, y, z) {
+    const iy = cY(y - 0.05);
+    return !!(solid(W, cX(x), iy, cZ(z)) || solid(W, cX(x - HW), iy, cZ(z - HW)) || solid(W, cX(x + HW), iy, cZ(z - HW)) || solid(W, cX(x - HW), iy, cZ(z + HW)) || solid(W, cX(x + HW), iy, cZ(z + HW)));
+  }
+  /* 광선: 처음 닿는 칸. 돌려줌 {i, pi(바로 앞 빈 칸), d} 또는 null */
+  function ray(W, ox, oy, oz, dx, dy, dz, max) {
+    let cx = cX(ox), cy = cY(oy), cz = cZ(oz);
+    const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1, sz = dz > 0 ? 1 : -1;
+    const tdx = dx ? Math.abs(CS / dx) : 1e9, tdy = dy ? Math.abs(1 / dy) : 1e9, tdz = dz ? Math.abs(CS / dz) : 1e9;
+    const fx = ox / CS + C0 - cx, fy = oy + G0 - cy, fz = oz / CS + C0 - cz;
+    let tx = dx ? (dx > 0 ? 1 - fx : fx) * tdx : 1e9, ty = dy ? (dy > 0 ? 1 - fy : fy) * tdy : 1e9, tz = dz ? (dz > 0 ? 1 - fz : fz) * tdz : 1e9;
+    let pi = inB(cx, cy, cz) ? idx(cx, cy, cz) : -1, d = 0;
+    for (let n = 0; n < 80; n++) {
+      if (tx < ty && tx < tz) { d = tx; tx += tdx; cx += sx; } else if (ty < tz) { d = ty; ty += tdy; cy += sy; } else { d = tz; tz += tdz; cz += sz; }
+      if (d > max) return null;
+      if (!inB(cx, cy, cz)) { if (cy < 0 || cy >= NY) return null; pi = -1; continue; }
+      const i = idx(cx, cy, cz);
+      if (W.g[i]) return { i, pi, d };
+      pi = i;
+    }
+    return null;
+  }
+  function los(W, ax, ay, az, bx, by, bz, skip12) {
+    const dx = bx - ax, dy = by - ay, dz = bz - az, d = Math.hypot(dx, dy, dz); if (d < 0.01) return true;
+    const h = ray(W, ax, ay, az, dx / d, dy / d, dz / d, d);
+    return !h || (skip12 && W.g[h.i] === 12);
+  }
+  function canPlace(W, i, bridge, noAdj) {
+    const x = iX(i), y = iY(i), z = iZ(i);
+    if (x < 1 || z < 1 || x > NX - 2 || z > NZ - 2 || y < 1 || y > NY - 2) return false;
+    if (W.g[i] || W.M.prot[i]) return false;
+    if (!noAdj) {
+      let adj = W.g[i - 1] || W.g[i + 1] || W.g[i - NX] || W.g[i + NX] || W.g[i - NX * NZ] || W.g[i + NX * NZ];
+      if (!adj && bridge) adj = W.g[i - 1 - NX] || W.g[i + 1 - NX] || W.g[i - 1 + NX] || W.g[i + 1 + NX];
+      if (!adj) return false;
+    }
+    const x0 = (x - C0) * CS, z0 = (z - C0) * CS, y0 = y - G0;
+    for (const c of W.chars) { if (!c.al) continue; if (c.x + HW > x0 && c.x - HW < x0 + CS && c.z + HW > z0 && c.z - HW < z0 + CS && c.y + PH > y0 && c.y < y0 + 1 - 0.02) return false; }
+    return true;
+  }
+  const blocks = (c) => c.b[1] + c.b[2] + c.b[3] + c.b[4] + c.b[5] + c.b[6];
+  function pickMat(c) { if (c.b[c.sb] > 0) return c.sb; for (let m = 1; m <= 6; m++) if (c.b[m] > 0) { c.sb = m; return m; } return 0; }
+  function nextMat(c) { for (let k = 1; k <= 6; k++) { const m = (c.sb - 1 + k) % 6 + 1; if (c.b[m] > 0) { c.sb = m; return m; } } return c.sb; }
+  function toolPower(W, c, id) {
+    const b = BLK[id], tm = W.tm[c.t]; let p = 1;
+    if (b.tool === 'shear') p = c.sh ? 6 : 1; else if (b.tool === 'axe') p = D.TOOL_PW[c.ax]; else if (b.tool === 'pick') p = D.TOOL_PW[c.pk]; else p = c.pk || c.ax || c.sh ? 1.5 : 1;
+    return p * (1 + 0.25 * tm.up[UI.haste]) * (c.fx.weak > W.t ? 0.3 : 1);
+  }
+  const breakTime = (W, c, id) => BLK[id].hp / toolPower(W, c, id);
+
+  /* ======================= 이동 ======================= */
+  function moveChar(W, c, inp, dt) {
+    const t = W.t, fx = c.fx;
+    const sp = SPD * (fx.haste > t ? 1.3 : 1) * (fx.slow > t ? 0.55 : 1) * (fx.rally > t ? 1.2 : 1);
+    let mx = inp.mx || 0, mz = inp.mz || 0; const ml = Math.hypot(mx, mz); if (ml > 1) { mx /= ml; mz /= ml; }
+    let acc = (c.kbT > 0 ? 7 : c.gr ? 70 : 20) * dt; if (!c.gr && ml < 0.05) acc *= 0.2;
+    let dx = mx * sp - c.vx, dz = mz * sp - c.vz; const dl = Math.hypot(dx, dz);
+    if (dl > acc) { dx *= acc / dl; dz *= acc / dl; }
+    c.vx += dx; c.vz += dz;
+    if (c.kbT > 0) c.kbT -= dt; if (c.jcd > 0) c.jcd -= dt; if (c.coy > 0) c.coy -= dt;
+    if (inp.jump && (c.gr || c.coy > 0) && c.jcd <= 0) { c.vy = JV * (fx.jump > t ? 1.33 : 1); c.gr = 0; c.coy = 0; c.jcd = 0.3; }
+    if (c.gr && inp.careful && c.kbT <= 0) {
+      if (c.vx && !supported(W, c.x + c.vx * dt, c.y, c.z)) c.vx = 0;
+      if (c.vz && !supported(W, c.x + c.vx * dt, c.y, c.z + c.vz * dt)) c.vz = 0;
+    }
+    let bump = false;
+    if (c.vx) { const nx = c.x + c.vx * dt; if (hitBox(W, nx, c.y, c.z)) { if (c.gr && Math.abs(c.vx) > 1 && !hitBox(W, nx, c.y + 1.02, c.z) && !hitBox(W, c.x, c.y + 1.02, c.z)) bump = true; c.x = c.vx > 0 ? Math.floor((nx + HW) / CS) * CS - HW - 1e-3 : (Math.floor((nx - HW) / CS) + 1) * CS + HW + 1e-3; c.vx = 0; } else c.x = nx; }
+    if (c.vz) { const nz = c.z + c.vz * dt; if (hitBox(W, c.x, c.y, nz)) { if (c.gr && Math.abs(c.vz) > 1 && !hitBox(W, c.x, c.y + 1.02, nz) && !hitBox(W, c.x, c.y + 1.02, c.z)) bump = true; c.z = c.vz > 0 ? Math.floor((nz + HW) / CS) * CS - HW - 1e-3 : (Math.floor((nz - HW) / CS) + 1) * CS + HW + 1e-3; c.vz = 0; } else c.z = nz; }
+    if (bump && c.jcd <= 0 && (ml > 0.3)) { c.vy = JV; c.gr = 0; c.jcd = 0.3; }   // 한 칸 턱은 걸으면 저절로 넘음
+    const flo = fx.flo > t ? 0.35 : 1;
+    c.vy = Math.max(-27, c.vy - GRAV * flo * dt);
+    const ny = c.y + c.vy * dt, was = c.gr;
+    if (hitBox(W, c.x, ny, c.z)) {
+      if (c.vy <= 0) { c.y = cY(ny + 0.02) + 1 - G0; c.gr = 1; } else c.gr = 0;
+      c.vy = 0;
+    } else { c.y = ny; c.gr = 0; if (was && c.vy <= 0) c.coy = 0.12; }
+    c.x = clamp(c.x, -NX + 1, NX - 1); c.z = clamp(c.z, -NZ + 1, NZ - 1);
+  }
+
+  /* ======================= 놓기 · 부수기 ======================= */
+  function bridgeCell(W, c, inp) {
+    if (!(c.gr || c.coy > 0)) return -1;
+    let dx = inp.mx || 0, dz = inp.mz || 0; const m = Math.hypot(dx, dz);
+    if (m < 0.2) { dx = Math.sin(c.yaw); dz = Math.cos(c.yaw); } else { dx /= m; dz /= m; }
+    const fy = cY(c.y - 0.05);
+    for (const d of [0.5, 1.0]) {
+      const qx = cX(c.x + dx * d), qz = cZ(c.z + dz * d); if (!inB(qx, fy, qz)) continue;
+      const i = idx(qx, fy, qz);
+      if (!W.g[i]) return canPlace(W, i, true) ? i : -1;
+    }
+    return -1;
+  }
+  function place(W, c, i, mat) {   // 호스트 판정
+    if (!c.al || !(c.b[mat] > 0) || mat < 1 || mat > 6 || i < 0 || i >= NC) return false;
+    const dx = wX(iX(i)) - c.x, dy = wY(iY(i)) + 0.5 - (c.y + EYE), dz = wX(iZ(i)) - c.z;
+    if (dx * dx + dy * dy + dz * dz > (REACH + 2.5) * (REACH + 2.5)) return false;
+    if (!canPlace(W, i, true)) return false;
+    setCell(W, i, mat); c.b[mat]--; c.st.p++;
+    ev(W, ['pl', i, mat, c.s]);
+    return true;
+  }
+  function doBuild(W, c, inp, dt, auth) {
+    if (c.plT > 0) c.plT -= dt;
+    c.bld = inp.build ? 1 : 0;
+    if (!(inp.build || inp.pcE) || c.plT > 0) return;
+    const mat = pickMat(c);
+    if (!mat) { if (inp.buildE || inp.pcE) W.note = '자재 없음 — 보급소에서 발판을 삼'; return; }
+    /* 누르고 있기 = 다리(발밑 앞 칸), 짧게 누르기(pcE) = 조준한 면에 한 칸 */
+    let i = inp.build ? bridgeCell(W, c, inp) : -1, rep = 0.09;
+    if (i < 0 && inp.pcE && inp.pc >= 0 && W.g[inp.pc] === 0 && canPlace(W, inp.pc, false)) { i = inp.pc; rep = 0.1; }
+    if (i < 0) return;
+    W.placedBy = c.s;
+    c.plT = rep;
+    if (auth) place(W, c, i, mat);
+    else { W.g[i] = mat; W.chg.push(i); W.pend.set(i, W.t + 1.4); c.b[mat]--; W.evOut.push(['P', i, mat]); W.fxLocal = ['pl', i]; }
+  }
+  function doBreak(W, c, bc, dt, auth) {
+    const id = bc >= 0 && bc < NC ? W.g[bc] : 0;
+    if (!c.al || id < 1 || id > 6) { c.bkI = -1; c.bkP = 0; return; }
+    const dx = wX(iX(bc)) - c.x, dy = wY(iY(bc)) + 0.5 - (c.y + EYE), dz = wX(iZ(bc)) - c.z;
+    if (dx * dx + dy * dy + dz * dz > (REACH + 1.5) * (REACH + 1.5)) { c.bkI = -1; c.bkP = 0; return; }
+    if (c.bkI !== bc) { c.bkI = bc; c.bkP = 0; }
+    c.bkP += dt / breakTime(W, c, id);
+    if (c.bkP >= 1) {
+      c.bkI = -1; c.bkP = 0;
+      if (auth) { setCell(W, bc, 0); c.st.b++; ev(W, ['bk', bc, id]); }
+    }
+  }
+
+  /* ======================= 피해 · 쓰러짐 ======================= */
+  function damage(W, tg, dmg, src, kx, ky, kz, melee) {
+    if (!tg.al || tg.inv > W.t) return false;
+    if (melee) { if (tg.hitT > W.t) return false; tg.hitT = W.t + 0.35; }
+    const cut = Math.min(0.7, D.ARMOR[tg.ar].cut + 0.06 * W.tm[tg.t].up[UI.plate]);
+    tg.hp -= dmg * (1 - cut); tg.regenT = W.t + 6;
+    if (src && src !== tg) { tg.last = { s: src.s, t: W.t }; if (src.fx.cloak > W.t) src.fx.cloak = 0; }
+    if (kx || ky || kz) {
+      if (tg.here) { tg.vx += kx; tg.vz += kz; tg.vy = Math.max(tg.vy, 0) + ky; tg.gr = 0; tg.kbT = 0.4; }
+      else ev(W, ['K', tg.s, Math.round(kx * 10), Math.round(ky * 10), Math.round(kz * 10)]);
+    }
+    ev(W, ['hit', tg.s, Math.round(dmg * (1 - cut)), src ? src.s : -1]);
+    if (tg.hp <= 0) kill(W, tg, src && src !== tg ? src : (W.t - tg.last.t < 8 ? W.chars[tg.last.s] : null), 0);
+    return true;
+  }
+  function kill(W, c, by, how) {
+    if (!c.al) return;
+    c.al = 0; c.hp = 0; c.st.d++; c.bkI = -1; c.fx.cloak = 0;
+    if (by && by.t !== c.t) { by.st.k++; if (by.al) for (let i = 0; i < 3; i++) by.r[i] += c.r[i]; }
+    c.r = [0, 0, 0]; c.b = [0, 0, 0, 0, 0, 0, 0]; c.it = c.it.map(() => 0); c.am = Math.floor(c.am / 2);
+    const tm = W.tm[c.t];
+    if (tm.core > 0) c.rsT = W.t + RESPAWN; else { c.out = 1; c.rsT = 0; }
+    ev(W, ['die', c.s, by ? by.s : -1, how, c.out]);
+    checkOver(W);
+  }
+  function checkOver(W) {
+    if (W.over) return;
+    let alive = 0, last = -1;
+    for (const tm of W.tm) { tm.out = W.chars.some((c) => c.t === tm.t && !c.out) ? 0 : 1; if (!tm.out) { alive++; last = tm.t; } }
+    if (alive <= 1) finish(W, last, alive ? '마지막까지 남음' : '');
+  }
+  function finish(W, win, why) {
+    if (W.over) return;
+    if (win < 0) { let best = -1; for (const tm of W.tm) { const k = W.chars.filter((c) => c.t === tm.t).reduce((a, c) => a + c.st.k, 0); if (k > best) { best = k; win = tm.t; } } why = '처치 수'; }
+    W.over = { win, why, time: Math.round(W.t), st: W.chars.map((c) => c.st), cores: W.cores };
+  }
+  function destroyCore(W, tm, by, how) {
+    if (tm.gone) return;
+    tm.gone = 1; tm.core = 0;
+    const b = tm.b; setCell(W, idx(b.core[0], G0, b.core[1]), 0); setCell(W, idx(b.core[0], G0 + 1, b.core[1]), 0);
+    if (by) by.st.c++;
+    W.cores.push([tm.t, by ? by.s : -1]);
+    ev(W, ['coreX', tm.t, by ? by.s : -1, how || 0]);
+    for (const c of W.chars) if (c.t === tm.t && !c.al && !c.out && c.rsT <= 0) c.out = 1;
+    checkOver(W);
+  }
+  function coreExposed(W, tm) {
+    const b = tm.b, x = b.core[0], z = b.core[1];
+    for (let y = G0; y <= G0 + 1; y++) if (!solid(W, x - 1, y, z) || !solid(W, x + 1, y, z) || !solid(W, x, y, z - 1) || !solid(W, x, y, z + 1)) return true;
+    return !solid(W, x, G0 + 2, z);
+  }
+  function hitCore(W, tm, dmg, by) {
+    if (tm.core <= 0) return;
+    if (W.t < 0.1 * W.T) { if (by) ev(W, ['no', by.s, '방호막 — 아직 핵에 피해를 줄 수 없음']); return; }
+    const g = tm.up[UI.guard]; dmg *= g === 2 ? 0.5 : g === 1 ? 0.7 : 1;
+    tm.core -= dmg; tm.hitT = W.t;
+    ev(W, ['core', tm.t, by ? by.s : -1]);
+    if (tm.core <= 0) destroyCore(W, tm, by, 0);
+  }
+  function explode(W, x, y, z, r, dmg, pw, src) {
+    ev(W, ['boom', Math.round(x * 10), Math.round(y * 10), Math.round(z * 10), Math.round(r * 10)]);
+    const x0 = Math.max(1, cX(x - r)), x1 = Math.min(NX - 2, cX(x + r)), z0 = Math.max(1, cZ(z - r)), z1 = Math.min(NZ - 2, cZ(z + r)), y0 = Math.max(0, cY(y - r)), y1 = Math.min(NY - 1, cY(y + r));
+    for (let iy = y0; iy <= y1; iy++) for (let cz = z0; cz <= z1; cz++) for (let cx = x0; cx <= x1; cx++) {
+      const i = idx(cx, iy, cz), id = W.g[i]; if (id < 1 || id > 6) continue;
+      const d = Math.hypot(wX(cx) - x, wY(iy) + 0.5 - y, wX(cz) - z);
+      if (d < r && (1 - d / r) * pw > BLK[id].res) { setCell(W, i, 0); if (src) src.st.b++; }
+    }
+    for (const c of W.chars) {
+      if (!c.al) continue;
+      const dx = c.x - x, dy = c.y + 0.9 - y, dz = c.z - z, d = Math.hypot(dx, dy, dz); if (d >= r) continue;
+      const f = 1 - d / r, hl = Math.hypot(dx, dz) || 1, mate = src && c.t === src.t && c !== src;
+      damage(W, c, mate ? 0.01 : dmg * f * (c === src ? 0.5 : 1), src, dx / hl * 13 * f, 3 + 6 * f, dz / hl * 13 * f, false);
+    }
+    for (const tm of W.tm) {
+      if (tm.core <= 0 || (src && tm.t === src.t)) continue;
+      const d = Math.hypot(tm.b.cx - x, 1 - y, tm.b.cz - z);
+      if (d < r * 0.8 && coreExposed(W, tm)) hitCore(W, tm, 25 * (1 - d / r) * pw, src);
+    }
+  }
+
+  /* ======================= 공격 · 발사 · 물건 ======================= */
+  const aimDir = (yaw, pit) => [Math.sin(yaw) * Math.cos(pit), Math.sin(pit), Math.cos(yaw) * Math.cos(pit)];
+  function swing(W, c, yaw, pit) {   // 호스트 판정
+    if (!c.al) return;
+    c.lastSw = W.t; c.swN = (c.swN + 1) & 15;
+    const fxh = Math.sin(yaw), fzh = Math.cos(yaw), ex = c.x, ey = c.y + EYE, ez = c.z;
+    let best = null, bd = 1e9;
+    for (const e of W.chars) {
+      if (!e.al || e.t === c.t || e.inv > W.t) continue;
+      const dx = e.x - c.x, dz = e.z - c.z, dy = e.y - c.y, d = Math.hypot(dx, dy, dz); if (d > MREACH || d >= bd) continue;
+      const hl = Math.hypot(dx, dz) || 1e-3, dot = (dx * fxh + dz * fzh) / hl;
+      if (dot < (d < 1.3 ? -0.2 : 0.45)) continue;
+      if (!los(W, ex, ey, ez, e.x, e.y + 1.0, e.z)) continue;
+      best = e; bd = d;
+    }
+    const m = D.MELEE[c.ml], tm = W.tm[c.t];
+    if (best) {
+      const dx = best.x - c.x, dz = best.z - c.z, hl = Math.hypot(dx, dz) || 1;
+      const dmg = m.dmg * (tm.up[UI.sharp] ? 1.2 : 1) * (c.fx.weak > W.t ? 0.7 : 1);
+      damage(W, best, dmg, c, dx / hl * 6.2 * m.kb, 4.2, dz / hl * 6.2 * m.kb, true);
+      return;
+    }
+    const dir = aimDir(yaw, pit);
+    for (const et of W.tm) {
+      if (et.t === c.t || et.core <= 0) continue;
+      const dx = et.b.cx - ex, dy = 1 - ey, dz = et.b.cz - ez, d = Math.hypot(dx, dy, dz); if (d > 4.2) continue;
+      if ((dx * dir[0] + dy * dir[1] + dz * dir[2]) / d < 0.25) continue;
+      if (!los(W, ex, ey, ez, et.b.cx, 1, et.b.cz, true)) continue;
+      hitCore(W, et, (3 + 2.5 * c.pk + 1.5 * Math.min(3, c.ml)) * (c.fx.weak > W.t ? 0.7 : 1), c);
+      return;
+    }
+  }
+  function fire(W, c, dir) {   // 호스트 판정
+    const w = D.RANGED[c.rg]; if (!c.al || !w || c.am < w.use || c.fcd > 0.08) return false;
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    c.am -= w.use; c.fcd = w.cd;
+    W.pj.push({ id: W.pjId++, k: c.rg, s: c.s, x: c.x + dir[0] / l * 0.5, y: c.y + 1.4, z: c.z + dir[2] / l * 0.5, vx: dir[0] / l * w.spd, vy: dir[1] / l * w.spd, vz: dir[2] / l * w.spd, g: w.g, life: 3 });
+    ev(W, ['shot', c.s, c.rg]);
+    return true;
+  }
+  function useItem(W, c, ci, dir) {   // 호스트 판정. 돌려줌 '' 또는 못 쓰는 까닭
+    const it = D.CONS[ci]; if (!it || !c.al) return '쓸 수 없음';
+    if (!(c.it[ci] > 0)) return it.nm + ' 없음';
+    if (c.ucd > 0) return '';
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1, d = [dir[0] / l, dir[1] / l, dir[2] / l], t = W.t;
+    const thr = (k, spd, g, o) => W.pj.push(Object.assign({ id: W.pjId++, k, s: c.s, x: c.x + d[0] * 0.5, y: c.y + 1.4, z: c.z + d[2] * 0.5, vx: d[0] * spd, vy: d[1] * spd, vz: d[2] * spd, g, life: 4 }, o));
+    if (it.id === 'float') return '부양 띠는 떨어질 때 저절로 쓰임';
+    if (it.id === 'tnt') thr(10, 15, 16, { vy: d[1] * 15 + 3, fuse: t + 2.2 });
+    else if (it.id === 'fire') thr(11, 26, 0, {});
+    else if (it.id === 'anchor') thr(12, 30, 14, { vy: d[1] * 30 + 2 });
+    else if (it.id === 'bridge') { const hl = Math.hypot(d[0], d[2]) || 1; W.pj.push({ id: W.pjId++, k: 13, s: c.s, x: c.x, y: c.y + 1.0, z: c.z, vx: d[0] / hl * 14, vy: 0, vz: d[2] / hl * 14, g: 0, life: 4, fy: cY(c.y - 0.05), n: 16, lc: -1 }); }
+    else if (it.id === 'heal') { if (c.hp >= 100) return '체력이 가득함'; c.hp = Math.min(100, c.hp + 50); }
+    else if (it.id === 'jump') c.fx.jump = t + 30;
+    else if (it.id === 'haste') c.fx.haste = t + 30;
+    else if (it.id === 'cloak') c.fx.cloak = t + 25;
+    else if (it.id === 'wall') {
+      const ax = Math.abs(d[0]) > Math.abs(d[2]), sx = ax ? Math.sign(d[0]) : 0, sz = ax ? 0 : Math.sign(d[2]) || 1, bx = cX(c.x) + sx, bz = cZ(c.z) + sz, by = cY(c.y + 0.02);
+      let n = 0;
+      for (let h = 0; h < 3; h++) for (let o = -1; o <= 1; o++) { const x = bx + (ax ? 0 : o), z = bz + (ax ? o : 0); if (!inB(x, by + h, z)) continue; const i = idx(x, by + h, z); if (canPlace(W, i, true)) { setCell(W, i, 2); n++; } }
+      if (!n) return '세울 곳 없음';
+    }
+    c.it[ci]--; c.ucd = 0.45;
+    ev(W, ['use', c.s, ci]);
+    return '';
+  }
+  function teleport(W, c, x, y, z) {
+    c.x = x; c.y = y; c.z = z; c.vx = c.vy = c.vz = 0; c.ox = x; c.oy = y; c.oz = z; c.tpT = W.t + 1.2;
+    ev(W, ['T', c.s, Math.round(x * 20), Math.round(y * 20), Math.round(z * 20), Math.round(c.yaw * 100)]);
+  }
+  function stepProjectiles(W, dt) {
+    for (let n = W.pj.length - 1; n >= 0; n--) {
+      const p = W.pj[n], sp = Math.hypot(p.vx, p.vy, p.vz), sub = Math.max(1, Math.ceil(sp * dt / 0.45)), h = dt / sub, src = W.chars[p.s];
+      let dead = false;
+      p.life -= dt; if (p.life <= 0) dead = true;
+      for (let k = 0; k < sub && !dead; k++) {
+        const lx = p.x, ly = p.y, lz = p.z;
+        p.vy -= p.g * h; p.x += p.vx * h; p.y += p.vy * h; p.z += p.vz * h;
+        if (p.y < -14 || Math.abs(p.x) > NX || Math.abs(p.z) > NZ) { dead = true; break; }
+        if (p.k === 10 && W.t >= p.fuse) { explode(W, p.x, p.y, p.z, 5, 55, 1, src); dead = true; break; }
+        const cx = cX(p.x), cy = cY(p.y), cz = cZ(p.z), blk = solid(W, cx, cy, cz);
+        if (p.k === 13) {
+          if (blk) { dead = true; break; }
+          const q = cz * NX + cx;
+          if (q !== p.lc && inB(cx, p.fy, cz)) {
+            if (p.lc >= 0) { const ox = p.lc % NX, oz = Math.floor(p.lc / NX); if (ox !== cx && oz !== cz) { const j = idx(cx, p.fy, oz); if (canPlace(W, j, true, true)) setCell(W, j, 1); } }
+            p.lc = q; const i = idx(cx, p.fy, cz);
+            if (canPlace(W, i, true, true)) { setCell(W, i, 1); ev(W, ['pl', i, 1, p.s]); }
+            if (--p.n <= 0) { dead = true; break; }
+          }
+          continue;
+        }
+        let hitP = null;
+        if (p.k !== 10 && p.k !== 12) for (const e of W.chars) { if (!e.al || e.t === src.t) continue; if (p.y > e.y - 0.1 && p.y < e.y + PH + 0.15 && Math.hypot(p.x - e.x, p.z - e.z) < 0.6) { hitP = e; break; } }
+        if (!blk && !hitP) continue;
+        dead = true;
+        if (p.k <= 3) {
+          const w = D.RANGED[p.k], hl = Math.hypot(p.vx, p.vz) || 1;
+          if (hitP) damage(W, hitP, w.dmg, src, p.vx / hl * 5 * w.kb, 2.5 * w.kb, p.vz / hl * 5 * w.kb, false);
+          if (w.splash) { ev(W, ['puff', Math.round(p.x * 10), Math.round(p.y * 10), Math.round(p.z * 10)]); for (const e of W.chars) { if (!e.al || e === hitP || e.t === src.t) continue; const dx = e.x - lx, dz = e.z - lz, d = Math.hypot(dx, e.y + 0.9 - ly, dz); if (d < w.splash) { const f = 1 - d / (w.splash + 1), q = Math.hypot(dx, dz) || 1; damage(W, e, 2, src, dx / q * 11 * f, 4 * f, dz / q * 11 * f, false); } } }
+          else if (!hitP) ev(W, ['tick', Math.round(lx * 10), Math.round(ly * 10), Math.round(lz * 10)]);
+        } else if (p.k === 10) { W.tnt.push({ x: lx, y: ly, z: lz, t: p.fuse, s: p.s }); }
+        else if (p.k === 11) explode(W, lx, ly, lz, 3.2, 26, 0.55, src);
+        else if (p.k === 12 && src.al) {
+          let tx = wX(cX(lx)), tz = wX(cZ(lz)), ty = cY(ly) - G0, ok = false;
+          for (let u = 0; u < 3 && !ok; u++) { if (!hitBox(W, tx, ty + u, tz)) { ty += u; ok = true; } }
+          if (ok) { teleport(W, src, tx, ty, tz); ev(W, ['warp', src.s]); }
+        }
+      }
+      if (dead) W.pj.splice(n, 1);
+    }
+    for (let n = W.tnt.length - 1; n >= 0; n--) { const q = W.tnt[n]; if (W.t >= q.t) { W.tnt.splice(n, 1); explode(W, q.x, q.y, q.z, 5, 55, 1, W.chars[q.s]); } }
+  }
+
+  /* ======================= 보급소 ======================= */
+  function shellCells(W, tm, layer) {
+    const b = tm.b, x0 = b.core[0], z0 = b.core[1], out = [];
+    for (let dy = 0; dy <= layer + 1; dy++) for (let dx = -layer; dx <= layer; dx++) for (let dz = -layer; dz <= layer; dz++) {
+      const m = Math.max(Math.abs(dx), Math.abs(dz));
+      if (!(m === layer && dy <= layer) && !(dy === layer + 1 && m < layer)) continue;
+      const x = x0 + dx, z = z0 + dz, y = G0 + dy; if (!inB(x, y, z)) continue;
+      if (dy === 0 && !solid(W, x, GY, z)) continue;   // 섬 밖(허공)은 건너뜀
+      out.push(idx(x, y, z));
+    }
+    return out;
+  }
+  function shellInfo(W, tm) {
+    for (let layer = 1; layer <= 2; layer++) { const cs = shellCells(W, tm, layer), miss = cs.filter((i) => !W.g[i] && !W.M.prot[i]); if (miss.length > Math.max(1, cs.length * 0.12)) return { layer, miss, mul: layer === 2 ? 2.5 : 1 }; }
+    return null;
+  }
+  function priceOf(W, c, e) {
+    const tm = W.tm[c.t], cost = e.cost.slice();
+    if (e.k === 'upg') { const u = D.UPG[e.u], lv = u.rep ? 0 : tm.up[e.u]; if (lv >= u.cost.length) return null; cost[1] = u.cost[lv]; }
+    else if (e.k === 'trap') cost[1] = 1 + tm.traps.length;
+    else if (e.k === 'shell') { const s = shellInfo(W, tm); if (s) for (let i = 0; i < 3; i++) cost[i] = Math.round(cost[i] * s.mul); }
+    return cost;
+  }
+  /* 살 수 없는 까닭('' = 살 수 있음) */
+  function whyNot(W, c, e) {
+    const tm = W.tm[c.t];
+    if (!c.al) return '쓰러진 동안에는 살 수 없음';
+    if (Math.hypot(c.x - tm.b.x, c.z - tm.b.z) > BASE_R + 2 || c.y < -3) return '자기 섬 안에서만 살 수 있음';
+    if (e.k === 'melee') { if (c.ml === e.t) return '이미 지님'; if (e.t !== 4 && c.ml !== 4 && c.ml > e.t) return '더 좋은 검을 지님'; }
+    if (e.k === 'armor' && c.ar >= e.t) return '이미 같거나 더 좋은 방어구';
+    if (e.k === 'rng' && c.rg === e.t) return '이미 지님';
+    if (e.k === 'ammo' && !c.rg) return '원거리 무기가 없음';
+    if (e.k === 'pick') { if (c.pk >= e.t) return '이미 지님'; if (c.pk < e.t - 1) return '앞 단계 곡괭이가 필요'; }
+    if (e.k === 'axe') { if (c.ax >= e.t) return '이미 지님'; if (c.ax < e.t - 1) return '앞 단계 도끼가 필요'; }
+    if (e.k === 'shear' && c.sh) return '이미 지님';
+    if (e.k === 'con' && c.it[e.c] >= 9) return '더 지닐 수 없음';
+    if (e.k === 'upg') { const u = D.UPG[e.u]; if (!u.rep && tm.up[e.u] >= u.cost.length) return '끝까지 강화함'; if (u.id === 'mend') { if (tm.core <= 0) return '핵이 부서짐'; if (tm.core >= 100) return '핵 체력이 가득함'; } if (u.id === 'guard' && tm.core <= 0) return '핵이 부서짐'; }
+    if (e.k === 'trap' && tm.traps.length >= 3) return '함정은 3개까지 대기';
+    if (e.k === 'shell') { if (tm.core <= 0) return '핵이 부서짐'; if (!shellInfo(W, tm)) return '더 둘 곳 없음'; }
+    const cost = priceOf(W, c, e); if (!cost) return '끝까지 강화함';
+    for (let i = 0; i < 3; i++) if (c.r[i] < cost[i]) return D.RES[i].nm + ' ' + (cost[i] - c.r[i]) + ' 부족';
+    return '';
+  }
+  function buy(W, c, id) {   // 호스트 판정
+    const e = D.SHOP[D.SI[id]]; if (!e) return '없는 물건';
+    const why = whyNot(W, c, e); if (why) return why;
+    const cost = priceOf(W, c, e), tm = W.tm[c.t];
+    if (e.k === 'shell') { const s = shellInfo(W, tm); let n = 0; for (const i of s.miss) if (canPlace(W, i, true, true)) { setCell(W, i, e.b); n++; } if (!n) return '분대원이 서 있어 둘 수 없음'; }
+    for (let i = 0; i < 3; i++) c.r[i] -= cost[i];
+    if (e.k === 'blk') { c.b[e.b] += e.n; if (!(c.b[c.sb] > 0)) c.sb = e.b; }
+    else if (e.k === 'melee') c.ml = e.t;
+    else if (e.k === 'armor') c.ar = e.t;
+    else if (e.k === 'rng') { c.rg = e.t; c.am += e.t === 2 ? 12 : 6; }
+    else if (e.k === 'ammo') c.am += e.n;
+    else if (e.k === 'pick') c.pk = e.t;
+    else if (e.k === 'axe') c.ax = e.t;
+    else if (e.k === 'shear') c.sh = 1;
+    else if (e.k === 'con') c.it[e.c]++;
+    else if (e.k === 'upg') { if (D.UPG[e.u].id === 'mend') tm.core = 100; else tm.up[e.u]++; ev(W, ['upg', c.t, e.u, c.s]); }
+    else if (e.k === 'trap') { tm.traps.push(e.u); ev(W, ['upg', c.t, 100 + e.u, c.s]); }
+    ev(W, ['buy', c.s]);
+    return '';
+  }
+
+  /* ======================= 시간 단계 · 생성기 · 환경 ======================= */
+  function stormR(W, t) {
+    const M = W.M, a = 0.8 * W.T;
+    if (t < a) return M.R0;
+    if (t < W.T) return M.R0 + (M.rMin - M.R0) * (t - a) / (W.T - a);
+    return Math.max(0, M.rMin * (1 - (t - W.T) / 50));
+  }
+  const genMul = (W, k) => { const f = W.t / W.T; return k === 1 ? (f >= 0.5 ? 2.2 : f >= 0.2 ? 1.5 : 1) : k === 2 ? (f >= 0.6 ? 2.2 : f >= 0.35 ? 1.5 : 1) : 1; };
+  function stepWorldEnv(W, dt) {
+    const t = W.t;
+    while (W.ph < D.PHASES.length && t >= D.PHASES[W.ph].f * W.T) {
+      const p = D.PHASES[W.ph]; W.ph++;
+      ev(W, ['ph', W.ph - 1]);
+      if (p.k === 'fall') for (const tm of W.tm) destroyCore(W, tm, null, 1);
+    }
+    W.stormR = stormR(W, t);
+    for (const g of W.gens) {
+      const tm = g.t >= 0 ? W.tm[g.t] : null;
+      const rate = g.k === 0 ? 1.25 * (1 + 0.5 * tm.up[UI.forge]) : g.k === 1 ? (g.slow ? 1 / 16 : 1 / 12) * genMul(W, 1) : 1 / 22 * genMul(W, 2);
+      g.acc += rate * dt;
+      let near = null;
+      for (const c of W.chars) if (c.al && Math.abs(c.x - g.x) < 1.9 && Math.abs(c.z - g.z) < 1.9 && c.y > -0.6 && c.y < 2.6) (near || (near = [])).push(c);
+      if (near && g.stock > 0) { near[0].r[g.k] += g.stock; g.stock = 0; ev(W, ['get', near[0].s, g.k]); }
+      while (g.acc >= 1) {
+        g.acc -= 1;
+        if (!near) g.stock = Math.min(g.k === 0 ? 48 : g.k === 1 ? 6 : 4, g.stock + 1);
+        else if (g.k === 0) { for (const c of near) c.r[0]++; }
+        else { const c = near[(g.rr = (g.rr || 0) + 1) % near.length]; c.r[g.k]++; ev(W, ['get', c.s, g.k]); }
+      }
+      if (tm && tm.up[UI.forge] >= 4) { tm.acc2 += dt / 30; if (tm.acc2 >= 1) { tm.acc2 -= 1; if (near) near[0].r[1]++; } }
+    }
+    for (const tm of W.tm) {
+      const b = tm.b; let intr = null;
+      for (const c of W.chars) {
+        if (!c.al) continue;
+        const d = Math.hypot(c.x - b.x, c.z - b.z); if (d > BASE_R || c.y < -3) continue;
+        if (c.t === tm.t) { if (tm.up[UI.heal] && c.hp < 100) c.hp = Math.min(100, c.hp + 4 * dt); }
+        else if (!intr) intr = c;
+      }
+      tm.press = (tm.press || 0) * Math.exp(-dt / 50);
+      if (tm.core > 0 && tm.core < 100 && t - tm.hitT > 8) tm.core = Math.min(100, tm.core + 2 * dt);   // 8초 동안 맞지 않으면 핵이 천천히 회복
+      if (intr) {
+        if (t - tm.intrT > 1.5) tm.press = Math.min(3, tm.press + 1);
+        tm.intrT = t;
+        if (tm.traps.length && t >= tm.trapCd) {
+          const k = D.TRAP[tm.traps.shift()].id; tm.trapCd = t + 20;
+          if (k === 'alarm') intr.fx.mark = t + 15; else if (k === 'slow') intr.fx.slow = t + 8; else if (k === 'weak') intr.fx.weak = t + 10;
+          else for (const c of W.chars) if (c.al && c.t === tm.t && Math.hypot(c.x - b.x, c.z - b.z) < BASE_R) { c.fx.rally = t + 12; c.hp = Math.min(100, c.hp + 20); }
+          ev(W, ['trap', tm.t, D.TRAP.findIndex((q) => q.id === k), intr.s]);
+        }
+      }
+    }
+    const fin = t > W.T + 50;
+    for (const c of W.chars) {
+      if (c.al) {
+        if (c.fcd > 0) c.fcd -= dt; if (c.ucd > 0) c.ucd -= dt; if (c.swT > 0) c.swT -= dt;
+        if (c.hp < 100 && t > c.regenT) c.hp = Math.min(100, c.hp + dt);
+        if (fin || Math.hypot(c.x, c.z) > W.stormR) { c.hp -= (fin ? 12 : t > W.T ? 9 : 5) * dt; c.regenT = t + 3; if (c.hp <= 0) kill(W, c, t - c.last.t < 8 ? W.chars[c.last.s] : null, 2); }
+        if (c.al && c.y < -6 && c.vy < 0 && c.it[CI.float] > 0 && c.here) { c.it[CI.float]--; c.vy = 20; c.fx.flo = t + 2.2; ev(W, ['use', c.s, CI.float]); }
+        if (c.al && c.y < -11) kill(W, c, t - c.last.t < 8 ? W.chars[c.last.s] : null, 1);
+      } else if (!c.out && c.rsT > 0 && t >= c.rsT) {
+        c.rsT = 0; c.al = 1; c.hp = 100; c.inv = t + 3; c.fx = { haste: 0, jump: 0, cloak: 0, slow: 0, weak: 0, rally: 0, mark: 0 }; c.hand = 0; c.snap = null;
+        spawnAt(W, c); teleport(W, c, c.x, c.y, c.z); ev(W, ['rsp', c.s]);
+      }
+    }
+    if (!W.over && t >= W.T + 75) {
+      let win = -1, best = -1;
+      for (const tm of W.tm) { const m = W.chars.filter((c) => c.t === tm.t && c.al); const sc = m.length * 1000 + m.reduce((a, c) => a + c.hp, 0); if (m.length && sc > best) { best = sc; win = tm.t; } }
+      finish(W, win, '남은 인원 · 체력');
+    }
+    if (W.log.length && t - W.log[0][3] > 3) { let k = 0; while (k < W.log.length && t - W.log[k][3] > 3) k++; W.log.splice(0, k); }
+  }
+
+  /* ======================= 한 걸음 ======================= */
+  const NOIN = { mx: 0, mz: 0, pc: -1, bc: -1, use: -1 };
+  /* 호스트: inputOf(seat, c) → 입력(이 기기가 움직이는 자리) 또는 undefined(다른 기기) */
+  function worldStep(W, dt, inputOf) {
+    if (W.over) return;
+    W.t += dt; W.pathN = 0;
+    for (const c of W.chars) {
+      const inp = inputOf(c.s, c);
+      c.here = inp !== undefined;
+      if (!c.al) continue;
+      if (inp) {
+        c.ox = c.x; c.oy = c.y; c.oz = c.z;
+        if (inp.yaw != null) { c.yaw = inp.yaw; c.pit = inp.pit || 0; }
+        if (inp.sb) c.sb = inp.sb; if (inp.hand != null) c.hand = inp.hand && c.rg ? 1 : 0;
+        if (inp.buy) { const why = buy(W, c, inp.buy); if (why && !c.ai) W.note = why; }
+        doBuild(W, c, inp, dt, true);
+        moveChar(W, c, inp, dt);
+        c.atk = inp.atk ? 1 : 0;
+        if (inp.atk) {
+          if (c.hand === 1 && c.rg) { if (c.fcd <= 0) { if (c.am >= D.RANGED[c.rg].use) fire(W, c, inp.ad || aimDir(c.yaw, c.pit)); else if (inp.atkE) W.note = '볼트 없음'; } }
+          else { if (c.swT <= 0) { c.swT = SW_CD; swing(W, c, c.yaw, c.pit); } doBreak(W, c, inp.bc, dt, true); }
+        } else { c.bkI = -1; c.bkP = 0; }
+        if (inp.use >= 0) { const why = useItem(W, c, inp.use, inp.ad || aimDir(c.yaw, c.pit)); if (why && !c.ai) W.note = why; }
+      } else {
+        const r = c.rin;
+        if (r) { c.atk = r.atk; c.bld = r.bld; if (r.atk && r.bk >= 0 && !(c.hand === 1 && c.rg)) doBreak(W, c, r.bk, dt, true); else { c.bkI = -1; c.bkP = 0; } }
+      }
+    }
+    stepProjectiles(W, dt);
+    stepWorldEnv(W, dt);
+  }
+  /* 손님: 자기 분대원만 움직이고 발판은 먼저 놓아 봄. 행동은 W.evOut에 쌓임 */
+  function guestStep(W, dt, c, inp) {
+    W.t += dt;
+    for (const [i, exp] of W.pend) if (W.t > exp) { W.pend.delete(i); if (W.g[i] >= 1 && W.g[i] <= 6) { W.g[i] = 0; W.chg.push(i); } }
+    if (!c || !c.al || !inp) return;
+    c.ox = c.x; c.oy = c.y; c.oz = c.z;
+    if (c.swT > 0) c.swT -= dt; if (c.fcd > 0) c.fcd -= dt; if (c.ucd > 0) c.ucd -= dt;
+    c.yaw = inp.yaw; c.pit = inp.pit || 0;
+    if (inp.sb) c.sb = inp.sb; if (inp.hand != null) c.hand = inp.hand && c.rg ? 1 : 0;
+    if (inp.buy) W.evOut.push(['B', inp.buy]);
+    doBuild(W, c, inp, dt, false);
+    moveChar(W, c, inp, dt);
+    c.atk = inp.atk ? 1 : 0;
+    const ad = inp.ad || aimDir(c.yaw, c.pit), q = (v) => Math.round(v * 1000);
+    if (inp.atk) {
+      if (c.hand === 1 && c.rg) { if (c.fcd <= 0) { const w = D.RANGED[c.rg]; if (c.am >= w.use) { c.fcd = w.cd; c.am -= w.use; W.evOut.push(['F', q(ad[0]), q(ad[1]), q(ad[2])]); } else if (inp.atkE) W.note = '볼트 없음'; } }
+      else { if (c.swT <= 0) { c.swT = SW_CD; c.swN = (c.swN + 1) & 15; W.evOut.push(['S', Math.round(c.yaw * 100), Math.round(c.pit * 100)]); } doBreak(W, c, inp.bc, dt, false); }
+    } else { c.bkI = -1; c.bkP = 0; }
+    if (inp.use >= 0 && c.ucd <= 0) { if (c.it[inp.use] > 0) { c.ucd = 0.45; W.evOut.push(['U', inp.use, q(ad[0]), q(ad[1]), q(ad[2])]); } else W.note = D.CONS[inp.use].nm + ' 없음'; }
+    if (c.y < -6 && c.vy < 0 && c.it[CI.float] > 0 && !(c.fx.flo > W.t)) { c.it[CI.float]--; c.vy = 20; c.fx.flo = W.t + 2.2; W.evOut.push(['U', CI.float, 0, 0, 0]); }
+  }
+  /* 호스트: 손님이 보낸 행동 */
+  function remoteEvent(W, c, q) {
+    if (!c || c.here) return;
+    const k = q[1];
+    if (k === 'P') place(W, c, q[2] | 0, q[3] | 0);
+    else if (k === 'S') { if (W.t - c.lastSw > 0.28 && c.al) swing(W, c, q[2] / 100, q[3] / 100); }
+    else if (k === 'F') { c.fcd = Math.min(c.fcd, 0.05); fire(W, c, [q[2] / 1000, q[3] / 1000, q[4] / 1000]); }
+    else if (k === 'U') { if ((q[2] | 0) === CI.float) { if (c.it[CI.float] > 0) { c.it[CI.float]--; ev(W, ['use', c.s, CI.float]); } } else { c.ucd = 0; useItem(W, c, q[2] | 0, [q[3] / 1000, q[4] / 1000, q[5] / 1000]); } }
+    else if (k === 'B') { const why = buy(W, c, String(q[2])); if (why) ev(W, ['no', c.s, why]); }
+  }
+
+  /* ======================= 봇 ======================= */
+  const LVP = [null,
+    { think: 1.3, react: 0.65, aim: 0.24, cad: 0.4, whiff: 0.32, items: 0, noise: 0.6, strafe: 0, rng: 0.25, turn: 6 },
+    { think: 0.8, react: 0.38, aim: 0.11, cad: 0.16, whiff: 0.13, items: 0.5, noise: 0.3, strafe: 0.5, rng: 0.6, turn: 9 },
+    { think: 0.45, react: 0.18, aim: 0.045, cad: 0, whiff: 0.03, items: 1, noise: 0.12, strafe: 1, rng: 1, turn: 14 }];
+  function aiInit(W, c) {
+    const R = prng((W.st.seed + c.s * 7919) >>> 0), mates = W.chars.filter((q) => q.t === c.t);
+    const A = c.A = { R, aggr: R(), greed: R(), caut: R(), think: R() * 0.5, goal: 'collect', gt: -1, path: null, pi: 0, pT: -9, tgt: -1, seeT: 0, stuck: 0, bd: 1e9, want: '', needB: 20, strafe: 1, strT: 0, useT: 0, def: 0, strat: (W.strat && W.strat[c.t]) || '', gl: null, yaw: c.yaw, lastG: [c.x, c.y, c.z], fireT: 0, fail: {}, swAt: 0, swHold: 0, miss: 0 };
+    if (mates.length > 1) { const k = mates.indexOf(c); A.def = k === (W.st.seed + c.t) % mates.length ? 1 : 0; }   // 분대마다 한 명은 수비 쪽으로 기움(고정 규칙이 아니라 점수 보정)
+  }
+  /* 길찾기: 서 있을 칸(발 칸) 그래프. 이동 종류 0 걷기 · 1 오르기 · 2 내려가기 · 3 다리 · 4 부수고 지나가기 */
+  let AS = null;
+  function findPath(W, c, goals, nb) {
+    if (!AS) AS = { gs: new Float32Array(NC), st: new Uint32Array(NC), from: new Int32Array(NC), mv: new Uint8Array(NC), stamp: 0, heap: [] };
+    const g = W.g, st = AS.st, gs = AS.gs, from = AS.from, mv = AS.mv, stamp = ++AS.stamp, heap = AS.heap; heap.length = 0;
+    let sx = cX(c.x), sy = cY(c.y + 0.02), sz = cZ(c.z);
+    while (sy > 1 && !solid(W, sx, sy - 1, sz)) sy--;
+    if (sy <= 1) return null;
+    const s = idx(sx, sy, sz), gx = iX(goals[0]), gz = iZ(goals[0]), gy = iY(goals[0]);
+    const isGoal = (i) => goals.indexOf(i) >= 0;
+    const hh = (x, y, z) => (Math.abs(x - gx) + Math.abs(z - gz) + Math.abs(y - gy) * 0.4) * 2.6;
+    const push = (i, f) => { let n = heap.length; heap.push(i, f); while (n > 0) { const p = ((n >> 1) - 1 >> 1) << 1; if (heap[p + 1] <= f) break; heap[n] = heap[p]; heap[n + 1] = heap[p + 1]; n = p; } heap[n] = i; heap[n + 1] = f; };
+    const pop = () => { const top = heap[0], li = heap[heap.length - 2], lf = heap[heap.length - 1]; heap.length -= 2; const len = heap.length; if (len) { let n = 0; for (;;) { let k = n * 2 + 2; if (k >= len) break; if (k + 2 < len && heap[k + 3] < heap[k + 1]) k += 2; if (heap[k + 1] >= lf) break; heap[n] = heap[k]; heap[n + 1] = heap[k + 1]; n = k; } heap[n] = li; heap[n + 1] = lf; } return top; };
+    st[s] = stamp; gs[s] = 0; from[s] = -1; mv[s] = 0; push(s, hh(sx, sy, sz));
+    const relax = (i, cost, cur, type, x, y, z) => { if (st[i] === stamp && gs[i] <= cost) return; st[i] = stamp; gs[i] = cost; from[i] = cur; mv[i] = type; push(i, cost + hh(x, y, z)); };
+    const DX = [1, -1, 0, 0], DZ = [0, 0, 1, -1], LY = NX * NZ;
+    let n = 0, end = -1;
+    while (heap.length && n++ < 9000) {
+      const cur = pop(); if (isGoal(cur)) { end = cur; break; }
+      const x = iX(cur), y = iY(cur), z = iZ(cur), gc = gs[cur];
+      for (let d = 0; d < 4; d++) {
+        const x2 = x + DX[d], z2 = z + DZ[d]; if (x2 < 1 || z2 < 1 || x2 > NX - 2 || z2 > NZ - 2) continue;
+        const i = idx(x2, y, z2), a = g[i], b = y + 1 < NY ? g[i + LY] : 0;
+        if (!a && !b) {
+          if (g[i - LY]) relax(i, gc + 1, cur, 0, x2, y, z2);
+          else {
+            let y2 = y - 1; while (y2 > y - 4 && y2 > 1 && !g[idx(x2, y2 - 1, z2)]) y2--;
+            if (y2 > 1 && g[idx(x2, y2 - 1, z2)] && y2 > y - 4) relax(idx(x2, y2, z2), gc + 1.3 + (y - y2) * 0.2, cur, 2, x2, y2, z2);
+            if (nb > 0 && !W.M.prot[i - LY]) relax(i, gc + 3.2, cur, 3, x2, y, z2);
+          }
+        } else {
+          if (a && y + 2 < NY && !b && !g[i + 2 * LY] && !g[cur + 2 * LY]) relax(i + LY, gc + 1.6, cur, 1, x2, y + 1, z2);
+          if ((a === 0 || (a >= 1 && a <= 6)) && (b === 0 || (b >= 1 && b <= 6))) {
+            const bt = (a ? breakTime(W, c, a) : 0) + (b ? breakTime(W, c, b) : 0);
+            if (bt < 30 && (g[i - LY] || nb > 0)) relax(i, gc + 1.5 + bt * 2.2 + (g[i - LY] ? 0 : 3), cur, 4, x2, y, z2);
+          }
+        }
+      }
+    }
+    if (end < 0) return null;
+    const out = []; let br = 0;
+    for (let i = end; i !== s && i >= 0; i = from[i]) { out.push([i, mv[i]]); if (mv[i] === 3 || (mv[i] === 4 && !g[i - LY])) br++; }
+    out.reverse();
+    return { p: out, br, cost: gs[end], t: W.t };
+  }
+  const cellOf = (x, y, z) => idx(clamp(cX(x), 1, NX - 2), clamp(cY(y + 0.02), 1, NY - 2), clamp(cZ(z), 1, NZ - 2));
+  function botShop(W, c) {
+    const A = c.A, tm = W.tm[c.t], P = LVP[c.lv], t = W.t, tot = blocks(c), cand = [];
+    const add = (id, u) => { if (u > 0) cand.push([id, u + (A.R() - 0.5) * P.noise * 0.5]); };
+    add('b1', tot < 12 ? 2.4 : tot < A.needB ? 1.5 : tot < 40 ? 0.2 : 0);
+    if (c.ml === 0) add('m1', 1.5 + A.aggr * 0.4); else if (c.ml === 1 || c.ml === 4) add('m2', 0.95 + A.aggr * 0.4);
+    if (c.ml < 3 || c.ml === 4) add('m3', 1.3);
+    if (c.ar === 0) add('a1', 1.25 + A.caut * 0.4); else if (c.ar === 1) add('a2', 0.9 + A.caut * 0.3);
+    if (c.ar < 3) add('a3', 1.25);
+    if (c.pk === 0) add('p1', 1.0 + A.aggr * 0.3); else if (c.pk === 1) add('p2', 0.6); else if (c.pk === 2) add('p3', 0.35);
+    if (!c.ax) add('x1', 0.45); if (!c.sh) add('sh', 0.4);
+    const sh = tm.core > 0 ? shellInfo(W, tm) : null;
+    if (sh && A.strat !== 'rush') { const first = sh.layer === 1; add(first ? (c.r[0] > 70 ? 's3' : 's2') : 's3', first ? 1.3 + A.caut * 0.5 + A.def * 0.5 + (tm.press || 0) * 0.4 + (A.strat === 'turtle' ? 1 : 0) : 0.4 + A.caut * 0.3 + A.def * 0.4 + (A.strat === 'turtle' ? 0.8 : 0)); if (c.r[2] >= 6) add('s6', 0.7 + A.def * 0.4); }
+    if (P.rng > 0.3) { if (!c.rg) add('r1', 0.5 + (1 - A.aggr) * 0.3); else if (c.am < 4) add('am', 0.9); }
+    if (P.items > 0) {
+      if (c.it[CI.heal] < 1) add('c_heal', 0.7 * P.items);
+      if (c.it[CI.tnt] < 1 && c.ml > 0) add('c_tnt', (0.45 + A.aggr * 0.4) * P.items);
+      if (c.it[CI.float] < 1) add('c_float', 0.8 * P.items);
+      if (c.it[CI.bridge] < 1 && P.items >= 1) add('c_bridge', 0.35);
+      if (c.it[CI.haste] < 1 && P.items >= 1) add('c_haste', 0.25);
+    }
+    const up = tm.up;
+    if (up[UI.forge] < 4) add('u_forge', 1.1 - up[UI.forge] * 0.2 + A.greed * 0.3);
+    if (!up[UI.sharp]) add('u_sharp', 0.9 + A.aggr * 0.3);
+    if (up[UI.plate] < 4) add('u_plate', 0.8 - up[UI.plate] * 0.1);
+    if (tm.core > 0) { if (up[UI.guard] < 2) add('u_guard', 0.6 + A.caut * 0.3); if (tm.core < 55) add('u_mend', 1.4); if (tm.traps.length < 2) add('t_' + D.TRAP[Math.floor(A.R() * 4)].id, 0.45); if (!up[UI.heal]) add('u_heal', 0.4); }
+    if (up[UI.haste] < 2) add('u_haste', 0.35);
+    cand.sort((a, b) => b[1] - a[1]);
+    A.want = '';
+    for (const q of cand) {
+      const e = D.SHOP[D.SI[q[0]]], why = whyNot(W, c, e);
+      if (!why) { if (q[1] >= cand[0][1] * 0.55) { buy(W, c, q[0]); return true; } continue; }
+      if (!A.want && why.indexOf('부족') >= 0) A.want = q[0];
+    }
+    void t;
+    return false;
+  }
+  function botThink(W, c) {
+    const A = c.A, P = LVP[c.lv], tm = W.tm[c.t], b = tm.b, t = W.t, R = A.R;
+    const dHome = Math.hypot(c.x - b.x, c.z - b.z), inBase = dHome < BASE_R && c.y > -2;
+    if (inBase) for (let k = 0; k < 3; k++) if (!botShop(W, c)) break;
+    const tot = blocks(c), sc = {}, nz = () => (R() - 0.5) * P.noise;
+    const want = A.want ? D.SHOP[D.SI[A.want]] : null, wc = want ? priceOf(W, c, want) || [0, 0, 0] : [0, 0, 0];
+    let intr = null, id = 1e9;
+    for (const e of W.chars) if (e.al && e.t !== c.t) { const d = Math.hypot(e.x - b.x, e.z - b.z); if (d < BASE_R + 3 && d < id) { id = d; intr = e; } }
+    if (tm.core > 0 && (intr || t - tm.hitT < 4)) sc.defend = 1.7 + A.caut * 0.7 + A.def * 0.6 + (t - tm.hitT < 4 ? 0.9 : 0) - dHome / 70;
+    else if (tm.core > 0 && P.strafe > 0) {   // 다가오는 적(우리 섬 쪽으로 반 넘게 건너옴)을 미리 맞으러 감 — 보통 · 어려움
+      for (const e of W.chars) if (e.al && e.t !== c.t) { const d = Math.hypot(e.x - b.x, e.z - b.z), eb = W.tm[e.t].b; if (d < 40 && d < Math.hypot(e.x - eb.x, e.z - eb.z) && (!intr || d < id)) { id = d; intr = e; } }
+      if (intr) sc.defend = 1.15 + A.caut * 0.5 + A.def * 0.6 - dHome / 60;
+    }
+    const gear = Math.min(3, c.ml) + c.ar + c.pk;
+    sc.collect = (wc[0] > c.r[0] ? 0.75 + Math.min(0.5, (wc[0] - c.r[0]) / 80) : 0.3) + (t < 22 ? 0.9 : 0) + A.def * 0.25 + (tot < 10 ? 0.5 : 0) - (c.r[0] > 150 ? 0.8 : 0) - gear * 0.1;
+    const canGo = tot >= 10;
+    const pr = tm.core > 0 ? (tm.press || 0) * (A.def || W.chars.filter((q) => q.t === c.t).length < 2 ? 0.6 : 0.25) : 0;   // 자꾸 쳐들어오면 섬을 덜 비움
+    sc.collect += pr * 0.6;
+    sc.cry = (0.75 + A.greed * 0.5 + (wc[1] > c.r[1] ? 0.35 : 0) - (c.r[1] >= 8 ? 0.7 : 0) - A.def * 0.3 - pr) * (canGo ? 1 : 0.2);
+    sc.ess = (0.5 + A.greed * 0.45 + (t > 0.35 * W.T ? 0.25 : 0) + (wc[2] > c.r[2] ? 0.3 : 0) - (c.r[2] >= 6 ? 0.7 : 0) - A.def * 0.3 - pr) * (canGo ? 1 : 0.2) * (t > 40 ? 1 : 0.3);
+    if (!inBase && (c.r[0] > 60 || c.r[1] >= 4 || c.r[2] >= 3 || (c.hp < 40 && !c.it[CI.heal]))) sc.home = 0.75 + (c.hp < 40 ? 0.9 * (0.4 + A.caut) : 0) + Math.min(0.6, c.r[1] * 0.1 + c.r[2] * 0.15);
+    const ready = (c.ml > 0 ? 0.3 : 0) + (c.ar > 0 ? 0.25 : 0) + (c.pk > 0 ? 0.25 : 0) + (tot >= A.needB ? 0.2 : 0);
+    let bt = -1, bs = -9;
+    for (const et of W.tm) {
+      if (et.t === c.t || et.out) continue;
+      const d = Math.hypot(c.x - et.b.x, c.z - et.b.z);
+      let home = 0; for (const e of W.chars) if (e.al && e.t === et.t && Math.hypot(e.x - et.b.x, e.z - et.b.z) < 22) home++;
+      const s = (et.core > 0 ? (et.core < 60 ? 0.3 : 0) + (home ? 0 : 0.55) + (t > 0.1 * W.T && shellInfo(W, et) && shellInfo(W, et).layer === 1 ? 0.2 : 0) : 0.2) - d / 220 + (A.gt === et.t ? 0.25 : 0) + nz() * 0.6;   // 비어 있는 섬 · 방벽 없는 핵을 노림
+      if (s > bs) { bs = s; bt = et.t; }
+    }
+    if (bt >= 0) sc.attack = 0.3 + A.aggr * 0.7 + ready * 0.9 + (t / W.T) * 1.0 + bs + (tm.core <= 0 ? 0.6 : 0) - A.def * (tm.core > 0 ? 0.55 : 0) - pr * 0.5 + (A.strat === 'rush' ? 2.5 : A.strat === 'turtle' && t < 0.7 * W.T ? -3 : -(1 - Math.min(1, t / (0.3 * W.T))) * 1.4) - (t < 0.1 * W.T - 14 ? 3 : 0);
+    let ne = null, nd = 1e9;
+    for (const e of W.chars) if (e.al && e.t !== c.t) { const d = Math.hypot(e.x - c.x, e.y - c.y, e.z - c.z); if (d < nd && (e.fx.cloak <= t || d < 4)) { nd = d; ne = e; } }
+    if (ne && nd < 9) sc.fight = 1.25 + A.aggr * 0.7 - (c.hp < 40 ? 0.9 : 0) + (nd < 4 ? 0.6 : 0);
+    const rNow = Math.hypot(c.x, c.z);
+    if (t > 0.8 * W.T - 20 && rNow > stormR(W, t + 14) - 4) sc.center = 3.6;
+    if (t > 0.7 * W.T && sc.attack != null) sc.attack += 0.8;
+    let best = 'collect', bv = -9;
+    for (const k in sc) { const v = sc[k] + nz() + (k === A.goal ? 0.3 : 0) - (A.fail[k] > t ? 2.5 : 0); if (v > bv) { bv = v; best = k; } }
+    /* 목표 → 갈 칸 */
+    let goals = null, gl = null;
+    const gcell = (cx, cz) => idx(cx, G0, cz);
+    if (best === 'collect') goals = [gcell(b.gen[0], b.gen[1])];
+    else if (best === 'home') goals = [gcell(b.sp[0], b.sp[1])];
+    else if (best === 'cry' || best === 'ess') {
+      const k = best === 'cry' ? 1 : 2; let bg = null, bd = 1e9;
+      for (const g of W.gens) { if (g.k !== k) continue; const d = Math.hypot(g.x - c.x, g.z - c.z) - g.stock * 4 + (A.gl === g ? -8 : 0); if (d < bd) { bd = d; bg = g; } }
+      if (bg) { goals = [gcell(bg.cx, bg.cz)]; gl = bg; }
+    } else if (best === 'attack') {
+      const et = W.tm[bt]; A.gt = bt;
+      if (et.core > 0) { const x = et.b.core[0], z = et.b.core[1]; goals = [gcell(x - 1, z), gcell(x + 1, z), gcell(x, z - 1), gcell(x, z + 1)].filter((i) => W.g[i - NX * NZ]); goals.sort((p, q) => Math.hypot(wX(iX(p)) - c.x, wX(iZ(p)) - c.z) - Math.hypot(wX(iX(q)) - c.x, wX(iZ(q)) - c.z)); }
+      else { let e2 = null, d2 = 1e9; for (const e of W.chars) if (e.al && e.t === bt) { const d = Math.hypot(e.x - c.x, e.z - c.z); if (d < d2) { d2 = d; e2 = e; } } if (e2) goals = [cellOf(e2.x, e2.y, e2.z)]; }
+    } else if (best === 'defend') goals = intr ? [cellOf(intr.x, intr.y, intr.z)] : [gcell(b.core[0] - b.dir[0], b.core[1] - b.dir[1])];
+    else if (best === 'fight') goals = [cellOf(ne.x, ne.y, ne.z)];
+    else if (best === 'center') { goals = []; for (const g of W.gens) if (g.k === 2) goals.push(gcell(g.cx, g.cz)); goals.sort((p, q) => Math.hypot(wX(iX(p)) - c.x, wX(iZ(p)) - c.z) - Math.hypot(wX(iX(q)) - c.x, wX(iZ(q)) - c.z)); }
+    A.goal = best; A.gl = gl;
+    if (!goals || !goals.length) { A.path = null; return; }
+    const here = cellOf(c.x, c.y, c.z);
+    if (goals.indexOf(here) >= 0 && c.gr) { A.path = { p: [], br: 0, t }; A.pi = 0; return; }
+    if (W.pathN >= 2) { A.think = 0.1; return; }
+    W.pathN++;
+    const path = findPath(W, c, goals, tot);
+    if (!path) { A.path = null; A.fail[best] = t + 6; A.think = 0.15; return; }
+    if (path.br > tot) {   // 다리 재료가 모자람 → 먼저 보급
+      A.needB = Math.min(64, path.br + 6); A.path = null;
+      if (best !== 'center') { A.goal = 'collect'; if (!inBase || c.r[0] < 4) { const p2 = findPath(W, c, [gcell(b.gen[0], b.gen[1])], tot); if (p2 && p2.br <= tot) { A.path = p2; A.pi = 0; } } }
+      return;
+    }
+    A.needB = Math.max(16, Math.min(64, path.br + 8));
+    A.path = path; A.pi = 0; A.stuck = 0; A.bd = 1e9;
+  }
+  function aiInput(W, c, dt) {
+    if (!c.A) aiInit(W, c);
+    const A = c.A, P = LVP[c.lv], t = W.t, R = A.R;
+    const inp = { mx: 0, mz: 0, yaw: c.yaw, pit: 0, jump: 0, build: 0, atk: 0, careful: 1, pc: -1, bc: -1, use: -1, hand: 0, buy: '' };
+    if (!c.al) return inp;
+    if (c.gr) A.lastG = [c.x, c.y, c.z];
+    A.think -= dt;
+    if (A.think <= 0) { A.think = P.think * (0.8 + R() * 0.4); botThink(W, c); }
+    let wantYaw = null, wantPit = 0;
+    /* 길 따라가기 */
+    const path = A.path;
+    if (path && path.p.length) {
+      while (A.pi < path.p.length) {
+        const q = path.p[A.pi], x = wX(iX(q[0])), z = wX(iZ(q[0])), y = wY(iY(q[0]));
+        if (Math.abs(c.x - x) < 0.5 && Math.abs(c.z - z) < 0.5 && Math.abs(c.y - y) < 0.7) { A.pi++; A.stuck = 0; A.bd = 1e9; } else break;
+      }
+      if (A.pi < path.p.length) {
+        const q = path.p[A.pi], i = q[0], x = wX(iX(i)), z = wX(iZ(i)), y = wY(iY(i)), LY = NX * NZ;
+        let type = q[1]; const a = W.g[i], b2 = W.g[i + LY];
+        const dx = x - c.x, dz = z - c.z, d = Math.hypot(dx, dz) || 1e-3;
+        if (type === 4 && !a && !b2) type = W.g[i - LY] ? 0 : 3;
+        if (type !== 4 && type !== 1 && (a || b2) && y <= c.y + 0.2) { if ((a === 0 || a < 7) && (b2 === 0 || b2 < 7)) type = 4; else { A.path = null; A.think = 0; } }
+        if (type === 4) {
+          const bi = b2 && b2 < 7 ? i + LY : i;
+          inp.bc = bi; inp.atk = 1;
+          const ty = wY(iY(bi)) + 0.5 - (c.y + EYE);
+          wantYaw = Math.atan2(dx, dz); wantPit = Math.atan2(ty, d);
+          if (d > 2.6) { inp.mx = dx / d; inp.mz = dz / d; }
+        } else {
+          inp.mx = dx / d; inp.mz = dz / d;
+          if (type === 3 || (type === 0 && !W.g[i - LY])) { if (blocks(c) > 0) inp.build = 1; else { A.path = null; A.think = 0; A.needB = 24; } }
+          if (type === 2) inp.careful = Math.abs(c.y - y) < 0.3 ? 1 : 0;
+          if (type === 1 && c.gr && d < 2.4) inp.jump = 1;
+          wantYaw = Math.atan2(dx, dz);
+        }
+        const pd = d + Math.abs(c.y - y);
+        if (pd < A.bd - 0.05) { A.bd = pd; A.stuck = 0; } else A.stuck += dt;
+        if (A.stuck > 1.0 && type !== 4 && c.gr) inp.jump = 1;
+        if (A.stuck > (type === 4 ? 14 : 2.4)) { A.path = null; A.think = 0; A.stuck = 0; }
+        if (t - path.t > 4 && A.goal !== 'attack') { A.think = Math.min(A.think, 0.05); }
+      }
+    }
+    /* 싸움 */
+    let e = null, ed = 1e9;
+    for (const q of W.chars) { if (!q.al || q.t === c.t) continue; const d = Math.hypot(q.x - c.x, q.y - c.y, q.z - c.z); if (d < ed && d < 30 && (q.fx.cloak <= t || d < 4)) { ed = d; e = q; } }
+    if (e !== null && A.tgt !== e.s) { A.tgt = e.s; A.seeT = t; }
+    const seen = e && t - A.seeT > P.react;
+    if (seen && ed < MREACH + 0.6 && inp.bc < 0 && los(W, c.x, c.y + EYE, c.z, e.x, e.y + 1, e.z)) {
+      wantYaw = Math.atan2(e.x - c.x, e.z - c.z) + Math.sin(t * 3.1 + c.s) * P.aim * 2; wantPit = 0;
+      /* 난이도: 휘두르는 간격(cad초 더 쉼) · 헛손질(whiff) */
+      if (c.swT <= 0 && t >= A.swAt) { A.swAt = t + SW_CD + P.cad * (0.6 + R() * 0.8); A.miss = R() < P.whiff ? (R() < 0.5 ? 1.5 : -1.5) : 0; A.swHold = t + 0.08; }
+      if (t < A.swHold) { if (A.miss) wantYaw += A.miss; else if (Math.abs(angD(c.yaw, wantYaw)) < 0.9) inp.atk = 1; if (A.miss) { inp.atk = 1; A.yaw = wantYaw; } }
+      if (A.goal === 'fight' || A.goal === 'defend' || !path || A.pi >= (path.p.length || 0)) {
+        const dx = e.x - c.x, dz = e.z - c.z, d = Math.hypot(dx, dz) || 1;
+        if (t > A.strT) { A.strT = t + 0.5 + R() * 0.7; A.strafe = R() < 0.5 ? -1 : 1; }
+        let fw = d > 2.2 ? 1 : d < 1.4 ? -0.6 : 0.1, sd = P.strafe * A.strafe * 0.8;
+        /* 등 뒤가 허공이면(밀려 떨어질 자리) 물러서지 않고 옆으로 돌아 자리를 바꿈 — 보통 · 어려움 */
+        if (P.strafe > 0 && !supported(W, c.x - dx / d * 2.4, c.y, c.z - dz / d * 2.4)) { fw = Math.max(fw, 0.5); sd = A.strafe * (0.6 + P.strafe * 0.5); }
+        inp.mx = dx / d * fw - dz / d * sd; inp.mz = dz / d * fw + dx / d * sd; inp.build = 0;
+        if (P.strafe >= 1 && c.gr && R() < 0.02) inp.jump = 1;
+      }
+    } else if (seen && c.rg && c.am >= D.RANGED[c.rg].use && ed > 6 && ed < 30 && inp.bc < 0 && t > A.fireT && los(W, c.x, c.y + EYE, c.z, e.x, e.y + 1, e.z)) {
+      const w = D.RANGED[c.rg], tt = ed / w.spd, er = () => (R() - 0.5) * 2 * P.aim * ed * 0.35;
+      const ax = e.x + e.vx * tt * P.rng + er() - c.x, ay = e.y + 1.0 + 0.5 * w.g * tt * tt + er() * 0.5 - (c.y + 1.4), az = e.z + e.vz * tt * P.rng + er() - c.z;
+      inp.hand = 1; inp.atk = 1; inp.ad = [ax, ay, az]; wantYaw = Math.atan2(ax, az);
+      if (c.fcd <= 0) A.fireT = t + w.cd + (1.2 - P.rng) * (0.5 + R());
+      if (inp.build) inp.atk = 0;
+    } else if (path && A.pi >= path.p.length) {
+      /* 도착해서 할 일 */
+      if (A.goal === 'attack' && A.gt >= 0 && W.tm[A.gt].core > 0) { const et = W.tm[A.gt], dx = et.b.cx - c.x, dz = et.b.cz - c.z; wantYaw = Math.atan2(dx, dz); wantPit = Math.atan2(1 - (c.y + EYE), Math.hypot(dx, dz)); inp.atk = 1; }
+      else if (A.goal === 'collect' || A.goal === 'cry' || A.goal === 'ess') { const b = W.tm[c.t].b; if (A.goal === 'collect') wantYaw = b.yaw; }
+    }
+    /* 물건 */
+    if (P.items > 0 && t > A.useT) {
+      if (c.hp < 45 && c.it[CI.heal] > 0) { inp.use = CI.heal; A.useT = t + 1; }
+      else if (A.goal === 'attack' && A.gt >= 0 && c.it[CI.tnt] > 0 && W.tm[A.gt].core > 0) {
+        const et = W.tm[A.gt], dx = et.b.cx - c.x, dz = et.b.cz - c.z, d = Math.hypot(dx, dz);
+        if (d > 5.5 && d < 10 && !coreExposed(W, et)) { inp.use = CI.tnt; inp.ad = [dx / d, 0.12, dz / d]; A.useT = t + 4; }
+      } else if (P.items >= 1 && c.it[CI.haste] > 0 && seen && ed < 8 && c.fx.haste < t) { inp.use = CI.haste; A.useT = t + 1; }
+      else if (P.items >= 1 && c.it[CI.bridge] > 0 && path && inp.build && c.gr) {
+        let k = 0; while (A.pi + k < path.p.length && path.p[A.pi + k][1] === 3 && (k === 0 || (iX(path.p[A.pi + k][0]) - iX(path.p[A.pi + k - 1][0]) === iX(path.p[A.pi][0]) - cX(c.x) && iZ(path.p[A.pi + k][0]) - iZ(path.p[A.pi + k - 1][0]) === iZ(path.p[A.pi][0]) - cZ(c.z)))) k++;
+        if (k >= 7 && Math.abs(c.x - wX(cX(c.x))) < 0.6 && Math.abs(c.z - wX(cZ(c.z))) < 0.6) { inp.use = CI.bridge; inp.ad = [iX(path.p[A.pi][0]) - cX(c.x), 0, iZ(path.p[A.pi][0]) - cZ(c.z)]; if (inp.ad[0] || inp.ad[2]) A.useT = t + 3; else inp.use = -1; }
+      }
+    }
+    if (wantYaw != null) { const dy = angD(wantYaw, A.yaw), mx = P.turn * dt; A.yaw += clamp(dy, -mx, mx); }
+    inp.yaw = A.yaw; inp.pit = wantPit;
+    return inp;
+  }
+
+  /* ======================= 네트워크 묶기 ======================= */
+  const enc = (i, id) => { const s = i.toString(36); return '0000'.slice(s.length) + s + id.toString(36); };
+  function packChar(c) {
+    const f = (c.al ? 1 : 0) | (c.gr ? 2 : 0) | (c.bld ? 4 : 0) | (c.fx.cloak > 0 ? 8 : 0) | (c.atk ? 128 : 0);
+    return [Math.round(c.x * 20), Math.round(c.y * 20), Math.round(c.z * 20), Math.round(c.yaw * 100), Math.round(c.pit * 100), f, c.hand | (c.sb << 1), c.atk ? c.bkI : -1, Math.round(c.vx * 10), Math.round(c.vy * 10), Math.round(c.vz * 10)];
+  }
+  function packHost(W, full) {
+    const t = W.t, o = { t: Math.round(t * 100) / 100, q: W.logSeq, p: [], iv: {}, tm: [], g: [], pj: [], tn: [], ev: [] };
+    for (const c of W.chars) {
+      const f = (c.al ? 1 : 0) | (c.gr ? 2 : 0) | (c.bld ? 4 : 0) | (c.fx.cloak > t ? 8 : 0) | (c.inv > t ? 16 : 0) | (c.fx.mark > t ? 32 : 0) | (c.out ? 64 : 0) | (c.atk ? 128 : 0);
+      o.p.push([Math.round(c.x * 20), Math.round(c.y * 20), Math.round(c.z * 20), Math.round(c.yaw * 100), Math.round(c.pit * 100), f, Math.round(c.hp), c.hand | (c.ml << 1) | (c.rg << 4) | (c.ar << 6) | (c.sb << 8), c.swN, c.atk ? c.bkI : -1, Math.round(c.bkP * 20)]);
+      if (!c.here) { const fx = c.fx, r = (v) => Math.max(0, Math.round((v - t) * 10)); o.iv[c.s] = [c.r[0], c.r[1], c.r[2], c.b.slice(1), c.am, c.pk, c.ax, c.sh, c.it, r(c.rsT), [r(fx.haste), r(fx.jump), r(fx.slow), r(fx.weak), r(fx.rally)], c.st.k, c.st.d]; }
+    }
+    for (const tm of W.tm) o.tm.push([Math.round(tm.core), tm.up.join(''), tm.traps.join(''), t - tm.intrT < 1.5 ? 1 : 0, t - tm.hitT < 2 ? 1 : 0, tm.out]);
+    for (const g of W.gens) o.g.push(g.stock);
+    for (const p of W.pj) o.pj.push([p.id, p.k, Math.round(p.x * 10), Math.round(p.y * 10), Math.round(p.z * 10), Math.round(p.vx * 10), Math.round(p.vy * 10), Math.round(p.vz * 10)]);
+    for (const q of W.tnt) o.tn.push([Math.round(q.x * 10), Math.round(q.y * 10), Math.round(q.z * 10), Math.round((q.t - t) * 10)]);
+    for (const e of W.ev) if (t - e[e.length - 1] < 1.6) o.ev.push(e.slice(0, -1));
+    if (W.log.length) { let s = ''; for (const l of W.log) s += enc(l[1], l[2]); o.bl = [W.log[0][0], s]; }
+    if (full) { let s = ''; for (const i of W.touched) s += enc(i, W.g[i]); o.fs = s; }
+    return o;
+  }
+  /* 손님: 호스트 소식 반영. me = 내 자리(-1 관전) */
+  function applyHost(W, hs, me, now) {
+    if (typeof hs.t === 'number') { if (Math.abs(hs.t - W.t) > 0.5) W.t = hs.t; else W.t += (hs.t - W.t) * 0.1; }
+    const t = W.t;
+    if (hs.fs != null && hs.q !== W.fsQ) {
+      W.fsQ = hs.q; const keep = new Set();
+      for (let k = 0; k + 5 <= hs.fs.length; k += 5) { const i = parseInt(hs.fs.slice(k, k + 4), 36), id = parseInt(hs.fs[k + 4], 36); keep.add(i); if (W.g[i] !== id && !W.pend.has(i)) { W.g[i] = id; W.chg.push(i); } W.touched.add(i); }
+      for (const i of W.touched) if (!keep.has(i) && !W.pend.has(i) && W.g[i] !== W.M.g0[i]) { W.g[i] = W.M.g0[i]; W.chg.push(i); }
+      W.gseq = hs.q; W.needSync = false;
+    }
+    if (hs.bl) {
+      const a = hs.bl[0], s = hs.bl[1], n = s.length / 5;
+      if (a > W.gseq + 1) W.needSync = true;
+      else for (let k = Math.max(0, W.gseq + 1 - a); k < n; k++) { const i = parseInt(s.slice(k * 5, k * 5 + 4), 36), id = parseInt(s[k * 5 + 4], 36); W.pend.delete(i); if (W.g[i] !== id) { W.g[i] = id; W.chg.push(i); } W.touched.add(i); W.gseq = a + k; }
+    } else if (hs.q > W.gseq) W.needSync = true;
+    for (let s = 0; s < W.chars.length && s < hs.p.length; s++) {
+      const c = W.chars[s], p = hs.p[s], f = p[5], wasAl = c.al;
+      c.al = f & 1; c.out = f & 64 ? 1 : 0; c.hp = p[6]; c.inv = f & 16 ? t + 0.3 : 0; c.fx.mark = f & 32 ? t + 0.3 : 0;
+      c.ml = (p[7] >> 1) & 7; c.rg = (p[7] >> 4) & 3; c.ar = (p[7] >> 6) & 3;
+      if (s !== me) {
+        c.snap = { x: p[0] / 20, y: p[1] / 20, z: p[2] / 20, t: now }; c.yawT = p[3] / 100; c.pit = p[4] / 100; c.gr = f & 2 ? 1 : 0; c.bld = f & 4 ? 1 : 0; c.atk = f & 128 ? 1 : 0; c.fx.cloak = f & 8 ? t + 0.3 : 0;
+        c.hand = p[7] & 1; c.sb = (p[7] >> 8) & 7; c.swN = p[8]; c.bkI = p[9]; c.bkP = p[10] / 20;
+        if (!wasAl && c.al) { c.x = c.snap.x; c.y = c.snap.y; c.z = c.snap.z; }
+      } else if (hs.iv && hs.iv[s]) {
+        const v = hs.iv[s]; c.r = [v[0], v[1], v[2]];
+        const lag = W.pend.size > 0 || c.plT > 0;   // 방금 놓은 발판 수는 호스트 답이 올 때까지 내 값
+        if (!lag) for (let m = 1; m <= 6; m++) c.b[m] = v[3][m - 1];
+        if (c.fcd <= 0.05) c.am = v[4];
+        c.pk = v[5]; c.ax = v[6]; c.sh = v[7]; if (c.ucd <= 0.05) c.it = v[8].slice(); c.rsT = v[9] ? t + v[9] / 10 : 0;
+        const fx = v[10]; c.fx.haste = fx[0] ? t + fx[0] / 10 : 0; c.fx.jump = fx[1] ? t + fx[1] / 10 : 0; c.fx.slow = fx[2] ? t + fx[2] / 10 : 0; c.fx.weak = fx[3] ? t + fx[3] / 10 : 0; c.fx.rally = fx[4] ? t + fx[4] / 10 : 0;
+        c.st.k = v[11]; c.st.d = v[12]; c.fx.cloak = f & 8 ? t + 0.3 : 0;
+      }
+    }
+    hs.tm.forEach((v, i) => { const tm = W.tm[i]; if (!tm) return; tm.core = v[0]; tm.up = v[1].split('').map(Number); tm.traps = v[2].split('').map(Number); if (v[3]) tm.intrT = t; if (v[4]) tm.hitT = t; tm.out = v[5]; });
+    hs.g.forEach((v, i) => { if (W.gens[i]) W.gens[i].stock = v; });
+    W.pj = hs.pj.map((p) => ({ id: p[0], k: p[1], x: p[2] / 10, y: p[3] / 10, z: p[4] / 10, vx: p[5] / 10, vy: p[6] / 10, vz: p[7] / 10, g: p[1] <= 3 ? D.RANGED[p[1]].g : p[1] === 10 ? 16 : p[1] === 12 ? 14 : 0 }));
+    W.tnt = hs.tn.map((q) => ({ x: q[0] / 10, y: q[1] / 10, z: q[2] / 10, t: t + q[3] / 10 }));
+    const out = [];
+    for (const e of hs.ev) { if (e[0] <= (W.evSeen || 0)) continue; W.evSeen = e[0]; out.push(e);
+      const c = W.chars[me];
+      if (c && e[1] === 'K' && e[2] === me) { c.vx += e[3] / 10; c.vy = Math.max(c.vy, 0) + e[4] / 10; c.vz += e[5] / 10; c.gr = 0; c.kbT = 0.4; }
+      if (c && e[1] === 'T' && e[2] === me) { c.x = c.ox = e[3] / 20; c.y = c.oy = e[4] / 20; c.z = c.oz = e[5] / 20; c.vx = c.vy = c.vz = 0; c.tpYaw = e[6] / 100; }
+      if (e[1] === 'ph') W.ph = e[2] + 1;
+    }
+    W.stormR = stormR(W, t);
+    return out;
+  }
+  /* 호스트: 손님 자리의 위치 소식 */
+  function ingest(W, s, a, now) {
+    const c = W.chars[s]; if (!c || c.here || !Array.isArray(a)) return;
+    const x = a[0] / 20, y = a[1] / 20, z = a[2] / 20;
+    if (W.t < c.tpT && Math.hypot(x - c.x, y - c.y, z - c.z) > 5) return;
+    c.tpT = 0;
+    c.snap = { x, y, z, t: now }; c.yawT = a[3] / 100; c.pit = a[4] / 100; c.gr = a[5] & 2 ? 1 : 0;
+    c.rin = { atk: a[5] & 128 ? 1 : 0, bld: a[5] & 4 ? 1 : 0, bk: a[7] }; c.hand = a[6] & 1 && c.rg ? 1 : 0; c.sb = (a[6] >> 1) & 7 || 1;
+    c.vx = (a[8] || 0) / 10; c.vy = (a[9] || 0) / 10; c.vz = (a[10] || 0) / 10;
+  }
+  /* 다른 기기가 움직이는 분대원을 부드럽게 따라감(화면 프레임마다) */
+  function smooth(W, c, dt, now) {
+    const s = c.snap; if (!s) return;
+    const age = Math.min(0.2, (now - s.t) / 1000), tx = s.x + c.vx * age * 0, ty = s.y, tz = s.z + c.vz * age * 0, k = 1 - Math.exp(-dt * 14);
+    c.ox = c.x; c.oy = c.y; c.oz = c.z;
+    if (Math.hypot(tx - c.x, ty - c.y, tz - c.z) > 6) { c.x = tx; c.y = ty; c.z = tz; } else { c.x += (tx - c.x) * k; c.y += (ty - c.y) * k; c.z += (tz - c.z) * k; }
+    if (c.yawT != null) c.yaw += angD(c.yawT, c.yaw) * k;
+    c.ox = c.x; c.oy = c.y; c.oz = c.z;
+  }
+
+  Object.assign(S, { NX, NZ, NY, CS, G0, GY, NC, C0, DT, HW, PH, EYE, REACH, MREACH, BASE_R, RESPAWN, idx, cX, cY, cZ, wX, wY, iX, iY, iZ, inB, prng, angD, genMap, makeWorld, worldStep, guestStep, remoteEvent, aiInput, aiInit, ray, los, canPlace, blocks, pickMat, nextMat, toolPower, breakTime, whyNot, priceOf, buy, shellInfo, stormR, packChar, packHost, applyHost, ingest, smooth, aimDir, bridgeCell, coreExposed, findPath, supported, hitBox, finish });
+  D.sim = S;
+  if (typeof module === 'object' && module) module.exports = S;
+})();

@@ -1,0 +1,1437 @@
+/* 황제와 노예 (ecard) — 황제·시민·노예 다섯 장으로 하는 2인 심리전. 3명 이상이면 1:1 토너먼트.
+   규칙 요약: 한 판(세트)마다 한쪽은 황제 1 + 시민 4, 다른 쪽은 노예 1 + 시민 4. 한 수마다 둘이 동시에 한 장씩 엎어 내고 공개.
+   황제 > 시민 > 노예 > 황제. 시민끼리는 버리고 다음 수. 3판마다 측을 바꾼다. 노예 측이 이기면 판돈 5배.
+   웃돈(선택): 매 수 카드를 내기 전에 0·1·2를 동시에 걸고 공개 — 이번 수에서 이기면 받고, 지거나 시민끼리 비기면 상대에게 넘어간다.
+   상태는 JSON. 숨김 정보는 이번 수에 고른 카드(pc)·걸 값(pb)뿐 — 손패 구성은 공개 정보다. */
+(function () {
+  const L = window.Lounge, U = L.util;
+  const ID = 'ecard';
+  const HAND = 5, SWAP = 3, START = 30, STEP_SETS = 6, OT_MAX = 6;
+  const LEN = { s: 6, m: 12, l: 18 };
+  const SAY = ['이번 수에 건다.', '아직이다.', '지금이다.', '손이 떨리는군.', '읽혔다.', '믿든 말든.', '후회할 거다.', '……'];
+
+  /* ---------- 작은 도우미 ---------- */
+  function hash() {   // 결정적 0~1 (AI 의도를 상태에 저장하지 않고 다시 만들기 위해)
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < arguments.length; i++) {
+      let x = (arguments[i] | 0) >>> 0;
+      for (let j = 0; j < 4; j++) { h ^= x & 255; h = Math.imul(h, 16777619) >>> 0; x >>>= 8; }
+    }
+    h ^= h >>> 13; h = Math.imul(h, 0x5bd1e995) >>> 0; h ^= h >>> 15;
+    return (h >>> 0) / 4294967296;
+  }
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const other = (m, seat) => (m.p[0] === seat ? m.p[1] : m.p[0]);
+  const ix = (m, seat) => (m.p[0] === seat ? 0 : 1);
+
+  /* 지금 판의 황제 측 자리 */
+  function empOf(s) {
+    const m = s.m;
+    if (m.set <= s.len) return Math.floor((m.set - 1) / SWAP) % 2 === 0 ? m.e0 : other(m, m.e0);
+    return (m.set - s.len) % 2 === 1 ? m.e0 : other(m, m.e0);
+  }
+  /* 판돈: 6판마다 1씩 오름(연장은 마지막 판돈) */
+  const stakeOf = (s, set) => 1 + Math.floor((Math.min(set, s.len) - 1) / STEP_SETS);
+
+  /* ---------- 대진표 ---------- */
+  const SLOTS = { 4: [1, 4, 2, 3], 8: [1, 8, 4, 5, 2, 7, 3, 6] };
+  function buildCup(n) {
+    const seeds = U.shuffle(Array.from({ length: n }, (_, i) => i));
+    const P = n <= 4 ? 4 : 8;
+    const sl = SLOTS[P].map((k) => (k <= n ? seeds[k - 1] : -1));
+    const r0 = [];
+    for (let i = 0; i < sl.length; i += 2) r0.push([sl[i], sl[i + 1], -1]);
+    return { R: [r0], ri: 0, mi: 0, nr: Math.log2(P) };
+  }
+  const RNAME = (nr, ri) => { const left = nr - ri; return left === 1 ? '결승' : left === 2 ? '4강' : '8강'; };
+
+  /* ---------- 시작 ---------- */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length;
+    const s = {
+      v: 1, n, len: LEN[opts.len] || 12, bt: opts.bets === 'off' ? 0 : 1, tm: +opts.timer || 0,
+      sd: (Math.random() * 1e9) | 0, eid: 0, mno: 0, m: null, cup: null,
+      ph: 'bet', pb: {}, pc: {}, bets: null, last: null,
+      hist: [], sets: [], chat: [],
+      acc: { sw: Array(n).fill(0), slw: Array(n).fill(0), bn: Array(n).fill(0), big: Array(n).fill(0), mw: Array(n).fill(0) },
+      out: Array(n).fill(-1), champ: -1, win: -1,
+      nm: players.map((p, i) => String((p && p.name) || ('자리 ' + (i + 1))).slice(0, 14)),
+    };
+    if (n <= 2) startMatch(s, 0, 1);
+    else { s.cup = buildCup(n); nextCupMatch(s); }
+    return s;
+  }
+
+  function startMatch(s, a, b) {
+    s.mno++;
+    const e0 = Math.random() < 0.5 ? a : b;
+    s.m = { no: s.mno, p: [a, b], ch: [START, START], set: 1, k: HAND, e0, sw: [0, 0], slw: [0, 0] };
+    s.m.B = stakeOf(s, 1);
+    s.m.emp = empOf(s);
+    s.ph = s.bt ? 'bet' : 'card'; s.pb = {}; s.pc = {}; s.bets = null;
+  }
+
+  /* 토너먼트: 다음 경기(부전승은 바로 올림) */
+  function nextCupMatch(s) {
+    const c = s.cup;
+    for (;;) {
+      const R = c.R[c.ri];
+      const i = R.findIndex((x) => x[2] < 0);
+      if (i < 0) {
+        const W = R.map((x) => x[2]);
+        if (W.length === 1) { s.champ = W[0]; s.out[W[0]] = c.nr; s.ph = 'over'; s.m = s.m || null; return; }
+        const nx = [];
+        for (let j = 0; j < W.length; j += 2) nx.push([W[j], W[j + 1], -1]);
+        c.R.push(nx); c.ri++; continue;
+      }
+      const x = R[i];
+      if (x[0] < 0 || x[1] < 0) { x[2] = x[0] < 0 ? x[1] : x[0]; continue; }
+      c.mi = i;
+      startMatch(s, x[0], x[1]);
+      return;
+    }
+  }
+
+  /* ---------- 차례 ---------- */
+  function actor(s) {
+    if (s.ph === 'over' || !s.m) return null;
+    const box = s.ph === 'bet' ? s.pb : s.pc;
+    const l = s.m.p.filter((x) => box[x] == null);
+    return l.length ? l : null;
+  }
+
+  function offTurn(s, seat, a) { return !!a && a.t === 'say'; }
+
+  function pushSay(s, seat, k) {
+    if (!(k >= 0 && k < SAY.length) || seat < 0 || seat >= s.n) return false;
+    const now = Date.now();
+    const lastMine = s.chat.filter((c) => c.s === seat).pop();
+    if (lastMine && now - lastMine.at < 1200) return false;
+    s.eid++;
+    s.chat.push({ i: s.eid, s: seat, k, at: now });
+    if (s.chat.length > 8) s.chat.shift();
+    return true;
+  }
+
+  function apply(s, seat, a) {
+    if (!a || typeof a !== 'object') throw new Error('bad action');
+    if (a.t === 'say') { if (!pushSay(s, seat, a.k | 0)) throw new Error('say rejected'); return s; }
+    const act = actor(s);
+    if (!act || !act.includes(seat)) throw new Error('not your turn');
+    const m = s.m, me = ix(m, seat);
+    if (a.say != null) pushSay(s, seat, a.say | 0);
+    if (a.t === 'bet') {
+      if (s.ph !== 'bet') throw new Error('not betting');
+      const v = clamp(a.v | 0, 0, Math.min(2, m.ch[me]));
+      s.pb[seat] = v;
+      if (m.p.every((x) => s.pb[x] != null)) {
+        s.bets = [s.pb[m.p[0]], s.pb[m.p[1]]];
+        s.pb = {}; s.ph = 'card'; s.eid++;
+        s.last = { id: s.eid, t: 'bets', b: s.bets.slice(), mno: m.no };
+      }
+      return s;
+    }
+    if (a.t === 'card') {
+      if (s.ph !== 'card') throw new Error('not card phase');
+      if (a.c !== 'K' && a.c !== 'C') throw new Error('bad card');
+      if (a.c === 'C' && m.k <= 1) throw new Error('no citizen left');
+      s.pc[seat] = a.c;
+      if (m.p.every((x) => s.pc[x] != null)) resolve(s);
+      return s;
+    }
+    throw new Error('unknown action');
+  }
+
+  /* 칩 옮기기(가진 만큼만) → 실제 옮긴 양 */
+  function pay(m, from, to, amt) {
+    const fi = ix(m, from), ti = ix(m, to);
+    const v = Math.max(0, Math.min(amt, m.ch[fi]));
+    m.ch[fi] -= v; m.ch[ti] += v;
+    return v;
+  }
+
+  function resolve(s) {
+    const m = s.m, e = m.emp, sl = other(m, e);
+    const bets = s.bets || [0, 0];
+    const be = bets[ix(m, e)], bs = bets[ix(m, sl)];
+    const ke = s.pc[e] === 'K', ks = s.pc[sl] === 'K';
+    const B = m.B, setNo = m.set;
+    const ch0 = m.ch.slice();
+    const duels = [];
+    s.hist.push([m.no, setNo, m.k, e, sl, ke ? 1 : 0, ks ? 1 : 0, be, bs]);
+    duels.push({ k: m.k, ce: ke ? 'E' : 'C', cs: ks ? 'S' : 'C' });
+    let w = -1, payAmt = 0;
+    if (ke && ks) { w = sl; payAmt = pay(m, e, sl, 5 * B + be + bs); }
+    else if (ke || ks) { w = e; payAmt = pay(m, sl, e, B + be + bs); }
+    else {
+      // 시민끼리: 걸었던 웃돈은 상대에게
+      const ne = pay(m, e, sl, be); const ns = pay(m, sl, e, bs);
+      s.acc.bn[e] += ns - ne; s.acc.bn[sl] += ne - ns;
+      m.k--;
+      if (m.k === 1 && m.ch[0] > 0 && m.ch[1] > 0) {
+        // 마지막 한 장씩 — 황제와 노예가 마주친다
+        s.hist.push([m.no, setNo, 1, e, sl, 1, 1, 0, 0]);
+        duels.push({ k: 1, ce: 'E', cs: 'S', forced: 1 });
+        w = sl; payAmt = pay(m, e, sl, 5 * B);
+      }
+    }
+    if (w >= 0 && (be || bs)) {
+      const l = w === e ? sl : e;
+      s.acc.bn[w] += be + bs; s.acc.bn[l] -= be + bs;
+    }
+    s.eid++;
+    const last = { id: s.eid, t: 'duel', mno: m.no, set: setNo, e, sl, B, be, bs, d: duels, w, pay: payAmt, ch0, ch: m.ch.slice(), p: m.p.slice() };
+    s.pc = {}; s.pb = {}; s.bets = null;
+    const bust = m.ch[0] <= 0 || m.ch[1] <= 0;
+    if (w >= 0) {
+      m.sw[ix(m, w)]++;
+      s.acc.sw[w]++;
+      if (w === sl) { m.slw[ix(m, w)]++; s.acc.slw[w]++; }
+      s.acc.big[w] = Math.max(s.acc.big[w], payAmt);
+      s.sets.push([m.no, setNo, e, sl, w, HAND - duels[duels.length - 1].k + 1, payAmt]);
+      if (s.sets.length > 160) s.sets.shift();
+      const endLen = setNo >= s.len && m.ch[0] !== m.ch[1];
+      const otOver = setNo >= s.len + OT_MAX;
+      if (bust || endLen || otOver) finishMatch(s, last);
+      else { m.set++; m.k = HAND; m.B = stakeOf(s, m.set); m.emp = empOf(s); s.ph = s.bt ? 'bet' : 'card'; }
+    } else if (bust) {
+      finishMatch(s, last);   // 웃돈으로 칩이 바닥난 경우
+    } else {
+      s.ph = s.bt ? 'bet' : 'card';
+    }
+    if (s.hist.length > 900) s.hist.splice(0, s.hist.length - 900);
+    s.last = last;
+  }
+
+  function finishMatch(s, last) {
+    const m = s.m;
+    let wi;
+    if (m.ch[0] !== m.ch[1]) wi = m.ch[0] > m.ch[1] ? 0 : 1;
+    else if (m.sw[0] !== m.sw[1]) wi = m.sw[0] > m.sw[1] ? 0 : 1;
+    else wi = Math.random() < 0.5 ? 0 : 1;
+    const w = m.p[wi], l = m.p[1 - wi];
+    s.acc.mw[w]++;
+    last.mt = { w, l, ch: m.ch.slice(), sw: m.sw.slice() };
+    if (!s.cup) { s.win = w; s.out[l] = 0; s.out[w] = 1; s.ph = 'over'; return; }
+    const c = s.cup;
+    last.mt.rn = RNAME(c.nr, c.ri);
+    c.R[c.ri][c.mi][2] = w;
+    s.out[l] = c.ri;
+    nextCupMatch(s);
+    if (s.ph !== 'over') last.mt.next = s.m.p.slice();
+  }
+
+  /* ---------- 결과 ---------- */
+  const PLACE = (s, i) => {
+    if (!s.cup) return i === s.win ? '승리' : '패배';
+    const nr = s.cup.nr, o = s.out[i];
+    if (o >= nr) return '우승';
+    const left = nr - o;
+    return left === 1 ? '준우승' : left === 2 ? '4강' : '8강';
+  };
+  function result(s) {
+    if (s.ph !== 'over') return null;
+    const w = s.cup ? s.champ : s.win;
+    if (w < 0) return null;
+    const m = s.m;
+    const stats = [];
+    if (!s.cup && m) stats.push({ label: '남은 칩', values: Array.from({ length: s.n }, (_, i) => String(m.p.includes(i) ? m.ch[ix(m, i)] : '-')) });
+    if (s.cup) stats.push({ label: '성적', values: Array.from({ length: s.n }, (_, i) => PLACE(s, i)), best: false });
+    stats.push({ label: '이긴 판', values: s.acc.sw.slice() });
+    stats.push({ label: '노예로 이긴 판', values: s.acc.slw.slice() });
+    if (s.bt) stats.push({ label: '웃돈 손익', values: s.acc.bn.map((v) => (v > 0 ? '+' + v : String(v))), best: false });
+    stats.push({ label: '가장 큰 한 판', values: s.acc.big.slice(), unit: '칩' });
+    const hl = [];
+    const topSl = s.acc.slw.indexOf(Math.max(...s.acc.slw));
+    const nmOf = (i) => (s.nm && s.nm[i]) || ('자리 ' + (i + 1));
+    if (s.acc.slw[topSl] > 0) hl.push(nmOf(topSl) + ' — 노예로 황제를 꺾은 판 ' + s.acc.slw[topSl]);
+    const big = Math.max(...s.acc.big), bigI = s.acc.big.indexOf(big);
+    if (big >= 5) hl.push('가장 큰 한 판: ' + nmOf(bigI) + ' ' + big + '칩');
+    if (s.bt) { const bb = s.acc.bn.indexOf(Math.max(...s.acc.bn)); if (s.acc.bn[bb] > 0) hl.push('웃돈 수익 최고: ' + nmOf(bb) + ' +' + s.acc.bn[bb]); }
+    return {
+      winners: [w],
+      title: (s.cup ? '토너먼트 우승 — ' : '승리 — ') + nmOf(w),
+      text: s.cup ? '' : (m ? '칩 ' + m.ch[0] + ' : ' + m.ch[1] : ''),
+      stats, highlights: hl, _w: w,
+    };
+  }
+
+  /* ---------- AI ---------- */
+  /* 황제 측 시점의 한 수 보수표. 행 = 황제 측(E/C), 열 = 노예 측(S/C) */
+  function matrix(k, B, be, bs) {
+    const X = B + be + bs;
+    const V = k - 1 >= 1 ? B * (k - 1 - 6) / (k - 1) : 0;   // 시민끼리 비긴 뒤 이어지는 판의 값(무작위 섞기 기준)
+    return { a: -(5 * B + be + bs), b: X, c: X, d: (bs - be) + V };
+  }
+  function eqMix(M) {
+    const den = M.a - M.b - M.c + M.d;
+    if (Math.abs(den) < 1e-9) return { p: 0.5, q: 0.5 };
+    return { p: clamp((M.d - M.c) / den, 0.02, 0.98), q: clamp((M.d - M.b) / den, 0.02, 0.98) };
+  }
+  function habits(s, seat) {
+    return {
+      early: hash(s.sd, seat, 11) * 2 - 1,   // 핵심 카드를 일찍(+) / 늦게(−) 내는 버릇
+      bluff: hash(s.sd, seat, 12),           // 허세 웃돈
+      betty: hash(s.sd, seat, 13),           // 웃돈 크기
+      talk: hash(s.sd, seat, 14),            // 말 걸기
+      liar: hash(s.sd, seat, 15),            // 말과 다르게 내기
+    };
+  }
+  const styleOf = (seat) => { try { return (L.aiStyle && L.aiStyle(seat)) || 'bal'; } catch (e) { return 'bal'; } };
+
+  /* 상대 모형: 지난 수들에서 그 자리가 이 측일 때 핵심 카드를 언제 냈는지 + 웃돈과의 관계 */
+  function model(s, o, side, k, obet) {
+    const q0 = 1 / k;
+    let nk = 0, kk = 0, N = 0, res = 0, kb = 0, kn = 0, nb = 0, nn = 0;
+    for (const r of s.hist) {
+      if (r[2] < 2) continue;
+      const isE = r[3] === o, isS = r[4] === o;
+      if (!(side === 'E' ? isE : isS)) continue;
+      const key = side === 'E' ? r[5] : r[6], bet = side === 'E' ? r[7] : r[8];
+      N++; res += key - 1 / r[2];
+      if (r[2] === k) { nk++; kk += key; }
+      if (key) { kn++; if (bet > 0) kb++; } else { nn++; if (bet > 0) nb++; }
+    }
+    const tilt = N ? clamp(res / (N + 4), -0.35, 0.35) * Math.min(1, (6 - k) / 2 + 0.4) : 0;
+    const pri = clamp(q0 + tilt, 0.02, 0.98);
+    let q = (kk + 2 * pri) / (nk + 2);
+    if (obet != null && s.bt) {
+      const pbk = (kb + 1) / (kn + 2), pbn = (nb + 1) / (nn + 2);
+      const lk = obet > 0 ? pbk : 1 - pbk, ln = obet > 0 ? pbn : 1 - pbn;
+      q = q * lk / (q * lk + (1 - q) * ln);
+    }
+    return { q: clamp(q, 0.01, 0.99), conf: Math.min(1, N / 14) };
+  }
+
+  /* 이 자리가 지금 핵심 카드(황제/노예)를 낼 확률. withBets: 카드 단계(웃돈 공개 뒤) */
+  function keyProb(s, seat, lv, withBets) {
+    const m = s.m, k = m.k, B = m.B, isE = m.emp === seat, o = other(m, seat);
+    const bets = withBets && s.bets ? s.bets : [0, 0];
+    const be = bets[ix(m, m.emp)], bs = bets[ix(m, other(m, m.emp))];
+    const M = matrix(k, B, be, bs);
+    const eq = eqMix(M);
+    const myEq = isE ? eq.p : eq.q;
+    const ob = withBets && s.bets ? bets[ix(m, o)] : null;
+    const mo = model(s, o, isE ? 'S' : 'E', k, ob);
+    const qo = mo.q;
+    let evK, evC;
+    if (isE) { evK = qo * M.a + (1 - qo) * M.b; evC = qo * M.c + (1 - qo) * M.d; }
+    else { evK = -(qo * M.a + (1 - qo) * M.c); evC = -(qo * M.b + (1 - qo) * M.d); }
+    const T = B * (lv >= 3 ? 0.4 : 0.9);
+    const br = 1 / (1 + Math.exp(-(evK - evC) / T));
+    const hb = habits(s, seat);
+    const st = styleOf(seat);
+    const hw = lv <= 1 ? 1 : lv === 2 ? 0.6 : 0.15;
+    let early = hb.early * hw + (st === 'agg' ? 0.25 : st === 'def' ? -0.2 : 0);
+    const qh = clamp(myEq * Math.exp(early * 0.5 * (k - 3)), 0.03, 0.95);
+    let P;
+    if (lv <= 1) P = 0.8 * qh + 0.2 * (0.25 + 0.5 * hash(s.sd, seat, m.no, m.set, k, 3));
+    else {
+      // 상대가 균형 섞기에서 얼마나 벗어났나 — 벗어난 만큼만 파고든다(근거가 약하면 균형 섞기 유지)
+      const dev = Math.abs(qo - (isE ? eq.q : eq.p));
+      const w = lv === 2 ? 0.7 * Math.min(1, mo.conf * 1.3) * clamp(dev / 0.14, 0, 1) : 0.9 * Math.min(1, mo.conf * 1.6 + 0.15) * clamp(dev / 0.1, 0, 1);
+      P = (1 - w) * qh + w * br;
+    }
+    return clamp(P, 0.02, 0.98);
+  }
+  /* 웃돈 단계에서 마음속으로 정해 둔 카드(상태에 저장하지 않고 같은 값으로 다시 만든다) */
+  function intent(s, seat, lv) { return hash(s.sd, seat, s.m.no, s.m.set, s.m.k, 7) < keyProb(s, seat, lv, false); }
+
+  function aiSay(s, seat, lv, key) {
+    const hb = habits(s, seat);
+    if (Math.random() > 0.08 + hb.talk * 0.22) return undefined;
+    const lie = Math.random() < (lv >= 3 ? 0.5 : lv === 2 ? 0.35 : 0.15) + hb.liar * 0.15;
+    const truth = key ? [0, 2, 5] : [1, 3, 7];
+    const fake = key ? [1, 3, 7] : [0, 2, 6];
+    const pool = lie ? fake : truth;
+    return pool[(Math.random() * pool.length) | 0];
+  }
+
+  function ai(s, seat, lv) {
+    lv = lv || 2;
+    const m = s.m;
+    if (!m) return null;
+    const isE = m.emp === seat, me = ix(m, seat), k = m.k;
+    if (s.ph === 'bet') {
+      const key = intent(s, seat, lv);
+      const hb = habits(s, seat), st = styleOf(seat);
+      let pb;
+      if (isE) pb = key ? [0.85, 0.66, 0.46][lv - 1] : [0.05, 0.1 + hb.bluff * 0.14, 0.34 + hb.bluff * 0.1][lv - 1];
+      else pb = key ? [0.62, 0.42, 0.17 + (k <= 3 ? 0.08 : 0)][lv - 1] : [0.03, 0.06 + hb.bluff * 0.08, 0.13 + (k <= 3 ? 0.06 : 0)][lv - 1];
+      if (st === 'gamble') pb *= 1.35; else if (st === 'def') pb *= 0.7;
+      // 칩이 모자라면 몸을 사린다
+      const risk = isE ? 5 * m.B : m.B;
+      if (m.ch[me] <= risk + 2) pb *= 0.5;
+      let v = 0;
+      if (Math.random() < pb) v = Math.random() < 0.25 + hb.betty * 0.4 ? 2 : 1;
+      v = Math.min(v, m.ch[me]);
+      const a = { t: 'bet', v };
+      const say = aiSay(s, seat, lv, key);
+      if (say != null) a.say = say;
+      return a;
+    }
+    if (s.ph === 'card') {
+      if (k <= 1) return { t: 'card', c: 'K' };
+      const commit = s.bt ? [0.85, 0.65, 0.15][lv - 1] : 0;
+      const kin = s.bt ? (intent(s, seat, lv) ? 1 : 0) : 0;
+      const P = commit * kin + (1 - commit) * keyProb(s, seat, lv, true);
+      const a = { t: 'card', c: Math.random() < P ? 'K' : 'C' };
+      if (!s.bt) { const say = aiSay(s, seat, lv, a.c === 'K'); if (say != null) a.say = say; }
+      return a;
+    }
+    return null;
+  }
+
+  let FAST = false;   // 관전 빨리 보기(이 기기 — 로컬·방장에서만 의미 있음)
+  function aiDelayFor(s, seat, lv) {
+    if (!s.m || s.ph === 'over') return -1;
+    const base = s.ph === 'bet' ? 650 + Math.random() * 700 : 800 + Math.random() * 900;
+    return FAST ? base * 0.35 : base;
+  }
+
+  /* ---------- 상황 도움말 ---------- */
+  function hint(s, seat) {
+    const m = s.m;
+    if (!m || s.ph === 'over') return null;
+    const L1 = [];
+    const inM = m.p.includes(seat);
+    const duel = HAND - m.k + 1;
+    L1.push(m.set + '판 · ' + duel + '번째 수 · 판돈 ' + m.B + (s.cup ? ' · ' + RNAME(s.cup.nr, s.cup.ri) : ''));
+    if (inM) {
+      const isE = m.emp === seat;
+      L1.push(isE ? '황제 측 — 황제 1장 · 시민 ' + (m.k - 1) + '장' : '노예 측 — 노예 1장 · 시민 ' + (m.k - 1) + '장');
+      L1.push(isE ? '황제가 노예를 만나면 판돈의 5배를 잃습니다. 그 전에 황제를 내야 이깁니다.' : '노예가 황제와 마주쳐야 이깁니다(판돈 5배). 시민을 만나면 집니다.');
+      L1.push('무작위로 낸다면 이 판에서 노예 측이 이길 확률은 1/' + m.k + '입니다.');
+      if (s.ph === 'card' && s.bets) {
+        const ob = s.bets[ix(m, other(m, seat))];
+        if (ob > 0) L1.push('상대 웃돈 +' + ob + '. 핵심 카드인지, 허세인지.');
+      }
+      if (s.ph === 'bet') L1.push('웃돈은 이번 수에서 이기면 받고, 지거나 시민끼리 비기면 상대에게 넘어갑니다.');
+    } else L1.push('관전 중입니다. 손패 구성은 공개, 이번 수에 고른 카드만 비밀입니다.');
+    return L1.slice(0, 6);
+  }
+
+  /* ---------- 외부에서 쓰는 것 ---------- */
+  const E = { init, actor, apply, ai, result, aiDelayFor, offTurn, hint, empOf, stakeOf, model, keyProb, matrix, eqMix, SAY, HAND, START, RNAME, PLACE, ix, other, setFast: (v) => { FAST = !!v; }, isFast: () => FAST };
+
+  /* ======================= 그림(직접 그린 SVG, CC0) ======================= */
+  const GOLD = '#d4ad5c';
+  const FACE = {
+    E: { bg: ['#4a1016', '#16070a'], glow: '#e6ad4e', ga: 0.55, frame: '#d9b25f', ink: '#f0d48a', name: '황제', fig: '#0e0708', rim: '#e9c46c' },
+    C: { bg: ['#2b3642', '#0f141a'], glow: '#9fb6cc', ga: 0.38, frame: '#9fb0bf', ink: '#dbe3ea', name: '시민', fig: '#0b0e12', rim: '#b9c8d6' },
+    S: { bg: ['#33231a', '#0d0806'], glow: '#b0602c', ga: 0.42, frame: '#8f6c4b', ink: '#e2b68c', name: '노예', fig: '#0b0705', rim: '#c48c5c' },
+  };
+  function figure(t, f) {
+    const R = 'stroke="' + f.rim + '" stroke-width="1.1" stroke-opacity=".75"';
+    if (t === 'E') return '' +
+      '<path d="M14 124 C16 97 31 87 50 87 C69 87 84 97 86 124 Z" fill="' + f.fig + '" ' + R + '/>' +
+      '<path d="M43 88 L50 124 L57 88" fill="none" stroke="' + GOLD + '" stroke-width="2.2"/>' +
+      '<path d="M25 95 Q50 108 75 95 Q78 101 73 106 Q50 117 27 106 Q22 101 25 95 Z" fill="#efe6d4"/>' +
+      '<path d="M34 102 l1.4 3.2 l1.4 -3.2 Z M46 106 l1.4 3.2 l1.4 -3.2 Z M58 104 l1.4 3.2 l1.4 -3.2 Z M68 100 l1.2 3 l1.2 -3 Z" fill="#14090a"/>' +
+      '<ellipse cx="50" cy="66" rx="11.5" ry="13.5" fill="' + f.fig + '" ' + R + '/>' +
+      '<path d="M37.5 56 L39 41 L44.5 48 L50 37 L55.5 48 L61 41 L62.5 56 Z" fill="url(#ecGd)" stroke="#5a3a10" stroke-width=".7"/>' +
+      '<circle cx="39" cy="41" r="1.7" fill="#f6dc8e"/><circle cx="50" cy="37" r="1.9" fill="#f6dc8e"/><circle cx="61" cy="41" r="1.7" fill="#f6dc8e"/>' +
+      '<circle cx="50" cy="50" r="2" fill="#b3202c"/><circle cx="44" cy="52.5" r="1.2" fill="#2a5ea8"/><circle cx="56" cy="52.5" r="1.2" fill="#2a5ea8"/>' +
+      '<path d="M73 125 L80 80" stroke="' + GOLD + '" stroke-width="2.4" stroke-linecap="round"/><circle cx="80.6" cy="76" r="4" fill="url(#ecGd)"/>' +
+      '<path d="M80.6 69 v-4 M78.6 67 h4" stroke="#f6dc8e" stroke-width="1.2"/>';
+    if (t === 'C') return '' +
+      '<path d="M6 104 h9 v-13 h7 v7 h5 v-17 h8 v23 h30 v-19 h7 v9 h6 v-15 h9 v25 h7 v20 H6 Z" fill="#131a22" opacity=".9"/>' +
+      '<path d="M17 124 C19 99 32 89 50 89 C68 89 81 99 83 124 Z" fill="' + f.fig + '" ' + R + '/>' +
+      '<path d="M50 91 L42 105 L50 124 L58 105 Z" fill="#18212a"/>' +
+      '<path d="M45 90 L50 99 L55 90 Z" fill="#d4cfc2"/><path d="M50 98 L48 102 L50 113 L52 102 Z" fill="#6e2a2a"/>' +
+      '<ellipse cx="50" cy="66" rx="11" ry="13" fill="' + f.fig + '" ' + R + '/>' +
+      '<path d="M37 59 Q37.5 47 51 46 Q63.5 46 64 56 L71 59 Q60 62.5 37 60.5 Z" fill="#3b3128" stroke="' + f.rim + '" stroke-width=".8" stroke-opacity=".7"/>' +
+      '<path d="M40 56 Q51 52 63 55" stroke="#5a4a3a" stroke-width=".8" fill="none"/>';
+    return '' +
+      '<path d="M18 125 C20 105 31 93 48 93 C66 93 80 103 84 125 Z" fill="' + f.fig + '" ' + R + '/>' +
+      '<path d="M30 101 l4 4 l4 -4 l4 4 l4 -4 l4 4 l4 -4 l4 4 l4 -4 l4 4" stroke="#2f2218" stroke-width="1.4" fill="none"/>' +
+      '<ellipse cx="46.5" cy="75" rx="11" ry="12.5" transform="rotate(-18 46.5 75)" fill="' + f.fig + '" ' + R + '/>' +
+      '<ellipse cx="49" cy="89.5" rx="9" ry="3" fill="none" stroke="#8d949b" stroke-width="2.2"/>' +
+      '<path d="M27 124 L35 110 L45 112 L41 124 Z M73 124 L65 110 L55 112 L59 124 Z" fill="' + f.fig + '"/>' +
+      '<rect x="31" y="108" width="12" height="7" rx="2" fill="#6b7178" stroke="#2b2f33" stroke-width=".8"/>' +
+      '<rect x="57" y="108" width="12" height="7" rx="2" fill="#6b7178" stroke="#2b2f33" stroke-width=".8"/>' +
+      '<g fill="none" stroke="#a3aab1" stroke-width="1.3"><ellipse cx="46" cy="112" rx="3" ry="1.8"/><ellipse cx="50" cy="113" rx="1.8" ry="3"/><ellipse cx="54" cy="112" rx="3" ry="1.8"/>' +
+      '<ellipse cx="50" cy="118.5" rx="1.8" ry="3"/><ellipse cx="50" cy="124" rx="3" ry="1.8"/><ellipse cx="50" cy="129" rx="1.8" ry="3"/></g>';
+  }
+  function pip(t, c) {
+    if (t === 'E') return '<path d="M-5 3 L-6 -4 L-2.5 -1 L0 -5.5 L2.5 -1 L6 -4 L5 3 Z" fill="' + c + '"/>';
+    if (t === 'C') return '<circle r="3.2" fill="none" stroke="' + c + '" stroke-width="1.4"/><circle r="1" fill="' + c + '"/>';
+    return '<ellipse cx="-2.2" rx="3" ry="2" fill="none" stroke="' + c + '" stroke-width="1.3"/><ellipse cx="2.2" rx="3" ry="2" fill="none" stroke="' + c + '" stroke-width="1.3"/>';
+  }
+  const DEFS = '<defs><linearGradient id="ecGd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6dc8e"/><stop offset="1" stop-color="#a87a28"/></linearGradient></defs>';
+  function faceSVG(t) {
+    const f = FACE[t];
+    return '<svg viewBox="0 0 100 140" preserveAspectRatio="xMidYMid meet" aria-hidden="true">' + DEFS +
+      '<linearGradient id="ecB' + t + '" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="' + f.bg[0] + '"/><stop offset="1" stop-color="' + f.bg[1] + '"/></linearGradient>' +
+      '<radialGradient id="ecG' + t + '" cx=".5" cy=".46" r=".5"><stop offset="0" stop-color="' + f.glow + '" stop-opacity="' + f.ga + '"/><stop offset="1" stop-color="' + f.glow + '" stop-opacity="0"/></radialGradient>' +
+      '<rect x="1" y="1" width="98" height="138" rx="8" fill="url(#ecB' + t + ')"/>' +
+      '<rect x="4" y="12" width="92" height="104" fill="url(#ecG' + t + ')"/>' +
+      '<g>' + figure(t, f) + '</g>' +
+      '<rect x="5.5" y="5.5" width="89" height="129" rx="5" fill="none" stroke="' + f.frame + '" stroke-width="1.1" stroke-opacity=".85"/>' +
+      '<g transform="translate(13 15)">' + pip(t, f.ink) + '</g><g transform="translate(87 125) rotate(180)">' + pip(t, f.ink) + '</g>' +
+      '<rect x="19" y="111" width="62" height="22" rx="3" fill="#000" fill-opacity=".72" stroke="' + f.frame + '" stroke-width=".9"/>' +
+      '<text x="50" y="128" text-anchor="middle" font-size="16" letter-spacing="1.5" fill="' + f.ink + '" font-family="Black Han Sans, IBM Plex Sans KR, sans-serif">' + f.name + '</text>' +
+      '<rect x="1" y="1" width="98" height="138" rx="8" fill="none" stroke="#000" stroke-opacity=".6" stroke-width="1.5"/></svg>';
+  }
+  const BACK = '<svg viewBox="0 0 100 140" preserveAspectRatio="xMidYMid meet" aria-hidden="true">' +
+    '<pattern id="ecLat" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><path d="M0 0 H12 M0 0 V12" stroke="#7a5a2a" stroke-width=".9" stroke-opacity=".55"/></pattern>' +
+    '<radialGradient id="ecBk" cx=".5" cy=".45" r=".7"><stop offset="0" stop-color="#3a1418"/><stop offset="1" stop-color="#12070a"/></radialGradient>' +
+    '<rect x="1" y="1" width="98" height="138" rx="8" fill="url(#ecBk)"/><rect x="7" y="7" width="86" height="126" rx="4" fill="url(#ecLat)"/>' +
+    '<rect x="7" y="7" width="86" height="126" rx="4" fill="none" stroke="#c9a253" stroke-width="1.2"/>' +
+    '<circle cx="50" cy="70" r="20" fill="#14080b" stroke="#c9a253" stroke-width="1.2"/><circle cx="50" cy="70" r="16" fill="none" stroke="#c9a253" stroke-width=".6" stroke-dasharray="1.5 2.5"/>' +
+    '<path d="M42 72 L43 62 L46.5 66.5 L50 60 L53.5 66.5 L57 62 L58 72 Z" fill="#c9a253"/>' +
+    '<g fill="none" stroke="#c9a253" stroke-width="1.1"><ellipse cx="46.5" cy="77" rx="3" ry="1.8"/><ellipse cx="50" cy="77" rx="1.6" ry="2.6"/><ellipse cx="53.5" cy="77" rx="3" ry="1.8"/></g>' +
+    '<rect x="1" y="1" width="98" height="138" rx="8" fill="none" stroke="#000" stroke-opacity=".7" stroke-width="1.5"/></svg>';
+  const ICON = '<g fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round">' +
+    '<rect x="7" y="12" width="22" height="32" rx="3" transform="rotate(-11 18 28)"/>' +
+    '<rect x="27" y="12" width="22" height="32" rx="3" transform="rotate(11 38 28)"/></g>' +
+    '<path d="M11.5 31 L12 22 L15.5 26 L18.5 20 L21 25.5 L24.5 22.5 L24 31 Z" fill="currentColor" transform="rotate(-11 18 28)"/>' +
+    '<g fill="none" stroke="currentColor" stroke-width="2" transform="rotate(11 38 28)"><ellipse cx="34" cy="27" rx="3.2" ry="2.2"/><ellipse cx="38" cy="27" rx="2" ry="3.2"/><ellipse cx="42" cy="27" rx="3.2" ry="2.2"/></g>';
+  const TOOL = {
+    log: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M5 5h14M5 10h14M5 15h9M5 20h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="18.5" cy="18" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M20.8 20.3l2 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+    say: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 5h16v10H10l-5 4v-4H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 10h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+    cup: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M3 4h5v6h5M3 14h5v6M8 17h5v-7M13 13.5h7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>',
+    fast: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 6l7 6-7 6zM12 6l7 6-7 6z" fill="currentColor"/></svg>',
+  };
+  const ECG_PT = [[0, 14], [9, 14], [11, 12], [13, 14], [15, 14], [17, 3], [19.5, 22], [21.5, 14], [24, 14], [26, 11], [28, 14], [32, 14]];
+  const ECG_D = (() => { const out = []; for (let r = 0; r < 4; r++) ECG_PT.forEach(([x, y], j) => out.push((r || j ? 'L' : 'M') + (x + r * 32) + ' ' + y)); return out.join(''); })();
+
+  /* ======================= 소리(WebAudio 합성) ======================= */
+  const Snd = {
+    ac: null,
+    ctx() {
+      if (!this.ac) { try { this.ac = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { this.ac = null; } }
+      if (this.ac && this.ac.state === 'suspended') { try { this.ac.resume(); } catch (e) {} }
+      return this.ac;
+    },
+    vol() { try { return L.audio && L.audio.sfx ? L.audio.sfx() : 0.6; } catch (e) { return 0.6; } },
+    thump(t0, f, g) {
+      const ac = this.ac, o = ac.createOscillator(), gn = ac.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(f, t0); o.frequency.exponentialRampToValueAtTime(f * 0.55, t0 + 0.16);
+      gn.gain.setValueAtTime(0.0001, t0); gn.gain.exponentialRampToValueAtTime(g, t0 + 0.012); gn.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.2);
+      o.connect(gn); gn.connect(ac.destination); o.start(t0); o.stop(t0 + 0.22);
+    },
+    beat(str) {
+      const v = this.vol() * 0.85 * (str || 1); if (v <= 0.001) return;
+      const ac = this.ctx(); if (!ac) return;
+      const t = ac.currentTime + 0.01; this.thump(t, 64, v); this.thump(t + 0.17, 55, v * 0.65);
+    },
+    drone(sec) {   // 공개 직전의 낮은 울림
+      const v = this.vol() * 0.18; if (v <= 0.001) return;
+      const ac = this.ctx(); if (!ac) return;
+      const t = ac.currentTime + 0.01, o = ac.createOscillator(), o2 = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+      o.type = 'sawtooth'; o2.type = 'sawtooth'; o.frequency.value = 55; o2.frequency.value = 58.3;
+      lp.type = 'lowpass'; lp.frequency.value = 260;
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(v, t + sec * 0.8); g.gain.exponentialRampToValueAtTime(0.0001, t + sec + 0.25);
+      o.connect(lp); o2.connect(lp); lp.connect(g); g.connect(ac.destination);
+      o.start(t); o2.start(t); o.stop(t + sec + 0.3); o2.stop(t + sec + 0.3);
+    },
+  };
+
+  /* ======================= 스타일 ======================= */
+  const CSS = `
+.ec{word-break:keep-all;overflow-wrap:break-word;position:absolute;inset:0;display:flex;flex-direction:column;overflow:hidden;color:#ece3d1;font-family:var(--f-body);user-select:none;-webkit-user-select:none;
+ background:radial-gradient(120% 70% at 50% 44%,#28160f 0%,#130a0a 52%,#050304 100%)}
+.ec *{box-sizing:border-box}
+.ec-lamp{position:absolute;left:0;right:0;top:0;height:70%;pointer-events:none;background:radial-gradient(ellipse 60% 75% at 50% 0,rgba(255,214,150,.14),transparent 70%);animation:ecFl 7s infinite;z-index:0}
+@keyframes ecFl{0%,100%{opacity:1}46%{opacity:1}48%{opacity:.82}50%{opacity:.97}52%{opacity:.88}}
+.ec-vig{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 90px 30px #000;z-index:1}
+.ec-pl{position:relative;z-index:3;display:flex;align-items:center;gap:8px;padding:6px 10px;min-height:54px}
+.ec-pl.top{padding-right:58px}
+.ec-av{flex:none;width:36px;height:36px;border-radius:50%;border:2px solid var(--c);display:grid;place-items:center;background:#000a;color:var(--c)}
+.ec-av svg{width:22px;height:22px}
+.ec-who{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1 1 auto}
+.ec-nm{font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:17px}
+.ec-sub{display:flex;gap:6px;align-items:center;min-width:0;font-size:12.5px;color:#cbbfa6;white-space:nowrap}
+.ec-sd{padding:0 7px;border-radius:8px;border:1px solid;line-height:18px;font-size:12px;font-weight:600}
+.ec-sd.E{color:#ecc86e;border-color:#ecc86e77;background:#3a2a0c88}.ec-sd.S{color:#dc9e76;border-color:#a0603e99;background:#2a140a88}
+.ec-ok{color:#a8dca9;font-weight:600}.ec-ok::before{content:"✓ "}.ec-wait{color:#cbbfa6}
+.ec-hr{flex:none;display:flex;flex-direction:column;align-items:center;width:58px}
+.ec-hr svg{width:56px;height:20px;overflow:hidden}
+.ec-hr g{animation:ecEcg var(--beat,1s) linear infinite}
+@keyframes ecEcg{from{transform:translateX(0)}to{transform:translateX(-32px)}}
+.ec-hr b{font:600 11.5px var(--f-mono);color:#eba596;line-height:13px;white-space:nowrap}
+.ec-chips{flex:none;display:flex;flex-direction:column;align-items:flex-end;min-width:52px}
+.ec-chips b{font:700 19px var(--f-mono);color:#f0d48a;line-height:21px}
+.ec-chips span{font-size:12px;color:#c4b79e;white-space:nowrap}
+.ec-chips .dl{font:700 14px var(--f-mono);position:absolute;right:12px;top:-4px;animation:ecUp 1.4s forwards;pointer-events:none}
+.ec-chips .dl.p{color:#9fd3a0}.ec-chips .dl.m{color:#e0705f}
+@keyframes ecUp{0%{opacity:0;transform:translateY(8px)}15%{opacity:1}80%{opacity:1}100%{opacity:0;transform:translateY(-14px)}}
+.ec-oh{position:relative;z-index:2;display:flex;justify-content:center;align-items:flex-start;gap:0;height:calc(var(--ow) * 1.4 + 18px);padding-bottom:2px}
+.ec-oh .ec-card{margin:0 -3px}
+.ec-oh .cnt,.ec-hand .cnt{position:absolute;bottom:0;left:0;right:0;text-align:center;font-size:12px;color:#d2c6ac;line-height:14px}
+.ec-mid{position:relative;flex:1 1 auto;min-height:0;margin:0 6px;z-index:2}
+.ec-felt{position:absolute;inset:2px 0;border-radius:44% / 30%;box-shadow:inset 0 0 0 5px #2b170d,inset 0 0 0 7px #6b4a2455,inset 0 0 50px #000d,0 12px 30px #000c}
+.ec-felt::after{content:"";position:absolute;inset:0;border-radius:inherit;background:radial-gradient(ellipse 50% 52% at 50% 46%,rgba(255,226,170,.16),rgba(0,0,0,.42) 62%,rgba(0,0,0,.78) 100%)}
+.ec-slot{position:absolute;left:50%;width:var(--sw);height:calc(var(--sw) * 1.4);margin-left:calc(var(--sw) / -2);border-radius:8px;border:1.5px dashed #d4ad5c66;display:grid;place-items:center}
+.ec-slot.t{top:calc(50% - var(--sw) * 1.4 - 8px)}.ec-slot.b{top:calc(50% + 8px)}
+.ec-slot .ec-card{position:absolute;inset:0;width:100%;height:100%}
+.ec-slot .lk{position:absolute;left:50%;transform:translateX(-50%);bottom:-18px;font-size:12px;color:#e2d5b8;white-space:nowrap;background:#000c;padding:0 6px;border-radius:6px;line-height:16px}
+.ec-slot.t .lk{bottom:auto;top:-18px}
+.ec-bet{position:absolute;left:calc(50% + var(--sw) / 2 + 8px);display:flex;align-items:center;gap:3px;font:700 15px var(--f-mono);color:#f6dc96;text-shadow:0 1px 3px #000}
+.ec-bet.t{top:calc(50% - var(--sw) * .7 - 18px)}.ec-bet.b{top:calc(50% + var(--sw) * .7 - 2px)}
+.ec-bet i{width:16px;height:16px;border-radius:50%;background:radial-gradient(circle,#e8c46a 0 35%,#8d6421 37% 60%,#e8c46a 62%);box-shadow:0 2px 0 #3a2508,0 4px 0 #8d6421,0 6px 0 #3a2508}
+.ec-bet.z{color:#c4b79e;font:500 12px var(--f-body);background:#0008;padding:1px 6px;border-radius:6px}
+.ec-bet.pulse{animation:ecPop .5s}
+@keyframes ecPop{0%{transform:scale(.4);opacity:0}70%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
+.ec-info{position:absolute;left:12px;top:50%;transform:translateY(-50%);width:100px;display:flex;flex-direction:column;gap:3px;font-size:12.5px;color:#ddd1b7;z-index:2;text-shadow:0 1px 2px #000}
+.ec-info .stk{font:700 22px var(--f-mono);color:#f0d48a;line-height:24px}
+.ec-info .stk small{font:500 12px var(--f-body);color:#d0c4aa;margin-left:3px}
+.ec-info .x5{color:#eeb08a}
+.ec-info .rd{color:#e9dfca;font-weight:700}
+.ec-info .cup{color:#d4ad5c;font-weight:700}
+.ec-tools{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px;z-index:4}
+.ec-tool{width:46px;height:46px;border-radius:50%;background:#0c0809e6;border:1px solid #d4ad5c99;color:#f0dcaa;display:grid;place-items:center;padding:0;cursor:pointer}
+.ec-tool.on{background:#5a3d14;border-color:#f0d48a}
+.ec-tool:active{transform:scale(.94)}
+.ec-hand{position:relative;z-index:3;display:flex;justify-content:center;align-items:flex-start;gap:6px;height:calc(var(--hw) * 1.4 + 38px);padding:14px 8px 0;touch-action:manipulation}
+.ec-hand .ec-card .nmL{position:absolute;left:-4px;right:-4px;top:calc(100% + 3px);text-align:center;font:600 13px var(--f-body);line-height:16px;color:#cfd8e0;pointer-events:none;transition:opacity .16s}
+.ec-hand .ec-card .nmL.E{color:#f3d27e}.ec-hand .ec-card .nmL.S{color:#eeb08a}
+.ec-hand .ec-card.sel .nmL{opacity:0}
+.ec-card{position:relative;width:var(--w,60px);height:calc(var(--w,60px) * 1.4);perspective:600px;flex:none}
+.ec-card .in{position:absolute;inset:0;transform-style:preserve-3d;transition:transform var(--fd,.5s) cubic-bezier(.3,.7,.2,1)}
+.ec-card.down .in{transform:rotateY(180deg)}
+.ec-card .f{position:absolute;inset:0;backface-visibility:hidden;-webkit-backface-visibility:hidden;border-radius:7%;overflow:hidden;box-shadow:0 4px 10px #000c}
+.ec-card .f svg{width:100%;height:100%;display:block}
+.ec-card .f.bk{transform:rotateY(180deg)}
+.ec-hand .ec-card{--w:var(--hw);transition:transform .16s,filter .16s;cursor:pointer}
+.ec-hand .ec-card.sel{transform:translateY(-12px)}
+.ec-hand .ec-card.sel .f{box-shadow:0 0 0 2px #f0d48a,0 0 18px #f0d48aaa,0 8px 14px #000c}
+.ec-hand .ec-card.dim{filter:brightness(.62) saturate(.75)}
+.ec-hand.lock .ec-card{cursor:default}
+.ec-tip{position:relative;z-index:3;text-align:center;font-size:13px;color:#ddd0b6;min-height:20px;line-height:17px;padding:2px 12px 0}
+.ec-tip b{color:#f0d48a;font-weight:700}
+.ec-tbar{position:relative;z-index:3;display:flex;align-items:center;gap:8px;height:18px;margin:2px 14px 0}
+.ec-tbar .tr{flex:1;height:6px;background:#ffffff1f;border-radius:3px;overflow:hidden}
+.ec-tbar i{display:block;height:100%;background:#d4ad5c;width:100%}
+.ec-tbar i.low{background:#e0533f}
+.ec-tbar b{flex:none;min-width:34px;text-align:right;font:700 14px var(--f-mono);color:#f0d48a}
+.ec-tbar b.low{color:#ff7a62}
+.ec-act{position:relative;z-index:3;display:flex;gap:8px;padding:6px 10px calc(10px + env(safe-area-inset-bottom,0px));min-height:66px;align-items:stretch}
+.ec-btn{flex:1 1 0;min-height:52px;min-width:0;border-radius:10px;border:1px solid #d4ad5c99;background:linear-gradient(#36261c,#1f1510);color:#f4e6c4;font:700 16px var(--f-body);cursor:pointer;padding:4px 6px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;line-height:1.15}
+.ec-btn small{font-weight:500;font-size:12px;color:#cbbfa6}
+.ec-btn.pri{background:linear-gradient(#caa04a,#8d6421);color:#1a1006;border-color:#f0d48a}
+.ec-btn.pri small{color:#2e1d06}
+.ec-btn:disabled,.ec-btn.pri:disabled{cursor:default;background:#140d0b;border:1px dashed #5f5045;color:#a89c88}
+.ec-btn:disabled small,.ec-btn.pri:disabled small{color:#988c79}
+.ec-btn:not(:disabled):active{transform:scale(.97)}
+.ec-wait{flex:1;display:flex;align-items:center;justify-content:center;font-size:14px;color:#cbbfa6;text-align:center;padding:0 8px}
+.ec-cu{position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+ background:radial-gradient(ellipse 70% 55% at 50% 50%,rgba(40,14,12,.86),rgba(0,0,0,.95));animation:ecIn .25s}
+@keyframes ecIn{from{opacity:0}to{opacity:1}}
+.ec-cu .pz{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 80px 10px rgba(150,20,20,0);transition:box-shadow .12s}
+.ec-cu .pz.on{box-shadow:inset 0 0 90px 22px rgba(150,20,20,.42)}
+.ec-cu .who{font-size:14px;color:#e2d5b8;display:flex;align-items:center;gap:6px}
+.ec-cu .who .dot{width:9px;height:9px;border-radius:50%;background:var(--c)}
+.ec-cu .ec-card{--w:var(--cw)}
+.ec-cu .mid{min-height:58px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 16px}
+.ec-vd{font:400 21px var(--f-display);color:#f0d48a;letter-spacing:.5px}
+.ec-vd.r{color:#e0705f}.ec-vd.n{color:#cfc4ad}
+.ec-vs{font-size:14px;color:#ddd0b6;margin-top:3px}
+.ec-cu .meta{font-size:13px;color:#cbbfa6}
+.ec-cu .skip{position:absolute;bottom:calc(10px + env(safe-area-inset-bottom,0px));right:12px;font-size:12px;color:#b9ac95}
+.ec-mo{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;padding:18px 22px;border:1px solid #d4ad5c66;border-radius:12px;background:#0e0909e6;max-width:86%}
+.ec-mo h3{margin:0;font:400 24px var(--f-display);color:#f0d48a}
+.ec-mo p{margin:0;font-size:13px;color:#cfc4ad}
+.ec-mo .sc{font:700 18px var(--f-mono);color:#ece3d1}
+.ec-bub{position:absolute;z-index:16;max-width:62%;padding:5px 10px;border-radius:10px;background:rgba(14,9,8,.8);border:1px solid #d4ad5c55;font-size:13px;color:#ece3d1;pointer-events:none;animation:ecBub 1.6s forwards;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ec-bub .n{color:var(--c);font-weight:700;margin-right:5px;font-size:12px}
+@keyframes ecBub{0%{opacity:0;transform:translateY(4px)}12%{opacity:1;transform:none}82%{opacity:1}100%{opacity:0}}
+.ec-shb{position:absolute;inset:0;z-index:29;background:#000a;animation:ecIn .2s}
+.ec-sh{position:absolute;left:0;right:0;bottom:0;max-height:80%;z-index:30;background:#140d0c;border-top:1px solid #d4ad5c66;border-radius:16px 16px 0 0;padding:10px 14px calc(14px + env(safe-area-inset-bottom,0px));overflow:auto;box-shadow:0 -10px 30px #000c}
+.ec-sh h3{margin:4px 0 8px;font:400 18px var(--f-display);color:#f0d48a;display:flex;align-items:center;justify-content:space-between}
+.ec-sh h4{margin:12px 0 6px;font-size:13px;color:#e9dfca}
+.ec-x{width:44px;height:44px;border-radius:50%;border:1px solid #d4ad5c44;background:#0008;color:#e5cf9c;font-size:18px;cursor:pointer}
+.ec-say{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.ec-say button{min-height:46px;border-radius:10px;border:1px solid #d4ad5c44;background:#1e1512;color:#ece3d1;font:500 14px var(--f-body);cursor:pointer}
+.ec-say button:disabled{border-style:dashed;color:#988c79;background:#120c0a}
+.ec-rd{display:grid;grid-template-columns:auto 1fr;gap:4px 8px;font-size:13px;align-items:center}
+.ec-bars{display:flex;gap:4px;align-items:flex-end;height:30px;margin-top:14px}
+.ec-bars span{width:28px;background:#d4ad5c;border-radius:2px 2px 0 0;position:relative;min-height:2px}
+.ec-bars span.s{background:#c07a50}
+.ec-bars span i{position:absolute;bottom:-15px;left:-2px;right:-2px;text-align:center;font-style:normal;font-size:11px;color:#c4b79e}
+.ec-bars span b{position:absolute;top:-14px;left:0;right:0;text-align:center;font:600 11px var(--f-mono);color:#f2e9d6}
+.ec-rdrow{display:flex;gap:16px;flex-wrap:wrap;margin:4px 0 18px}
+.ec-rdrow>div{display:flex;flex-direction:column;gap:4px}
+.ec-rdrow .t{font-size:12px;color:#cbbfa6}
+.ec-log{width:100%;border-collapse:collapse;font-size:13px}
+.ec-log td{padding:5px 4px;border-top:1px solid #ffffff12;white-space:nowrap}
+.ec-log td.r{text-align:right;font-family:var(--f-mono)}
+.ec-log .w{color:#f0d48a}.ec-log .sl{color:#dc9e76}
+.ec-br{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px}
+.ec-br .col{display:flex;flex-direction:column;justify-content:space-around;gap:8px;min-width:104px;flex:1}
+.ec-br .col>b{font-size:12px;color:#cbbfa6;text-align:center}
+.ec-br .mt{border:1px solid #ffffff22;border-radius:8px;padding:3px 6px;font-size:12px;background:#0c0808}
+.ec-br .mt.cur{border-color:#f0d48a;box-shadow:0 0 10px #f0d48a55}
+.ec-br .mt div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:18px}
+.ec-br .mt .win{color:#f0d48a;font-weight:700}.ec-br .mt .lose{color:#9d9382;text-decoration:line-through}
+.ec-cur{position:absolute;inset:0;z-index:40;background:radial-gradient(ellipse at 50% 40%,#1c1110,#050304);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:20px;text-align:center}
+.ec-cur .big{font:400 26px var(--f-display);color:#f0d48a}
+.ec-cur p{margin:0;color:#ddd0b6;font-size:14px;max-width:280px}
+.ec-cur button{min-width:180px}
+`;
+
+  /* ======================= 뷰 ======================= */
+  function mount(root, api) {
+    const h = L.h;
+    if (!document.getElementById('ec-css')) document.head.append(h('style', { id: 'ec-css', text: CSS }));
+    const wrap = h('div', { class: 'ec' });
+    const lamp = h('div', { class: 'ec-lamp' }), vig = h('div', { class: 'ec-vig' });
+    const topP = h('div', { class: 'ec-pl top ec-top' });
+    const oh = h('div', { class: 'ec-oh' });
+    const mid = h('div', { class: 'ec-mid' });
+    const felt = h('div', { class: 'ec-felt' });
+    const meP = h('div', { class: 'ec-pl me ec-mep' });
+    const hand = h('div', { class: 'ec-hand' });
+    const tip = h('div', { class: 'ec-tip', role: 'status' });
+    const tbar = h('div', { class: 'ec-tbar', hidden: true }, h('div', { class: 'tr' }, h('i')), h('b', { text: '' }));
+    const act = h('div', { class: 'ec-act' });
+    mid.append(felt);
+    function paintFelt() {
+      let f = null; try { f = L.ui.felt && L.ui.felt(); } catch (e) { f = null; }
+      const c = f && f.c ? f.c : ['#24806a', '#1c6650', '#0c3528'];
+      felt.style.background = 'radial-gradient(ellipse 70% 62% at 50% 46%,' + c[0] + ' 0%,' + c[1] + ' 42%,' + c[2] + ' 100%)';
+    }
+    paintFelt();
+    window.addEventListener('lounge-felt', paintFelt);
+    wrap.append(lamp, vig, topP, oh, mid, meP, hand, tip, tbar, act);
+    root.append(wrap);
+
+    let st = null, shownId = 0, chatSeen = 0, sel = -1, revealed = -1, sentAt = 0, dead = false;
+    let animating = false, skipping = false, curRes = null, sheet = null, cur = null;
+    const Q = [];
+    let tKey = '', tStart = 0, tTimer = 0;
+    const busyK = new Set();
+    function busy(k, on) {
+      const was = busyK.size > 0;
+      if (on) busyK.add(k); else busyK.delete(k);
+      const now = busyK.size > 0;
+      if (was !== now) api.setBusy(now);
+    }
+    const NM = (i) => (api.players[i] && api.players[i].name) || ('자리 ' + (i + 1));
+    const COL = (i) => (api.players[i] && api.players[i].color) || '#d4ad5c';
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const SP = () => Math.max(0.2, (L.debug.speed || 1) * (L.speed ? L.speed() : 1) * (E.isFast() ? 2.6 : 1));
+    const wait = (ms) => (skipping || dead ? Promise.resolve() : new Promise((r) => { const t = setTimeout(() => { curRes = null; r(); }, ms / SP()); curRes = () => { clearTimeout(t); curRes = null; r(); }; }));
+    const skipNow = () => { skipping = true; if (curRes) curRes(); };
+    const multi = () => api.mySeats().length > 1;
+    const actorsNow = (s) => L.actorsOf({ actor: E.actor }, s);
+
+    /* 이 화면에서 비밀(이번 수에 고른 카드)을 볼 수 있는 자리 */
+    function looker(s) {
+      s = s || st;
+      if (!s) return -1;
+      if (!multi()) return api.viewer();
+      if (cur && cur.solo) return -1;
+      const list = actorsNow(s);
+      if (list.length > 1) return list.includes(revealed) ? revealed : -1;
+      return api.viewer();
+    }
+    function bottomSeat(s) {
+      const m = s.m; if (!m) return 0;
+      const lk = looker(s);
+      if (m.p.includes(lk)) return lk;
+      const mine = m.p.filter((x) => api.canAct(x));
+      if (mine.length === 1) return mine[0];
+      if (mine.length > 1 && m.p.includes(revealed)) return revealed;
+      return mine.length ? mine[0] : m.p[0];
+    }
+    const canSee = (s, seat) => seat === looker(s);
+    const keyT = (s, seat) => (s.m.emp === seat ? 'E' : 'S');
+
+    function layout() {
+      const W = wrap.clientWidth || 360, H = wrap.clientHeight || 640;
+      const hw = Math.round(Math.max(44, Math.min(78, (W - 40) / 5.3, (H - 420) / 1.4 + 40)));
+      const ow = Math.round(Math.max(26, Math.min(40, W / 11, H / 22)));
+      wrap.style.setProperty('--hw', hw + 'px');
+      wrap.style.setProperty('--ow', ow + 'px');
+      const mh = mid.clientHeight || 260;
+      const sw = Math.round(Math.max(44, Math.min(86, (mh - 44) / 2 / 1.4, W * 0.2)));
+      wrap.style.setProperty('--sw', sw + 'px');
+      const cw = Math.round(Math.max(70, Math.min(150, W * 0.36, (H - 230) / 2 / 1.4)));
+      wrap.style.setProperty('--cw', cw + 'px');
+    }
+
+    function cardEl(t, down, extra) {
+      const c = h('div', { class: 'ec-card' + (down ? ' down' : '') + (extra ? ' ' + extra : '') });
+      const inn = h('div', { class: 'in' });
+      inn.append(h('div', { class: 'f fr', html: t ? faceSVG(t) : '' }), h('div', { class: 'f bk', html: BACK }));
+      c.append(inn);
+      return c;
+    }
+
+    /* 심박: 이번 판에서 이 자리가 잃을 수 있는 몫과 위험 확률로 정하는 연출 값 */
+    function bpmOf(s, seat) {
+      const m = s.m;
+      if (!m || !m.p.includes(seat) || s.ph === 'over') return 62;
+      const isE = m.emp === seat, i = E.ix(m, seat);
+      const b = s.bets ? s.bets[0] + s.bets[1] : 0;
+      const loss = isE ? 5 * m.B + b : m.B + b;
+      const pl = isE ? 1 / m.k : (m.k - 1) / m.k;
+      const ten = clamp(pl * loss / Math.max(4, m.ch[i]) * 2.2, 0, 1);
+      return Math.round(64 + ten * 82 + (5 - m.k) * 4);
+    }
+
+    function panel(el, s, seat, isTop) {
+      el.innerHTML = '';
+      const m = s.m;
+      if (!m) return;
+      const i = E.ix(m, seat), side = keyT(s, seat);
+      const av = h('span', { class: 'ec-av', style: { '--c': COL(seat) }, html: '<svg viewBox="-8 -8 16 16">' + pip(side, 'currentColor') + '</svg>' });
+      const sub = h('div', { class: 'ec-sub' }, h('span', { class: 'ec-sd ' + side, text: side === 'E' ? '황제 측' : '노예 측' }));
+      if (s.ph === 'bet' || s.ph === 'card') {
+        const box = s.ph === 'bet' ? s.pb : s.pc;
+        sub.append(h('span', { class: box[seat] != null ? 'ec-ok' : 'ec-wait', text: box[seat] != null ? (s.ph === 'bet' ? '웃돈 결정' : '카드 결정') : (api.players[seat] && api.players[seat].ai ? '생각 중' : '고르는 중') }));
+      }
+      const bpm = bpmOf(s, seat);
+      const hr = h('span', { class: 'ec-hr', title: '심박 — 이번 판에 걸린 몫이 클수록 빨라집니다', style: { '--beat': (60 / bpm).toFixed(2) + 's' } });
+      hr.innerHTML = '<svg viewBox="0 0 56 24"><g><path d="' + ECG_D + '" fill="none" stroke="#c8483a" stroke-width="1.6" stroke-linejoin="round"/></g></svg><b>' + bpm + ' bpm</b>';
+      const ch = h('span', { class: 'ec-chips' }, h('b', { text: String(m.ch[i]) }), h('span', { text: '칩 · 판 ' + m.sw[i] }));
+      el.append(av, h('div', { class: 'ec-who' }, h('span', { class: 'ec-nm', text: NM(seat) }), sub), hr, ch);
+    }
+    function handRow(el, s, seat, small) {
+      el.innerHTML = '';
+      const m = s.m; if (!m) return;
+      const k = m.k, t = keyT(s, seat);
+      const box = s.ph === 'card' ? s.pc : null;
+      const pend = box && box[seat] != null;
+      const see = canSee(s, seat);
+      const n = pend ? k - 1 : k;
+      let faces;
+      if (pend && !see) faces = Array(n).fill(null);
+      else {
+        const keyIn = pend ? s.pc[seat] !== 'K' : true;
+        faces = Array(n).fill('C');
+        if (keyIn) faces[Math.floor((n - 1) / 2)] = t;
+      }
+      const mineNow = !small && api.canAct(seat) && see && s.ph === 'card' && actorsNow(s).includes(seat) && !animating;
+      el.classList.toggle('lock', !mineNow);
+      if (!small) handLive = mineNow;
+      faces.forEach((f, j) => {
+        const c = cardEl(f || 'C', !f, (mineNow && sel === j ? 'sel' : '') + (mineNow && sel >= 0 && sel !== j ? ' dim' : ''));
+        if (small) c.style.setProperty('--w', 'var(--ow)');
+        else if (f) c.append(h('span', { class: 'nmL ' + f, text: FACE[f].name }));
+        c.dataset.i = j; c.dataset.t = f || '';
+        el.append(c);
+      });
+      const cnt = t === 'E' ? '황제 1 · 시민 ' + (k - 1) : '노예 1 · 시민 ' + (k - 1);
+      el.append(h('span', { class: 'cnt', text: small ? cnt + (pend ? ' · 한 장 엎음' : '') : '' }));
+    }
+
+    /* 카드 고르기: 손패 줄에 한 번만 건 pointerdown(다시 그려져도 눌림이 사라지지 않음) */
+    let handLive = false, selAt = 0;
+    hand.addEventListener('pointerdown', (e) => {
+      if (!handLive || animating || (e.pointerType === 'mouse' && e.button !== 0)) return;
+      const c = e.target.closest ? e.target.closest('.ec-card') : null;
+      if (!c || !hand.contains(c)) return;
+      const j = +c.dataset.i;
+      if (!(j >= 0)) return;
+      e.preventDefault();
+      if (sel === j) { if (Date.now() - selAt > 250 && Date.now() - sentAt > 300) playSel(); return; }
+      sel = j; selAt = Date.now(); api.buzz(6, 'ui'); api.sfx('click', { vol: 0.5 }); renderLower();
+    });
+
+    function renderMid(s) {
+      mid.querySelectorAll(':scope > :not(.ec-felt)').forEach((e) => e.remove());
+      const m = s.m; if (!m) return;
+      const bot = bottomSeat(s), top = E.other(m, bot);
+      const info = h('div', { class: 'ec-info' });
+      if (s.cup) info.append(h('span', { class: 'cup', text: E.RNAME(s.cup.nr, s.cup.ri) + ' · ' + (s.cup.mi + 1) + '경기' }));
+      info.append(h('span', { class: 'rd', text: (m.set > s.len ? '연장 ' : '') + m.set + (m.set > s.len ? '판' : ' / ' + s.len + '판') }));
+      info.append(h('span', { text: (E.HAND - m.k + 1) + '번째 수' }));
+      info.append(h('span', { class: 'stk', html: m.B + '<small>판돈</small>' }));
+      info.append(h('span', { class: 'x5', text: '노예 승 ×5 = ' + 5 * m.B }));
+      mid.append(info);
+      // 자리(엎어 둔 카드)
+      [[top, 't'], [bot, 'b']].forEach(([seat, pos]) => {
+        const sl = h('div', { class: 'ec-slot ' + pos });
+        if (s.ph === 'card' && s.pc[seat] != null) {
+          const see = canSee(s, seat);
+          const t = s.pc[seat] === 'K' ? keyT(s, seat) : 'C';
+          sl.append(cardEl(t, !see));
+          if (see) sl.append(h('span', { class: 'lk', text: '공개 전' }));
+        }
+        mid.append(sl);
+        if (s.bt && s.ph === 'card' && s.bets) {
+          const v = s.bets[E.ix(m, seat)];
+          const b = h('div', { class: 'ec-bet ' + pos + (v ? '' : ' z') + (s.last && s.last.t === 'bets' && s.last.id > betShown ? ' pulse' : '') });
+          if (v) { for (let q = 0; q < v; q++) b.append(h('i')); b.append(h('span', { text: '+' + v })); } else b.append(h('span', { text: '웃돈 없음' }));
+          mid.append(b);
+        }
+      });
+      if (s.last && s.last.t === 'bets') betShown = Math.max(betShown, s.last.id);
+      // 도구
+      if (E.isFast() && m.p.some((x) => api.canAct(x))) E.setFast(false);   // 내 경기에서는 빨리 보기 끔
+      const tools = h('div', { class: 'ec-tools' });
+      tools.append(h('button', { class: 'ec-tool', type: 'button', 'aria-label': '수 읽기 기록', title: '기록 (R)', 'data-action': 'log', html: TOOL.log, onclick: () => openLog() }));
+      if (sayer() >= 0) tools.append(h('button', { class: 'ec-tool', type: 'button', 'aria-label': '한마디', title: '한마디', html: TOOL.say, onclick: () => openSay() }));
+      if (s.cup) tools.append(h('button', { class: 'ec-tool', type: 'button', 'aria-label': '대진표', title: '대진표', html: TOOL.cup, onclick: () => openBracket() }));
+      if (api.isHost && !m.p.some((x) => api.canAct(x))) tools.append(h('button', { class: 'ec-tool' + (E.isFast() ? ' on' : ''), type: 'button', 'aria-label': '관전 빨리 보기', title: '관전 빨리 보기', html: TOOL.fast, onclick: (e) => { E.setFast(!E.isFast()); e.currentTarget.classList.toggle('on', E.isFast()); api.sfx('click'); } }));
+      mid.append(tools);
+    }
+    let betShown = 0;
+
+    function renderLower() {
+      const s = st; if (!s) return;
+      const m = s.m;
+      act.innerHTML = '';
+      tip.innerHTML = '';
+      if (!m) return;
+      const bot = bottomSeat(s);
+      handRow(hand, s, bot, false);
+      if (s.ph === 'over') { tip.textContent = '승부가 끝났습니다.'; return; }
+      const list = actorsNow(s);
+      const mine = api.canAct(bot) && list.includes(bot) && canSee(s, bot) && !animating;
+      const isE = m.emp === bot;
+      if (!m.p.some((x) => api.canAct(x))) {
+        tip.textContent = '관전 — ' + NM(m.p[0]) + ' 대 ' + NM(m.p[1]);
+        act.append(h('div', { class: 'ec-wait', text: s.ph === 'bet' ? '웃돈을 정하는 중' : '카드를 고르는 중' }));
+        return;
+      }
+      if (!mine) {
+        const myPend = list.includes(bot);
+        act.append(h('div', { class: 'ec-wait', text: animating ? '공개 중' : myPend ? '차례를 기다리는 중' : (s.ph === 'bet' ? '상대가 웃돈을 정하는 중' : '상대가 카드를 고르는 중') }));
+        return;
+      }
+      const i = E.ix(m, bot);
+      if (s.ph === 'bet') {
+        tip.innerHTML = '웃돈 — 이기면 받고, <b>지거나 비기면</b> 넘겨줍니다.';
+        [0, 1, 2].forEach((v) => {
+          act.append(h('button', { class: 'ec-btn' + (v ? '' : ''), type: 'button', disabled: v > m.ch[i], 'data-action': 'b' + v,
+            html: v ? '+' + v + '<small>' + v + '칩을 건다</small>' : '걸지 않음<small>0칩</small>',
+            onclick: () => send({ t: 'bet', v }) }));
+        });
+        return;
+      }
+      // 카드
+      const kt = keyT(s, bot);
+      const faces = Array(m.k).fill('C'); faces[Math.floor((m.k - 1) / 2)] = kt;
+      const pick = sel >= 0 ? faces[sel] : null;
+      const ob = s.bets ? s.bets[1 - i] : 0;
+      tip.innerHTML = ob ? '상대 웃돈 <b>+' + ob + '</b>. 핵심 카드인가, 허세인가.' : (isE ? '황제는 시민을 누르지만, 노예에게 찔립니다.' : '노예는 황제를 찌르지만, 시민에게 눌립니다.');
+      act.append(h('button', { class: 'ec-btn pri', type: 'button', disabled: !pick, 'data-action': 'play',
+        html: pick ? ({ E: '황제를', C: '시민을', S: '노예를' }[pick] + ' 낸다') + '<small>한 번 더 눌러도 냅니다</small>' : '카드를 고르세요<small>' + (isE ? '황제 1 · 시민 ' + (m.k - 1) : '노예 1 · 시민 ' + (m.k - 1)) + '</small>',
+        onclick: () => playSel() }));
+    }
+
+    function playSel() {
+      const s = st; if (!s || !s.m || sel < 0) return;
+      const m = s.m, bot = bottomSeat(s);
+      const faces = Array(m.k).fill('C'); faces[Math.floor((m.k - 1) / 2)] = keyT(s, bot);
+      const f = faces[sel]; if (!f) return;
+      send({ t: 'card', c: f === 'C' ? 'C' : 'K' });
+    }
+    function send(a) {
+      const s = st; if (!s || !s.m) return;
+      if (Date.now() - sentAt < 300) return;
+      const bot = bottomSeat(s);
+      if (!api.canAct(bot) || !actorsNow(s).includes(bot)) return;
+      sentAt = Date.now();
+      sel = -1;
+      if (multi()) revealed = -1;
+      api.buzz(a.t === 'card' ? 16 : 10); api.sfx(a.t === 'card' ? 'card' : 'chip', { vol: 0.8 });
+      api.actAs(bot, a);
+    }
+
+    /* 한마디: 판에 있는 내 자리(관전 중이면 내 첫 자리) */
+    function sayer() {
+      const s = st; if (!s) return -1;
+      const lk = looker(s);
+      if (lk >= 0) return lk;
+      const mine = api.mySeats();
+      if (s.m) { const inM = s.m.p.filter((x) => mine.includes(x)); if (inM.length === 1) return inM[0]; if (inM.length > 1) return -1; }
+      return mine.length === 1 ? mine[0] : -1;
+    }
+
+    /* 가림막(한 폰 여럿 — 동시에 고를 사람이 둘 이상 남았을 때. 한 명 남으면 core 가림막) */
+    /* holder: 지금 폰을 들고 있는(마지막으로 비밀 화면을 본) 사람.
+       한 명만 남았는데 core가 그 자리를 이미 보여 준 적이 있어 core 가림막이 안 뜨는 경우(앞 수에서 그 사람이 마지막이었음)
+       — 앞 사람이 고른 뒤 폰을 넘기라는 가림막을 게임이 직접 띄운다. */
+    let holder = -1, lastViewer = -2;
+    function curtainCheck() {
+      const s = st;
+      const v = api.viewer();
+      if (v !== lastViewer) { lastViewer = v; if (v >= 0) holder = v; }
+      const done = () => { hideCur(); const lk = looker(s); if (lk >= 0) holder = lk; };
+      if (!s || !multi() || !(s.ph === 'bet' || s.ph === 'card') || animating) { done(); return; }
+      const list = actorsNow(s);
+      if (list.length < 2) {
+        const one = list[0];
+        if (one != null && api.canAct(one) && v === one && holder >= 0 && holder !== one) { showCur(one, true); return; }
+        done(); return;
+      }
+      if (list.includes(revealed)) { done(); return; }
+      const pend = list.filter((x) => api.canAct(x));
+      if (!pend.length) { done(); return; }
+      showCur(pend[0]);
+    }
+    function showCur(seat, solo) {
+      if (cur && cur.seat === seat && !!cur.solo === !!solo) return;
+      hideCur();
+      const el = h('div', { class: 'ec-cur' },
+        h('div', { html: '<svg viewBox="0 0 100 140" width="70" height="98">' + BACK.replace(/^<svg[^>]*>|<\/svg>$/g, '') + '</svg>' }),
+        h('div', { class: 'big', text: NM(seat) }),
+        h('p', { text: (st.ph === 'bet' ? '웃돈을 정할 차례입니다.' : '카드를 고를 차례입니다.') + ' 화면은 본인만 봅니다.' }),
+        h('button', { class: 'btn primary', type: 'button', text: '내 차례 보기', onclick: () => { if (solo) holder = seat; else revealed = seat; hideCur(); api.sfx('click'); render(); } }));
+      cur = { seat, el, solo: !!solo };
+      wrap.append(el);
+    }
+    function hideCur() { if (cur) { cur.el.remove(); cur = null; } }
+
+    /* 제한 시간(이 기기에서 조작하는 사람 자리만) */
+    function timerCheck() {
+      const s = st;
+      if (!s || !s.tm || !s.m || animating || s.ph === 'over') { tbar.hidden = true; tKey = ''; return; }
+      const bot = bottomSeat(s);
+      const mine = api.canAct(bot) && actorsNow(s).includes(bot) && canSee(s, bot);
+      if (!mine) { tbar.hidden = true; tKey = ''; return; }
+      const k = [s.m.no, s.m.set, s.m.k, s.ph, bot].join('.');
+      if (k !== tKey) { tKey = k; tStart = performance.now(); }
+      tbar.hidden = false;
+    }
+    function timerTick() {
+      if (dead) return;
+      const s = st;
+      if (s && tKey && !tbar.hidden) {
+        const left = s.tm - (performance.now() - tStart) / 1000;
+        const i = tbar.querySelector('i'), sec = tbar.querySelector('b');
+        i.style.width = clamp(left / s.tm * 100, 0, 100) + '%';
+        i.classList.toggle('low', left < 4);
+        sec.textContent = Math.max(0, Math.ceil(left)) + '초'; sec.classList.toggle('low', left < 4);
+        if (left <= 0) {
+          const bot = bottomSeat(s), m = s.m;
+          tKey = 'x';
+          if (s.ph === 'bet') send({ t: 'bet', v: 0 });
+          else send({ t: 'card', c: Math.random() < 1 / m.k ? 'K' : 'C' });
+          if (bot >= 0) api.toast('시간 초과 — 자동으로 냈습니다', 1200);
+        }
+      }
+      tTimer = setTimeout(timerTick, 200);
+    }
+
+    function render() {
+      if (!st || dead) return;
+      layout();
+      const s = st, m = s.m;
+      if (!m) return;
+      curtainCheck();   // 먼저: 가림막이 뜨면 그 아래에는 비밀 화면을 그리지 않음
+      const bot = bottomSeat(s), top = E.other(m, bot);
+      if (sel >= m.k) sel = -1;
+      panel(topP, s, top, true);
+      panel(meP, s, bot, false);
+      handRow(oh, s, top, true);
+      renderMid(s);
+      renderLower();
+      timerCheck();
+    }
+
+    /* 말풍선 */
+    function bubbles(s) {
+      for (const c of s.chat) {
+        if (c.i <= chatSeen) continue;
+        chatSeen = c.i;
+        const m = s.m; let at = 'mid';
+        if (m && m.p.includes(c.s)) at = c.s === bottomSeat(s) ? 'b' : 't';
+        const b = h('div', { class: 'ec-bub', style: { '--c': COL(c.s) } }, h('span', { class: 'n', text: NM(c.s) }), E.SAY[c.k] || '');
+        if (at === 't') { b.style.top = (topP.offsetTop + topP.offsetHeight + 2) + 'px'; b.style.left = '52px'; }
+        else if (at === 'b') { b.style.top = (meP.offsetTop - 30) + 'px'; b.style.left = '52px'; }
+        else { b.style.top = (mid.offsetTop + 6) + 'px'; b.style.left = '50%'; b.style.transform = 'translateX(-50%)'; }
+        wrap.append(b);
+        setTimeout(() => b.remove(), 1700);
+      }
+    }
+
+    /* ---------- 공개 연출 ---------- */
+    const VD = {
+      CC: ['시민과 시민', '둘 다 버리고 다음 수로 넘어갑니다.', 'n'],
+      EC: ['황제가 시민을 누릅니다', '황제 측이 판을 가져갑니다.', ''],
+      CS: ['시민이 노예를 누릅니다', '황제 측이 판을 가져갑니다.', ''],
+      ES: ['노예가 황제를 찌릅니다', '노예 측 승리 — 판돈 다섯 배.', 'r'],
+    };
+    async function playDuel(last, prevS) {
+      const viewS = prevS || st;
+      const bot = viewS.m && viewS.m.p.includes(bottomSeat(viewS)) ? bottomSeat(viewS) : last.p[0];
+      const top = last.p[0] === bot ? last.p[1] : last.p[0];
+      const myView = canSee(viewS, bot) || api.canAct(bot) && !multi();
+      const cu = h('div', { class: 'ec-cu' });
+      const pz = h('div', { class: 'pz' });
+      const whoT = h('div', { class: 'who' }, h('span', { class: 'dot', style: { '--c': COL(top) } }), NM(top) + ' · ' + (top === last.e ? '황제 측' : '노예 측'));
+      const whoB = h('div', { class: 'who' }, h('span', { class: 'dot', style: { '--c': COL(bot) } }), NM(bot) + ' · ' + (bot === last.e ? '황제 측' : '노예 측'));
+      const midBox = h('div', { class: 'mid' });
+      const meta = h('div', { class: 'meta' });
+      const skip = h('div', { class: 'skip', text: '누르면 넘김' });
+      let slotT = h('div'), slotB = h('div');
+      cu.append(pz, whoT, slotT, midBox, slotB, whoB, meta, skip);
+      wrap.append(cu);
+      skipping = false;
+      cu.addEventListener('click', () => skipNow());
+      const bpm = Math.max(bpmOf(viewS, bot), 90);
+      const beatMs = 60000 / bpm;
+      for (let j = 0; j < last.d.length; j++) {
+        const d = last.d[j];
+        const cT = top === last.e ? d.ce : d.cs, cB = bot === last.e ? d.ce : d.cs;
+        const nT = cardEl(cT, true), nB = cardEl(cB, !myView || d.forced);
+        slotT.replaceWith(nT); slotB.replaceWith(nB); slotT = nT; slotB = nB;
+        midBox.innerHTML = '';
+        midBox.append(h('div', { class: 'ec-vs', text: d.forced ? '남은 한 장 — 황제와 노예' : (E.HAND - d.k + 1) + '번째 수' }));
+        meta.textContent = '판돈 ' + last.B + (last.be || last.bs ? ' · 웃돈 ' + (last.be + last.bs) : '');
+        const decisive = d.ce !== 'C' || d.cs !== 'C';
+        const beats = decisive ? 3 : 2;
+        if (decisive) Snd.drone((beats * beatMs) / 1000 / SP());
+        for (let b = 0; b < beats; b++) {
+          pz.classList.add('on'); Snd.beat(0.7 + b * 0.15); api.buzz(18, 'hit');
+          await wait(140); pz.classList.remove('on');
+          await wait(Math.max(160, beatMs - 140));
+          if (dead) return;
+        }
+        const fd = (decisive ? 0.75 : 0.45) / SP();
+        [nT, nB].forEach((c) => c.style.setProperty('--fd', fd + 's'));
+        if (!(myView && !d.forced)) { nB.classList.remove('down'); }
+        await wait(decisive ? 260 : 80);
+        nT.classList.remove('down');
+        api.sfx('card');
+        await wait(fd * 1000 * SP() + 60);
+        if (skipping) { nT.classList.remove('down'); nB.classList.remove('down'); }
+        const key = (d.ce === 'E' ? 'E' : 'C') + (d.cs === 'S' ? 'S' : 'C');
+        const v = VD[key];
+        midBox.innerHTML = '';
+        midBox.append(h('div', { class: 'ec-vd ' + v[2], text: v[0] }), h('div', { class: 'ec-vs', text: v[1] }));
+        if (key === 'ES') { api.sfx('hit'); api.buzz(60, 'hit'); }
+        else if (key === 'CC') api.sfx('whoosh', { vol: 0.6 });
+        else api.sfx('thud');
+        await wait(decisive ? 1250 : 700);
+        if (dead) return;
+      }
+      if (last.w >= 0) {
+        midBox.innerHTML = '';
+        const winE = last.w === last.e;
+        midBox.append(h('div', { class: 'ec-vd' + (winE ? '' : ' r'), text: NM(last.w) + ' +' + last.pay }),
+          h('div', { class: 'ec-vs', text: (winE ? '황제 측' : '노예 측') + ' 승리 · 판돈 ' + last.B + (winE ? '' : ' ×5') + (last.be + last.bs ? ' + 웃돈 ' + (last.be + last.bs) : '') }));
+        const me = api.mySeats();
+        if (me.includes(last.w)) { api.sfx('win'); L.haptic && L.haptic('win', 40); }
+        else if (last.p.some((x) => me.includes(x))) api.sfx('lose');
+        else api.sfx('result');
+        await wait(1100);
+      } else if (last.be || last.bs) {
+        midBox.append(h('div', { class: 'ec-vs', text: '웃돈은 서로에게 넘어갑니다.' }));
+        await wait(500);
+      }
+      if (last.mt && !dead) {
+        cu.innerHTML = '';
+        const mt = last.mt;
+        const box = h('div', { class: 'ec-mo' }, h('h3', { text: NM(mt.w) + ' 승리' }),
+          h('div', { class: 'sc', text: NM(last.p[0]) + ' ' + mt.ch[0] + ' : ' + mt.ch[1] + ' ' + NM(last.p[1]) }),
+          h('p', { text: mt.rn ? (mt.rn === '결승' ? '토너먼트 우승' : mt.rn + ' 통과') : '이긴 판 ' + Math.max(mt.sw[0], mt.sw[1]) + ' · 진 판 ' + Math.min(mt.sw[0], mt.sw[1]) }),
+          mt.next ? h('p', { text: '다음 경기 — ' + NM(mt.next[0]) + ' 대 ' + NM(mt.next[1]) }) : null);
+        cu.append(pz, box);
+        await wait(1700);
+      }
+      cu.remove();
+    }
+
+    async function pump() {
+      if (animating) return;
+      animating = true; busy('anim', true);
+      try {
+        while (Q.length && !dead) {
+          const it = Q.shift();
+          if (it.last.t === 'duel') {
+            render();
+            await playDuel(it.last, it.prev);
+            if (it.last.w >= 0) floatDelta(it.last);
+          }
+        }
+      } catch (e) { console.error(e); }
+      skipping = false; curRes = null;
+      animating = false; busy('anim', false);
+      if (!dead) { render(); bubbles(st); }
+    }
+    function floatDelta(last) {
+      const s = st; if (!s.m) return;
+      last.p.forEach((seat, j) => {
+        const dv = last.ch[j] - last.ch0[j]; if (!dv) return;
+        const pnl = s.m.p.includes(seat) ? (seat === bottomSeat(s) ? meP : topP) : null;
+        if (!pnl) return;
+        const chips = pnl.querySelector('.ec-chips'); if (!chips) return;
+        chips.style.position = 'relative';
+        const d = h('span', { class: 'dl ' + (dv > 0 ? 'p' : 'm'), text: (dv > 0 ? '+' : '−') + Math.abs(dv) });
+        chips.append(d); setTimeout(() => d.remove(), 1500);
+      });
+    }
+
+    /* ---------- 시트: 기록 · 한마디 · 대진표 ---------- */
+    function openSheet(title, body) {
+      closeSheet();
+      const bg = h('div', { class: 'ec-shb', onclick: () => closeSheet() });
+      const sh = h('div', { class: 'ec-sh', role: 'dialog', 'aria-label': title },
+        h('h3', {}, h('span', { text: title }), h('button', { class: 'ec-x', type: 'button', 'aria-label': '닫기', text: '×', onclick: () => closeSheet() })), body);
+      wrap.append(bg, sh);
+      sheet = { bg, sh };
+    }
+    function closeSheet() { if (sheet) { sheet.bg.remove(); sheet.sh.remove(); sheet = null; return true; } return false; }
+
+    function readStats(s, seat, side) {
+      const by = [0, 0, 0, 0, 0];
+      let kb = 0, nbk = 0, k0 = 0, nk0 = 0;
+      for (const r of s.hist) {
+        const isMe = side === 'E' ? r[3] === seat : r[4] === seat;
+        if (!isMe || r[2] < 2) continue;
+        const key = side === 'E' ? r[5] : r[6], bet = side === 'E' ? r[7] : r[8];
+        if (key) by[E.HAND - r[2]]++;
+        if (bet > 0) { nbk++; if (key) kb++; } else { nk0++; if (key) k0++; }
+      }
+      return { by, kb, nbk, k0, nk0 };
+    }
+    function openLog() {
+      const s = st; if (!s || !s.m) return;
+      const body = h('div');
+      const m = s.m;
+      body.append(h('p', { class: 'muted', style: { margin: '0 0 6px', fontSize: '12px' }, text: '핵심 카드(황제·노예)를 몇 번째 수에 냈는지. 상대의 버릇을 읽는 데 씁니다. 마지막 한 장에서 강제로 낸 경우는 빼고 셉니다.' }));
+      m.p.forEach((seat) => {
+        body.append(h('h4', {}, h('span', { style: { color: COL(seat) }, text: '● ' }), NM(seat)));
+        const row = h('div', { class: 'ec-rdrow' });
+        ['E', 'S'].forEach((side) => {
+          const r = readStats(s, seat, side);
+          const mx = Math.max(1, ...r.by);
+          const bars = h('div', { class: 'ec-bars' });
+          r.by.slice(0, 4).forEach((v, q) => bars.append(h('span', { class: side === 'S' ? 's' : '', style: { height: Math.max(2, v / mx * 28) + 'px' } }, h('b', { text: v ? String(v) : '' }), h('i', { text: (q + 1) + '수' }))));
+          const col = h('div', {}, h('span', { class: 't', text: side === 'E' ? '황제를 낸 수' : '노예를 낸 수' }), bars);
+          if (s.bt) col.append(h('span', { class: 't', style: { marginTop: '12px' }, text: '웃돈 건 수 → 핵심 ' + r.kb + '/' + r.nbk + ' · 안 건 수 → ' + r.k0 + '/' + r.nk0 }));
+          else col.append(h('span', { class: 't', style: { marginTop: '12px' }, text: ' ' }));
+          row.append(col);
+        });
+        body.append(row);
+      });
+      const sets = s.sets.filter((x) => x[0] === m.no).slice(-14).reverse();
+      body.append(h('h4', { text: '이번 경기의 판' }));
+      if (!sets.length) body.append(h('p', { class: 'muted', style: { fontSize: '12px' }, text: '아직 끝난 판이 없습니다.' }));
+      else {
+        const tb = h('table', { class: 'ec-log' });
+        sets.forEach((x) => {
+          const slW = x[4] === x[3];
+          tb.append(h('tr', {}, h('td', { text: x[1] + '판' }), h('td', { text: '황제 ' + NM(x[2]) }), h('td', { text: x[5] > 5 ? '끝' : x[5] + '수째' }),
+            h('td', { class: slW ? 'sl' : 'w', text: (slW ? '노예' : '황제') + ' 승' }), h('td', { class: 'r', text: '+' + x[6] })));
+        });
+        body.append(tb);
+      }
+      openSheet('수 읽기 기록', body);
+    }
+    function openSay() {
+      const seat = sayer(); if (seat < 0) return;
+      const body = h('div', { class: 'ec-say' });
+      E.SAY.forEach((t, k) => body.append(h('button', { type: 'button', text: t, onclick: () => { api.actAs(seat, { t: 'say', k }); api.sfx('click', { vol: 0.6 }); closeSheet(); } })));
+      openSheet('한마디', h('div', {}, h('p', { class: 'muted', style: { margin: '0 0 8px', fontSize: '12px' }, text: '진실일 수도, 거짓일 수도 있습니다.' }), body));
+    }
+    function openBracket() {
+      const s = st; if (!s || !s.cup) return;
+      const c = s.cup, br = h('div', { class: 'ec-br' });
+      for (let r = 0; r < c.nr; r++) {
+        const col = h('div', { class: 'col' }, h('b', { text: E.RNAME(c.nr, r) }));
+        const R = c.R[r];
+        const cnt = Math.pow(2, c.nr - r - 1);
+        for (let i = 0; i < cnt; i++) {
+          let x = R ? R[i] : null;
+          if (!x && r > 0) {   // 아직 안 만든 라운드: 앞 라운드에서 올라온 사람만 채워 보여 줌
+            const P = c.R[r - 1] ? c.R[r - 1] : null;
+            const up = (q) => (P && P[q] && P[q][2] >= 0 ? P[q][2] : -2);
+            x = [up(2 * i), up(2 * i + 1), -1];
+          }
+          const cur = s.ph !== 'over' && r === c.ri && i === c.mi;
+          const mt = h('div', { class: 'mt' + (cur ? ' cur' : '') });
+          [0, 1].forEach((j) => {
+            const seat = x ? x[j] : -2;
+            const nm = seat === -1 ? '부전승' : seat < 0 ? '—' : NM(seat);
+            const cls = x && x[2] >= 0 && seat >= 0 ? (x[2] === seat ? 'win' : 'lose') : '';
+            mt.append(h('div', { class: cls, text: nm }));
+          });
+          col.append(mt);
+        }
+        br.append(col);
+      }
+      const champ = s.champ >= 0 ? h('p', { style: { margin: '10px 0 0', color: '#f0d48a' }, text: '우승 — ' + NM(s.champ) }) : null;
+      openSheet('대진표', h('div', {}, br, champ));
+    }
+
+    /* ---------- 입력: 키보드 · 오른쪽 클릭 ---------- */
+    const offIn = api.input && api.input.on ? api.input.on((type, id) => {
+      if (type !== 'down' || !st || animating) return;
+      if (id === 'log') { if (!closeSheet()) openLog(); return; }
+      const s = st; if (!s.m) return;
+      const bot = bottomSeat(s);
+      if (!api.canAct(bot) || !actorsNow(s).includes(bot) || !canSee(s, bot)) return;
+      if (s.ph === 'bet' && /^b[012]$/.test(id)) { const v = +id[1]; if (v <= s.m.ch[E.ix(s.m, bot)]) send({ t: 'bet', v }); return; }
+      if (s.ph === 'card') {
+        const kp = Math.floor((s.m.k - 1) / 2);
+        if (id === 'key') { sel = kp; renderLower(); }
+        else if (id === 'cit' && s.m.k > 1) { sel = kp === 0 ? 1 : 0; renderLower(); }
+        else if (id === 'play') playSel();
+      }
+    }) : null;
+    const onCancel = (e) => { if (closeSheet()) { e.preventDefault(); return; } if (sel >= 0) { sel = -1; renderLower(); e.preventDefault(); } };
+    window.addEventListener('lounge-cancel', onCancel);
+    const onRs = () => { if (!animating) render(); else layout(); };
+    window.addEventListener('resize', onRs);
+    timerTick();
+
+    return {
+      update(state, prev) {
+        if (dead) return;
+        const prevSt = st;
+        st = state;
+        if (!state) return;
+        if (!prev || !prevSt) { shownId = state.last ? state.last.id : 0; chatSeen = state.chat.length ? state.chat[state.chat.length - 1].i : 0; render(); return; }
+        if (state.last && state.last.id !== shownId) {
+          shownId = state.last.id;
+          if (state.last.t === 'duel') { sel = -1; Q.push({ last: state.last, prev: prevSt }); pump(); }
+          else if (state.last.t === 'bets') api.sfx('chip', { vol: 0.7 });
+        }
+        if (!animating) { render(); bubbles(state); }
+        else if (state.chat.length && state.chat[state.chat.length - 1].i > chatSeen) bubbles(state);
+      },
+      destroy() {
+        dead = true;
+        clearTimeout(tTimer);
+        skipNow();
+        window.removeEventListener('lounge-cancel', onCancel);
+        window.removeEventListener('resize', onRs);
+        window.removeEventListener('lounge-felt', paintFelt);
+        if (offIn) offIn();
+        busyK.clear(); api.setBusy(false);
+        E.setFast(false);
+        wrap.remove();
+      },
+    };
+  }
+
+  /* ======================= 등록 ======================= */
+  function cardFig(list, cap) {   // 규칙 그림: 카드 여러 장 + 화살표
+    const W = 340, cw = 62, chh = 87, gap = (W - list.length * cw) / (list.length + 1);
+    let g = '';
+    list.forEach((t, i) => {
+      const x = gap + i * (cw + gap);
+      g += '<svg x="' + x.toFixed(1) + '" y="6" width="' + cw + '" height="' + chh + '" viewBox="0 0 100 140">' + (t === 'B' ? BACK : faceSVG(t)).replace(/^<svg[^>]*>|<\/svg>$/g, '') + '</svg>';
+      if (i < list.length - 1 && cap[i]) {
+        const ax = x + cw + 4, bx = x + cw + gap - 4;
+        g += '<path d="M' + ax + ' 50 H' + bx + '" stroke="#d4ad5c" stroke-width="2" marker-end="url(#ecAr)"/><text x="' + ((ax + bx) / 2) + '" y="42" text-anchor="middle" font-size="11" fill="#e9dfca">' + cap[i] + '</text>';
+      }
+    });
+    return '<svg viewBox="0 0 340 100" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif"><defs><marker id="ecAr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#d4ad5c"/></marker></defs>' + g + '</svg>';
+  }
+  const FIG_RANK = cardFig(['E', 'C', 'S', 'E'], ['누른다', '누른다', '찌른다']);
+  const FIG_HANDS = '<svg viewBox="0 0 340 120" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif" font-size="12">' +
+    ['E', 'C', 'C', 'C', 'C'].map((t, i) => '<svg x="' + (8 + i * 31) + '" y="22" width="40" height="56" viewBox="0 0 100 140">' + faceSVG(t).replace(/^<svg[^>]*>|<\/svg>$/g, '') + '</svg>').join('') +
+    ['S', 'C', 'C', 'C', 'C'].map((t, i) => '<svg x="' + (180 + i * 31) + '" y="22" width="40" height="56" viewBox="0 0 100 140">' + faceSVG(t).replace(/^<svg[^>]*>|<\/svg>$/g, '') + '</svg>').join('') +
+    '<text x="86" y="14" text-anchor="middle" fill="#ecc86e">황제 측</text><text x="258" y="14" text-anchor="middle" fill="#dc9e76">노예 측</text>' +
+    '<text x="86" y="98" text-anchor="middle" fill="#cfc4ad">이기면 판돈 ×1</text><text x="258" y="98" text-anchor="middle" fill="#cfc4ad">이기면 판돈 ×5</text>' +
+    '<text x="170" y="115" text-anchor="middle" fill="#9d917c" font-size="11">3판마다 측을 바꿉니다</text></svg>';
+  const RULES = [
+    { h: '목표', p: [
+      '두 사람이 칩 30개씩 들고 마주 앉습니다. 정해진 판 수(기본 12판)가 끝났을 때 칩이 더 많은 쪽이 이깁니다.',
+      '칩이 바닥나면 그 자리에서 집니다.'] },
+    { h: '카드와 상성', p: [
+      '황제는 시민을 누릅니다. 시민은 노예를 누릅니다. 노예는 황제를 찌릅니다.',
+      '시민과 시민이 만나면 승부가 나지 않습니다. 두 장을 버리고 다음 수로 넘어갑니다.'], fig: { svg: FIG_RANK, cap: '세 장의 물고 물리는 관계' } },
+    { h: '한 판의 진행', p: [
+      '한쪽은 황제 1장과 시민 4장, 다른 쪽은 노예 1장과 시민 4장을 받습니다. 서로의 손패 구성은 공개입니다.',
+      '매 수마다 두 사람이 동시에 한 장을 엎어 내고, 함께 공개합니다.',
+      '황제나 노예가 나오는 순간 그 판은 끝납니다. 시민끼리면 다음 수로 넘어가고, 끝까지 가면 마지막 한 장에서 황제와 노예가 마주칩니다(노예 측 승리).'], fig: { svg: FIG_HANDS, cap: '두 측의 손패' } },
+    { h: '판돈과 칩', p: [
+      '판돈은 처음 6판은 1, 7~12판은 2, 13~18판은 3입니다.',
+      '황제 측이 이기면 판돈만큼, 노예 측이 이기면 판돈의 5배를 상대에게서 받습니다.',
+      '노예 측은 한 번 이기면 크게 받지만, 대부분의 판에서는 집니다. 황제 측은 자주 이기지만 한 번의 실수가 큽니다.'] },
+    { h: '웃돈(선택 규칙)', p: [
+      '매 수, 카드를 고르기 전에 웃돈 0·1·2를 동시에 정하고 함께 공개합니다. 상대가 얼마를 걸었는지 보고 나서 카드를 고릅니다.',
+      '그 수에서 판이 끝나면 걸린 웃돈은 모두 이긴 쪽이 가져갑니다. 시민끼리 비기면 각자 건 만큼 상대에게 넘깁니다.',
+      '웃돈은 신호입니다. 확신의 표시일 수도, 상대를 움직이려는 허세일 수도 있습니다.'] },
+    { h: '측 바꾸기 · 연장', p: [
+      '3판마다 황제 측과 노예 측을 바꿉니다. 첫 판의 황제 측은 무작위입니다.',
+      '마지막 판이 끝났을 때 칩이 같으면, 측을 번갈아 가며 한 판씩 더 합니다(최대 6판, 그래도 같으면 이긴 판 수로).'] },
+    { h: '토너먼트(3~8명)', p: [
+      '3명 이상이면 1:1 토너먼트입니다. 대진은 무작위이고, 빈자리는 부전승입니다.',
+      '경기에 나서지 않은 사람은 그 경기를 관전합니다. 관전자에게는 이번 수에 고른 카드가 보이지 않습니다.',
+      '경기마다 칩 30개로 새로 시작합니다. 마지막까지 남은 한 사람이 우승합니다.'] },
+    { h: '예시', p: [
+      '내가 황제 측, 시민끼리 두 번 비겨 이제 세 장씩 남았습니다. 무작위로 낸다면 노예 측이 이길 확률은 1/3입니다.',
+      '상대가 웃돈 2를 걸었습니다. 노예를 내려는 자신감인가, 내 황제를 묶어 두려는 허세인가 — 판단은 기록에 남은 상대의 버릇으로.'] },
+    { h: '조작', p: [
+      '웃돈: 아래의 「걸지 않음 · +1 · +2」 중 하나를 누릅니다.',
+      '카드: 손패에서 한 장을 눌러 고르고, 아래의 「○○를 낸다」 버튼을 누르거나 같은 카드를 한 번 더 눌러 냅니다.',
+      '오른쪽 도구: 수 읽기 기록 · 한마디(진실도 거짓도 될 수 있는 짧은 말) · 대진표 · 관전 빨리 보기.',
+      '제한 시간 옵션을 켜면, 시간이 다 됐을 때 웃돈 0 또는 무작위 카드로 자동 처리됩니다.',
+      '한 폰으로 둘이 할 때는 고를 때마다 가림막이 뜹니다.'] },
+    { h: 'AI', p: [
+      'AI 난이도는 자리마다 쉬움·보통·어려움으로 고릅니다.',
+      'AI는 상대가 핵심 카드를 몇 번째 수에 내는지, 웃돈과 실제 카드가 얼마나 맞는지 기억해 읽습니다. 어려움은 균형 잡힌 섞기를 기본으로, 버릇이 보이는 만큼만 파고듭니다.'] },
+    { h: '만든 사람', p: [
+      '카드 그림·탁자·아이콘: 이 게임용으로 직접 그린 벡터(CC0).',
+      '심장 박동·저음 효과: 브라우저 WebAudio 합성(CC0). 그 밖의 효과음은 한판 라운지 공용 합성음.',
+      '규칙의 뼈대(황제·시민·노예 다섯 장 대결)는 널리 알려진 카드 대결 방식을 참고했고, 판돈·웃돈·심박·토너먼트는 이 게임의 독자 구성입니다.'] },
+  ];
+
+  function preview(cv) {
+    const ctx = cv.getContext('2d'), W = cv.width, H = cv.height;
+    const g = ctx.createRadialGradient(W / 2, H * 0.45, 20, W / 2, H * 0.5, W * 0.6);
+    g.addColorStop(0, '#2c1a12'); g.addColorStop(0.55, '#140a0a'); g.addColorStop(1, '#050304');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    const lg = ctx.createRadialGradient(W / 2, 0, 10, W / 2, 0, H);
+    lg.addColorStop(0, 'rgba(255,214,150,.22)'); lg.addColorStop(1, 'rgba(255,214,150,0)');
+    ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
+    const cards = [['#4a1016', '#d9b25f', '황제'], ['#2b3642', '#9fb0bf', '시민'], ['#33231a', '#8f6c4b', '노예']];
+    cards.forEach((c, i) => {
+      ctx.save();
+      ctx.translate(W / 2 + (i - 1) * 150, H / 2 + Math.abs(i - 1) * 14);
+      ctx.rotate((i - 1) * 0.12);
+      const w = 120, hh = 168;
+      ctx.shadowColor = 'rgba(0,0,0,.7)'; ctx.shadowBlur = 24; ctx.shadowOffsetY = 10;
+      ctx.fillStyle = c[0]; ctx.fillRect(-w / 2, -hh / 2, w, hh);
+      ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+      ctx.strokeStyle = c[1]; ctx.lineWidth = 2; ctx.strokeRect(-w / 2 + 7, -hh / 2 + 7, w - 14, hh - 14);
+      ctx.fillStyle = '#0d0708';
+      ctx.beginPath(); ctx.ellipse(0, -18, 15, 18, 0, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-42, 52); ctx.bezierCurveTo(-40, 14, -20, 4, 0, 4); ctx.bezierCurveTo(20, 4, 40, 14, 42, 52); ctx.closePath(); ctx.fill();
+      if (i === 0) { ctx.fillStyle = '#e8c46a'; ctx.beginPath(); ctx.moveTo(-16, -30); ctx.lineTo(-17, -50); ctx.lineTo(-8, -40); ctx.lineTo(0, -54); ctx.lineTo(8, -40); ctx.lineTo(17, -50); ctx.lineTo(16, -30); ctx.closePath(); ctx.fill(); }
+      if (i === 2) { ctx.strokeStyle = '#a3aab1'; ctx.lineWidth = 3; for (let k = 0; k < 4; k++) { ctx.beginPath(); ctx.ellipse(-12 + k * 8, 38, 5, 3, 0, 0, 7); ctx.stroke(); } }
+      if (i === 1) { ctx.fillStyle = '#3b3128'; ctx.fillRect(-18, -36, 36, 8); }
+      ctx.fillStyle = c[1]; ctx.font = '22px "Black Han Sans", sans-serif'; ctx.textAlign = 'center'; ctx.fillText(c[2], 0, hh / 2 - 16);
+      ctx.restore();
+    });
+  }
+
+  L.register({
+    id: ID, name: '황제와 노예', tag: '2인 심리전', cat: '카드', hidden: true, fixedOrder: true, undo: false,
+    icon: ICON, tint: '#3a0f16', time: '10–20분', mood: 'tension', ambient: 'casino',
+    blurb: '황제는 시민을, 시민은 노예를, 노예는 황제를 이긴다. 다섯 장으로 겨루는 한 수 한 수의 읽기 싸움.',
+    quick: [
+      '황제 > 시민 > 노예 > 황제. 둘이 동시에 한 장씩 엎어 내고 함께 공개합니다.',
+      '한쪽은 황제 1·시민 4, 다른 쪽은 노예 1·시민 4. 시민끼리는 버리고 다음 수로.',
+      '노예 측이 이기면 판돈의 5배. 정해진 판이 끝났을 때 칩이 많은 쪽이 승리. 3명 이상이면 토너먼트.',
+    ],
+    rules: RULES,
+    tutorial: [
+      { text: '황제는 시민을, 시민은 노예를, 노예는 황제를 이깁니다. 시민끼리는 승부 없이 버립니다.', sel: '.ec-hand' },
+      { text: '상대의 측과 칩, 심박. 심박은 이번 판에 걸린 몫이 클수록 빨라집니다.', sel: '.ec-top' },
+      { text: '판돈과 진행. 노예 측이 이기면 판돈의 5배를 받습니다.', sel: '.ec-info' },
+      { text: '카드를 내기 전에 웃돈을 정합니다. 걸린 액수는 공개됩니다 — 신호이자 허세의 도구.', sel: '.ec-act' },
+      { text: '오른쪽 도구에서 상대가 핵심 카드를 몇 번째 수에 냈는지 확인할 수 있습니다.', sel: '.ec-tools' },
+    ],
+    options: [
+      { id: 'len', label: '판 길이', tip: '3판마다 측을 바꿉니다. 토너먼트는 경기마다 이 길이.', choices: [{ v: 's', label: '짧게 6판' }, { v: 'm', label: '보통 12판' }, { v: 'l', label: '길게 18판' }], def: 'm' },
+      { id: 'bets', label: '웃돈', tip: '매 수 카드를 내기 전에 0·1·2를 동시에 걸고 공개합니다.', choices: [{ v: 'on', label: '켬' }, { v: 'off', label: '끔' }], def: 'on' },
+      { id: 'timer', label: '제한 시간', tip: '시간이 다 되면 웃돈 0, 카드는 무작위로 냅니다.', choices: [{ v: 0, label: '없음' }, { v: 20, label: '20초' }, { v: 10, label: '10초' }], def: 0 },
+    ],
+    controls: [
+      { id: 'key', label: '황제·노예 고르기', keys: ['KeyK'] },
+      { id: 'cit', label: '시민 고르기', keys: ['KeyC'] },
+      { id: 'play', label: '고른 카드 내기', keys: ['Space', 'KeyF'] },
+      { id: 'b0', label: '웃돈 걸지 않음', keys: ['Digit0', 'Numpad0'] },
+      { id: 'b1', label: '웃돈 +1', keys: ['Digit1', 'Numpad1'] },
+      { id: 'b2', label: '웃돈 +2', keys: ['Digit2', 'Numpad2'] },
+      { id: 'log', label: '수 읽기 기록', keys: ['KeyR'] },
+    ],
+    minPlayers: 2, maxPlayers: 8, defaultPlayers: 2, aiDelay: 1000,
+    init, actor, apply, ai, aiDelayFor, result, offTurn, hint, mount, preview,
+    panelInfo(s) { if (!s.m) return null; return [{ label: '판', value: s.m.set + ' / ' + s.len }, { label: '판돈', value: String(s.m.B) }]; },
+    _t: E,
+  });
+})();

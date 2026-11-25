@@ -1,0 +1,920 @@
+/* 숫자 슬라이드 퍼즐 — 빈칸 옆 타일을 밀어 1부터 차례대로 맞추는 고전 퍼즐 (3×3 ~ 8×8, 숫자/그림).
+   혼자(기본): 크기 고르기·되돌리기·힌트·크기별 최고 기록(이 폰에 저장). 대결: 2~4명이 같은 섞임을 동시에 풀어 먼저 맞추면 승리
+   (한 폰에 한 명, 나머지는 AI 또는 온라인 친구).
+   Board = string, one char per cell (48+v, v=0 is the gap), goal = 1..N²-1 then gap. Moves = gap directions u/d/l/r.
+   'mv' actions are cumulative ({f: confirmed count, q: moves since}) so a dropped/duplicated guest message is harmless.
+   Solvers: IDA* (Manhattan) for 3×3 / 4×4 hints, row-then-column reduction + 3×3 IDA* for any size (AI and big-board hints). */
+(function () {
+  const L = window.Lounge, U = L.util;
+  /* ---------- 오늘의 퍼즐 (날짜 YYYYMMDD 씨앗 → 모두 같은 퍼즐). 기록·연속 일수는 이 기기에만, 지난 7일치만 남김 ---------- */
+  function mkDaily(gid, short, fmt, lower) {
+    const SK = 'lounge.daily.' + gid;
+    const ymd = (d) => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+    const toD = (n) => new Date(Math.floor(n / 10000), Math.floor(n / 100) % 100 - 1, n % 100, 12);
+    const shift = (n, k) => { const d = toD(n); d.setDate(d.getDate() + k); return ymd(d); };
+    const rd = () => { try { return JSON.parse(localStorage.getItem(SK) || '{}') || {}; } catch (e) { return {}; } };
+    const wr = (o) => { try { localStorage.setItem(SK, JSON.stringify(o)); } catch (e) {} };
+    const D = {
+      today: () => ymd(new Date()),
+      md: (n) => (Math.floor(n / 100) % 100) + '/' + (n % 100),
+      long: (n) => (Math.floor(n / 100) % 100) + '월 ' + (n % 100) + '일',
+      seed(n) { let h = (n >>> 0) ^ 0x9e3779b9; h = Math.imul(h ^ (h >>> 16), 0x85ebca6b); h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35); return (h ^ (h >>> 16)) >>> 0; },
+      score: (n) => { const o = rd(); return o.done ? o.done[n] : undefined; },
+      streak() { const o = rd(), t = D.today(); return o.last && (o.last === t || o.last === shift(t, -1)) ? o.st | 0 : 0; },
+      prune() {
+        const o = rd(), cut = shift(D.today(), -6);
+        if (o.done) for (const k in o.done) if (+k < cut) delete o.done[k];
+        wr(o);
+        try { const all = U.store.get('best.' + gid, {}); let ch = 0; for (const k in all) if (/^d\d{8}$/.test(k) && +k.slice(1) < cut) { delete all[k]; ch = 1; } if (ch) U.store.set('best.' + gid, all); } catch (e) {}
+      },
+      /* 완료 기록 → 새 최고면 true */
+      complete(n, sc, api) {
+        const o = rd(); o.done = o.done || {};
+        const old = o.done[n], first = old == null;
+        if (first || (lower ? sc < old : sc > old)) o.done[n] = sc;
+        if (first) { o.st = o.last === shift(n, -1) ? (o.st | 0) + 1 : o.last === n ? o.st | 0 || 1 : 1; if (!o.last || n > o.last) o.last = n; }
+        wr(o);
+        if (api) api.best('d' + n, sc, { label: '오늘의 퍼즐 ' + D.md(n), lower: !!lower, unit: fmt === 'time' ? '' : fmt, fmt: fmt === 'time' ? 'time' : '' });
+        D.prune();
+        return !first && o.done[n] === sc && sc !== old;
+      },
+      text(n) {
+        const sc = D.score(n);
+        const v = fmt === 'time' ? (sc >= 60 ? Math.floor(sc / 60) + '분 ' + Math.round(sc % 60) + '초' : Math.round(sc) + '초') : sc + fmt;
+        return '한판 라운지 ' + short + ' ' + D.md(n) + ' ✓ ' + v + ' · 연속 ' + Math.max(1, D.streak()) + '일';
+      },
+      share(n, api) {
+        const t = D.text(n), ok = () => api && api.toast('복사했어요: ' + t);
+        const fb = () => { try { const ta = L.h('textarea', { style: { position: 'fixed', left: '-999px' } }); ta.value = t; document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove(); ok(); } catch (e) { if (api) api.toast(t); } };
+        try { if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(ok, fb); else fb(); } catch (e) { fb(); }
+      },
+      fmtScore(sc) { return sc == null ? '' : fmt === 'time' ? (sc >= 60 ? Math.floor(sc / 60) + '분 ' + Math.round(sc % 60) + '초' : Math.round(sc) + '초') : sc + fmt; },
+      /* 단계/모드 고르기 맨 위에 넣는 큰 카드 */
+      card(onPlay, api, sub) {
+        const n = D.today(), sc = D.score(n), st = D.streak();
+        const box = L.h('div', { class: 'daily-card', style: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px', borderRadius: '14px', border: '2px solid var(--brass,#e3ae45)', background: 'linear-gradient(135deg,rgba(227,174,69,.22),rgba(227,174,69,.06))' } });
+        const head = L.h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' } });
+        head.append(L.h('div', { style: { display: 'flex', flexDirection: 'column', lineHeight: '1.2' } },
+          L.h('b', { style: { fontSize: '18px' }, text: '📅 오늘의 퍼즐' }),
+          L.h('span', { class: 'muted', style: { fontSize: '13px' }, text: D.long(n) + (sub ? ' · ' + sub : '') })),
+          L.h('div', { style: { textAlign: 'right', lineHeight: '1.2', fontSize: '13px' } },
+            L.h('div', { style: { fontSize: '15px', fontWeight: '700', color: sc != null ? '#8fd14f' : 'inherit' }, text: sc != null ? '완료 ✓' : '미완료' }),
+            L.h('div', { class: 'muted', text: '🔥 연속 ' + st + '일' })));
+        box.append(head);
+        if (sc != null) box.append(L.h('div', { style: { fontSize: '13px' }, text: '오늘 최고 ' + D.fmtScore(sc) }));
+        const row = L.h('div', { style: { display: 'flex', gap: '6px' } });
+        row.append(L.h('button', { class: 'btn primary', style: { flex: '1', minHeight: '48px' }, text: sc != null ? '다시 도전 ▶' : '도전하기 ▶', onclick: () => onPlay(n) }));
+        if (sc != null) row.append(L.h('button', { class: 'btn', style: { flex: '0 0 auto', minHeight: '48px', padding: '0 14px' }, text: '📋 공유', onclick: () => D.share(n, api) }));
+        box.append(row);
+        return box;
+      },
+    };
+    return D;
+  }
+  const KEY = 'lounge.slide';
+  const store = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { return {}; } };
+  const save = (o) => { try { localStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} };
+
+  const enc = (a) => a.map((v) => String.fromCharCode(48 + v)).join('');
+  const dec = (s) => Array.from(s, (c) => c.charCodeAt(0) - 48);
+  const DR = { u: -1, d: 1, l: 0, r: 0 }, DC = { u: 0, d: 0, l: -1, r: 1 }, OPP = { u: 'd', d: 'u', l: 'r', r: 'l' };
+  const goalStr = (n) => { const a = []; for (let i = 1; i < n * n; i++) a.push(i); a.push(0); return enc(a); };
+
+  /* apply gap moves to an array board; returns false on an illegal move */
+  function step(b, n, g, d) {
+    const r = Math.floor(g / n) + DR[d], c = (g % n) + DC[d];
+    if (r < 0 || c < 0 || r >= n || c >= n) return -1;
+    const ng = r * n + c; b[g] = b[ng]; b[ng] = 0; return ng;
+  }
+  function applyMoves(str, n, q) {
+    const b = dec(str); let g = b.indexOf(0);
+    for (const d of q) { g = step(b, n, g, d); if (g < 0) return null; }
+    return enc(b);
+  }
+  const correct = (str) => { let k = 0; for (let i = 0; i < str.length - 1; i++) if (str.charCodeAt(i) - 48 === i + 1) k++; return k; };
+
+  /* ---------- 그림 조각 모드: 직접 그리는 독자 그림(테마 6종, seed로 세부가 바뀜). screw.js도 def._paint로 같이 씀 ---------- */
+  const THEMES = ['산과 호수', '밤의 도시', '바다 섬', '우주', '꽃 언덕', '추상화'];
+  function artRand(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const ABS_PALS = [
+    ['#1f3a5f', '#e3ae45', '#ee6a55', '#f2e9d8', '#2e8a7a'], ['#2b1d3a', '#c85a8a', '#f0a868', '#5cc8f2', '#f2e9d8'],
+    ['#14453a', '#e8c34a', '#e1694b', '#9fd3c7', '#22303f'], ['#202a4a', '#7d6bd6', '#f2c14e', '#ef7b6a', '#d9e6f2'],
+  ];
+  // g: 2d context, w×h pixels, th: theme index (0..5)
+  function paintScene(g, w, h, seed, th) {
+    const R = artRand(seed), m = Math.min(w, h);
+    const lin = (y0, y1, a, b, c) => { const lg = g.createLinearGradient(0, y0, 0, y1); lg.addColorStop(0, a); if (c) { lg.addColorStop(0.55, b); lg.addColorStop(1, c); } else lg.addColorStop(1, b); return lg; };
+    const circ = (x, y, r, f) => { g.fillStyle = f; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); };
+    const ridge = (base, amp, col, rough) => { // jagged ridge from left to right, filled to bottom
+      g.fillStyle = col; g.beginPath(); g.moveTo(0, h);
+      let y = base; for (let x = 0; x <= w + 8; x += w / 14) { y = base - amp * (0.3 + R() * 0.7) * (rough ? 1 : Math.abs(Math.sin(x / w * 3 + seed))); g.lineTo(x, y); }
+      g.lineTo(w, h); g.closePath(); g.fill();
+    };
+    g.save(); g.globalAlpha = 1;
+    if (th === 0) { // mountains & lake
+      const warm = R() < 0.5;
+      g.fillStyle = lin(0, h * 0.6, warm ? '#f2a65a' : '#5ab0e6', warm ? '#f7d9a0' : '#cfeaf5'); g.fillRect(0, 0, w, h);
+      circ(w * (0.2 + R() * 0.6), h * (0.16 + R() * 0.12), m * 0.09, warm ? '#fff1c4' : '#fffbe6');
+      for (let i = 0; i < 4; i++) { g.fillStyle = 'rgba(255,255,255,.7)'; const cx = R() * w, cy = h * (0.08 + R() * 0.2); for (let k = 0; k < 3; k++) { g.beginPath(); g.ellipse(cx + k * m * 0.05, cy + (k % 2) * m * 0.01, m * 0.06, m * 0.025, 0, 0, 7); g.fill(); } }
+      ridge(h * 0.5, h * 0.28, warm ? '#8a5f7a' : '#6a7fa8', true);
+      g.fillStyle = 'rgba(255,255,255,.75)'; // snow caps
+      for (let i = 0; i < 3; i++) { const x = w * (0.15 + i * 0.33 + R() * 0.1), y = h * (0.24 + R() * 0.06); g.beginPath(); g.moveTo(x, y); g.lineTo(x + m * 0.07, y + m * 0.08); g.lineTo(x - m * 0.07, y + m * 0.08); g.fill(); }
+      ridge(h * 0.6, h * 0.12, warm ? '#4f6b3a' : '#3d7a4a', false);
+      g.fillStyle = lin(h * 0.62, h, warm ? '#e8a868' : '#5fb2d6', warm ? '#5a6a8a' : '#24577a'); g.fillRect(0, h * 0.64, w, h * 0.36);
+      g.fillStyle = 'rgba(255,255,255,.35)'; for (let i = 0; i < 12; i++) g.fillRect(R() * w, h * (0.66 + R() * 0.3), m * (0.04 + R() * 0.1), 2);
+      g.fillStyle = '#2f4a2a'; for (let i = 0; i < 9; i++) { const x = R() * w, y = h * (0.6 + R() * 0.05), s = m * (0.03 + R() * 0.03); g.beginPath(); g.moveTo(x, y - s * 2.4); g.lineTo(x + s, y + s * 0.3); g.lineTo(x - s, y + s * 0.3); g.fill(); }
+    } else if (th === 1) { // night city
+      g.fillStyle = lin(0, h, '#0d1030', '#2a2058', '#c0587a'); g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 70; i++) { g.fillStyle = 'rgba(255,255,255,' + (0.3 + R() * 0.7).toFixed(2) + ')'; g.fillRect(R() * w, R() * h * 0.5, 1.6, 1.6); }
+      const mx = w * (0.15 + R() * 0.7), my = h * 0.17; circ(mx, my, m * 0.08, '#fbefc8'); circ(mx + m * 0.035, my - m * 0.02, m * 0.07, '#141640');
+      for (let layer = 0; layer < 2; layer++) {
+        let x = -5;
+        while (x < w) {
+          const bw = m * (0.08 + R() * 0.1), bh = h * (layer ? 0.25 + R() * 0.3 : 0.35 + R() * 0.3), y = h * 0.86 - bh;
+          g.fillStyle = layer ? '#141026' : '#2a2448'; g.fillRect(x, y, bw, bh + h);
+          if (layer) for (let wy = y + 6; wy < h * 0.84; wy += m * 0.04) for (let wx = x + 4; wx < x + bw - 6; wx += m * 0.035) if (R() < 0.45) { g.fillStyle = R() < 0.7 ? '#f7d06a' : '#7fd3f0'; g.fillRect(wx, wy, m * 0.016, m * 0.02); }
+          x += bw + (layer ? 2 : 0);
+        }
+      }
+      g.fillStyle = lin(h * 0.86, h, '#3a2a58', '#0d0b1a'); g.fillRect(0, h * 0.86, w, h);
+      for (let i = 0; i < 24; i++) { g.fillStyle = R() < 0.5 ? 'rgba(247,208,106,.5)' : 'rgba(239,107,122,.5)'; g.fillRect(R() * w, h * (0.88 + R() * 0.1), m * 0.05, 2); }
+    } else if (th === 2) { // sea island
+      g.fillStyle = lin(0, h * 0.55, '#3aa6e0', '#bfe9f7'); g.fillRect(0, 0, w, h);
+      circ(w * (0.6 + R() * 0.3), h * 0.15, m * 0.08, '#fff6c8');
+      g.fillStyle = lin(h * 0.5, h, '#2fb3c4', '#0f4e86'); g.fillRect(0, h * 0.5, w, h * 0.5);
+      g.strokeStyle = 'rgba(255,255,255,.45)'; g.lineWidth = Math.max(1.5, m * 0.006);
+      for (let i = 0; i < 16; i++) { const x = R() * w, y = h * (0.55 + R() * 0.42), s = m * (0.03 + R() * 0.03); g.beginPath(); g.arc(x, y, s, Math.PI * 1.15, Math.PI * 1.85); g.stroke(); }
+      const ix = w * (0.25 + R() * 0.3), iy = h * 0.56, iw = m * 0.3;
+      g.fillStyle = '#f2d79a'; g.beginPath(); g.ellipse(ix, iy, iw, m * 0.07, 0, Math.PI, 0); g.fill();
+      g.fillStyle = '#5fae4c'; g.beginPath(); g.ellipse(ix + iw * 0.2, iy - m * 0.03, iw * 0.5, m * 0.06, 0, Math.PI, 0); g.fill();
+      g.strokeStyle = '#7a5130'; g.lineWidth = m * 0.022; g.beginPath(); g.moveTo(ix - iw * 0.2, iy - m * 0.02); g.quadraticCurveTo(ix - iw * 0.12, iy - m * 0.2, ix - iw * 0.3, iy - m * 0.3); g.stroke();
+      g.fillStyle = '#2f8a3a';
+      for (let k = 0; k < 5; k++) { const a = -Math.PI + k * Math.PI / 4.2 + 0.1; g.beginPath(); g.ellipse(ix - iw * 0.3 + Math.cos(a) * m * 0.07, iy - m * 0.3 + Math.sin(a) * m * 0.03, m * 0.08, m * 0.022, a, 0, 7); g.fill(); }
+      const bx = w * (0.65 + R() * 0.2), by = h * (0.72 + R() * 0.1), bs = m * 0.08; // sailboat
+      g.fillStyle = '#c0483a'; g.beginPath(); g.moveTo(bx - bs, by); g.lineTo(bx + bs, by); g.lineTo(bx + bs * 0.7, by + bs * 0.35); g.lineTo(bx - bs * 0.7, by + bs * 0.35); g.fill();
+      g.fillStyle = '#fff8ea'; g.beginPath(); g.moveTo(bx, by - bs * 1.6); g.lineTo(bx + bs * 0.9, by - bs * 0.1); g.lineTo(bx, by - bs * 0.1); g.fill();
+      g.fillStyle = '#f2d06a'; g.beginPath(); g.moveTo(bx - 2, by - bs * 1.3); g.lineTo(bx - bs * 0.7, by - bs * 0.1); g.lineTo(bx - 2, by - bs * 0.1); g.fill();
+      for (let i = 0; i < 3; i++) { g.strokeStyle = '#33415a'; g.lineWidth = 1.5; const x = R() * w, y = h * (0.08 + R() * 0.2); g.beginPath(); g.moveTo(x - 6, y); g.quadraticCurveTo(x - 3, y - 4, x, y); g.quadraticCurveTo(x + 3, y - 4, x + 6, y); g.stroke(); }
+    } else if (th === 3) { // space
+      g.fillStyle = lin(0, h, '#060818', '#141238', '#2a0f3a'); g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 5; i++) { const x = R() * w, y = R() * h, r = m * (0.2 + R() * 0.3), rg = g.createRadialGradient(x, y, 0, x, y, r); rg.addColorStop(0, ['rgba(200,90,180,.35)', 'rgba(80,150,240,.3)', 'rgba(240,160,90,.25)'][i % 3]); rg.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = rg; g.fillRect(0, 0, w, h); }
+      for (let i = 0; i < 120; i++) { g.fillStyle = 'rgba(255,255,255,' + (0.3 + R() * 0.7).toFixed(2) + ')'; const s = R() < 0.08 ? 2.4 : 1.2; g.fillRect(R() * w, R() * h, s, s); }
+      const px = w * (0.3 + R() * 0.4), py = h * (0.4 + R() * 0.2), pr = m * 0.2; // ringed planet
+      const pg = g.createRadialGradient(px - pr * 0.4, py - pr * 0.4, pr * 0.1, px, py, pr); pg.addColorStop(0, '#f7d49a'); pg.addColorStop(1, '#b0603a');
+      g.fillStyle = pg; g.beginPath(); g.arc(px, py, pr, 0, 7); g.fill();
+      g.fillStyle = 'rgba(120,50,30,.35)'; for (let k = -2; k <= 2; k++) g.fillRect(px - pr, py + k * pr * 0.3, pr * 2, pr * 0.08);
+      g.strokeStyle = 'rgba(240,220,180,.85)'; g.lineWidth = m * 0.02; g.beginPath(); g.ellipse(px, py, pr * 1.7, pr * 0.42, -0.35, 0, 7); g.stroke();
+      const qx = w * (R() < 0.5 ? 0.15 : 0.8), qy = h * (0.12 + R() * 0.15), qr = m * 0.08;
+      const qg = g.createRadialGradient(qx - qr * 0.3, qy - qr * 0.3, 1, qx, qy, qr); qg.addColorStop(0, '#9fe0ff'); qg.addColorStop(1, '#2a5ab0'); g.fillStyle = qg; g.beginPath(); g.arc(qx, qy, qr, 0, 7); g.fill();
+      circ(w * (0.1 + R() * 0.8), h * (0.8 + R() * 0.1), m * 0.04, '#c8c0d8');
+      const rx = w * (0.65 + R() * 0.2), ry = h * (0.72 + R() * 0.1), rs = m * 0.05; // little rocket
+      g.save(); g.translate(rx, ry); g.rotate(-0.7);
+      g.fillStyle = '#f08a4a'; g.beginPath(); g.moveTo(-rs * 0.5, rs * 1.2); g.lineTo(0, rs * 2.2); g.lineTo(rs * 0.5, rs * 1.2); g.fill();
+      g.fillStyle = '#eef0f6'; g.beginPath(); g.moveTo(0, -rs * 1.8); g.quadraticCurveTo(rs * 0.9, -rs * 0.5, rs * 0.6, rs * 1.3); g.lineTo(-rs * 0.6, rs * 1.3); g.quadraticCurveTo(-rs * 0.9, -rs * 0.5, 0, -rs * 1.8); g.fill();
+      circ(0, -rs * 0.3, rs * 0.32, '#5cc8f2'); g.restore();
+    } else if (th === 4) { // flower hills
+      g.fillStyle = lin(0, h * 0.5, '#7cc6f0', '#e8f6fb'); g.fillRect(0, 0, w, h);
+      circ(w * (0.1 + R() * 0.8), h * 0.13, m * 0.07, '#ffe680');
+      const hills = ['#8fcf6a', '#6ab35a', '#4f9a4a'];
+      hills.forEach((c, k) => { g.fillStyle = c; g.beginPath(); g.moveTo(0, h); const y0 = h * (0.45 + k * 0.13); g.lineTo(0, y0); g.bezierCurveTo(w * 0.3, y0 - h * 0.12 * (R() + 0.3), w * 0.6, y0 + h * 0.08, w, y0 - h * 0.05 * R()); g.lineTo(w, h); g.fill(); });
+      const FC = ['#f25a6a', '#f7c84a', '#ffffff', '#c06ae0', '#f78a3a', '#5a9af2'];
+      for (let i = 0; i < 46; i++) {
+        const y = h * (0.55 + R() * 0.43), x = R() * w, s = m * (0.012 + (y / h - 0.5) * 0.05), c = FC[Math.floor(R() * FC.length)];
+        g.strokeStyle = '#2f6a2a'; g.lineWidth = Math.max(1, s * 0.3); g.beginPath(); g.moveTo(x, y); g.lineTo(x, y + s * 2.2); g.stroke();
+        for (let p = 0; p < 5; p++) { const a = p / 5 * Math.PI * 2; circ(x + Math.cos(a) * s, y + Math.sin(a) * s, s * 0.7, c); }
+        circ(x, y, s * 0.55, '#f6e05a');
+      }
+      for (let i = 0; i < 3; i++) { const x = R() * w, y = h * (0.25 + R() * 0.2), s = m * 0.025; g.fillStyle = FC[(i + 2) % FC.length]; g.beginPath(); g.ellipse(x - s, y, s, s * 0.6, -0.5, 0, 7); g.ellipse(x + s, y, s, s * 0.6, 0.5, 0, 7); g.fill(); g.fillStyle = '#333'; g.fillRect(x - 1, y - s * 0.6, 2, s * 1.2); }
+    } else { // abstract
+      const P = ABS_PALS[Math.floor(R() * ABS_PALS.length)], pick = () => P[Math.floor(R() * P.length)];
+      const lg = g.createLinearGradient(0, 0, w, h); lg.addColorStop(0, P[0]); lg.addColorStop(1, P[4]); g.fillStyle = lg; g.fillRect(0, 0, w, h);
+      const cx = w * (0.3 + R() * 0.4), cy = h * (0.3 + R() * 0.4);
+      for (let i = 0; i < 14; i++) { g.fillStyle = i % 2 ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.08)'; g.beginPath(); g.moveTo(cx, cy); const a0 = i / 14 * Math.PI * 2; g.arc(cx, cy, m * 1.5, a0, a0 + Math.PI / 7); g.fill(); }
+      for (let i = 5; i > 0; i--) { g.globalAlpha = 0.85; circ(cx, cy, m * 0.09 * i, P[i % 5]); }
+      for (let i = 0; i < 9; i++) {
+        g.fillStyle = pick(); g.strokeStyle = pick(); g.lineWidth = m * 0.012; g.globalAlpha = 0.9;
+        const x = R() * w, y = R() * h, r = m * (0.05 + R() * 0.14), k = Math.floor(R() * 3);
+        g.beginPath();
+        if (k === 0) g.arc(x, y, r, 0, Math.PI * 2); else if (k === 1) { g.moveTo(x, y - r); g.lineTo(x + r, y + r * 0.8); g.lineTo(x - r, y + r * 0.8); g.closePath(); } else g.rect(x - r, y - r * 0.5, r * 2, r);
+        if (R() < 0.5) g.fill(); else g.stroke();
+      }
+    }
+    g.restore();
+  }
+  // a canvas with the picture (cached by caller)
+  function artCanvas(seed, th, w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h || w)); paintScene(c.getContext('2d'), c.width, c.height, seed, th); return c; }
+  /* lower bound on moves: Manhattan + linear conflicts (admissible) */
+  function lowerBound(str, n) {
+    const b = dec(str); let h = 0;
+    for (let i = 0; i < b.length; i++) { const v = b[i]; if (v) h += Math.abs(Math.floor((v - 1) / n) - Math.floor(i / n)) + Math.abs(((v - 1) % n) - (i % n)); }
+    const lis = (a) => { const t = []; for (const x of a) { let lo = 0, hi = t.length; while (lo < hi) { const md = (lo + hi) >> 1; if (t[md] < x) lo = md + 1; else hi = md; } t[lo] = x; } return t.length; };
+    for (let k = 0; k < n; k++) { // tiles already in their goal row/column but out of order: each extra one costs 2 more moves
+      const row = [], col = [];
+      for (let i = 0; i < n; i++) {
+        const x = b[k * n + i]; if (x && Math.floor((x - 1) / n) === k) row.push((x - 1) % n);
+        const y = b[i * n + k]; if (y && (y - 1) % n === k) col.push(Math.floor((y - 1) / n));
+      }
+      h += 2 * (row.length - lis(row)) + 2 * (col.length - lis(col));
+    }
+    return h;
+  }
+
+  const DAILY = mkDaily('slide', '슬라이드', '수', true);
+  const DN = 5; // 오늘의 퍼즐 = 5×5 그림 판
+  function srand(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function scramble(n, seed) {
+    const r = seed ? srand(seed) : Math.random;
+    for (;;) {
+      const a = []; for (let i = 0; i < n * n; i++) a.push(i);
+      for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; }
+      // solvable iff permutation parity (gap = N²) equals the gap's Manhattan distance parity from its home
+      const p = a.map((v) => (v ? v : n * n) - 1), seen = new Array(n * n).fill(false);
+      let par = 0;
+      for (let i = 0; i < p.length; i++) { if (seen[i]) continue; let j = i, len = 0; while (!seen[j]) { seen[j] = true; j = p[j]; len++; } par += len - 1; }
+      const g = a.indexOf(0), dist = (n - 1 - Math.floor(g / n)) + (n - 1 - (g % n));
+      if ((par & 1) !== (dist & 1)) { const nz = []; for (let i = 0; i < a.length && nz.length < 2; i++) if (a[i]) nz.push(i); const t = a[nz[0]]; a[nz[0]] = a[nz[1]]; a[nz[1]] = t; }
+      const s = enc(a);
+      if (correct(s) <= Math.floor(n * n / 3)) return s;
+    }
+  }
+
+  /* ---------- IDA* (Manhattan). b: array, n: width. Returns moves string, or null if over budget ---------- */
+  function ida(b0, n, budget) {
+    const b = b0.slice(), N = n * n;
+    const gr = new Int8Array(N), gc = new Int8Array(N);
+    for (let v = 1; v < N; v++) { gr[v] = Math.floor((v - 1) / n); gc[v] = (v - 1) % n; }
+    let h = 0, gap = b.indexOf(0);
+    for (let i = 0; i < N; i++) if (b[i]) h += Math.abs(gr[b[i]] - Math.floor(i / n)) + Math.abs(gc[b[i]] - (i % n));
+    const path = []; let nodes = 0;
+    const DIRS = ['u', 'd', 'l', 'r'];
+    function search(g, bound, prev) {
+      const f = g + h;
+      if (f > bound) return f;
+      if (h === 0) return -1;
+      if (++nodes > budget) throw 0;
+      let min = 1e9;
+      const r = Math.floor(gap / n), c = gap % n;
+      for (const d of DIRS) {
+        if (prev && OPP[prev] === d) continue;
+        const nr = r + DR[d], nc = c + DC[d];
+        if (nr < 0 || nc < 0 || nr >= n || nc >= n) continue;
+        const ng = nr * n + nc, v = b[ng];
+        const dh = (Math.abs(gr[v] - r) + Math.abs(gc[v] - c)) - (Math.abs(gr[v] - nr) + Math.abs(gc[v] - nc));
+        b[gap] = v; b[ng] = 0; const og = gap; gap = ng; h += dh; path.push(d);
+        const t = search(g + 1, bound, d);
+        if (t === -1) return -1;
+        path.pop(); h -= dh; gap = og; b[ng] = v; b[og] = 0;
+        if (t < min) min = t;
+      }
+      return min;
+    }
+    try {
+      let bound = h;
+      for (let it = 0; it < 80; it++) { const t = search(0, bound, null); if (t === -1) return path.join(''); bound = t; }
+    } catch (e) { return null; }
+    return null;
+  }
+
+  /* ---------- reduction solver for any size: solve top row + left column, shrink, finish 3×3 with IDA* ----------
+     returns {q: moves, tg: target tile value per move (for hints)} */
+  function reduce(str, n) {
+    const b = dec(str); let gap = b.indexOf(0);
+    const out = [], tg = [];
+    let cur = 0;
+    const lock = new Uint8Array(n * n);
+    const nb = (i) => { const r = Math.floor(i / n), c = i % n, o = []; if (r > 0) o.push(i - n); if (r < n - 1) o.push(i + n); if (c > 0) o.push(i - 1); if (c < n - 1) o.push(i + 1); return o; };
+    const dirOf = (from, to) => (to === from - n ? 'u' : to === from + n ? 'd' : to === from - 1 ? 'l' : 'r');
+    function bfs(from, to, extra) { // gap path avoiding locked cells and `extra`
+      if (from === to) return [];
+      const prev = new Int16Array(n * n).fill(-1); prev[from] = from;
+      const qq = [from];
+      for (let k = 0; k < qq.length; k++) {
+        const x = qq[k];
+        for (const y of nb(x)) {
+          if (prev[y] !== -1 || lock[y] || y === extra) continue;
+          prev[y] = x;
+          if (y === to) { const p = []; let z = y; while (z !== from) { p.push(z); z = prev[z]; } return p.reverse(); }
+          qq.push(y);
+        }
+      }
+      return null;
+    }
+    function mv(to) { const d = dirOf(gap, to); b[gap] = b[to]; b[to] = 0; gap = to; out.push(d); tg.push(cur); }
+    function gapTo(t, extra) { const p = bfs(gap, t, extra); if (!p) return false; p.forEach(mv); return true; }
+    function moveTile(v, to) {
+      let pos = b.indexOf(v), guard = 0;
+      while (pos !== to) {
+        if (++guard > 200) return false;
+        // distance map for the tile from `to`
+        const dist = new Int16Array(n * n).fill(-1); dist[to] = 0; const qq = [to];
+        for (let k = 0; k < qq.length; k++) for (const y of nb(qq[k])) if (dist[y] < 0 && !lock[y]) { dist[y] = dist[qq[k]] + 1; qq.push(y); }
+        if (dist[pos] < 0) return false;
+        const cand = nb(pos).filter((y) => !lock[y] && dist[y] >= 0).sort((a, c) => dist[a] - dist[c]);
+        let ok = false;
+        for (const y of cand) {
+          const p = bfs(gap, y, pos);
+          if (p) { p.forEach(mv); mv(pos); pos = y; ok = true; break; }
+        }
+        if (!ok) return false;
+      }
+      return true;
+    }
+    function line(cell, k0) { // cell(k, d); k from k0 .. n-1 along the line, d = depth away from it
+      for (let k = k0; k < n - 2; k++) {
+        const t = cell(k, 0), v = goalAt(t); cur = v;
+        if (!moveTile(v, t)) return false;
+        lock[t] = 1;
+      }
+      const tA = cell(n - 2, 0), tB = cell(n - 1, 0), A = goalAt(tA), B = goalAt(tB);
+      if (b[tA] === A && b[tB] === B) { lock[tA] = lock[tB] = 1; return true; }
+      cur = A;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt === 1) { // park B away from the corner first
+          const park = cell(n - 1, 2); cur = B;
+          if (!moveTile(B, park)) return false;
+          lock[park] = 1; cur = A;
+          const okA = moveTile(A, tB); lock[park] = 0;
+          if (!okA) return false;
+          lock[tB] = 1; cur = B;
+          const ok = moveTile(B, cell(n - 1, 1)) && (lock[cell(n - 1, 1)] = 1) && gapTo(tA, -1);
+          lock[tB] = 0; lock[cell(n - 1, 1)] = 0;
+          if (!ok) return false;
+        } else {
+          if (!moveTile(A, tB)) continue;
+          lock[tB] = 1; cur = B;
+          const okB = moveTile(B, cell(n - 1, 1));
+          if (okB) lock[cell(n - 1, 1)] = 1;
+          const okG = okB && gapTo(tA, -1);
+          lock[tB] = 0; lock[cell(n - 1, 1)] = 0;
+          if (!okG) continue;
+        }
+        mv(tB); mv(cell(n - 1, 1));
+        lock[tA] = lock[tB] = 1;
+        return true;
+      }
+      return false;
+    }
+    const goalAt = (i) => (i === n * n - 1 ? 0 : i + 1);
+    let r0 = 0;
+    while (n - r0 > 3) {
+      const R = r0;
+      if (!line((k, d) => (R + d) * n + k, R)) return null;
+      if (!line((k, d) => k * n + (R + d), R + 1)) return null;
+      r0++;
+    }
+    // final 3×3 (bottom-right) with IDA*
+    const loc = [], cells = [];
+    for (let r = r0; r < n; r++) for (let c = r0; c < n; c++) cells.push(r * n + c);
+    for (const ci of cells) { const v = b[ci]; loc.push(v ? cells.indexOf(v - 1) + 1 : 0); }
+    if (loc.some((v, i) => v < 0)) return null;
+    const last = ida(loc, 3, 400000);
+    if (last == null) return null;
+    for (const d of last) { const gi = cells.indexOf(gap), lr = Math.floor(gi / 3) + DR[d], lc = (gi % 3) + DC[d]; cur = b[cells[lr * 3 + lc]]; mv(cells[lr * 3 + lc]); }
+    return { q: out.join(''), tg };
+  }
+
+  /* plan cache (AI) */
+  const PLAN = new Map();
+  function planFor(str, n, opt) {
+    const k = n + ':' + str + (opt ? '*' : '');
+    if (PLAN.has(k)) return PLAN.get(k);
+    let q = null;
+    if (opt && n === 3) q = ida(dec(str), 3, 600000);
+    if (q == null) { const r = reduce(str, n); q = r ? r.q : ''; }
+    if (PLAN.size > 60) PLAN.clear();
+    PLAN.set(k, q);
+    return q;
+  }
+  function remember(str, n, opt, q) { if (PLAN.size > 60) PLAN.clear(); PLAN.set(n + ':' + str + (opt ? '*' : ''), q); }
+
+  function newBoard(s, n, img, dy) {
+    s.dy = dy || 0;
+    if (s.dy) { n = DN; img = 1; }
+    s.n = n; s.img = img ? 1 : 0; s.art = s.dy ? DAILY.seed(s.dy) % 1e9 : Math.floor(Math.random() * 1e9);
+    const tm = s.thm == null ? -1 : s.thm;
+    s.th = s.dy ? s.art % THEMES.length : tm >= 0 && tm < THEMES.length ? tm : Math.floor(Math.random() * THEMES.length);
+    const sc = scramble(n, s.dy ? DAILY.seed(s.dy) : 0);
+    // shortest solution: exact for 3×3 (IDA*), otherwise a guaranteed lower bound (Manhattan + linear conflict)
+    const oq = n === 3 ? ida(dec(sc), 3, 3000000) : null;
+    s.op = oq != null ? oq.length : 0; s.lb = lowerBound(sc, n);
+    s.b = s.b.map(() => sc); s.c = s.b.map(() => 0);
+    s.k = (s.k || 0) + 1; s.won = 0; s.ft = 0; s.hu = 0; s.h = ''; s.end = 0;
+    s.t0 = s.race ? Date.now() + 3500 : 0;
+    s.fin = s.b.map(() => 0); s.w = -1;
+    return s;
+  }
+
+  const def = {
+    id: 'slide', name: '숫자 슬라이드 퍼즐', tag: '타일 밀기 퍼즐', cat: '아케이드',
+    blurb: '빈칸 옆 타일을 밀어 1부터 차례대로 맞춰요. 3×3부터 8×8, 숫자 판과 그림 판. 친구와 같은 판으로 빨리 풀기 대결도!',
+    tint: '#23415e',
+    icon: '<rect x="8" y="8" width="12" height="12" rx="2" fill="currentColor"/><rect x="22" y="8" width="12" height="12" rx="2" fill="currentColor"/><rect x="36" y="8" width="12" height="12" rx="2" fill="currentColor"/><rect x="8" y="22" width="12" height="12" rx="2" fill="currentColor"/><rect x="22" y="22" width="12" height="12" rx="2" fill="currentColor" opacity=".55"/><rect x="36" y="22" width="12" height="12" rx="2" fill="currentColor"/><rect x="8" y="36" width="12" height="12" rx="2" fill="currentColor"/><rect x="22" y="36" width="12" height="12" rx="2" fill="currentColor"/><rect x="36" y="36" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 3"/><path d="M28 28h10" stroke="#000" stroke-opacity=".35" stroke-width="2.5"/>',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 1, fixedOrder: true, hidden: false, aiDelay: 300,
+    maxPlayersIf: (o) => (o && o.mode === 'race' ? 4 : 1),
+    realtimeIf: (o) => !!o && o.mode === 'race',
+    options: [
+      { id: 'mode', label: '방식', tip: '혼자 또는 대결.', choices: [{ v: 'solo', label: '혼자 풀기', tip: '혼자 시간·횟수 기록.' }, { v: 'race', label: '대결(빨리 풀기)', tip: '모두 같은 판을 누가 먼저 맞추나.' }], def: 'solo' },
+      { id: 'size', label: '크기', choices: [3, 4, 5, 6, 7, 8].map((v) => ({ v: String(v), label: v + '×' + v })), def: '4' },
+      { id: 'look', label: '판', tip: '조각 모양.', choices: [{ v: 'num', label: '숫자' }, { v: 'img', label: '그림 조각', tip: '그림 조각으로 맞춰요.' }], def: 'num' },
+      { id: 'theme', label: '그림', choices: [{ v: 'rnd', label: '무작위' }].concat(THEMES.map((t, i) => ({ v: String(i), label: t }))), def: 'rnd' },
+    ],
+    controls: [
+      { id: 'up', label: '타일 위로', keys: ['ArrowUp', 'KeyW'], pad: ['up', 'ly-'] },
+      { id: 'down', label: '타일 아래로', keys: ['ArrowDown', 'KeyS'], pad: ['down', 'ly+'] },
+      { id: 'left', label: '타일 왼쪽으로', keys: ['ArrowLeft', 'KeyA'], pad: ['left', 'lx-'] },
+      { id: 'right', label: '타일 오른쪽으로', keys: ['ArrowRight', 'KeyD'], pad: ['right', 'lx+'] },
+      { id: 'undo', label: '되돌리기', keys: ['KeyZ', 'Backspace'], pad: ['b'] },
+      { id: 'hint', label: '힌트', keys: ['KeyH'], pad: ['y'] },
+      { id: 'shuffle', label: '새로 섞기', keys: ['KeyR'], pad: ['back'] },
+    ],
+    quick: [
+      '목표: 타일을 1, 2, 3 … 순서대로 놓고 빈칸을 오른쪽 아래 끝으로!',
+      '빈칸과 같은 줄(가로·세로)의 타일을 누르거나 밀면, 그 사이 타일이 한꺼번에 빈칸 쪽으로 밀려요.',
+      '혼자서는 적은 수·짧은 시간 기록에 도전. 대결에서는 같은 판을 가장 먼저 맞춘 사람이 이겨요.',
+    ],
+    rules: [
+      { h: '목표', p: ['판에는 빈칸이 하나 있어요. 타일을 밀어 왼쪽 위부터 1, 2, 3 … 순서대로 놓고, 빈칸이 오른쪽 아래 끝에 오면 완성!',
+        '그림 조각 판은 숫자 대신 그림 조각이에요. 조각을 맞추면 한 장의 그림이 돼요(작은 번호를 켜고 끌 수 있어요).',
+        '그림은 산과 호수·밤의 도시·바다 섬·우주·꽃 언덕·추상화 중 하나(기본은 무작위)이고 판마다 모습이 조금씩 달라요. 👁 그림 보기 버튼을 누르고 있으면 완성 그림을 볼 수 있어요.'] },
+      { h: '미는 법', p: ['빈칸 바로 옆 타일을 누르면 빈칸으로 한 칸 밀려요.',
+        '빈칸과 같은 가로줄·세로줄에 있는 타일을 누르면 그 타일까지 한 줄이 한꺼번에 밀려요.',
+        '화면을 밀어도(스와이프) 돼요: 민 방향으로 빈칸 옆 타일이 움직여요.',
+        '예시: 빈칸이 맨 왼쪽이고 같은 줄 세 번째 타일을 누르면, 타일 2개가 왼쪽으로 한 칸씩 밀려요(2수).'] },
+      { h: '기록', p: ['수는 움직인 타일 개수예요. 시간은 첫 수를 둔 순간부터 재요.',
+        '크기·판(숫자/그림)마다 가장 적은 수와 가장 짧은 시간이 이 폰에 저장돼요. 힌트를 쓴 판은 기록에 남지 않아요.',
+        '섞임은 언제나 풀 수 있게 만들어져요.',
+        '위쪽에 이 판의 최소 수가 나와요. 3×3은 컴퓨터가 찾은 가장 짧은 길(최적)이고, 4×4부터는 너무 오래 걸려서 「적어도 이만큼은 필요한 수」(하한)를 보여 줘요.'] },
+      { h: '도움 기능(혼자)', p: ['↶ 되돌리기: 방금 민 것을 되돌려요(수도 줄어요). ⟲ 새로 섞기. ▦ 크기: 3×3~8×8과 숫자/그림을 골라요.',
+        '💡 힌트: 3×3은 가장 빠른 길의 다음 수를, 더 큰 판은 지금 맞출 목표 타일과 다음 수를 빛나게 알려 줘요.'] },
+      { h: '대결', p: ['2~4명이 똑같이 섞인 판을 동시에 풀어요. 3, 2, 1 뒤에 시작하고, 가장 먼저 맞춘 사람이 이겨요.',
+        '위쪽 작은 판에서 상대가 얼마나 맞췄는지 보여요(맞은 칸이 밝게). 대결에선 되돌리기·힌트가 없어요.',
+        '한 폰에 한 명이 해요. 친구와는 온라인/LAN으로, 혼자면 AI와 겨뤄요. AI 난이도(푸는 빠르기)는 자리마다 쉬움·보통·어려움으로 골라요.'] },
+      { h: '오늘의 퍼즐(혼자)', p: ['「크기」 버튼 맨 위 카드에서 매일 하나씩 정해진 5×5 그림 판을 풀어요. 날짜가 같으면 누구나 같은 그림·같은 섞임이에요.', '적은 수로 맞출수록 좋은 기록. 하루씩 이어서 풀면 🔥 연속 일수가 올라가고, 「📋 공유」로 판 내용 없이 결과를 복사할 수 있어요. 크기별 기록과는 따로예요.'] },
+      { h: '조작(PC)', p: ['마우스로 타일 클릭. 방향키/WASD: 빈칸 옆 타일을 그 방향으로 밀기. Z 되돌리기 · H 힌트 · R 새로 섞기.'] },
+    ],
+    tutorial: [
+      { text: '빈칸 옆 타일을 누르면 빈칸으로 밀려요. 같은 줄의 먼 타일을 누르면 한 줄이 한꺼번에 밀려요.' },
+      { text: '1, 2, 3 … 순서대로 맞추고 빈칸을 오른쪽 아래로 보내면 완성! 위쪽 두 줄부터 맞추면 쉬워요.' },
+      { text: '아래 버튼: 되돌리기 · 새로 섞기 · 힌트 · 크기(3×3~8×8, 숫자/그림).', sel: '.sl-bar' },
+    ],
+
+    init(players, opts) {
+      const o = opts || {};
+      const race = o.mode === 'race';
+      const s = { race: race ? 1 : 0, b: players.map(() => ''), k: 0, nm: players.map((p) => String(p.name || '').slice(0, 8)) };
+      if (!race) s.b = [''];
+      s.thm = o.theme == null || o.theme === 'rnd' ? -1 : U.clamp(parseInt(o.theme, 10) || 0, 0, THEMES.length - 1);
+      return newBoard(s, U.clamp(parseInt(o.size, 10) || 4, 3, 8), o.look === 'img');
+    },
+    actor(s) {
+      if (s.end) return null;
+      if (!s.race) return 0;
+      const a = []; s.b.forEach((_, i) => a.push(i));
+      return a;
+    },
+    apply(s, seat, a) {
+      if (!a || s.end) throw new Error('over');
+      const t = a.t;
+      if (t === 'mv') {
+        if (s.won) throw new Error('solved');
+        if (s.race && Date.now() < s.t0 - 300) throw new Error('not started');
+        const f = a.f | 0, c = s.c[seat];
+        if (typeof a.q !== 'string' || f > c || a.q.length > 600) throw new Error('bad');
+        const q = a.q.slice(c - f).replace(/[^udlr]/g, '');
+        if (!q) return s;
+        const nb = applyMoves(s.b[seat], s.n, q);
+        if (nb == null) throw new Error('illegal');
+        if (!s.race && !s.t0) s.t0 = Date.now();
+        s.b[seat] = nb; s.c[seat] += q.length;
+        if (!s.race) { s.h += '|' + q; if (s.h.length > 240) s.h = s.h.slice(s.h.indexOf('|', s.h.length - 240)); }
+        if (nb === goalStr(s.n)) {
+          const tm = Math.max(0, Date.now() - s.t0);
+          if (s.race) { s.fin[seat] = tm; s.w = seat; s.end = 1; } else { s.won = 1; s.ft = tm; }
+        }
+      } else if (t === 'undo') {
+        if (s.race || s.won || !s.h) throw new Error('no undo');
+        const i = s.h.lastIndexOf('|'), q = s.h.slice(i + 1);
+        s.h = s.h.slice(0, Math.max(0, i));
+        const inv = Array.from(q).reverse().map((d) => OPP[d]).join('');
+        s.b[0] = applyMoves(s.b[0], s.n, inv); s.c[0] = Math.max(0, s.c[0] - q.length);
+      } else if (t === 'hint') {
+        if (s.race || s.won) throw new Error('no hint');
+        s.hu = 1;
+      } else if (t === 'new') {
+        if (s.race) throw new Error('race');
+        if (s.dy && !a.n) newBoard(s, DN, 1, s.dy); // 오늘의 퍼즐 처음부터 다시
+        else {
+          if (a.th != null) s.thm = U.clamp(a.th | 0, -1, THEMES.length - 1);
+          newBoard(s, U.clamp(a.n | 0 || s.n, 3, 8), a.img == null ? s.img : a.img);
+        }
+      } else if (t === 'daily') {
+        if (s.race) throw new Error('race');
+        const d = a.d | 0;
+        if (d < 20000101 || d > 29991231) throw new Error('bad date');
+        newBoard(s, DN, 1, d);
+      } else if (t === 'end') {
+        if (!s.won) throw new Error('not yet');
+        s.end = 1;
+      } else throw new Error('unknown');
+      return s;
+    },
+    aiDelayFor(s, seat, lv) {
+      if (s.end || s.won) return s.won && !s.race ? 900 : -1;
+      const base = !s.race ? 110 : [0, 820, 470, 270][lv || 2];
+      const wait = s.race ? Math.max(0, s.t0 - Date.now()) : 0;
+      return wait + base * (0.75 + Math.random() * 0.5);
+    },
+    ai(s, seat, lv) {
+      if (!s.race && s.won) return { t: 'end' };
+      const n = s.n, str = s.b[seat], c = s.c[seat];
+      if (s.race && lv === 1 && Math.random() < 0.1) { // beginner fumble: a random push
+        const ds = ['u', 'd', 'l', 'r'].filter((d) => applyMoves(str, n, d) != null);
+        return { t: 'mv', f: c, q: ds[Math.floor(Math.random() * ds.length)] };
+      }
+      const opt = !s.race || lv === 3;
+      const q = planFor(str, n, opt);
+      if (!q) return null;
+      const k = 1;
+      const nx = applyMoves(str, n, q.slice(0, k));
+      if (nx) remember(nx, n, opt, q.slice(k));
+      return { t: 'mv', f: c, q: q.slice(0, k) };
+    },
+    result(s) {
+      if (!s.end) return null;
+      const fmt = (ms) => (ms / 1000).toFixed(1) + '초';
+      if (!s.race) return { winners: [0], title: s.dy ? '오늘의 퍼즐 ' + DAILY.md(s.dy) + ' 완성!' : s.n + '×' + s.n + ' 완성!', text: s.c[0] + '수 · ' + fmt(s.ft),
+        stats: [{ label: '판', value: s.n + '×' + s.n + (s.img ? ' 그림' : ' 숫자') }, { label: '수', value: s.c[0] + '수' }, { label: s.op ? '최소(최적)' : '최소(하한)', value: s.op ? s.op + '수' : (s.lb || 0) + '수 이상' }, { label: '시간', value: fmt(s.ft) }, { label: '힌트', value: s.hu ? '썼어요' : '안 썼어요' }] };
+      const order = s.b.map((_, i) => i).sort((a, b) => (b === s.w) - (a === s.w) || correct(s.b[b]) - correct(s.b[a]));
+      return { winners: [s.w], stats: [{ label: '맞춘 칸', values: s.b.map((b) => Math.round(correct(b) * 100 / (s.n * s.n - 1)) + '%') }, { label: '움직인 수', values: s.c.map((c) => c + '수') }], title: '먼저 맞춘 사람 승리!', text: order.map((i, r) => (r + 1) + '등 ' + (s.nm[i] || '#' + (i + 1)) + (i === s.w ? ' ' + fmt(s.fin[i]) + ' · ' + s.c[i] + '수' : ' ' + Math.round(correct(s.b[i]) * 100 / (s.n * s.n - 1)) + '%')).join('  ') };
+    },
+
+    /* ---------------- view ---------------- */
+    mount(root, api) {
+      const cvs = U.canvas(root), cv = cvs.cv, ctx = cvs.ctx;
+      let S = null, rafStop = null, now = 0;
+      const myList = () => (api.mySeats ? api.mySeats() : [0]);
+      let me = -1;
+      let pend = '', base = 0, seenK = -1, hint = null, hintPlan = null, lastWinK = -1;
+      let numOn = store().num !== 0;
+      const pos = {}; // drawn tile positions per value: [r, c]
+      const art = { k: -1, cv: null, size: 0 };
+      let flash = 0, cdLast = -1, startLocal = 0;
+
+      const bar = L.h('div', { class: 'sl-bar', style: { position: 'absolute', left: '0', right: '0', bottom: '0', display: 'flex', gap: '5px', padding: '8px 8px 10px', justifyContent: 'center', zIndex: 5 } });
+      const mkBtn = (ic, lab, fn) => {
+        const b = L.h('button', { class: 'btn sm', style: { flex: '1 1 0', minWidth: '0', minHeight: '52px', padding: '4px 2px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', lineHeight: '1.1' }, onclick: (e) => { e.stopPropagation(); fn(); } });
+        const i = L.h('span', { style: { fontSize: '18px' }, text: ic }), t = L.h('span', { style: { fontSize: '11px', whiteSpace: 'nowrap' }, text: lab });
+        b.append(i, t); bar.append(b); return { b, t };
+      };
+      const canMe = () => me >= 0 && api.canAct(me) && !api.players[me].ai;
+      const act = (a) => { if (canMe()) api.act(a); };
+      const bUndo = mkBtn('↶', '되돌리기', () => { if (pend) return; hint = null; act({ t: 'undo' }); });
+      const bNew = mkBtn('⟲', '새로 섞기', () => act({ t: 'new' }));
+      const bHint = mkBtn('💡', '힌트', () => doHint());
+      bUndo.b.dataset.action = 'undo'; bNew.b.dataset.action = 'shuffle'; bHint.b.dataset.action = 'hint';
+      const bSize = mkBtn('▦', '크기', () => openPicker());
+      let peek = false;
+      const bPeek = mkBtn('👁', '그림 보기', () => {});
+      bPeek.b.dataset.action = 'peek';
+      bPeek.b.onclick = (e) => { e.stopPropagation(); if (e.detail === 0) { peek = !peek; } }; // keyboard: toggle
+      bPeek.b.addEventListener('pointerdown', (e) => { e.preventDefault(); peek = true; });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => bPeek.b.addEventListener(ev, () => { peek = false; }));
+      const bNum = mkBtn('#', '번호', () => { numOn = !numOn; const o = store(); o.num = numOn ? 1 : 0; save(o); refreshBar(); });
+      root.append(bar);
+
+      let ov = null;
+      function closeOv() { if (ov) { ov.remove(); ov = null; } }
+      function panel(children) {
+        closeOv();
+        ov = L.h('div', { style: { position: 'absolute', inset: '0', zIndex: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', background: 'rgba(10,8,15,.6)' }, onpointerdown: (e) => { if (e.target === ov) closeOv(); } });
+        const sh = L.h('div', { class: 'sheet', style: { maxHeight: '88%', gap: '12px', overflowY: 'auto' } });
+        children.forEach((c) => c && sh.append(c));
+        ov.append(sh); root.append(ov);
+      }
+      const fmt = (ms) => { const t = Math.floor(ms / 100) / 10; return t < 60 ? t.toFixed(1) + '초' : Math.floor(t / 60) + '분 ' + String(Math.floor(t % 60)).padStart(2, '0') + '초'; };
+      const recKey = (n, img) => n + (img ? 'i' : 'n');
+      const optTxt = (s) => (s.op ? '최소 ' + s.op + '수' : s.lb ? '최소 ' + s.lb + '수 이상' : '');
+      if (L.best) { const ob = store().best || {}; for (const k in ob) { const n = parseInt(k, 10), r = ob[k]; if (!n || !r) continue; L.best.set('slide', 'm' + n, r.m, { label: n + '×' + n + ' 최소 이동', lower: true, unit: '수' }); L.best.set('slide', 't' + n, Math.round(r.t / 100) / 10, { label: n + '×' + n + ' 최단 시간', lower: true, fmt: 'time' }); } }
+      function openPicker() {
+        if (!S) return;
+        let img = S.img, th = S.thm == null ? -1 : S.thm;
+        const best = store().best || {};
+        const body = L.h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } });
+        function draw() {
+          body.innerHTML = '';
+          const chips = L.h('div', { style: { display: 'flex', gap: '6px' } });
+          [['숫자 판', 0], ['그림 판', 1]].forEach(([lab, v]) => chips.append(L.h('button', { class: 'btn sm' + (img === v ? ' primary' : ''), style: { flex: '1', minHeight: '46px' }, text: lab, onclick: () => { img = v; draw(); } })));
+          const grid = L.h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '6px' } });
+          for (let n = 3; n <= 8; n++) {
+            const r = best[recKey(n, img)];
+            const b = L.h('button', { class: 'btn sm' + (n === S.n && img === S.img ? ' primary' : ''), style: { minHeight: '62px', padding: '2px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', lineHeight: '1.15' }, onclick: () => { closeOv(); act({ t: 'new', n, img, th }); } });
+            b.append(L.h('span', { class: 'mono', style: { fontSize: '17px' }, text: n + '×' + n }),
+              L.h('span', { style: { fontSize: '10px', opacity: '.8' }, text: r ? r.m + '수' : '기록 없음' }),
+              r ? L.h('span', { style: { fontSize: '10px', opacity: '.8' }, text: fmt(r.t) }) : '');
+            grid.append(b);
+          }
+          body.append(chips);
+          if (img) {
+            const tg = L.h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '5px' } });
+            [[-1, '무작위']].concat(THEMES.map((t, i) => [i, t])).forEach(([v, lab]) => tg.append(L.h('button', { class: 'btn sm' + (th === v ? ' primary' : ''), style: { minHeight: '44px', padding: '2px', fontSize: '12px', lineHeight: '1.1' }, text: lab, onclick: () => { th = v; draw(); } })));
+            body.append(tg);
+          }
+          body.append(grid);
+        }
+        draw();
+        panel([DAILY.card((d) => { closeOv(); act({ t: 'daily', d }); }, api, '5×5 그림 판'), L.h('h2', { text: '크기 고르기' }), L.h('p', { class: 'muted', style: { margin: 0 }, text: '숫자 아래는 이 폰의 최고 기록(가장 적은 수 · 가장 짧은 시간).' }), body,
+          L.h('button', { class: 'btn', style: { minHeight: '48px' }, text: '닫기', onclick: closeOv })]);
+      }
+      function winPanel(newRec) {
+        if (S.dy) {
+          const sc = DAILY.score(S.dy);
+          return panel([L.h('h2', { text: '오늘의 퍼즐 완성! 🎉' }),
+            L.h('p', { style: { margin: 0, fontSize: '16px' }, text: S.c[0] + '수 · ' + fmt(S.ft) + (sc != null ? ' · 오늘 최고 ' + sc + '수' : '') }),
+            S.lb ? L.h('p', { class: 'muted', style: { margin: 0 }, text: '이 판은 최소 ' + S.lb + '수 이상 필요해요' }) : null,
+            L.h('p', { class: 'muted', style: { margin: 0 }, text: '🔥 연속 ' + DAILY.streak() + '일' + (S.hu ? ' · 힌트 사용' : '') }),
+            L.h('button', { class: 'btn primary', style: { minHeight: '52px', fontSize: '17px' }, text: '📋 결과 공유(복사)', onclick: () => DAILY.share(S.dy, api) }),
+            L.h('button', { 'data-action': 'shuffle', class: 'btn', style: { minHeight: '48px' }, text: '다시 도전', onclick: () => { closeOv(); act({ t: 'new' }); } }),
+            L.h('button', { class: 'btn ghost', style: { minHeight: '48px' }, text: '크기 고르기', onclick: () => openPicker() })]);
+        }
+        const r = (store().best || {})[recKey(S.n, S.img)];
+        panel([L.h('h2', { text: S.n + '×' + S.n + ' 완성!' }),
+          L.h('p', { style: { margin: 0, fontSize: '16px' }, text: S.c[0] + '수 · ' + fmt(S.ft) + (S.hu ? ' (힌트 사용)' : '') }),
+          optTxt(S) ? L.h('p', { style: { margin: 0, color: S.op && S.c[0] <= S.op ? '#8fd14f' : '#e3ae45' }, text: S.op ? (S.c[0] <= S.op ? '🏅 가장 짧은 길로 풀었어요! (최소 ' + S.op + '수)' : '최소 ' + S.op + '수 · 나는 ' + (S.c[0] - S.op) + '수 더') : '이 판은 최소 ' + S.lb + '수 이상 필요해요' }) : null,
+          r ? L.h('p', { class: 'muted', style: { margin: 0 }, text: (newRec ? '새 기록! ' : '') + '최고 ' + r.m + '수 · ' + fmt(r.t) }) : null,
+          L.h('button', { 'data-action': 'shuffle', class: 'btn primary', style: { minHeight: '52px', fontSize: '17px' }, text: '다시 섞어 한 판 더', onclick: () => { closeOv(); act({ t: 'new' }); } }),
+          L.h('button', { class: 'btn', style: { minHeight: '48px' }, text: '크기 바꾸기', onclick: () => openPicker() }),
+          L.h('button', { class: 'btn ghost', style: { minHeight: '48px' }, text: '그만하기', onclick: () => { closeOv(); act({ t: 'end' }); } })]);
+      }
+      function refreshBar() {
+        if (!S) return;
+        const solo = !S.race;
+        const show = (b, v) => { b.b.style.display = v ? 'flex' : 'none'; };
+        const dis = (b, v) => { b.b.disabled = !v; b.b.style.opacity = v ? '1' : '.4'; };
+        show(bUndo, solo); show(bNew, solo); show(bHint, solo); show(bSize, solo); show(bNum, !!S.img); show(bPeek, !!S.img && !S.won);
+        dis(bUndo, solo && !S.won && !!S.h); dis(bHint, solo && !S.won); dis(bNew, true); dis(bSize, true); dis(bNum, true); dis(bPeek, true);
+        bNum.t.textContent = numOn ? '번호 켬' : '번호 끔';
+        bar.style.display = solo || S.img ? 'flex' : 'none';
+      }
+
+      /* ---------- my board (confirmed + pending) ---------- */
+      const myBoard = () => { if (!S || me < 0) return null; const b = S.b[me]; return pend ? applyMoves(b, S.n, pend) || b : b; };
+      function push(q) {
+        if (!S || me < 0 || !canMe() || S.won || S.end) return;
+        if (S.race && Date.now() < S.t0) return;
+        const cur = myBoard(), nx = applyMoves(cur, S.n, q);
+        if (nx == null) return;
+        pend += q; hint = null;
+        api.sfx('tick'); api.buzz(8);
+        api.act({ t: 'mv', f: base, q: pend });
+      }
+      function slideTo(cell) { // tap a tile in the gap's line
+        const b = myBoard(); if (!b) return false;
+        const n = S.n, g = b.indexOf('0'), gr = Math.floor(g / n), gc = g % n, r = Math.floor(cell / n), c = cell % n;
+        if (cell === g) return false;
+        if (r === gr) push((c > gc ? 'r' : 'l').repeat(Math.abs(c - gc)));
+        else if (c === gc) push((r > gr ? 'd' : 'u').repeat(Math.abs(r - gr)));
+        else return false;
+        return true;
+      }
+      const tileDir = { up: 'd', down: 'u', left: 'r', right: 'l' }; // tile moves up = gap moves down
+      function nudge(dir) { push(tileDir[dir]); }
+
+      function doHint() {
+        if (!S || S.race || S.won || pend) return;
+        const b = S.b[0], n = S.n;
+        let q = null, tgt = 0;
+        if (hintPlan && hintPlan.from === b && hintPlan.q) { q = hintPlan.q; tgt = hintPlan.tg ? hintPlan.tg[0] : 0; }
+        else {
+          if (n === 3) q = ida(dec(b), 3, 500000);
+          if (q == null) { const r = reduce(b, n); if (r) { q = r.q; hintPlan = { from: b, q: r.q, tg: r.tg }; tgt = r.tg[0]; } }
+          else hintPlan = { from: b, q, tg: null };
+        }
+        if (!q) { api.toast('이미 거의 다 왔어요!'); return; }
+        const g = b.indexOf('0'), nr = Math.floor(g / n) + DR[q[0]], nc = (g % n) + DC[q[0]];
+        hint = { k: S.k, cell: nr * n + nc, tgt, at: now };
+        if (!S.hu) act({ t: 'hint' });
+        api.sfx('click');
+        if (tgt) api.toast('목표: ' + tgt + '번 타일을 제자리로');
+      }
+
+      /* ---------- layout & drawing ---------- */
+      let LAY = null;
+      function layout() {
+        const W = cvs.w, H = cvs.h, race = S.race && S.b.length > 1;
+        const top = race ? 104 : 70, bottom = (bar.style.display === 'none' ? 16 : 78);
+        const sz = Math.max(120, Math.min(W - 24, H - top - bottom - 16, 520));
+        LAY = { W, H, sz, x: (W - sz) / 2, y: top + Math.max(0, (H - top - bottom - sz) * 0.3), ts: sz / S.n, n: S.n, race };
+      }
+      function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+
+      function frame(dt) {
+        now += dt;
+        if (!S) return;
+        const W = cvs.w, H = cvs.h;
+        if (!LAY || LAY.W !== W || LAY.H !== H || LAY.n !== S.n || LAY.barKey !== bar.style.display) { layout(); LAY.barKey = bar.style.display; }
+        const bg = ctx.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, '#1d2233'); bg.addColorStop(1, '#17131f');
+        ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+        const n = S.n, ts = LAY.ts, bx = LAY.x, by = LAY.y, sz = LAY.sz;
+        const board = me >= 0 ? myBoard() : S.b[0];
+        const solved = board === goalStr(n);
+        const t0 = S.t0;
+        const elapsed = S.race ? Math.max(0, Date.now() - t0) : S.won ? S.ft : t0 ? Date.now() - t0 : 0;
+        const myC = me >= 0 ? S.c[me] + pend.length : S.c[0];
+
+        // header
+        ctx.textBaseline = 'middle';
+        if (LAY.race) {
+          const others = S.b.map((_, i) => i).filter((i) => i !== me);
+          const cw = Math.min(110, (W - 24) / Math.max(1, others.length));
+          others.forEach((i, k) => {
+            const x0 = (W - cw * others.length) / 2 + k * cw + 6, mw = Math.min(56, cw - 12), cs = mw / n, y0 = 10;
+            const bstr = S.b[i];
+            ctx.fillStyle = 'rgba(0,0,0,.3)'; rr(x0 - 3, y0 - 3, mw + 6, mw + 6, 5); ctx.fill();
+            for (let j = 0; j < n * n; j++) {
+              const v = bstr.charCodeAt(j) - 48; if (!v) continue;
+              ctx.fillStyle = v === j + 1 ? '#e3ae45' : 'rgba(242,233,216,.28)';
+              ctx.fillRect(x0 + (j % n) * cs + 0.5, y0 + Math.floor(j / n) * cs + 0.5, cs - 1, cs - 1);
+            }
+            const p = api.players[i] || {};
+            ctx.fillStyle = p.color || '#f2e9d8'; ctx.beginPath(); ctx.arc(x0 + 4, y0 + mw + 14, 4, 0, Math.PI * 2); ctx.fill();
+            ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'left'; ctx.font = '11px "IBM Plex Sans KR", sans-serif';
+            const pct = Math.round(correct(bstr) * 100 / (n * n - 1));
+            ctx.fillText(((p.name || '') + '').slice(0, 5) + ' ' + pct + '%', x0 + 11, y0 + mw + 14);
+          });
+        }
+        const hy = LAY.y - 22;
+        ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'left'; ctx.font = '22px "Black Han Sans", sans-serif';
+        ctx.fillText(S.dy ? '오늘의 퍼즐 ' + DAILY.md(S.dy) : n + '×' + n + (S.img ? ' 그림' : ''), bx, hy);
+        ctx.textAlign = 'right'; ctx.font = '15px "IBM Plex Mono", monospace'; ctx.fillStyle = '#e3ae45';
+        ctx.fillText(myC + '수  ' + fmt(elapsed), bx + sz, hy);
+        if (!S.race && !LAY.race) {
+          const r = (store().best || {})[recKey(n, S.img)], dsc = S.dy ? DAILY.score(S.dy) : null;
+          ctx.font = '11px "IBM Plex Sans KR", sans-serif'; ctx.fillStyle = '#ab9fb8';
+          const sub = S.dy ? (dsc != null ? '오늘 최고 ' + dsc + '수' : '오늘 첫 도전') : r ? '최고 ' + r.m + '수 · ' + fmt(r.t) : '첫 기록 도전';
+          ctx.fillText(optTxt(S) + ' · ' + sub, bx + sz, hy - 22 < 6 ? hy + 16 : hy - 20);
+        }
+
+        // frame
+        ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(bx - 8, by - 6, sz + 16, sz + 18, 14); ctx.fill();
+        const fg = ctx.createLinearGradient(0, by - 10, 0, by + sz + 10); fg.addColorStop(0, '#7a5534'); fg.addColorStop(1, '#4a321f');
+        ctx.fillStyle = fg; rr(bx - 9, by - 9, sz + 18, sz + 18, 13); ctx.fill();
+        ctx.strokeStyle = 'rgba(227,174,69,.55)'; ctx.lineWidth = 1.5; rr(bx - 9, by - 9, sz + 18, sz + 18, 13); ctx.stroke();
+        ctx.fillStyle = '#114536'; rr(bx - 2, by - 2, sz + 4, sz + 4, 7); ctx.fill();
+
+        // tiles
+        if (S.img && (art.k !== S.art + ':' + S.th || art.size !== Math.round(sz * cvs.dpr))) { art.k = S.art + ':' + S.th; art.size = Math.round(sz * cvs.dpr); art.cv = artCanvas(S.art, S.th | 0, art.size); }
+        const k = Math.min(1, dt * 0.022 * ((L.debug && L.debug.speed) || 1));
+        const g = 3, rad = Math.max(3, ts * 0.12);
+        const fsz = Math.round(ts * (n >= 7 ? 0.42 : 0.46));
+        for (let j = 0; j < n * n; j++) {
+          const v = board.charCodeAt(j) - 48; if (!v) continue;
+          const tr = Math.floor(j / n), tc = j % n;
+          let p = pos[v];
+          if (!p) p = pos[v] = [tr, tc];
+          p[0] += (tr - p[0]) * k; p[1] += (tc - p[1]) * k;
+          if (Math.abs(p[0] - tr) < 0.005) p[0] = tr; if (Math.abs(p[1] - tc) < 0.005) p[1] = tc;
+          const x = bx + p[1] * ts + g / 2, y = by + p[0] * ts + g / 2, w = ts - g;
+          const ok = v === j + 1;
+          if (S.img && art.cv) {
+            const sr = Math.floor((v - 1) / n), sc = (v - 1) % n, q = art.size / n;
+            ctx.save(); rr(x, y, w, w, rad * 0.6); ctx.clip();
+            ctx.drawImage(art.cv, sc * q, sr * q, q, q, x, y, w, w);
+            ctx.fillStyle = 'rgba(255,255,255,.14)'; ctx.fillRect(x, y, w, 2); ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(x, y + w - 2, w, 2);
+            ctx.restore();
+            if (numOn && !solved) {
+              const bs = Math.max(13, ts * 0.3);
+              ctx.fillStyle = 'rgba(20,14,26,.68)'; rr(x + 2, y + 2, bs * 1.25, bs, 3); ctx.fill();
+              ctx.fillStyle = ok ? '#e3ae45' : '#f2e9d8'; ctx.font = Math.round(bs * 0.7) + 'px "IBM Plex Mono", monospace'; ctx.textAlign = 'center';
+              ctx.fillText(String(v), x + 2 + bs * 0.62, y + 2 + bs / 2 + 1);
+            }
+          } else {
+            ctx.fillStyle = 'rgba(0,0,0,.35)'; rr(x, y + 2, w, w, rad); ctx.fill();
+            const tg = ctx.createLinearGradient(0, y, 0, y + w);
+            tg.addColorStop(0, ok ? '#f6e7c4' : '#f2e9d8'); tg.addColorStop(1, ok ? '#dcc08a' : '#cbbd9f');
+            ctx.fillStyle = tg; rr(x, y, w, w - 1, rad); ctx.fill();
+            ctx.fillStyle = 'rgba(255,255,255,.4)'; ctx.fillRect(x + rad, y + 1.5, w - rad * 2, 1.5);
+            ctx.fillStyle = ok ? '#7a4f12' : '#2a2233'; ctx.font = fsz + 'px "Black Han Sans", sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText(String(v), x + w / 2, y + w / 2 + 1);
+          }
+          if (hint && hint.k === S.k && (hint.cell === j || hint.tgt === v)) {
+            const pu = 0.5 + 0.5 * Math.sin((now - hint.at) / 140);
+            ctx.strokeStyle = hint.cell === j ? 'rgba(120,230,255,' + (0.5 + 0.5 * pu).toFixed(2) + ')' : 'rgba(227,174,69,.9)';
+            ctx.lineWidth = hint.cell === j ? 3.5 : 2; rr(x + 1, y + 1, w - 2, w - 2, rad); ctx.stroke();
+          }
+        }
+        if (hint && hint.tgt && hint.k === S.k) { // target cell outline
+          const j = hint.tgt - 1, x = bx + (j % n) * ts + 3, y = by + Math.floor(j / n) * ts + 3;
+          ctx.setLineDash([4, 4]); ctx.strokeStyle = 'rgba(227,174,69,.85)'; ctx.lineWidth = 2; rr(x, y, ts - 6, ts - 6, rad); ctx.stroke(); ctx.setLineDash([]);
+        }
+        if (peek && S.img && art.cv && !solved) { // 미리보기: hold to see the whole picture
+          ctx.drawImage(art.cv, 0, 0, art.size, art.size, bx, by, sz, sz);
+          ctx.fillStyle = 'rgba(10,8,15,.6)'; rr(bx + sz / 2 - 60, by + sz - 34, 120, 26, 8); ctx.fill();
+          ctx.fillStyle = '#f2e9d8'; ctx.textAlign = 'center'; ctx.font = '13px "IBM Plex Sans KR", sans-serif';
+          ctx.fillText('완성 그림: ' + THEMES[S.th | 0], bx + sz / 2, by + sz - 21);
+        }
+        if (solved && S.img && art.cv) { // the full picture slides in
+          flash = Math.min(1, flash + dt / 600);
+          ctx.globalAlpha = flash; ctx.drawImage(art.cv, 0, 0, art.size, art.size, bx, by, sz, sz); ctx.globalAlpha = 1;
+        } else if (!solved) flash = 0;
+
+        // countdown (race)
+        if (S.race) {
+          const left = t0 - Date.now();
+          if (left > -700 && !S.end) {
+            const num = left > 0 ? Math.ceil(left / 1000) : 0;
+            if (num !== cdLast) { cdLast = num; api.sfx(num ? 'tick' : 'whoosh'); }
+            ctx.fillStyle = 'rgba(10,8,15,' + (left > 0 ? 0.55 : 0.25) + ')'; ctx.fillRect(bx, by, sz, sz);
+            ctx.fillStyle = '#e3ae45'; ctx.textAlign = 'center'; ctx.font = Math.round(sz * 0.3) + 'px "Black Han Sans", sans-serif';
+            ctx.fillText(num ? String(Math.min(3, num)) : '시작!', bx + sz / 2, by + sz / 2);
+          }
+          if (S.end && S.w >= 0) {
+            ctx.fillStyle = 'rgba(10,8,15,.5)'; ctx.fillRect(bx, by + sz / 2 - 30, sz, 60);
+            ctx.fillStyle = '#e3ae45'; ctx.textAlign = 'center'; ctx.font = '26px "Black Han Sans", sans-serif';
+            ctx.fillText(S.w === me ? '내가 먼저 완성!' : ((api.players[S.w] || {}).name || '') + ' 완성!', bx + sz / 2, by + sz / 2);
+          }
+        } else if (S.won) {
+          ctx.fillStyle = '#e3ae45'; ctx.textAlign = 'center'; ctx.font = '24px "Black Han Sans", sans-serif';
+          ctx.fillText('완성!', W / 2, by + sz + 26 + Math.sin(now / 220) * 2);
+        } else if (!S.t0 && canMe()) {
+          ctx.fillStyle = '#ab9fb8'; ctx.textAlign = 'center'; ctx.font = '12px "IBM Plex Sans KR", sans-serif';
+          ctx.fillText('빈칸과 같은 줄의 타일을 눌러 밀어요', W / 2, by + sz + 22);
+        }
+      }
+
+      /* ---------- input ---------- */
+      let down = null;
+      const cellAt = (x, y) => { if (!LAY) return -1; const c = Math.floor((x - LAY.x) / LAY.ts), r = Math.floor((y - LAY.y) / LAY.ts); return r < 0 || c < 0 || r >= S.n || c >= S.n ? -1 : r * S.n + c; };
+      const onDown = (e) => { if (ov || !S) return; const p = cvs.local(e); down = { x: p.x, y: p.y, cell: cellAt(p.x, p.y) }; };
+      const onUp = (e) => {
+        if (!down || !S) return;
+        const p = cvs.local(e), dx = p.x - down.x, dy = p.y - down.y, d0 = down; down = null;
+        if (!canMe()) return;
+        if (Math.hypot(dx, dy) < 16) { if (d0.cell >= 0) slideTo(d0.cell); return; }
+        const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+        // swipe on a tile in the gap's line toward the gap → slide that line; otherwise push the tile next to the gap
+        const b = myBoard(), n = S.n, g = b.indexOf('0');
+        if (d0.cell >= 0 && d0.cell !== g) {
+          const r = Math.floor(d0.cell / n), c = d0.cell % n, gr = Math.floor(g / n), gc = g % n;
+          const toward = (r === gr && ((gc < c && dir === 'left') || (gc > c && dir === 'right'))) || (c === gc && ((gr < r && dir === 'up') || (gr > r && dir === 'down')));
+          if (toward) { slideTo(d0.cell); return; }
+        }
+        nudge(dir);
+      };
+      cv.addEventListener('pointerdown', onDown);
+      window.addEventListener('pointerup', onUp);
+      const offIn = api.input ? api.input.on((type, id) => {
+        if (type !== 'down' || !S || ov) return;
+        if (tileDir[id]) nudge(id);
+        else if (id === 'undo' && !S.race) bUndo.b.click();
+        else if (id === 'hint' && !S.race) doHint();
+        else if (id === 'shuffle' && !S.race) act({ t: 'new' });
+      }) : null;
+
+      rafStop = U.loop((dt) => frame(Math.min(dt * 1000, 50)));
+
+      return {
+        update(s, prev) {
+          const fresh = !S;
+          S = s;
+          if (me < 0 || fresh) { const ms = myList().filter((i) => i < s.b.length && api.players[i] && !api.players[i].ai); me = ms.length ? ms[0] : (s.race ? -1 : 0); if (!s.race) me = 0; }
+          if (s.k !== seenK) { // new scramble: snap tiles
+            seenK = s.k; pend = ''; base = me >= 0 ? s.c[me] : 0; hint = null; hintPlan = null; cdLast = -1; startLocal = now;
+            for (const v in pos) delete pos[v];
+            const b = me >= 0 ? s.b[me] : s.b[0];
+            for (let j = 0; j < b.length; j++) { const v = b.charCodeAt(j) - 48; if (v) pos[v] = [Math.floor(j / s.n), j % s.n]; }
+            closeOv(); LAY = null;
+          } else if (me >= 0) {
+            const c = s.c[me];
+            if (c < base || s.won || s.end) { pend = ''; base = c; }
+            else if (c >= base + pend.length) { pend = ''; base = c; }
+            else if (c > base) { pend = pend.slice(c - base); base = c; }
+            if (pend && applyMoves(s.b[me], s.n, pend) == null) { pend = ''; }
+          }
+          if (prev && prev !== s && prev.k === s.k && !s.race && prev.c[0] > s.c[0]) api.sfx('whoosh');
+          // solo win
+          if (!s.race && s.won && lastWinK !== s.k && prev && !prev.won) {
+            lastWinK = s.k;
+            let newRec = false;
+            if (s.dy) { if (canMe() && DAILY.complete(s.dy, s.c[0], api)) api.toast('오늘 최고 기록!'); }
+            else if (!s.hu && canMe()) {
+              const o = store(); o.best = o.best || {};
+              const key = recKey(s.n, s.img), r = o.best[key];
+              if (!r) o.best[key] = { m: s.c[0], t: s.ft };
+              else { if (s.c[0] < r.m) { r.m = s.c[0]; newRec = true; } if (s.ft < r.t) { r.t = s.ft; newRec = true; } }
+              save(o);
+              api.best('m' + s.n, s.c[0], { label: s.n + '×' + s.n + ' 최소 이동', lower: true, unit: '수' });
+              api.best('t' + s.n, Math.round(s.ft / 100) / 10, { label: s.n + '×' + s.n + ' 최단 시간', lower: true, fmt: 'time' });
+            }
+            api.sfx('win'); api.buzz(60);
+            setTimeout(() => { if (S && S.won && S.k === s.k && canMe()) winPanel(newRec); }, 700 / ((L.debug && L.debug.speed) || 1));
+          }
+          if (s.race && s.end && prev && !prev.end) { api.sfx(s.w === me ? 'win' : 'lose'); api.buzz(50); }
+          refreshBar();
+        },
+        destroy() { if (rafStop) rafStop(); cv.removeEventListener('pointerdown', onDown); window.removeEventListener('pointerup', onUp); if (offIn) offIn(); closeOv(); bar.remove(); api.setBusy(false); cvs.destroy(); },
+      };
+    },
+  };
+  def._daily = DAILY; def._paint = paintScene; def._themes = THEMES; def._lb = lowerBound; def._reduce = reduce; def._ida = ida; def._scramble = scramble; def._apply = applyMoves; def._goal = goalStr;
+  L.register(def);
+})();

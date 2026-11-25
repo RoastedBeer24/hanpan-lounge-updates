@@ -1,0 +1,1367 @@
+/* 포켓볼 — 8볼 (간이 WPA 규칙). 결정적 고정 스텝 물리: apply가 끝까지 시뮬레이션하고, 뷰는 last.pre+last.shot을 재생한다. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+
+  /* invisible box over a canvas region so the first-play tutorial (sel) can spotlight it.
+     set(x, y, w, h) in stage px; set(null) takes it out of the DOM (the tutorial then shows no ring). */
+  function tutSpot(root, cls) {
+    const e = L.h('div', { class: 'tut-spot ' + cls, 'aria-hidden': 'true', style: { position: 'absolute', pointerEvents: 'none', left: '0px', top: '0px', width: '0px', height: '0px' } });
+    let key = '';
+    const set = (x, y, w, h) => {
+      if (x == null || !(w > 0 && h > 0)) { if (e.parentNode) e.remove(); key = ''; return; }
+      if (!e.parentNode) root.append(e);
+      const v = [x, y, w, h].map(Math.round), k = v.join(',');
+      if (k === key) return; key = k;
+      Object.assign(e.style, { left: v[0] + 'px', top: v[1] + 'px', width: v[2] + 'px', height: v[3] + 'px' });
+    };
+    set.el = e;
+    return set;
+  }
+
+  /* ---------- table geometry (units) ---------- */
+  const W = 500, H = 1000, R = 15, D = 2 * R, H2 = H / 2;
+  const DT = 1 / 240, VMAX = 2600, MU = 250, KD = 0.32, EB = 0.95, EC = 0.78, MAXT = 15;
+  const CM = 44, SM = 28, JC = 16, JSX = 14, JSY = 21; // corner mouth, side mouth, jaw depths
+  const HEAD = H * 0.75, FOOT = H * 0.25;
+  const SEGS = [];
+  function seg(ax, ay, bx, by) { const dx = bx - ax, dy = by - ay; SEGS.push({ ax, ay, bx, by, dx, dy, l2: dx * dx + dy * dy }); }
+  seg(CM, 0, W - CM, 0); seg(CM, H, W - CM, H);
+  seg(0, CM, 0, H2 - SM); seg(0, H2 + SM, 0, H - CM);
+  seg(W, CM, W, H2 - SM); seg(W, H2 + SM, W, H - CM);
+  // corner jaws
+  seg(CM, 0, CM - JC, -JC); seg(0, CM, -JC, CM - JC);
+  seg(W - CM, 0, W - CM + JC, -JC); seg(W, CM, W + JC, CM - JC);
+  seg(CM, H, CM - JC, H + JC); seg(0, H - CM, -JC, H - CM + JC);
+  seg(W - CM, H, W - CM + JC, H + JC); seg(W, H - CM, W + JC, H - CM + JC);
+  // side jaws
+  seg(0, H2 - SM, -JSX, H2 - JSY); seg(0, H2 + SM, -JSX, H2 + JSY);
+  seg(W, H2 - SM, W + JSX, H2 - JSY); seg(W, H2 + SM, W + JSX, H2 + JSY);
+  const POCK = [[-10, -10, 23], [W + 10, -10, 23], [-21, H2, 22], [W + 21, H2, 22], [-10, H + 10, 23], [W + 10, H + 10, 23]];
+  const AIMP = [[2, 2], [W - 2, 2], [-6, H2], [W + 6, H2], [2, H - 2], [W - 2, H - 2]];
+
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const grpOf = (i) => (i === 0 ? -1 : i === 8 ? 8 : i < 8 ? 1 : 2);
+
+  /* ---------- deterministic simulation (only + - * / sqrt) ---------- */
+  function Sim(b, shot) {
+    this.x = new Float64Array(16); this.y = new Float64Array(16);
+    this.vx = new Float64Array(16); this.vy = new Float64Array(16);
+    this.on = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) if (b[i]) { this.x[i] = b[i][0]; this.y[i] = b[i][1]; this.on[i] = 1; }
+    this.vx[0] = shot.vx; this.vy[0] = shot.vy;
+    this.sp = shot.sp || 0;
+    this.first = -1; this.rail = false; this.pots = []; this.pk = []; this.cueIn = false;
+    this.cross = false; // cue ball centre went past the head string before the first contact (kitchen rule)
+    this.steps = 0; this.done = false; this.hits = 0; this.bounces = 0; this.caps = [];
+  }
+  Sim.prototype.step = function () {
+    const x = this.x, y = this.y, vx = this.vx, vy = this.vy, on = this.on;
+    let moving = 0;
+    for (let i = 0; i < 16; i++) {
+      if (!on[i]) continue;
+      const sx = vx[i], sy = vy[i];
+      if (sx === 0 && sy === 0) continue;
+      const s = Math.sqrt(sx * sx + sy * sy);
+      if (s < 3) { vx[i] = 0; vy[i] = 0; continue; }
+      let ns = (s - MU * DT) * (1 - KD * DT);
+      if (ns < 0) ns = 0;
+      const f = ns / s;
+      vx[i] = sx * f; vy[i] = sy * f;
+      x[i] += vx[i] * DT; y[i] += vy[i] * DT;
+      moving++;
+    }
+    if (this.first < 0 && !this.cross && on[0] && y[0] < HEAD) this.cross = true;
+    // ball-ball
+    for (let i = 0; i < 15; i++) {
+      if (!on[i]) continue;
+      const mi = vx[i] !== 0 || vy[i] !== 0;
+      for (let j = i + 1; j < 16; j++) {
+        if (!on[j]) continue;
+        if (!mi && vx[j] === 0 && vy[j] === 0) continue;
+        const dx = x[j] - x[i], dy = y[j] - y[i];
+        if (dx > D || dx < -D || dy > D || dy < -D) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= D * D) continue;
+        let d = Math.sqrt(d2), nx, ny;
+        if (d < 1e-9) { nx = 1; ny = 0; d = 0; } else { nx = dx / d; ny = dy / d; }
+        const rel = (vx[i] - vx[j]) * nx + (vy[i] - vy[j]) * ny;
+        if (rel > 0) {
+          let cueN = 0, cueNx = 0, cueNy = 0, spin = false;
+          if (this.first < 0 && (i === 0 || j === 0)) {
+            this.first = i === 0 ? j : i;
+            spin = this.sp !== 0;
+            if (i === 0) { cueN = vx[0] * nx + vy[0] * ny; cueNx = nx; cueNy = ny; }
+            else { cueN = -(vx[0] * nx + vy[0] * ny); cueNx = -nx; cueNy = -ny; }
+          }
+          const jm = rel * (1 + EB) / 2;
+          vx[i] -= jm * nx; vy[i] -= jm * ny; vx[j] += jm * nx; vy[j] += jm * ny;
+          if (spin && cueN > 0) { const k = this.sp * 0.55 * cueN; vx[0] += k * cueNx; vy[0] += k * cueNy; }
+          this.hits++;
+        }
+        const push = (D - d) / 2 + 0.001;
+        x[i] -= nx * push; y[i] -= ny * push; x[j] += nx * push; y[j] += ny * push;
+      }
+    }
+    // cushions + pockets
+    for (let i = 0; i < 16; i++) {
+      if (!on[i]) continue;
+      let px = x[i], py = y[i];
+      if (px > R + 1 && px < W - R - 1 && py > R + 1 && py < H - R - 1) continue;
+      for (let k = 0; k < SEGS.length; k++) {
+        const s = SEGS[k];
+        let t = ((px - s.ax) * s.dx + (py - s.ay) * s.dy) / s.l2;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        const qx = s.ax + s.dx * t, qy = s.ay + s.dy * t;
+        const ex = px - qx, ey = py - qy, d2 = ex * ex + ey * ey;
+        if (d2 >= R * R) continue;
+        const d = Math.sqrt(d2);
+        if (d < 1e-9) continue;
+        const nx = ex / d, ny = ey / d;
+        const vn = vx[i] * nx + vy[i] * ny;
+        if (vn < 0) {
+          const tx = vx[i] - vn * nx, ty = vy[i] - vn * ny;
+          vx[i] = tx * 0.97 - EC * vn * nx; vy[i] = ty * 0.97 - EC * vn * ny;
+          if (this.first >= 0) this.rail = true;
+          this.bounces++;
+        }
+        px = qx + nx * R; py = qy + ny * R; x[i] = px; y[i] = py;
+      }
+      let cap = px < -6 || px > W + 6 || py < -6 || py > H + 6;
+      if (!cap) for (let k = 0; k < 6; k++) {
+        const P = POCK[k], dx = px - P[0], dy = py - P[1];
+        if (dx * dx + dy * dy < P[2] * P[2]) { cap = true; break; }
+      }
+      if (cap) {
+        let pk = 0, bd = Infinity;
+        for (let k = 0; k < 6; k++) { const P = POCK[k], dx = px - P[0], dy = py - P[1], d2 = dx * dx + dy * dy; if (d2 < bd) { bd = d2; pk = k; } }
+        on[i] = 0; vx[i] = 0; vy[i] = 0;
+        this.pots.push(i); this.pk.push(pk); this.caps.push([i, px, py, this.steps, pk]);
+        if (i === 0) this.cueIn = true;
+      }
+    }
+    this.steps++;
+    if (!moving || this.steps > MAXT / DT) {
+      let still = true;
+      for (let i = 0; i < 16; i++) if (on[i] && (vx[i] !== 0 || vy[i] !== 0)) { still = false; break; }
+      if (still || this.steps > MAXT / DT) { this.done = true; for (let i = 0; i < 16; i++) { vx[i] = 0; vy[i] = 0; } }
+    }
+  };
+  Sim.prototype.run = function () { while (!this.done) this.step(); return this; };
+  Sim.prototype.balls = function () {
+    const out = [];
+    for (let i = 0; i < 16; i++) out.push(this.on[i] ? [r1(this.x[i]), r1(this.y[i])] : 0);
+    return out;
+  };
+  function simulate(b, shot) { return new Sim(b, shot).run(); }
+
+  /* ---------- rules ---------- */
+  function myGroup(s, seat) { return s.sol < 0 ? 0 : s.sol === seat ? 1 : 2; }
+  function remaining(b, g) { let n = 0; for (let i = 1; i < 16; i++) if (b[i] && grpOf(i) === g) n++; return n; }
+  function targets(s, seat) {
+    const g = myGroup(s, seat), out = [];
+    if (g === 0) { for (let i = 1; i < 16; i++) if (i !== 8 && s.b[i]) out.push(i); }
+    else { for (let i = 1; i < 16; i++) if (s.b[i] && grpOf(i) === g) out.push(i); }
+    if (!out.length && s.b[8]) out.push(8);
+    return out;
+  }
+  function freeSpot(b, x, y, skip) {
+    for (let i = 0; i < 16; i++) {
+      if (i === skip || !b[i]) continue;
+      const dx = b[i][0] - x, dy = b[i][1] - y;
+      if (dx * dx + dy * dy < (D + 0.3) * (D + 0.3)) return false;
+    }
+    return true;
+  }
+  function validPlace(s, x, y) {
+    if (!(x >= R && x <= W - R && y >= R && y <= H - R)) return false;
+    if (s.kit && y < HEAD) return false;
+    return freeSpot(s.b, x, y, 0);
+  }
+  function spotNear(b, x, y, skip, dir) {
+    for (let k = 0; k < 60; k++) {
+      const yy = y + dir * k * 4;
+      if (yy < R || yy > H - R) break;
+      if (freeSpot(b, x, yy, skip)) return [x, r1(yy)];
+      for (const dx of [D, -D, 2 * D, -2 * D]) if (freeSpot(b, x + dx, yy, skip)) return [x + dx, r1(yy)];
+    }
+    return [x, y];
+  }
+  /* judge a finished shot: s = state before shot (cue already placed), r = sim, call = called pocket (ignored on the break).
+     Verdict: foul code, win/lose (+why: e early 8, f 8 with a foul, p 8 in an uncalled pocket), r8 (8 down on the break),
+     assign (open table → group), own (legal balls in the called pocket), cont (shooter keeps the table). */
+  function judge(s, seat, r, call) {
+    const g = myGroup(s, seat), pots = r.pots, pk = r.pk, i8 = pots.indexOf(8);
+    const remBefore = g ? remaining(s.b, g) : 7;
+    let foul = null;
+    if (r.cueIn) foul = 'scr';
+    else if (r.first < 0) foul = 'nc';
+    else if (!s.brk) {
+      if (g === 0) { if (r.first === 8) foul = 'wf'; }
+      else if (remBefore > 0 ? grpOf(r.first) !== g : r.first !== 8) foul = 'wf';
+      // ball in hand behind the head string: an object ball inside the kitchen may only be hit first after the cue ball crossed the line
+      if (!foul && s.kit && s.b[r.first] && s.b[r.first][1] >= HEAD && !r.cross) foul = 'ko';
+    }
+    if (!foul && !r.rail && pots.length === 0) foul = 'nr';
+    const v = { foul, win: false, lose: false, why: '', r8: false, sol: s.sol, assign: false, cont: false, own: 0 };
+    if (i8 >= 0) {
+      if (s.brk) v.r8 = true;
+      else if (g === 0 || remBefore > 0) { v.lose = true; v.why = 'e'; }
+      else if (foul) { v.lose = true; v.why = 'f'; }
+      else if (pk[i8] !== call) { v.lose = true; v.why = 'p'; }
+      else v.win = true;
+    }
+    if (v.win || v.lose) return v;
+    if (!s.brk && g === 0 && !foul) {
+      for (let k = 0; k < pots.length; k++) {
+        const i = pots[k];
+        if (i !== 0 && i !== 8 && pk[k] === call) { v.assign = true; v.sol = grpOf(i) === 1 ? seat : 1 - seat; break; }
+      }
+    }
+    const ng = v.sol < 0 ? 0 : v.sol === seat ? 1 : 2;
+    if (!s.brk) for (let k = 0; k < pots.length; k++) { const i = pots[k]; if (i !== 0 && i !== 8 && pk[k] === call && (ng === 0 || grpOf(i) === ng)) v.own++; }
+    if (!foul) v.cont = s.brk ? pots.some((i) => i !== 0) : v.own > 0;
+    return v;
+  }
+
+  /* ---------- state ---------- */
+  function rack() {
+    const b = new Array(16).fill(0);
+    const order = U.shuffle([1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]);
+    // corners of back row: one solid, one stripe
+    const sol = order.filter((i) => i < 8), str = order.filter((i) => i > 8);
+    const cA = sol.pop(), cB = str.pop();
+    const rest = U.shuffle(sol.concat(str));
+    const rowH = (D + 0.4) * 0.8660254037844386;
+    const flip = Math.random() < 0.5;
+    let k = 0;
+    for (let row = 0; row < 5; row++) {
+      for (let j = 0; j <= row; j++) {
+        const x = W / 2 + (j - row / 2) * (D + 0.4), y = FOOT - row * rowH;
+        let id;
+        if (row === 2 && j === 1) id = 8;
+        else if (row === 4 && j === 0) id = flip ? cA : cB;
+        else if (row === 4 && j === 4) id = flip ? cB : cA;
+        else id = rest[k++];
+        b[id] = [r1(x), r1(y)];
+      }
+    }
+    b[0] = [W / 2, r1(H * 0.82)];
+    return b;
+  }
+  /* state: b balls, t shooter, sol seat owning solids (-1 open), bih ball in hand, kit placement limited to the kitchen
+     (after the opening break: shoot out of the kitchen), brk next shot is a break, ch breaker must choose after 8 on the break */
+  const GUIDES = ['off', 'short', 'long'];
+  function init(players, opts) {
+    const g = Math.max(0, GUIDES.indexOf((opts && opts.guide) || 'off'));
+    return { g, n: 2, b: rack(), t: 0, sol: -1, bih: 1, kit: 1, brk: 1, ch: 0, w: -1, seq: 0, last: null };
+  }
+  function actor(s) { return s.w >= 0 ? null : s.t; }
+  const CUE_SPOT = r1(H * 0.82);
+  function apply(s, seat, a) {
+    if (s.w >= 0 || seat !== s.t) throw new Error('not your turn');
+    if (s.ch) {
+      // 8-ball pocketed on a legal break: breaker re-spots the 8 and keeps shooting, or re-racks and breaks again
+      if (!a || a.type !== 'r8' || (a.c !== 'spot' && a.c !== 'rack')) throw new Error('choose');
+      s.ch = 0;
+      if (a.c === 'spot') s.b[8] = spotNear(s.b, W / 2, FOOT, 8, -1);
+      else { s.b = rack(); s.brk = 1; s.kit = 1; s.bih = 1; s.sol = -1; }
+      s.seq++;
+      s.last = { id: s.seq, seat, ch: a.c };
+      return s;
+    }
+    if (!a || a.type !== 'shoot') throw new Error('bad action');
+    const ang = +a.a, p = +a.p;
+    if (!isFinite(ang) || !isFinite(p) || p <= 0) throw new Error('bad shot');
+    let call = -1;
+    if (!s.brk) { call = +a.c; if (!(call >= 0 && call <= 5 && call === Math.floor(call))) throw new Error('call a pocket'); }
+    if (a.x != null || a.y != null) {
+      if (!s.bih) throw new Error('no ball in hand');
+      const x = r1(+a.x), y = r1(+a.y);
+      if (!validPlace(s, x, y)) throw new Error('bad placement');
+      s.b[0] = [x, y];
+    }
+    if (!s.b[0]) throw new Error('no cue');
+    if (s.kit && s.b[0][1] < HEAD) throw new Error('cue must be in the kitchen');
+    const pw = U.clamp(p, 0.02, 1), sp = U.clamp(Math.round((+a.sp || 0) * 100) / 100, -1, 1);
+    const shot = { vx: r1(Math.cos(ang) * pw * VMAX), vy: r1(Math.sin(ang) * pw * VMAX), sp };
+    const pre = s.b.map((q) => (q ? q.slice() : 0));
+    const r = simulate(pre, shot);
+    const v = judge(s, seat, r, call);
+    const ev = [];
+    s.b = r.balls();
+    if (v.foul) ev.push(v.foul);
+    if (v.assign) { s.sol = v.sol; ev.push('grp'); }
+    const wasBrk = s.brk;
+    s.brk = 0; s.kit = 0; s.bih = 0;
+    if (v.win) { s.w = seat; ev.push('win'); }
+    else if (v.lose) { s.w = 1 - seat; ev.push('lose', 'l' + v.why); }
+    else if (v.r8 && !v.foul) { s.ch = 1; ev.push('r8c'); } // the 8 stays down until the breaker chooses
+    else {
+      if (v.r8) { s.b[8] = spotNear(s.b, W / 2, FOOT, 8, -1); ev.push('r8'); }
+      if (v.cont) ev.push('cont');
+      else {
+        s.t = 1 - seat;
+        if (v.foul) { s.bih = 1; if (wasBrk) { s.kit = 1; ev.push('kit'); } }
+      }
+    }
+    if (!s.k) s.k = [[0, 0, 0, 0], [0, 0, 0, 0]];   // stats per seat: shots, balls potted, fouls, best run (balls in one visit)
+    { const K = s.k[seat], np = r.pots.filter((i) => i !== 0).length;
+      K[0]++; K[1] += np; if (v.foul) K[2]++;
+      s.kr = (s.kr || 0) + (v.foul ? 0 : np); K[3] = Math.max(K[3], s.kr); if (s.t !== seat || s.w >= 0) s.kr = 0; }
+    if (!s.b[0]) s.b[0] = spotNear(s.b, W / 2, CUE_SPOT, 0, 1);
+    else if (s.kit && s.b[0][1] < HEAD) s.b[0] = spotNear(s.b, W / 2, CUE_SPOT, 0, 1); // foul on the break left the cue up-table
+    s.seq++;
+    s.last = { id: s.seq, seat, pre, shot, ev, pots: r.pots.slice(), pk: r.pk.slice(), c: call, brk: wasBrk };
+    return s;
+  }
+  function result(s) {
+    const r = result0(s);
+    if (r) try {
+      const K = s.k || [[0, 0, 0, 0], [0, 0, 0, 0]], P = [0, 1];
+      r.stats = [
+        { label: '샷', values: P.map((i) => String(K[i][0])) },
+        { label: '넣은 공', values: P.map((i) => String(K[i][1])) },
+        { label: '한 번에 연속 최다', values: P.map((i) => String(K[i][3])) },
+        { label: '파울', values: P.map((i) => String(K[i][2])) },
+      ];
+    } catch (e) {}
+    return r;
+  }
+  function result0(s) {
+    if (s.w < 0) return null;
+    const ev = (s.last && s.last.ev) || [];
+    const text = ev.indexOf('lp') >= 0 ? '상대가 8번을 콜하지 않은 포켓에 넣었어요.' : ev.indexOf('lf') >= 0 ? '상대가 8번을 넣으면서 파울을 했어요.' :
+      ev.indexOf('le') >= 0 ? '상대가 8번을 너무 일찍 넣었어요.' : '자기 그룹을 모두 넣고 콜한 포켓에 8번까지 넣었어요.';
+    return { winners: [s.w], text };
+  }
+
+  /* ---------- AI ---------- */
+  function gauss() { return (Math.random() + Math.random() + Math.random() - 1.5) * 1.15; }
+  function segBlocked(b, ax, ay, bx, by, skipA, skipB) {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    if (l2 < 1) return false;
+    for (let i = 0; i < 16; i++) {
+      if (!b[i] || i === skipA || i === skipB) continue;
+      let t = ((b[i][0] - ax) * dx + (b[i][1] - ay) * dy) / l2;
+      if (t <= 0 || t >= 1) continue;
+      const qx = ax + dx * t - b[i][0], qy = ay + dy * t - b[i][1];
+      if (qx * qx + qy * qy < (D - 1) * (D - 1)) return true;
+    }
+    return false;
+  }
+  /* list of potting lines for cue position c towards target balls */
+  function potLines(b, cx, cy, tg, checkBlock) {
+    const out = [];
+    for (const t of tg) {
+      if (!b[t]) continue;
+      const tx = b[t][0], ty = b[t][1];
+      for (let k = 0; k < 6; k++) {
+        const P = AIMP[k];
+        let ux = P[0] - tx, uy = P[1] - ty;
+        const dp = Math.hypot(ux, uy); ux /= dp; uy /= dp;
+        if (k === 2 || k === 3) { if (Math.abs(ux) < 0.42) continue; } // side pockets: no steep angles
+        const gx = tx - ux * D, gy = ty - uy * D;
+        let vx = gx - cx, vy = gy - cy;
+        const dc = Math.hypot(vx, vy);
+        if (dc < 1) continue;
+        vx /= dc; vy /= dc;
+        const c = vx * ux + vy * uy;
+        if (c < 0.2) continue;
+        if (checkBlock && (segBlocked(b, cx, cy, gx, gy, 0, t) || segBlocked(b, tx, ty, P[0], P[1], t, 0))) continue;
+        const val = c * c * (1 - (dc + dp) / 2600);
+        out.push({ t, k, ang: Math.atan2(vy, vx), c, dc, dp, val, gx, gy });
+      }
+    }
+    out.sort((p, q) => q.val - p.val);
+    return out;
+  }
+  function ease(b, tg) {
+    if (!b[0]) return 0;
+    const ls = potLines(b, b[0][0], b[0][1], tg, true);
+    return ls.length ? ls[0].val : 0;
+  }
+  function powerFor(line, mult) {
+    const vObj = Math.sqrt(160 * 160 + 2 * MU * 1.2 * line.dp);
+    const vImp = vObj / Math.max(0.3, line.c) / 0.975;
+    const v0 = Math.sqrt(vImp * vImp + 2 * MU * 1.2 * line.dc);
+    return U.clamp(v0 * mult / VMAX, 0.08, 1);
+  }
+  /* the pocket the AI calls: its planned line's pocket, else where the noiseless sim sends a ball of its target set */
+  function aiCall(s, seat, a, r) {
+    if (s.brk) return -1;
+    if (a.c != null) return a.c;
+    const tg = targets(s, seat);
+    for (let k = 0; k < r.pots.length; k++) if (tg.indexOf(r.pots[k]) >= 0) return r.pk[k];
+    return 0;
+  }
+  /* per-seat level knobs: 1 쉬움 = shaky cue, few lines, no position play; 2 보통; 3 어려움 = steady cue, more lines and spins, position/safety play */
+  const PLV = {
+    1: { an: 0.009, pn: 0.06, lines: 4, spin: false, retest: 0, pos: 0, opp: 0.4, ms: 60 },
+    2: { an: 0.0045, pn: 0.03, lines: 7, spin: true, retest: 1, pos: 60, opp: 1, ms: 110 },
+    3: { an: 0.0026, pn: 0.018, lines: 10, spin: true, retest: 2, pos: 85, opp: 1.3, ms: 220 },
+  };
+  function scoreShot(s, seat, a, K) {
+    K = K || PLV[2];
+    const ss = { b: s.b.map((q) => (q ? q.slice() : 0)), sol: s.sol, brk: s.brk, kit: s.kit };
+    if (a.x != null) ss.b[0] = [a.x, a.y];
+    const shot = { vx: Math.cos(a.a) * a.p * VMAX, vy: Math.sin(a.a) * a.p * VMAX, sp: a.sp || 0 };
+    const r = simulate(ss.b, shot);
+    if (a.c == null && !s.brk) a.c = aiCall(s, seat, a, r);
+    const v = judge(ss, seat, r, a.c == null ? -1 : a.c);
+    if (v.win) return 5000;
+    if (v.lose) return -5000;
+    const nb = r.balls();
+    if (v.r8) { nb[8] = [W / 2, FOOT]; if (!v.foul) v.cont = true; }
+    const ns = { b: nb, sol: v.sol };
+    let sc = 0;
+    if (v.foul) sc -= 140;
+    if (v.cont) {
+      sc += 100 + v.own * 25;
+      sc += K.pos * ease(nb, targets(ns, seat));
+    } else {
+      // opponent's chances (with ball in hand after a foul they're much better)
+      sc -= K.opp * (v.foul ? 25 : 45) * ease(nb, targets(ns, 1 - seat));
+      // reward balls of mine left near pockets? small: count own potted by accident
+      sc += v.own * 10;
+    }
+    return sc;
+  }
+  function ai(s, seat, lv) {
+    if (s.ch) return { type: 'r8', c: 'spot' };
+    const t0 = Date.now();
+    const K = PLV[lv] || PLV[2];
+    const tg = targets(s, seat);
+    if (s.brk) {
+      const x = r1(W / 2 + (Math.random() - 0.5) * 120), y = r1(H * 0.82);
+      const ok = validPlace(s, x, y);
+      const cx = ok ? x : s.b[0][0], cy = ok ? y : s.b[0][1];
+      const ang = Math.atan2(FOOT - cy, W / 2 - cx) + gauss() * 0.006;
+      return ok ? { type: 'shoot', a: ang, p: 0.92 + Math.random() * 0.08, sp: 0, x, y } : { type: 'shoot', a: ang, p: 1, sp: 0 };
+    }
+    let place = null;
+    if (s.bih) {
+      // put the cue ball behind the easiest straight pot
+      let best = null;
+      for (const t of tg) {
+        if (!s.b[t]) continue;
+        for (let k = 0; k < 6; k++) {
+          const P = AIMP[k];
+          let ux = P[0] - s.b[t][0], uy = P[1] - s.b[t][1];
+          const dp = Math.hypot(ux, uy); ux /= dp; uy /= dp;
+          if ((k === 2 || k === 3) && Math.abs(ux) < 0.5) continue;
+          for (const back of [110, 170, 240]) {
+            for (const off of [0, 0.25, -0.25]) {
+              const c = Math.cos(off), sn = Math.sin(off);
+              const rx = ux * c - uy * sn, ry = ux * sn + uy * c;
+              const x = r1(s.b[t][0] - rx * back), y = r1(s.b[t][1] - ry * back);
+              if (!validPlace(s, x, y)) continue;
+              if (segBlocked(s.b, x, y, s.b[t][0], s.b[t][1], 0, t) || segBlocked(s.b, s.b[t][0], s.b[t][1], P[0], P[1], t, 0)) continue;
+              const val = (1 - Math.abs(off) * 0.6) * (1 - dp / 2000) - back / 3000 + Math.random() * (lv === 1 ? 0.5 : 0.03);
+              if (!best || val > best.val) best = { x, y, val };
+            }
+          }
+        }
+      }
+      if (!best) {
+        for (let k = 0; k < 200 && !best; k++) {
+          const x = r1(R + Math.random() * (W - 2 * R)), y = r1(R + Math.random() * (H - 2 * R));
+          if (validPlace(s, x, y)) best = { x, y };
+        }
+      }
+      if (best) place = { x: best.x, y: best.y };
+    }
+    const cx = place ? place.x : s.b[0][0], cy = place ? place.y : s.b[0][1];
+    const cands = [];
+    const add = (ang, p, sp, c) => cands.push(Object.assign({ type: 'shoot', a: ang, p: U.clamp(p, 0.05, 1), sp }, c == null ? {} : { c }, place || {}));
+    const lines = potLines(s.b, cx, cy, tg, true).slice(0, K.lines);
+    for (const ln of lines) {
+      add(ln.ang, powerFor(ln, 1), 0, ln.k);
+      if (!K.spin) continue;
+      if (lv === 3) { add(ln.ang, powerFor(ln, 1.3), 0.45, ln.k); add(ln.ang, powerFor(ln, 1.3), -0.45, ln.k); add(ln.ang, powerFor(ln, 0.85), 0, ln.k); }
+      else add(ln.ang, powerFor(ln, 1.35), Math.random() < 0.5 ? 0.4 : -0.4, ln.k);
+    }
+    // unblocked-line fallbacks and direct hits on target balls (safety / bank chances)
+    if (lines.length < 3) for (const ln of potLines(s.b, cx, cy, tg, false).slice(0, 4)) add(ln.ang, powerFor(ln, 1.1), 0, ln.k);
+    for (const t of tg) {
+      if (!s.b[t]) continue;
+      const base = Math.atan2(s.b[t][1] - cy, s.b[t][0] - cx);
+      add(base + (Math.random() - 0.5) * 0.06, 0.25 + Math.random() * 0.35, 0);
+      if (lv === 3) add(base + (Math.random() - 0.5) * 0.12, 0.15 + Math.random() * 0.2, 0); // soft safety touch
+    }
+    for (let k = 0; k < 4; k++) add(Math.random() * Math.PI * 2, 0.3 + Math.random() * 0.5, 0);
+    let best = null;
+    for (let i = 0; i < cands.length; i++) {
+      if (Date.now() - t0 > K.ms && best) break;
+      const c = cands[i];
+      let sc = scoreShot(s, seat, c, K);
+      if (K.retest && sc > 60 && Date.now() - t0 < K.ms - 10) { // robustness: re-test with a little noise
+        let sum = sc;
+        for (let r = 0; r < K.retest; r++) sum += scoreShot(s, seat, Object.assign({}, c, { a: c.a + gauss() * 0.006 }), K);
+        sc = sum / (K.retest + 1);
+      }
+      if (!best || sc > best.sc) best = { sc, c };
+    }
+    const c = best.c;
+    const out = Object.assign({}, c, { a: c.a + gauss() * K.an, p: U.clamp(c.p * (1 + gauss() * K.pn), 0.05, 1) });
+    if (!s.brk && !(out.c >= 0)) out.c = 0;
+    return out;
+  }
+
+  /* ---------- view ---------- */
+  const BCOL = ['#f4ecd8', '#f2c12e', '#2c5fc7', '#d6372b', '#6a3fa2', '#ef7d22', '#1f8a4c', '#8b2a2a', '#151515'];
+  const ballColor = (i) => (i <= 8 ? BCOL[i] : BCOL[i - 8]);
+  const RL = 30; // rail thickness in units
+
+  function mount(root, api) {
+    const cv = U.canvas(root), ctx = cv.ctx;
+    let st = null, disp = null, sim = null, simAcc = 0, shownSeq = -1, animLast = null;
+    let G = null; // layout
+    let aim = -Math.PI / 2, aimTurn = '', spin = 0, pow = 0, cuePos = null, placeOk = true;
+    let drag = null, dirty = true, fades = [], lastHits = 0, lastBounces = 0, lastPots = 0;
+    let feltPat = null, sentAt = 0, animTimer = 0, fast = false;
+    let locked = false, callMan = null, callNow = -1, callHit = -1, hintKey = '', chEl = null;
+    const lastPw = {}; // per seat: power of that player's previous shot (marker in the pull readout)
+    const PNAME = ['왼쪽 위', '오른쪽 위', '왼쪽 가운데', '오른쪽 가운데', '왼쪽 아래', '오른쪽 아래'];
+
+    const top = L.h('div', { class: 'hud top', style: { gap: '8px', flexWrap: 'nowrap', padding: '8px 10px' } });
+    const hint = L.h('div', { class: 'hud bottom', style: { padding: '6px 10px', transition: 'opacity .15s' } });
+    root.append(top, hint);
+    // invisible boxes over canvas regions for the first-play tutorial spotlight
+    const spTable = tutSpot(root, 'pl-table'), spKit = tutSpot(root, 'pl-kitchen'), spCue = tutSpot(root, 'pl-cueball'),
+      spShaft = tutSpot(root, 'pl-shaft'), spButt = tutSpot(root, 'pl-butt'), spFine = tutSpot(root, 'pl-fine'), spSpin = tutSpot(root, 'pl-spin');
+    const SPOTS = [spTable, spKit, spCue, spShaft, spButt, spFine, spSpin];
+
+    function layout() {
+      const w = cv.w, h = cv.h, topH = 64, botH = 40, colW = 58;
+      const aw = w - colW - 12, ah = h - topH - botH;
+      const k = Math.max(0.1, Math.min(aw / (W + 2 * RL), ah / (H + 2 * RL)));
+      const tw = k * (W + 2 * RL), th = k * (H + 2 * RL);
+      const ox = 6 + (aw - tw) / 2 + k * RL, oy = topH + (ah - th) / 2 + k * RL;
+      // right-hand column: aim lock, fine-aim ↺ ↻ and the spin ball (power comes only from pulling the stick back)
+      const mx = ox + k * (W + RL) + 8, mw = Math.max(44, Math.min(54, w - mx - 4));
+      const y0 = oy - k * RL, y1 = y0 + th;
+      const sr = Math.min(26, mw / 2);
+      const lock = { x: mx, y: y0, w: mw, h: 44 };
+      const fine = [{ x: mx, y: y0 + 52, w: mw, h: 48, d: -1 }, { x: mx, y: y0 + 108, w: mw, h: 48, d: 1 }];
+      G = { k, ox, oy, tw, th, lock, fine, spin: { x: mx + mw / 2, y: Math.max(y0 + 108 + 48 + 26 + sr, y1 - sr - 22), r: sr } };
+      feltPat = makeFelt();
+      dirty = true;
+    }
+    function makeFelt() {
+      const c = document.createElement('canvas'); c.width = 96; c.height = 96;
+      const g = c.getContext('2d');
+      const im = g.createImageData(96, 96);
+      for (let i = 0; i < im.data.length; i += 4) {
+        const n = Math.random();
+        im.data[i] = 255; im.data[i + 1] = 255; im.data[i + 2] = 255; im.data[i + 3] = n < 0.5 ? 0 : Math.floor((n - 0.5) * 22);
+      }
+      g.putImageData(im, 0, 0);
+      return ctx.createPattern(c, 'repeat');
+    }
+    cv.onresize = layout;
+    layout();
+    const TX = (x) => G.ox + x * G.k, TY = (y) => G.oy + y * G.k;
+    const UX = (px) => (px - G.ox) / G.k, UY = (py) => (py - G.oy) / G.k;
+    /* aiming camera: screen = cam.s * world + (cam.x, cam.y), where "world" is the resting layout (TX/TY px).
+       While a human aims, it pans / zooms out just enough to show the whole stick plus room to pull it back,
+       freezes while a finger is on the table, and glides back to the resting view once the shot is played. */
+    let cam = { s: 1, x: 0, y: 0 }, camT = { s: 1, x: 0, y: 0 };
+    const toW = (p) => ({ x: (p.x - cam.x) / cam.s, y: (p.y - cam.y) / cam.s });
+
+    function curBalls() {
+      if (sim) { const out = []; for (let i = 0; i < 16; i++) out.push(sim.on[i] ? [sim.x[i], sim.y[i]] : 0); return out; }
+      return disp || (st ? st.b : []);
+    }
+    // online guest: lock input after sending a shot until the host's next state arrives (prevents double shots)
+    function canHuman() { return st && !sim && st.w < 0 && api.canAct(st.t) && !(sentAt && performance.now() - sentAt < 5000); }
+
+    /* ---- HUD ---- */
+    function renderTop() {
+      top.innerHTML = '';
+      if (!st) return;
+      for (let seat = 0; seat < 2; seat++) {
+        const p = api.players[seat];
+        const g = myGroup(st, seat);
+        const on = st.w < 0 && st.t === seat;
+        const pills = L.h('div', { style: { display: 'flex', gap: '3px', flexWrap: 'wrap', minHeight: '14px', alignItems: 'center' } });
+        if (g) {
+          for (let i = 1; i < 16; i++) {
+            if (grpOf(i) !== g) continue;
+            const inT = !!st.b[i];
+            pills.append(L.h('span', { style: { width: '13px', height: '13px', borderRadius: '50%', flex: 'none', opacity: inT ? 1 : 0.18,
+              background: i > 8 ? 'linear-gradient(#f4ecd8 0 28%, ' + ballColor(i) + ' 28% 72%, #f4ecd8 72%)' : ballColor(i), boxShadow: 'inset 0 -2px 2px rgba(0,0,0,.35)' } }));
+          }
+          const rem = remaining(st.b, g);
+          pills.append(L.h('span', { style: { width: '13px', height: '13px', borderRadius: '50%', flex: 'none', background: '#151515', border: '1px solid rgba(255,255,255,.35)', opacity: rem === 0 ? 1 : 0.25 } }));
+        } else pills.append(L.h('span', { class: 'muted', style: { fontSize: '11px' }, text: st.brk ? '브레이크 대기' : '오픈 테이블' }));
+        top.append(L.h('div', { class: 'panel', style: { flex: '1 1 0', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '3px', padding: '6px 10px',
+          borderColor: on ? p.color : '', boxShadow: on ? '0 0 0 1px ' + p.color : 'none', opacity: on || st.w >= 0 ? 1 : 0.7 } },
+        L.h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden' } },
+          L.h('span', { class: 'dot', style: { '--c': p.color } }),
+          L.h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' }, text: p.name }),
+          L.h('span', { class: 'muted', style: { fontSize: '11px', marginLeft: 'auto', flex: 'none' }, text: g === 1 ? '솔리드' : g === 2 ? '스트라이프' : '' })),
+        pills));
+      }
+    }
+    function hintText() {
+      if (!st || st.w >= 0) return '';
+      if (st.ch && !sim) return api.players[st.t].name + (api.players[st.t].ai ? ' 선택 중…' : ' · 8번 처리 선택');
+      if (canHuman()) {
+        if (st.brk) return '큐볼을 키친에 놓고 손잡이를 당겨 브레이크';
+        const cl = callMan && callNow >= 0 ? '콜 ' + PNAME[callNow] : '포켓을 누르면 콜';
+        if (st.kit) return '키친 프리볼 · 키친 밖 공 먼저 · ' + cl;
+        if (st.bih) return '프리볼 · 큐볼을 끌어 놓기 · ' + cl;
+        return cl + ' · 손잡이를 뒤로 당겨 샷';
+      }
+      if (!sim) return api.players[st.t].name + (api.players[st.t].ai ? ' 생각 중…' : ' 차례');
+      return fast ? '빨리 감는 중…' : '화면을 누르면 빨리 감기';
+    }
+    function renderHint(force) {
+      const txt = hintText();
+      if (!force && txt === hintKey) return;
+      hintKey = txt;
+      hint.innerHTML = '';
+      if (txt) hint.append(L.h('div', { class: 'panel', style: { pointerEvents: 'none', fontSize: '12px', padding: '6px 12px', fontWeight: 600, maxWidth: '100%', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } },
+        callMan && callNow >= 0 && canHuman() && !st.brk ? L.h('span', { style: { color: 'var(--brass)', marginRight: '4px' }, text: '◎' }) : null, txt));
+    }
+    /* 8-ball on the break: breaker chooses (re-spot and continue / re-rack and break again) */
+    function renderChoice() {
+      const want = st && st.ch && st.w < 0 && !sim && api.canAct(st.t) && !(sentAt && performance.now() - sentAt < 5000);
+      if (!want) { if (chEl) { chEl.remove(); chEl = null; } return; }
+      if (chEl) return;
+      const pick = (c) => { if (!chEl) return; api.sfx('click'); api.buzz(15); chEl.remove(); chEl = null; if (!api.isHost) sentAt = performance.now(); api.act({ type: 'r8', c }); };
+      chEl = L.h('div', { class: 'overlay', style: { zIndex: 15, alignItems: 'flex-end', background: 'rgba(10,8,15,.35)', backdropFilter: 'none' } }, L.h('div', { class: 'sheet', style: { gap: '12px' } },
+        L.h('span', { class: 'label', text: '브레이크' }),
+        L.h('h2', { text: '브레이크에 8번!' }),
+        L.h('p', { class: 'muted', style: { margin: 0, fontSize: '13px' }, text: '8번을 풋 스폿에 다시 올리고 이어서 치거나, 다시 랙하고 브레이크할 수 있어요.' }),
+        L.h('button', { class: 'btn primary block', 'data-action': 'spot', text: '8번 올리고 계속 치기', onclick: () => pick('spot') }),
+        L.h('button', { class: 'btn block', 'data-action': 'rack', text: '다시 랙하고 브레이크', onclick: () => pick('rack') })));
+      root.append(chEl);
+    }
+
+    /* ---- aim helpers ---- */
+    function defaultAim() {   // 자동 조준 없음(사용자 요청): 늘 테이블 위쪽(랙 방향)을 똑바로 겨눈 채 시작
+      return -Math.PI / 2;
+    }
+    function rayCast(b, cx, cy, dx, dy) {
+      let tmin = Infinity, hit = -1;
+      for (let i = 1; i < 16; i++) {
+        if (!b[i]) continue;
+        const fx = cx - b[i][0], fy = cy - b[i][1];
+        const bb = fx * dx + fy * dy, cc = fx * fx + fy * fy - D * D;
+        const disc = bb * bb - cc;
+        if (disc < 0) continue;
+        const t = -bb - Math.sqrt(disc);
+        if (t > 0 && t < tmin) { tmin = t; hit = i; }
+      }
+      let tw = Infinity, nx = 0, ny = 0;
+      if (dx > 0) { const t = (W - R - cx) / dx; if (t < tw) { tw = t; nx = -1; ny = 0; } }
+      if (dx < 0) { const t = (R - cx) / dx; if (t < tw) { tw = t; nx = 1; ny = 0; } }
+      if (dy > 0) { const t = (H - R - cy) / dy; if (t < tw) { tw = t; nx = 0; ny = -1; } }
+      if (dy < 0) { const t = (R - cy) / dy; if (t < tw) { tw = t; nx = 0; ny = 1; } }
+      if (tw < tmin) return { t: Math.max(0, tw), hit: -1, nx, ny };
+      return { t: tmin, hit };
+    }
+    /* called pocket: the pocket the projected object-ball line points at (or the cue line if no ball is hit);
+       a pocket the player tapped stays called while the same object ball is aimed at */
+    function updateCall() {
+      if (!st || st.brk || st.ch || !canHuman()) { callNow = -1; return; }
+      const b = curBalls(), c = cuePos || b[0];
+      if (!c) return;
+      const dx = Math.cos(aim), dy = Math.sin(aim);
+      const rc = rayCast(b, c[0], c[1], dx, dy);
+      let ox = c[0], oy = c[1], ux = dx, uy = dy;
+      if (rc.hit > 0) {
+        const ex = c[0] + dx * rc.t, ey = c[1] + dy * rc.t, o = b[rc.hit];
+        ox = o[0]; oy = o[1]; ux = o[0] - ex; uy = o[1] - ey; const l = Math.hypot(ux, uy) || 1; ux /= l; uy /= l;
+      }
+      let best = 0, bc = -2;
+      for (let k = 0; k < 6; k++) {
+        let px = AIMP[k][0] - ox, py = AIMP[k][1] - oy; const l = Math.hypot(px, py) || 1;
+        const cs = (px * ux + py * uy) / l;
+        if (cs > bc) { bc = cs; best = k; }
+      }
+      callHit = rc.hit;
+      if (callMan && callMan.hit !== rc.hit) callMan = null;
+      const nc = callMan ? callMan.k : best;
+      if (nc !== callNow) { callNow = nc; renderHint(); }
+    }
+
+    /* ---- drawing ---- */
+    function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+    function drawTable() {
+      const k = G.k;
+      // shadow + rails
+      ctx.fillStyle = 'rgba(0,0,0,.45)'; rr(TX(-RL) + 4, TY(-RL) + 8, G.tw, G.th, 16 * k + 6); ctx.fill();
+      const wg = ctx.createLinearGradient(TX(-RL), 0, TX(W + RL), 0);
+      wg.addColorStop(0, '#5a2f16'); wg.addColorStop(0.5, '#8a4f26'); wg.addColorStop(1, '#5a2f16');
+      ctx.fillStyle = wg; rr(TX(-RL), TY(-RL), G.tw, G.th, 16 * k + 6); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,220,170,.18)'; ctx.lineWidth = 1.5; rr(TX(-RL) + 2, TY(-RL) + 2, G.tw - 4, G.th - 4, 16 * k + 4); ctx.stroke();
+      // wood grain
+      ctx.save(); rr(TX(-RL), TY(-RL), G.tw, G.th, 16 * k + 6); ctx.clip();
+      ctx.strokeStyle = 'rgba(40,15,5,.18)'; ctx.lineWidth = 1;
+      for (let i = 0; i < 26; i++) { const y = TY(-RL) + (i / 26) * G.th; ctx.beginPath(); ctx.moveTo(TX(-RL), y); ctx.bezierCurveTo(TX(W * 0.3), y + 6, TX(W * 0.7), y - 6, TX(W + RL), y + 2); ctx.stroke(); }
+      ctx.restore();
+      // sights (diamonds)
+      ctx.fillStyle = '#efe2c2';
+      const dm = (x, y) => { const s = 3.2; ctx.beginPath(); ctx.moveTo(x, y - s); ctx.lineTo(x + s * 0.7, y); ctx.lineTo(x, y + s); ctx.lineTo(x - s * 0.7, y); ctx.fill(); };
+      for (let i = 1; i < 4; i++) { dm(TX(W * i / 4), TY(-RL / 2 - 6)); dm(TX(W * i / 4), TY(H + RL / 2 + 6)); }
+      for (let i = 1; i < 8; i++) { if (i === 4) continue; dm(TX(-RL / 2 - 6), TY(H * i / 8)); dm(TX(W + RL / 2 + 6), TY(H * i / 8)); }
+      // cushion band
+      ctx.fillStyle = '#0f4a40'; ctx.fillRect(TX(-15), TY(-15), 30 * k + W * k, 30 * k + H * k);
+      // felt polygon
+      const P = [[CM - JC, -JC], [CM, 0], [W - CM, 0], [W - CM + JC, -JC], [W + JC, CM - JC], [W, CM], [W, H2 - SM], [W + JSX, H2 - JSY], [W + JSX, H2 + JSY], [W, H2 + SM],
+        [W, H - CM], [W + JC, H - CM + JC], [W - CM + JC, H + JC], [W - CM, H], [CM, H], [CM - JC, H + JC], [-JC, H - CM + JC], [0, H - CM], [0, H2 + SM], [-JSX, H2 + JSY],
+        [-JSX, H2 - JSY], [0, H2 - SM], [0, CM], [-JC, CM - JC]];
+      ctx.beginPath(); P.forEach((q, i) => (i ? ctx.lineTo(TX(q[0]), TY(q[1])) : ctx.moveTo(TX(q[0]), TY(q[1])))); ctx.closePath();
+      const fg = ctx.createRadialGradient(TX(W / 2), TY(H / 2), 10, TX(W / 2), TY(H / 2), H * k * 0.62);
+      fg.addColorStop(0, '#1f8a72'); fg.addColorStop(1, '#136352');
+      ctx.fillStyle = fg; ctx.fill();
+      if (feltPat) { ctx.fillStyle = feltPat; ctx.fill(); }
+      // cushion lip shading
+      ctx.strokeStyle = 'rgba(0,0,0,.28)'; ctx.lineWidth = 3; ctx.stroke();
+      // head string + foot spot
+      ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.setLineDash([4, 5]);
+      ctx.beginPath(); ctx.moveTo(TX(0), TY(HEAD)); ctx.lineTo(TX(W), TY(HEAD)); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,255,255,.22)'; ctx.beginPath(); ctx.arc(TX(W / 2), TY(FOOT), 2, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(TX(W / 2), TY(HEAD), 2, 0, 7); ctx.fill();
+      // pockets
+      POCK.forEach((q, i) => {
+        const r = (i === 2 || i === 3 ? 25 : 27) * k;
+        ctx.fillStyle = '#2a1608'; ctx.beginPath(); ctx.arc(TX(q[0]), TY(q[1]), r + 3 * k, 0, 7); ctx.fill();
+        const pg = ctx.createRadialGradient(TX(q[0]), TY(q[1]), r * 0.2, TX(q[0]), TY(q[1]), r);
+        pg.addColorStop(0, '#000'); pg.addColorStop(1, '#141010');
+        ctx.fillStyle = pg; ctx.beginPath(); ctx.arc(TX(q[0]), TY(q[1]), r, 0, 7); ctx.fill();
+      });
+    }
+    function drawBall(i, x, y, scale, alpha) {
+      const k = G.k, r = R * k * (scale || 1), px = TX(x), py = TY(y);
+      ctx.globalAlpha = alpha == null ? 1 : alpha;
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(px + r * 0.25, py + r * 0.35, r, r * 0.9, 0, 0, 7); ctx.fill();
+      ctx.save(); ctx.beginPath(); ctx.arc(px, py, r, 0, 7); ctx.clip();
+      if (i > 8) {
+        ctx.fillStyle = '#f4ecd8'; ctx.fillRect(px - r, py - r, 2 * r, 2 * r);
+        ctx.fillStyle = ballColor(i); ctx.fillRect(px - r, py - r * 0.55, 2 * r, r * 1.1);
+      } else { ctx.fillStyle = ballColor(i); ctx.fillRect(px - r, py - r, 2 * r, 2 * r); }
+      if (i > 0) {
+        ctx.fillStyle = '#f7f0de'; ctx.beginPath(); ctx.arc(px, py, r * 0.5, 0, 7); ctx.fill();
+        if (r > 5) {
+          ctx.fillStyle = '#1a1410'; ctx.font = '700 ' + Math.max(6, r * 0.66) + 'px "IBM Plex Mono", monospace';
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(String(i), px, py + r * 0.04);
+        }
+      } else {
+        ctx.fillStyle = 'rgba(214,55,43,.6)'; ctx.beginPath(); ctx.arc(px + r * 0.15, py + r * 0.1, r * 0.13, 0, 7); ctx.fill();
+      }
+      const sh = ctx.createRadialGradient(px - r * 0.35, py - r * 0.4, r * 0.05, px, py, r * 1.05);
+      sh.addColorStop(0, 'rgba(255,255,255,.55)'); sh.addColorStop(0.35, 'rgba(255,255,255,0)'); sh.addColorStop(1, 'rgba(0,0,0,.38)');
+      ctx.fillStyle = sh; ctx.fillRect(px - r, py - r, 2 * r, 2 * r);
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+    /* 예측선: 옵션 「예측선」(기본 없음 — 사용자 요청: 기본은 가이드 없이 큐 막대로만). 짧게 = 첫 충돌까지 + 목적구 방향 조금,
+       길게 = 목적구 길·큐볼 길, 벽에 먼저 닿으면 쿠션 1회 반사까지 */
+    function drawAim(b) {
+      const lv = (st && st.g) | 0; if (!lv || !b[0]) return;
+      const k = G.k, c = b[0], dx = Math.cos(aim), dy = Math.sin(aim);
+      const rc = rayCast(b, c[0], c[1], dx, dy);
+      const gx = c[0] + dx * rc.t, gy = c[1] + dy * rc.t;
+      const seg = (x0, y0, x1, y1, col, w, dash) => { ctx.strokeStyle = col; ctx.lineWidth = w; ctx.setLineDash(dash || []); ctx.beginPath(); ctx.moveTo(TX(x0), TY(y0)); ctx.lineTo(TX(x1), TY(y1)); ctx.stroke(); ctx.setLineDash([]); };
+      const maxL = lv === 1 ? 260 : 2000, t0 = Math.min(rc.t, maxL);
+      seg(c[0], c[1], c[0] + dx * t0, c[1] + dy * t0, 'rgba(255,255,255,.45)', 1.5, [5, 6]);
+      if (rc.t > maxL) return;
+      ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(TX(gx), TY(gy), R * k, 0, 7); ctx.stroke();
+      if (rc.hit >= 0) {
+        const o = b[rc.hit]; let ox = o[0] - gx, oy = o[1] - gy; const ol = Math.hypot(ox, oy) || 1; ox /= ol; oy /= ol;
+        const ot = lv === 1 ? 4 * R : rayCast([null], o[0], o[1], ox, oy).t;
+        seg(o[0], o[1], o[0] + ox * ot, o[1] + oy * ot, 'rgba(227,174,69,.85)', 2);
+        if (lv === 2) { // 큐볼은 접선 방향으로 (스핀 없을 때 기준)
+          let tx = -oy, ty = ox; if (tx * dx + ty * dy < 0) { tx = -tx; ty = -ty; }
+          const ct = Math.min(6 * R, rayCast(b, gx, gy, tx, ty).t);
+          seg(gx, gy, gx + tx * ct, gy + ty * ct, 'rgba(255,255,255,.3)', 1.5);
+        }
+      } else if (lv === 2) { // 쿠션 1회 반사
+        const rx = rc.nx ? -dx : dx, ry = rc.ny ? -dy : dy;
+        const r2 = rayCast(b, gx + rx * 0.5, gy + ry * 0.5, rx, ry);
+        seg(gx, gy, gx + rx * r2.t, gy + ry * r2.t, 'rgba(255,255,255,.3)', 1.5, [5, 6]);
+      }
+    }
+    /* ---- cue stick (world px). Fractions along the stick from the tip: 0 tip … SPLIT joint … 1 butt end ----
+       The stick is ALWAYS drawn at full length; the aiming camera makes room for it, and if a corner still cuts it off
+       it simply runs off the screen. */
+    const SPLIT = 0.52;
+    function edgeDist(px, py, ux, uy) { // distance from (px,py) along u to the screen edge
+      let t = 1e9;
+      if (ux > 1e-6) t = Math.min(t, (cv.w - px) / ux); else if (ux < -1e-6) t = Math.min(t, -px / ux);
+      if (uy > 1e-6) t = Math.min(t, (cv.h - py) / uy); else if (uy < -1e-6) t = Math.min(t, -py / uy);
+      return Math.max(0, t);
+    }
+    const stickLen = () => U.clamp(cv.h * 0.42, 210, 330);
+    const fullPull = () => U.clamp(cv.h * 0.2, 110, 170);
+    /* u points from the ball towards the butt. vis = how much of the (unpulled) stick is on screen.
+       Grab zone for power: the black butt, or — when the butt is off screen — the outer part of what is visible. */
+    function cueGeom() {
+      const c = cuePos || (st && st.b[0]);
+      if (!c || !G) return null;
+      const bx = TX(c[0]), by = TY(c[1]), ux = -Math.cos(aim), uy = -Math.sin(aim), s = cam.s;
+      const tip0 = R * G.k + 5, len = stickLen();
+      const vis = U.clamp(edgeDist(bx * s + cam.x, by * s + cam.y, ux, uy) / s - tip0, 0, len); // seen through the camera
+      // the finger's pull is in screen px (pullPx); the stick follows it 1:1 on screen.
+      // In a tight spot the stick slides back only as far as keeps its end on screen (power still shows in the readout)
+      let pull = drag && drag.mode === 'pow' ? drag.pullPx / s : 0;
+      if (pull && drag.tight) pull = (drag.pullPx / fullPull()) * Math.max(10 / s, Math.min(fullPull() / s, vis - 30 / s));
+      let bs = SPLIT * len; // where the power zone starts (distance from the tip)
+      if (vis - bs < 56) bs = vis < 120 ? 0 : Math.min(bs, vis * 0.45); // butt off screen: the visible end becomes the grip
+      return { bx, by, ux, uy, tip0, len, vis, bs, pull, sc: U.clamp(G.k / 0.5, 0.9, 1.3) };
+    }
+    /* which part of the stick is under the finger: 'butt' (power), 'shaft' (direction) or null. Wide 48px band. */
+    function stickHit(p) {
+      const g = cueGeom();
+      if (!g) return null;
+      const dx = p.x - g.bx, dy = p.y - g.by;
+      const along = dx * g.ux + dy * g.uy - g.tip0 - g.pull, perp = Math.abs(-dx * g.uy + dy * g.ux), s = cam.s;
+      if (perp > 24 / s || along < -6 / s || along > g.len + 14 / s) return null;
+      return { part: along >= g.bs ? 'butt' : 'shaft', g };
+    }
+    function drawCue(g) {
+      const tx = g.bx + g.ux * (g.tip0 + g.pull), ty = g.by + g.uy * (g.tip0 + g.pull);
+      const nx = -g.uy, ny = g.ux, w0 = 2.2 * g.sc, w1 = 5.4 * g.sc, L = g.len;
+      const hw = (f) => w0 + (w1 - w0) * f;
+      const P = (f) => [tx + g.ux * L * f, ty + g.uy * L * f];
+      const poly = (f0, f1) => {
+        const a = P(f0), b = P(f1), wa = hw(f0), wb = hw(f1);
+        ctx.beginPath();
+        ctx.moveTo(a[0] + nx * wa, a[1] + ny * wa); ctx.lineTo(b[0] + nx * wb, b[1] + ny * wb);
+        ctx.lineTo(b[0] - nx * wb, b[1] - ny * wb); ctx.lineTo(a[0] - nx * wa, a[1] - ny * wa); ctx.closePath();
+      };
+      const part = drag && (drag.mode === 'pow' || drag.mode === 'rot') ? drag.mode : '';
+      const fz = U.clamp(g.bs / L, 0.035, SPLIT); // power zone start as a fraction
+      ctx.save();
+      // shadow
+      ctx.save(); ctx.translate(5, 8); poly(0, 1); ctx.fillStyle = 'rgba(0,0,0,.32)'; ctx.fill(); ctx.restore();
+      // active-zone glow
+      if (part) {
+        ctx.save(); ctx.shadowColor = 'rgba(227,174,69,.9)'; ctx.shadowBlur = 12;
+        if (part === 'pow') poly(fz, 1); else poly(0.035, fz);
+        ctx.strokeStyle = 'rgba(255,226,150,.95)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+      }
+      // maple shaft
+      poly(0.035, SPLIT); ctx.fillStyle = '#e2c48e'; ctx.fill();
+      // black forearm + butt
+      poly(SPLIT, 1); ctx.fillStyle = '#16111a'; ctx.fill();
+      // wrap (linen look) with brass rings
+      poly(0.69, 0.9); ctx.fillStyle = '#2d2733'; ctx.fill();
+      ctx.save(); poly(0.69, 0.9); ctx.clip();
+      ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 1;
+      for (let f = 0.69; f < 0.9; f += 0.012) { const a = P(f), b = P(f + 0.012); ctx.beginPath(); ctx.moveTo(a[0] + nx * w1, a[1] + ny * w1); ctx.lineTo(b[0] - nx * w1, b[1] - ny * w1); ctx.stroke(); }
+      ctx.restore();
+      for (const f of [SPLIT, 0.69, 0.9, 0.972]) { poly(f, f + 0.008); ctx.fillStyle = '#e3ae45'; ctx.fill(); }
+      // ferrule + chalked tip
+      poly(0.008, 0.035); ctx.fillStyle = '#f4ecd8'; ctx.fill();
+      poly(0, 0.008); ctx.fillStyle = '#3d6fb0'; ctx.fill();
+      // round highlight along the stick
+      const a = P(0.03), b = P(1);
+      ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(a[0] - nx * hw(0.03) * 0.45, a[1] - ny * hw(0.03) * 0.45); ctx.lineTo(b[0] - nx * w1 * 0.45, b[1] - ny * w1 * 0.45); ctx.stroke();
+      // pull-back chevrons in the middle of the visible power zone while idle
+      if (!part) {
+        ctx.strokeStyle = 'rgba(227,174,69,.85)'; ctx.lineWidth = 1.6;
+        const mid = U.clamp((g.bs + Math.min(g.len, g.vis)) / 2 / L, fz + 0.02, 0.83);
+        for (const f of [mid - 0.03, mid + 0.02]) {
+          const c = P(f), e = P(f + 0.035);
+          ctx.beginPath(); ctx.moveTo(c[0] + nx * w1 * 0.75, c[1] + ny * w1 * 0.75); ctx.lineTo(e[0], e[1]); ctx.lineTo(c[0] - nx * w1 * 0.75, c[1] - ny * w1 * 0.75); ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+    /* power readout that follows the finger while pulling (kept off the thumb, inside the screen) */
+    function drawPullReadout(g) {
+      if (!drag || drag.mode !== 'pow') return;
+      let x = drag.fx - g.uy * 56 * drag.side, y = drag.fy + g.ux * 56 * drag.side;
+      x = U.clamp(x, 48, cv.w - 48); y = U.clamp(y, 84, cv.h - 64);
+      const live = pow > 0.03, lp = lastPw[st.t];
+      ctx.fillStyle = 'rgba(23,19,31,.88)'; rr(x - 44, y - 20, 88, 42, 12); ctx.fill();
+      ctx.strokeStyle = live ? 'rgba(227,174,69,.85)' : 'rgba(242,233,216,.25)'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = 'rgba(242,233,216,.12)'; rr(x - 36, y + 12, 72, 4, 2); ctx.fill();
+      if (live) { ctx.fillStyle = pow < 0.6 ? '#5fd3a0' : pow < 0.85 ? '#e3ae45' : '#ee6a55'; rr(x - 36, y + 12, 72 * pow, 4, 2); ctx.fill(); }
+      if (lp) { ctx.fillStyle = '#f2e9d8'; ctx.fillRect(x - 36 + 72 * lp - 1, y + 9, 2, 10); } // this player's previous shot
+      ctx.fillStyle = live ? '#f2e9d8' : '#ab9fb8'; ctx.font = '700 18px "IBM Plex Mono", monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(live ? Math.round(pow * 100) + '%' : '취소', x, y - 3);
+      if (drag.tight && !live) { ctx.fillStyle = '#e3ae45'; ctx.font = '700 11px "IBM Plex Sans KR", sans-serif'; ctx.fillText('옆으로 끌어도 돼요', x, y - 30); }
+    }
+    function btnBox(r, on) {
+      ctx.fillStyle = on ? 'rgba(227,174,69,.9)' : 'rgba(46,38,64,.92)'; rr(r.x, r.y, r.w, r.h, 10); ctx.fill();
+      ctx.strokeStyle = on ? 'rgba(255,240,200,.6)' : 'rgba(242,233,216,.15)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    function drawControls(g) {
+      const held = drag && drag.mode === 'fine' ? drag.d : 0;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      // aim lock
+      const lk = G.lock;
+      btnBox(lk, locked);
+      ctx.fillStyle = locked ? '#1a1410' : '#f2e9d8'; ctx.font = '700 11px "IBM Plex Sans KR", sans-serif';
+      ctx.fillText(locked ? '고정됨' : '조준', lk.x + lk.w / 2, lk.y + lk.h / 2 - 7);
+      ctx.fillText(locked ? '🔒' : '고정', lk.x + lk.w / 2, lk.y + lk.h / 2 + 8);
+      // fine aim buttons (hold to keep turning, speeds up)
+      G.fine.forEach((f) => {
+        btnBox(f, held === f.d);
+        ctx.fillStyle = held === f.d ? '#1a1410' : '#f2e9d8'; ctx.font = '700 20px "IBM Plex Sans KR", sans-serif';
+        ctx.fillText(f.d < 0 ? '↺' : '↻', f.x + f.w / 2, f.y + f.h / 2 + 1);
+      });
+      // spin: top = follow, centre = none, bottom = draw (tap or slide)
+      const s = G.spin;
+      ctx.fillStyle = '#f4ecd8'; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,.25)'; ctx.lineWidth = 1;
+      for (const yy of [-0.35, 0.35]) { ctx.beginPath(); ctx.moveTo(s.x - s.r * 0.9, s.y + yy * s.r); ctx.lineTo(s.x + s.r * 0.9, s.y + yy * s.r); ctx.stroke(); }
+      ctx.fillStyle = '#d6372b'; ctx.beginPath(); ctx.arc(s.x, s.y - spin * s.r * 0.68, 5.5, 0, 7); ctx.fill();
+      ctx.fillStyle = spin ? '#e3ae45' : '#ab9fb8'; ctx.font = '700 10px "IBM Plex Sans KR", sans-serif';
+      ctx.fillText(spin > 0.05 ? '밀어치기' : spin < -0.05 ? '끌어치기' : '스핀 없음', s.x, s.y + s.r + 10);
+    }
+    function drawCall(k, alpha, now) {
+      const P = POCK[k], r = (k === 2 || k === 3 ? 25 : 27) * G.k + 6 + (now ? Math.sin(now / 180) * 1.5 : 0);
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = '#e3ae45'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(TX(P[0]), TY(P[1]), r, 0, 7); ctx.stroke();
+      ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,240,200,.8)'; ctx.beginPath(); ctx.arc(TX(P[0]), TY(P[1]), r + 4, 0, 7); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    function draw(now) {
+      cv.clear();
+      if (!G || !st) return;
+      const dp = cv.dpr, worldT = () => ctx.setTransform(dp * cam.s, 0, 0, dp * cam.s, dp * cam.x, dp * cam.y), screenT = () => ctx.setTransform(dp, 0, 0, dp, 0, 0);
+      worldT();
+      drawTable();
+      const b = curBalls();
+      const human = canHuman() && !st.ch;
+      if (human) {
+        updateCall();
+        if (st.kit) { ctx.fillStyle = 'rgba(227,174,69,.08)'; ctx.fillRect(TX(0), TY(HEAD), W * G.k, (H - HEAD) * G.k); }
+        if (callMan && callNow >= 0) drawCall(callNow, 1, now);
+        drawAim(cuePos ? Object.assign(b.slice(), { 0: cuePos }) : b);
+      } else if (animLast && animLast.c >= 0) drawCall(animLast.c, 0.7, 0);
+      if (!human) { fadeHud(hint, false); fadeHud(top, false); }
+      // pocket fades
+      fades = fades.filter((f) => f.t < 1);
+      fades.forEach((f) => drawBall(f.i, f.x + (f.px - f.x) * f.t, f.y + (f.py - f.y) * f.t, 1 - f.t * 0.6, 1 - f.t));
+      for (let i = 15; i >= 0; i--) {
+        if (i === 0 && human && cuePos) continue;
+        if (b[i]) drawBall(i, b[i][0], b[i][1]);
+      }
+      if (human) {
+        const c = cuePos || b[0];
+        if (cuePos) {
+          drawBall(0, cuePos[0], cuePos[1]);
+          if (st.bih) {
+            ctx.strokeStyle = placeOk ? 'rgba(227,174,69,.9)' : 'rgba(238,106,85,.95)'; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+            ctx.beginPath(); ctx.arc(TX(cuePos[0]), TY(cuePos[1]), R * G.k + 7, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+          }
+        }
+        const g = c ? cueGeom() : null;
+        screenT(); drawControls(g); // under the stick: the stick is always drawn whole, over everything else
+        worldT(); if (g) drawCue(g);
+        screenT();
+        // the HUD bars never hide the stick: fade them (and let touches through) while the stick runs underneath
+        const ey = g ? (g.by + g.uy * (g.tip0 + g.pull + g.len)) * cam.s + cam.y : 0;
+        fadeHud(hint, g && ey > cv.h - 52); fadeHud(top, g && ey < 70);
+        if (g) drawPullReadout(g);
+      }
+      screenT();
+      placeSpots(human ? cueGeom() : null, human);
+    }
+    /* keep the tutorial anchors on the table / stick / controls as drawn (screen px, after the aiming camera) */
+    function placeSpots(g, human) {
+      const s = cam.s, X = (x) => x * s + cam.x, Y = (y) => y * s + cam.y, k = G.k;
+      const box = (x0, y0, x1, y1, pad) => {
+        const a = U.clamp(Math.min(x0, x1) - pad, 0, cv.w), b = U.clamp(Math.min(y0, y1) - pad, 0, cv.h);
+        const c = U.clamp(Math.max(x0, x1) + pad, 0, cv.w), d = U.clamp(Math.max(y0, y1) + pad, 0, cv.h);
+        return [a, b, c - a, d - b];
+      };
+      spTable(...box(X(TX(-RL)), Y(TY(-RL)), X(TX(W + RL)), Y(TY(H + RL)), 0));
+      if (human && st.kit) spKit(...box(X(TX(0)), Y(TY(HEAD)), X(TX(W)), Y(TY(H)), 2)); else spKit(null);
+      if (g) {
+        const at = (t) => [X(g.bx + g.ux * (g.tip0 + g.pull + t)), Y(g.by + g.uy * (g.tip0 + g.pull + t))];
+        const seg = (t0, t1) => { const a = at(t0), b = at(t1); return box(a[0], a[1], b[0], b[1], 12); };
+        spCue(...box(X(g.bx), Y(g.by), X(g.bx), Y(g.by), R * k * s + 10));
+        spShaft(...seg(0.035 * g.len, Math.max(0.035 * g.len + 10, g.bs)));
+        spButt(...seg(g.bs, Math.max(g.bs + 20, Math.min(g.len, g.vis))));
+        const f1 = G.fine[1];
+        spFine(G.lock.x - 2, G.lock.y - 2, G.lock.w + 4, f1.y + f1.h - G.lock.y + 4);
+        spSpin(G.spin.x - G.spin.r - 6, G.spin.y - G.spin.r - 4, G.spin.r * 2 + 12, G.spin.r * 2 + 22);
+      } else [spCue, spShaft, spButt, spFine, spSpin].forEach((f) => f(null));
+    }
+
+    // .hud > * re-enables pointer events on the children, so they are switched one by one
+    function fadeHud(el, on) {
+      const o = on ? '0.25' : '', pe = on ? 'none' : '';
+      if (el.style.opacity !== o) el.style.opacity = o;
+      for (const c of el.children) if (c.style.pointerEvents !== pe) c.style.pointerEvents = pe;
+    }
+    /* ---- input ---- */
+    function inRect(p, r) { return p.x >= r.x - 6 && p.x <= r.x + r.w + 6 && p.y >= r.y - 6 && p.y <= r.y + r.h + 6; }
+    let extra = 0; // fingers down besides the active one (a second finger turns the aim drag into fine mode)
+    function pocketAt(p) { // p in table px
+      for (let k = 0; k < 6; k++) if (Math.hypot(p.x - TX(POCK[k][0]), p.y - TY(POCK[k][1])) * cam.s < Math.max(26, (34 * G.k + 10) * cam.s)) return k;
+      return -1;
+    }
+    function tapCall(k) { callMan = { k, hit: callHit }; callNow = -1; updateCall(); api.sfx('click'); api.buzz(10); renderHint(); }
+    function setSpin(p) {
+      let v = U.clamp(-(p.y - G.spin.y) / (G.spin.r * 0.68), -1, 1);
+      v = Math.abs(v) < 0.22 ? 0 : Math.round(v * 4) / 4;
+      if (v !== spin) { spin = v; api.sfx('click'); api.buzz(8); }
+    }
+    function onDown(ev) {
+      if (sim && !drag) { if (!fast) { fast = true; renderHint(); } return; } // tap during the replay: fast-forward
+      if (drag) { if ((drag.mode === 'aim' || drag.mode === 'rot') && ev.pointerId !== drag.id) { extra++; drag.fine = true; drag.last = null; } return; }
+      if (!canHuman() || !G || st.ch) return;
+      const p = cv.local(ev), w = toW(p), s = cam.s; // p: screen px (controls, finger travel) · w: table px (balls, stick)
+      const onStick = (() => { const h0 = stickHit(w); if (!h0) return false; const g = h0.g, dx = w.x - g.bx, dy = w.y - g.by; return Math.abs(-dx * g.uy + dy * g.ux) * s < 14; })();
+      if (onStick && p.x > G.lock.x - 8) { /* stick lying over the right-hand column: the stick wins */ }
+      else if (inRect(p, G.lock)) { locked = !locked; U.store.set('pool.lock', locked); api.sfx('click'); api.buzz(10); dirty = true; return; }
+      else if (G.fine.some((f) => inRect(p, f))) { const f = G.fine.find((f) => inRect(p, f)); aim += f.d * 0.002; api.sfx('tick'); dirty = true; drag = { mode: 'fine', d: f.d, t: performance.now() }; }
+      else if (Math.hypot(p.x - G.spin.x, p.y - G.spin.y) < G.spin.r + 14) drag = { mode: 'spin' }, setSpin(p);
+      if (!drag) {
+        const c = cuePos || st.b[0];
+        const ux = UX(w.x), uy = UY(w.y);
+        const dBall = c ? Math.hypot(w.x - TX(c[0]), w.y - TY(c[1])) * s : 1e9; // screen px
+        // the stick wins over the ball area unless the touch is right on the ball (ball in hand) — near a screen edge
+        // only a short piece of the stick is visible and every pixel of it must stay grabbable
+        const sh0 = stickHit(w), rb = R * G.k * s;
+        const onBall = st.bih ? dBall < Math.max(22, rb + 10) : !sh0 && dBall < Math.max(26, rb + 14);
+        const sh = onBall ? null : sh0;
+        if (onBall && st.bih) drag = { mode: 'place', ox: c[0] - ux, oy: c[1] - uy, from: c.slice() };
+        else if (onBall) drag = { mode: 'none', x0: p.x, y0: p.y }; // not ball-in-hand: the cue ball stays put
+        else if (sh && sh.part === 'butt') {
+          // power: pull the stick back along its own axis, measured (in screen px) from where the finger first touched.
+          // When there is not enough screen behind the finger (cue ball near an edge / corner), the gesture becomes
+          // "tight": the distance the finger moves away from the grab point counts in ANY direction except towards the ball.
+          const g = sh.g, full = fullPull(), room = edgeDist(p.x, p.y, g.ux, g.uy) - 10;
+          // straight pulls use the room that is actually there (at least 70px), so pulling to the screen edge still gives
+          // a useful shot; sideways pulls in a tight spot use the normal full distance
+          drag = { mode: 'pow', tight: room < full, axisFull: U.clamp(room - 6, 36, full), pullPx: 0, fx: p.x, fy: p.y, x0: p.x, y0: p.y,
+            side: (-g.uy * (cv.w / 2 - p.x) + g.ux * (cv.h / 2 - p.y)) >= 0 ? 1 : -1, pk: st.brk ? -1 : pocketAt(w) };
+          pow = 0; api.buzz(8);
+        } else if (sh) {
+          // direction: rotate the stick around the cue ball (keep the grab offset so the stick never jumps)
+          const fa = Math.atan2(w.y - sh.g.by, w.x - sh.g.bx);
+          drag = { mode: 'rot', off: aim - (fa + Math.PI), x0: p.x, y0: p.y, moved: false, pk: st.brk ? -1 : pocketAt(w), last: null, fine: false };
+          api.buzz(6);
+        } else drag = { mode: 'aim', x0: p.x, y0: p.y, moved: false, pk: st.brk ? -1 : pocketAt(w), last: null, fine: false };
+      }
+      if (drag) drag.id = ev.pointerId;
+      try { cv.cv.setPointerCapture(ev.pointerId); } catch (e) {}
+      dirty = true;
+    }
+    /* power fraction 0..1 for a pull gesture: projection of the finger's displacement onto the stick axis
+       (u points from the ball to the butt); in a tight spot any direction away from the ball counts. */
+    function pullFrac(d, p) {
+      const ux = -Math.cos(aim), uy = -Math.sin(aim), ex = p.x - d.x0, ey = p.y - d.y0;
+      const along = ex * ux + ey * uy, dist = Math.hypot(ex, ey);
+      let f = Math.max(0, along) / (d.axisFull || fullPull());
+      if (d.tight && along > -0.5 * dist) f = Math.max(f, dist / fullPull()); // any direction except towards the ball
+      return U.clamp(f, 0, 1);
+    }
+    function angTo(ux, uy) { const c = cuePos || st.b[0]; return Math.hypot(ux - c[0], uy - c[1]) < 4 ? null : Math.atan2(uy - c[1], ux - c[0]); }
+    function onMove(ev) {
+      if (!drag || drag.id !== ev.pointerId || !canHuman()) return;
+      const p = cv.local(ev);
+      if (drag.mode === 'pow') {
+        drag.fx = p.x; drag.fy = p.y;
+        const np = Math.round(pullFrac(drag, p) * 1000) / 1000;
+        const t0 = Math.floor(pow * 10), t1 = Math.floor(np * 10);
+        if (t1 !== t0) { api.sfx('tick'); if (t1 > 0) api.buzz(t1 >= 9 ? 14 : 7); }
+        pow = np; drag.pullPx = pow * fullPull();
+      } else if (drag.mode === 'rot') {
+        if (!drag.moved && Math.hypot(p.x - drag.x0, p.y - drag.y0) < 5) return;
+        drag.moved = true;
+        if (locked) return;
+        const c = cuePos || st.b[0], w = toW(p);
+        const bx = TX(c[0]), by = TY(c[1]);
+        if (Math.hypot(w.x - bx, w.y - by) * cam.s < 14) return;
+        const a = Math.atan2(w.y - by, w.x - bx) + Math.PI;
+        if (drag.fine) {
+          if (drag.last != null) { let d = a - drag.last; d = Math.atan2(Math.sin(d), Math.cos(d)); aim += d / 8; }
+          drag.last = a;
+        } else aim = a + drag.off; // absolute: the farther from the cue ball the finger is, the finer each pixel
+      } else if (drag.mode === 'spin') setSpin(p);
+      else if (drag.mode === 'aim') {
+        if (!drag.moved && Math.hypot(p.x - drag.x0, p.y - drag.y0) < 8) return;
+        drag.moved = true;
+        if (locked) return;
+        const w = toW(p), a = angTo(UX(w.x), UY(w.y));
+        if (a == null) return;
+        if (drag.fine) { // two-finger precision: the finger's angular motion is scaled down 8×
+          if (drag.last != null) { let d = a - drag.last; d = Math.atan2(Math.sin(d), Math.cos(d)); aim += d / 8; }
+          drag.last = a;
+        } else aim = a; // absolute: the farther the finger is from the cue ball, the finer each pixel
+      } else if (drag.mode === 'place') {
+        const w = toW(p), x = U.clamp(UX(w.x) + drag.ox, R, W - R), y = U.clamp(UY(w.y) + drag.oy, st.kit ? HEAD : R, H - R);
+        cuePos = [r1(x), r1(y)];
+        placeOk = validPlace(st, cuePos[0], cuePos[1]);
+      }
+      dirty = true;
+    }
+    function onUp(ev) {
+      if (!drag) return;
+      if (ev.pointerId !== drag.id) { if (extra > 0) extra--; return; }
+      const d = drag; drag = null; extra = 0;
+      if (!canHuman()) return;
+      if (d.mode === 'pow') {
+        const pp = cv.local(ev);
+        if (pow <= 0.03 && d.pk >= 0 && Math.hypot(pp.x - d.x0, pp.y - d.y0) < 8) { pow = 0; tapCall(d.pk); dirty = true; return; }
+        if (pow > 0.03) {
+          const a = { type: 'shoot', a: aim, p: pow, sp: spin };
+          if (!st.brk) a.c = callNow >= 0 ? callNow : 0;
+          // only send a placement when the cue ball was actually moved: the resting spot is always legal,
+          // but may fail the strict placement check (frozen against a ball / jaw), which would reject the shot
+          const moved = cuePos && st.b[0] && (cuePos[0] !== st.b[0][0] || cuePos[1] !== st.b[0][1]);
+          if (st.bih && cuePos && (moved || !st.b[0])) {
+            if (!validPlace(st, cuePos[0], cuePos[1])) { pow = 0; api.sfx('thud'); api.toast(st.kit ? '키친(점선 아래)에 놓아 주세요' : '큐볼을 놓을 수 없는 자리예요'); dirty = true; return; }
+            a.x = cuePos[0]; a.y = cuePos[1];
+          }
+          api.sfx('hit'); api.buzz(15);
+          pow = 0;
+          if (!api.isHost) sentAt = performance.now();
+          api.act(a);
+        } else { if (pow > 0) { api.sfx('click'); api.toast('샷 취소'); } pow = 0; }
+      } else if (d.mode === 'rot') {
+        if (!d.moved) { if (d.pk >= 0) tapCall(d.pk); }
+        else if (locked) api.toast('조준 고정 중 · ↺ ↻ 로 조정');
+      } else if (d.mode === 'aim') {
+        if (!d.moved) {
+          if (d.pk >= 0) tapCall(d.pk);
+          else if (!locked) { const w = toW(cv.local(ev)), a = angTo(UX(w.x), UY(w.y)); if (a != null) aim = a; }
+          else api.toast('조준 고정 중 · ↺ ↻ 로 조정');
+        }
+      } else if (d.mode === 'place') {
+        if (!placeOk) { cuePos = d.from; placeOk = validPlace(st, cuePos[0], cuePos[1]); api.sfx('thud'); api.buzz(30); }
+        else { callMan = null; }
+      }
+      dirty = true;
+    }
+    cv.cv.addEventListener('pointerdown', onDown);
+    cv.cv.addEventListener('pointermove', onMove);
+    cv.cv.addEventListener('pointerup', onUp);
+    cv.cv.addEventListener('pointercancel', (ev) => { if (!drag) return; if (drag.id !== ev.pointerId) { if (extra > 0) extra--; return; } drag = null; extra = 0; pow = 0; dirty = true; });
+    try { locked = !!U.store.get('pool.lock', false); } catch (e) {}
+
+    /* ---- animation ---- */
+    const lastKey = (s) => (s.last ? s.last.id + ':' + (s.last.shot ? s.last.shot.vx + ':' + s.last.shot.vy : s.last.ch) : '');
+    function startAnim(last) {
+      sim = new Sim(last.pre, last.shot);
+      simAcc = 0; lastHits = 0; lastBounces = 0; lastPots = 0; animLast = last; fast = false;
+      api.setBusy(true);
+      renderHint();
+      // rAF stops in a background tab: make sure the replay (and the busy flag) still finishes
+      clearTimeout(animTimer);
+      const mine = sim, dur = new Sim(last.pre, last.shot).run().steps * DT;
+      animTimer = setTimeout(() => { if (sim === mine) { sim.run(); finishAnim(); } }, (dur / L.debug.speed) * 1000 + 2500);
+    }
+    function finishAnim() {
+      clearTimeout(animTimer);
+      sim = null; disp = null;
+      api.setBusy(false);
+      const l = animLast; animLast = null;
+      if (l) announce(l);
+      prepTurn(true);
+      renderTop(); renderHint(); renderChoice();
+      dirty = true;
+    }
+    function announce(l) {
+      const nm = api.players[l.seat].name;
+      const ev = l.ev;
+      const F = { scr: '파울 · 스크래치!', nc: '파울 · 아무 공도 못 맞혔어요', wf: '파울 · 다른 공을 먼저 맞혔어요', nr: '파울 · 쿠션에 닿은 공이 없어요',
+        ko: '파울 · 키친 안의 공을 먼저 맞혔어요' };
+      const f = ev.find((e) => F[e]);
+      if (ev.indexOf('win') >= 0) { api.toast(nm + ' · 8번 성공!'); api.sfx('win'); api.buzz(30); return; }
+      if (ev.indexOf('lose') >= 0) {
+        api.toast(ev.indexOf('lp') >= 0 ? '8번이 콜하지 않은 포켓에 들어갔어요' : ev.indexOf('lf') >= 0 ? '8번과 함께 ' + (f ? F[f].replace('파울 · ', '') : '파울') : '8번을 너무 일찍 넣었어요');
+        api.sfx('lose'); api.buzz(60); return;
+      }
+      if (ev.indexOf('r8c') >= 0) { api.toast('브레이크에 8번!'); api.sfx('pop'); return; }
+      if (f) {
+        const why = l.brk && ev.indexOf('r8') >= 0 ? ' · 8번은 다시 올려요' : '';
+        api.toast(F[f] + (ev.indexOf('kit') >= 0 ? ' 상대 키친 프리볼' : ' 상대 프리볼') + why); api.sfx('lose'); api.buzz(40); return;
+      }
+      if (ev.indexOf('grp') >= 0) { const g = myGroup(st, l.seat); api.toast(nm + ' · ' + (g === 1 ? '솔리드' : '스트라이프') + ' 결정'); return; }
+      if (ev.indexOf('cont') >= 0 && l.pots.length) { api.toast(nm + ' · 한 번 더'); return; }
+      if (!l.brk && l.c >= 0 && l.pots.some((i, k) => i !== 0 && l.pk[k] !== l.c)) api.toast('콜하지 않은 포켓 · 차례가 넘어가요');
+    }
+    function prepTurn(force) {
+      if (!st) return;
+      const key = st.seq + ':' + st.t;
+      if (!force && key === aimTurn) return;
+      aimTurn = key;
+      cuePos = st.b[0] ? st.b[0].slice() : null;
+      placeOk = true; pow = 0; spin = 0; callMan = null; callNow = -1;
+      aim = defaultAim();
+    }
+    /* where the aiming camera wants to be: the smallest zoom-out / pan that shows the stick's butt plus ~3/4 of a full
+       pull behind it, while keeping as much of the table on screen as possible. Resting view when nobody here aims. */
+    const CAM0 = { s: 1, x: 0, y: 0 };
+    function camGoal() {
+      if (!G || !st || sim || st.ch || !canHuman()) return CAM0;
+      const c = cuePos || st.b[0];
+      if (!c) return CAM0;
+      const bx = TX(c[0]), by = TY(c[1]), ux = -Math.cos(aim), uy = -Math.sin(aim), len = stickLen(), tip0 = R * G.k + 5;
+      // must: the middle of the black grip + 3/4 of a pull behind it; nice: the whole stick + 3/4 of a pull
+      const rMin = tip0 + 0.78 * len, eMin = fullPull() * 0.75, rFull = tip0 + len, eFull = fullPull() * 0.75, m = 6;
+      const cx = G.ox + W / 2 * G.k, cy = G.oy + H / 2 * G.k; // zoom about the table centre
+      const tx0 = G.ox - RL * G.k, ty0 = G.oy - RL * G.k, tx1 = tx0 + G.tw, ty1 = ty0 + G.th;
+      const vx1 = G.lock.x - 4, vy0 = 62, vy1 = cv.h - 34; // the free area between the HUD bars and the button column
+      const rc = rayCast(st.b, c[0], c[1], -ux, -uy), gx = TX(c[0] - ux * rc.t), gy = TY(c[1] - uy * rc.t); // ghost ball
+      const outBy = (x, y, x0, y0, x1, y1) => Math.max(0, x0 - x) + Math.max(0, x - x1) + Math.max(0, y0 - y) + Math.max(0, y - y1);
+      const shiftFor = (s, x, y, r, e) => { // extra pan that brings the point r (world) + e (screen) behind the ball on screen
+        const L2 = s * r + e, ex = s * bx + x + ux * L2, ey = s * by + y + uy * L2;
+        return [ex < m ? m - ex : ex > cv.w - m ? cv.w - m - ex : 0, ey < m ? m - ey : ey > cv.h - m ? cv.h - m - ey : 0];
+      };
+      let best = null;
+      for (let i = 0; i <= 7; i++) {
+        const s = 1 - i * 0.05, x0 = (1 - s) * cx, y0 = (1 - s) * cy;
+        const sm = shiftFor(s, x0, y0, rMin, eMin), sf = shiftFor(s, x0, y0, rFull, eFull);
+        for (const sh of [[0, 0], sm, sf]) {
+          const x = x0 + sh[0], y = y0 + sh[1], sbx = s * bx + x, sby = s * by + y;
+          if (sbx < 30 || sbx > vx1 - 10 || sby < vy0 + 10 || sby > vy1 - 10) continue; // the cue ball itself stays in view
+          const over = Math.max(0, -(s * tx0 + x)) + Math.max(0, s * tx1 + x - vx1) + Math.max(0, vy0 - (s * ty0 + y)) + Math.max(0, s * ty1 + y - vy1);
+          const cm = shiftFor(s, x, y, rMin, eMin), cf = shiftFor(s, x, y, rFull, eFull);
+          const cost = over + (1 - s) * 360 + (Math.abs(cm[0]) + Math.abs(cm[1])) + 0.3 * (Math.abs(cf[0]) + Math.abs(cf[1]))
+            + 3 * outBy(s * gx + x, s * gy + y, 10, vy0, vx1, vy1);
+          if (!best || cost < best.cost - 0.5) best = { cost, s, x, y };
+        }
+      }
+      return best || CAM0;
+    }
+    function updateCam(dt) {
+      // a finger on the table/stick freezes the view (the stick never slides out from under the thumb)
+      if (drag && drag.mode !== 'spin' && drag.mode !== 'fine') return;
+      camT = camGoal();
+      const d = Math.abs(camT.s - cam.s) * 500 + Math.abs(camT.x - cam.x) + Math.abs(camT.y - cam.y);
+      if (d < 0.25) { if (d > 0) { cam = { s: camT.s, x: camT.x, y: camT.y }; dirty = true; } return; }
+      const f = 1 - Math.exp(-dt * 7);
+      cam = { s: cam.s + (camT.s - cam.s) * f, x: cam.x + (camT.x - cam.x) * f, y: cam.y + (camT.y - cam.y) * f };
+      dirty = true;
+    }
+    const stop = U.loop((dt, now) => {
+      updateCam(dt);
+      if (fades.length) { fades.forEach((f) => (f.t += dt * 3 * L.debug.speed)); dirty = true; }
+      if (drag && drag.mode === 'fine') { const held = performance.now() - drag.t; if (held > 350) { aim += drag.d * dt * (held < 1200 ? 0.06 : 0.25); dirty = true; } }
+      if (st && !sim && callMan && callNow >= 0 && canHuman()) dirty = true; // pulsing called-pocket ring
+      if (sim) {
+        simAcc += dt * L.debug.speed * (fast ? 4 : 1);
+        let n = 0;
+        while (simAcc >= DT && !sim.done && n < 2400 * (fast ? 4 : 1)) { sim.step(); simAcc -= DT; n++; }
+        if (sim.hits > lastHits) { lastHits = sim.hits; api.sfx('hit'); }
+        if (sim.bounces > lastBounces + 1) { lastBounces = sim.bounces; api.sfx('bounce'); }
+        while (sim.caps.length > lastPots) {
+          const c = sim.caps[lastPots++];
+          const P = POCK.reduce((a, q) => (Math.hypot(q[0] - c[1], q[1] - c[2]) < Math.hypot(a[0] - c[1], a[1] - c[2]) ? q : a));
+          fades.push({ i: c[0], x: c[1], y: c[2], px: P[0], py: P[1], t: 0 });
+          api.sfx('pop');
+        }
+        dirty = true;
+        if (sim.done) finishAnim();
+      }
+      if (dirty) { dirty = false; draw(now); }
+    });
+
+    L.debug.pool = { geom: () => { const g = cueGeom(); return g && Object.assign({}, g, { cw: cv.w, ch: cv.h, col: G.lock.x, cam: Object.assign({}, cam), camT: Object.assign({}, camT) }); }, aim: (a) => { if (a != null) { aim = a; dirty = true; } return aim; } }; // test hook
+    const offKeys = api.input ? api.input.on((t, id) => {
+      if (t !== 'down') return;
+      const b = [...document.querySelectorAll('[data-action="' + id + '"]')].find((x) => !x.disabled && x.getClientRects().length);
+      if (b) b.click();
+    }) : null;
+    const noFocus = (e) => { const b = e.target && e.target.closest && e.target.closest('button[data-action]'); if (b) e.preventDefault(); };   // 마우스로 누른 버튼에 포커스가 남아 Space/Enter 단축키를 가로채지 않게
+    document.addEventListener('mousedown', noFocus, true);
+    return {
+      update(next, prev) {
+        st = next;
+        if (prev !== next) sentAt = 0;
+        const key = lastKey(next);
+        if (next.last && next.last.shot && key !== shownSeq && prev && prev !== next) {
+          shownSeq = key;
+          lastPw[next.last.seat] = Math.min(1, Math.hypot(next.last.shot.vx, next.last.shot.vy) / VMAX);
+          startAnim(next.last);
+        } else {
+          if (next.last && next.last.ch && key !== shownSeq && prev && prev !== next) {
+            api.toast(next.last.ch === 'rack' ? '다시 랙 · ' + api.players[next.last.seat].name + ' 브레이크' : '8번을 풋 스폿에 올렸어요'); api.sfx('click');
+          }
+          shownSeq = key;
+          if (!sim) { disp = null; prepTurn(prev == null || prev === next ? false : true); }
+        }
+        renderTop(); renderHint(); renderChoice();
+        dirty = true;
+      },
+      destroy() { if (offKeys) offKeys(); document.removeEventListener('mousedown', noFocus, true); stop(); clearTimeout(animTimer); cv.destroy(); top.remove(); hint.remove(); SPOTS.forEach((f) => f.el.remove()); if (chEl) chEl.remove(); if (sim) { sim = null; api.setBusy(false); } },
+    };
+  }
+
+  L.register({
+    id: 'pool', name: '포켓볼', tag: '당구',
+    blurb: '8볼 포켓볼(WPA 방식). 솔리드나 스트라이프 중 내 그룹을 모두 넣고, 포켓을 콜해 8번을 넣으면 승리. 파울이면 상대가 큐볼을 놓고 칩니다.',
+    controls: [
+      { id: 'spot', label: '8번 올리고 계속 치기', keys: ['Digit1'] },
+      { id: 'rack', label: '다시 랙하고 브레이크', keys: ['Digit2'] },
+    ],
+    minPlayers: 2, maxPlayers: 2, defaultPlayers: 2, hidden: false, aiDelay: 700,
+    options: [{ id: 'guide', label: '예측선', tip: '조준할 때 공이 갈 길을 보여 줘요.', choices: [{ v: 'off', label: '없음' }, { v: 'short', label: '짧게' }, { v: 'long', label: '길게 (쿠션 1회)', tip: '쿠션에 한 번 맞고 꺾이는 길까지.' }], def: 'off' }],
+    quick: [
+      '내 그룹 공 7개(솔리드 1–7번 또는 스트라이프 9–15번)를 다 넣고, 마지막에 8번(검은 공)을 넣으면 이겨요.',
+      '내 차례: 큐 가운데를 돌려 방향을 잡고, 검은 손잡이를 뒤로 당겼다 놓아 쳐요.',
+      '노린 포켓(금색 고리)에 내 공이 들어가면 한 번 더! 못 넣으면 상대 차례, 파울이면 상대가 큐볼을 아무 데나 놓고 쳐요.',
+    ],
+    rules: [
+      { h: '목표', p: ['2명이 하는 8볼 포켓볼이에요(WPA 정식 규칙).',
+        '공은 3가지예요: 솔리드(1–7번, 한 가지 색), 스트라이프(9–15번, 가운데 줄무늬), 그리고 8번(검은 공).',
+        '내 그룹(솔리드 또는 스트라이프) 7개를 모두 넣은 뒤, 노린 포켓에 8번을 넣으면 이겨요.',
+        '흰 공은 「큐볼」이에요. 큐로 치는 공은 언제나 큐볼이에요.'] },
+      { h: '차례에 할 일', p: ['① 큐볼로 내 그룹 공을 맞혀서 포켓에 넣어요.',
+        '② 노린 포켓(콜한 포켓)에 내 공이 들어가면 계속 쳐요.',
+        '③ 아무것도 못 넣으면 차례가 넘어가요. 파울을 하면 차례가 넘어가고, 상대가 큐볼을 테이블 아무 데나 놓고 쳐요(프리볼).',
+        '위쪽 이름표에 내 그룹(솔리드/스트라이프)과 남은 공이 보여요. 다 넣은 공은 흐리게 보여요.'] },
+      { h: '조작 (손가락)', p: ['큐는 세 부분으로 다뤄요: 가운데 밝은 부분 = 방향, 검은 손잡이 = 파워, 큐볼 = 위치(프리볼일 때만).',
+        '방향: 큐의 밝은 가운데 부분을 잡고 큐볼 둘레로 빙 돌리세요. 큐가 손가락을 따라 돌아요. 큐볼에서 멀리 잡을수록 더 세밀해요. 테이블 빈 곳을 누르거나 끌어도 그쪽으로 겨눠요.',
+        '파워: 검은 손잡이를 잡고 큐 방향 그대로 뒤로 당기세요. 많이 당길수록 세요(%가 보이고, 흰 눈금 = 내 지난 샷). 손을 떼면 쳐요.',
+        '취소: 당긴 큐를 공 쪽으로 다시 밀어 3% 아래에서 떼면 안 쳐요.',
+        '예측선(설정의 「예측선」 옵션, 기본 없음): 짧게 = 점선과 흰 원(큐볼이 닿는 자리) + 노란 선(목적구 방향) 조금. 길게 = 노란 선이 벽까지, 흐린 선 = 큐볼이 갈 길, 벽에 먼저 닿으면 쿠션 한 번 튕긴 길까지. 온라인에서는 방 옵션이라 모두 같아요.',
+        '미세 조정: 오른쪽 ↺ ↻ 버튼을 누르면 조금씩 돌아요(누르고 있으면 계속, 점점 빨라져요). 조준하는 동안 다른 손가락을 하나 더 대면 손가락 움직임이 1/8로 줄어요.',
+        '「조준 고정」을 켜면 큐 가운데를 돌리거나 테이블을 눌러도 조준이 안 바뀌어요(↺ ↻, 파워, 포켓 바꾸기는 돼요).',
+        '스핀: 오른쪽 아래 흰 공을 위로 밀면 밀어치기(맞힌 뒤 큐볼이 앞으로 더 감), 아래로 밀면 끌어치기(뒤로 돌아옴), 가운데는 스핀 없음.',
+        '프리볼일 때: 큐볼을 끌어 옮겨요. 빨간 테두리면 놓을 수 없는 자리예요(떼면 원래 자리로).',
+        '큐는 늘 같은 길이예요. 큐볼이 가장자리 가까이 있으면 화면이 저절로 살짝 물러나거나 옮겨져서 큐 전체와 당길 자리가 보여요. 그래도 큐가 화면 밖으로 이어지면 보이는 끝부분을 잡으면 되고, 당길 자리가 모자라면 공 쪽만 아니면 어느 방향으로 끌어도 파워가 올라가요.',
+        '공이 굴러가는 동안 화면을 누르면 빨리 감기(AI 샷도).'] },
+      { h: '포켓 콜 (노릴 포켓 정하기)', p: ['브레이크(첫 샷) 뒤에는 샷마다 노릴 포켓을 정해요. 이걸 「콜」이라고 해요.',
+        '노릴 포켓을 눌러 콜하면 금색 고리로 표시돼요. 누르지 않으면 맞은 공이 향하던 쪽 포켓이 콜된 것으로 쳐요(화면에는 안 보여요).',
+        '콜한 포켓에 내 공이 들어가면 계속 쳐요. 쿠션을 맞고 들어가도, 다른 공을 맞혀 들어가도(컴비네이션) 콜한 포켓이면 인정돼요.',
+        '콜하지 않은 포켓에 들어간 공은 그대로 빠진 채 남아요. 파울은 아니지만 차례가 넘어가요.',
+        '세이프티(일부러 안 넣고 수비하기)는 따로 선언하지 않아요. 그냥 공을 못 넣은 샷이 돼요.'] },
+      { h: '내 그룹 정하기', p: ['처음에는 그룹이 없어요(오픈 테이블). 이때는 8번만 아니면 어떤 공을 먼저 맞혀도 돼요.',
+        '브레이크 뒤, 파울 없이 콜한 포켓에 처음 넣은 공의 그룹이 내 그룹이 돼요. 상대는 다른 그룹이에요.',
+        '내 그룹을 다 넣으면 이제 8번이 내 목표 공이에요.'] },
+      { h: '브레이크와 키친', p: ['「키친」은 테이블 아래쪽 점선(헤드 스트링) 아래 구역이에요.',
+        '첫 샷(브레이크)은 큐볼을 키친 안 아무 데나 놓고 쳐요. 브레이크는 포켓을 콜하지 않아요.',
+        '브레이크에서 공이 들어가면 한 번 더 쳐요.',
+        '브레이크에서 파울(스크래치 포함)을 하면, 상대가 큐볼을 키친 안에 놓고 쳐요. 이때는 키친 밖의 공을 먼저 맞혀야 해요(키친 안의 공을 먼저 맞히면 파울).',
+        '브레이크에 8번이 들어가면 브레이크한 사람이 골라요: 8번을 제자리(풋 스폿)에 올리고 이어서 치기, 또는 다시 공을 모아 브레이크하기.',
+        '8번이 들어가면서 스크래치까지 했다면, 8번을 다시 올리고 상대가 키친 안에서 프리볼로 쳐요.'] },
+      { h: '파울과 프리볼', p: ['이럴 때 파울이에요: ① 스크래치(큐볼이 포켓에 들어감) ② 아무 공도 못 맞힘 ③ 내 그룹이 아닌 공을 먼저 맞힘 ④ 공을 하나도 못 넣었는데, 맞힌 뒤 어떤 공도 쿠션(벽)에 닿지 않음.',
+        '파울이면 차례가 넘어가고, 상대는 「프리볼」로 쳐요: 큐볼을 테이블 어디든(다른 공과 겹치지 않게) 놓고 칠 수 있어요. 브레이크 파울만 키친 안이에요.',
+        '파울을 여러 번 해도 그것만으로 지지는 않아요.'] },
+      { h: '점수·승리 (8번 공)', p: ['내 그룹을 모두 넣은 뒤, 파울 없이 콜한 포켓에 8번을 넣으면 이겨요.',
+        '이럴 때는 그 자리에서 져요: 8번을 콜하지 않은 포켓에 넣음 · 내 그룹이 남았는데 8번을 넣음 · 8번을 넣은 샷에서 파울(스크래치 포함).'] },
+      { h: '예시', p: ['브레이크로 3번(솔리드)이 들어갔어요 → 한 번 더 쳐요. 아직 그룹은 안 정해졌어요(오픈 테이블).',
+        '다음 샷: 11번(스트라이프)을 오른쪽 위 포켓으로 겨눠 쳐서 들어감 → 이제 나는 스트라이프, 상대는 솔리드. 계속 쳐요.',
+        '다음 샷: 내 공 9번을 노렸는데 큐볼이 상대 공 2번을 먼저 맞힘 → 파울! 상대가 큐볼을 원하는 자리에 놓고 쳐요.',
+        '나중에 스트라이프 7개를 다 넣었으면, 8번을 노리는 포켓을 확인하고(금색 고리) 넣으면 승리!'] },
+      { h: 'AI', p: ['AI 난이도는 자리마다 쉬움·보통·어려움으로 고를 수 있어요(조준 정확도, 샷 고르기, 포지션·세이프티 플레이가 달라요).'] },
+    ],
+    tutorial: [
+      { sel: '.pl-table', text: '8볼 포켓볼이에요. 솔리드(1–7번)나 스트라이프(9–15번, 줄무늬) 중 내 그룹 7개를 다 넣고, 마지막에 8번(검은 공)을 넣으면 이겨요.' },
+      { sel: '.pl-kitchen', text: '첫 샷은 브레이크! 큐볼(흰 공)은 아래쪽 점선 아래 「키친」 안에 있어요. 지금은 흰 공을 손가락으로 끌어 키친 안 다른 자리로 옮길 수도 있어요.' },
+      { sel: '.pl-shaft', text: '방향: 큐의 밝은 가운데 부분을 잡고 큐볼 둘레로 빙 돌리세요. 테이블 빈 곳을 눌러도 그쪽을 겨눠요. 조준선은 없어요 — 큐 방향을 보고 직접 겨눠요.' },
+      { sel: '.pl-butt', text: '파워: 검은 손잡이를 잡고 큐를 뒤로 쭉 당기세요. 많이 당길수록 세요(%로 보여요). 손을 떼면 쳐요. 공 쪽으로 다시 밀어 떼면 취소예요.' },
+      { sel: '.pl-fine', text: '↺ ↻ 버튼은 조준을 아주 조금씩 돌려요(누르고 있으면 계속). 위 「조준 고정」을 켜면 실수로 조준이 바뀌지 않아요.' },
+      { sel: '.pl-spin', text: '스핀: 이 흰 공을 위로 밀면 밀어치기(큐볼이 앞으로 더 감), 아래로 밀면 끌어치기(뒤로 돌아옴). 처음엔 가운데 그대로 두세요.' },
+      { sel: '.pl-table', text: '브레이크 뒤에는 노릴 포켓이 금색 고리로 저절로 정해져요(다른 포켓을 누르면 바꿔요). 그 포켓에 내 공을 넣으면 한 번 더! 큐볼이 빠지거나 상대 공을 먼저 맞히면 파울이에요.' },
+    ],
+    init, actor, apply, ai, result, mount,
+    _sim: { Sim, simulate, judge, W, H, R },
+  });
+})();

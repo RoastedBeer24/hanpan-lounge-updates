@@ -1,0 +1,2096 @@
+/* 리듬 레인 — realtime rhythm game, landscape (1 solo, 2–4 versus, one person per phone).
+   Play field: a perspective highway of 12 columns receding to the horizon. Notes are 2–6 columns wide and come in
+   five kinds: tap, hold (with beat ticks), slide (hold and follow a curving path, mid ticks), flick (swipe up/left/right)
+   and critical (gold, double weight). Same-time notes are joined by a line. Touch anywhere along the judgement line.
+   Every song is composed procedurally from a seed and played by a WebAudio synth; the chart is generated from the music
+   (drums → taps, sustained parts → holds, melody runs → slides, accents → critical/flick) and laid out by a two-hand model
+   (no crossovers, limited jacks, alternation). 「내 음악」 analyses a local file on the phone (tempo curve, beats,
+   downbeats, sections, pitch contour) and charts it with the same pipeline. Song clock = AudioContext.currentTime.
+   Online: the host owns the start (ph 'play' + rid) and broadcasts its song clock; each phone judges its own touches. */
+(function () {
+  'use strict';
+  const L = window.Lounge, U = L.util;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const PW = 0.05, GW = 0.095, BW = 0.14, TAIL_GRACE = 0.14, NC = 12;
+  const RW = [0, 0.1, 0.17, 0.26];   // 긴 음표 떼기: 완벽 / 좋음 / 아쉬움 (끝 시각 ± s)   // 완벽 / 좋음 / 아쉬움 half-windows (s), columns
+  function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  function gauss() { let u = 0; while (!u) u = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random()); }
+  const code = (seed) => seed.toString(36).toUpperCase().padStart(4, '0');
+
+  /* ======================= genres ======================= */
+  const SC = { maj: [0, 2, 4, 5, 7, 9, 11], min: [0, 2, 3, 5, 7, 8, 10], dor: [0, 2, 3, 5, 7, 9, 10] };
+  const PROG = {
+    min: [[0, 5, 2, 6], [0, 6, 5, 6], [0, 3, 4, 0], [0, 5, 3, 4], [5, 6, 0, 0], [0, 2, 5, 6]],
+    maj: [[0, 4, 5, 3], [0, 5, 3, 4], [3, 4, 0, 5], [0, 3, 0, 4], [5, 3, 0, 4]],
+    dor: [[0, 3, 0, 3], [0, 6, 3, 0], [0, 1, 3, 6]],
+    jazz: [[1, 4, 0, 0], [1, 4, 0, 5], [0, 5, 1, 4], [2, 5, 1, 4]],
+  };
+  /* drum strings: 16 steps per bar, [verse, chorus]. K kick, S snare/clap, H closed hat, O open hat/ride accent.
+     bass: R root F fifth T third O octave W walking(beat), '-' hold. chord: x hit, '-' hold. cells: lead rhythm per beat */
+  const GEN = {
+    elec: { nm: '일렉트로닉', bpm: [118, 138], modes: ['min', 'min', 'dor'], sw: 0, kit: 'elec', bass: 'saw', chord: 'stab', lead: 'pluck', pad: 'synth',
+      dr: [{ K: 'x...x...x...x...', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: '..x...x...x...x.' }, { K: 'x...x...x...x..x', S: '....x.......x...', H: 'xxxxxxxxxxxxxxxx', O: '..x...x...x...x.' }],
+      bp: ['..R...R...R...R.', 'R.RO.RR.R.RO.RRF'], cp: ['x..x..x...x..x..', 'x..x..x.x..x..x.'],
+      cells: ['x.x.', 'x..x', '.xx.', 'x-x.', 'x---', 'xxx.', '....', 'x.xx'] },
+    rock: { nm: '록', bpm: [112, 160], modes: ['min', 'maj', 'min'], sw: 0, kit: 'rock', bass: 'pick', chord: 'power', lead: 'drive', pad: null,
+      dr: [{ K: 'x.......x.x.....', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: '' }, { K: 'x.x.....x.x..x..', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: 'x...............' }],
+      bp: ['R.R.R.R.R.R.R.R.', 'R.R.R.R.R.R.O.F.'], cp: ['x-------x---x---', 'x.x.x.x.x.x.x.x.'],
+      cells: ['x---', 'x-x-', 'x.x.', 'xxx-', '..x-', 'x--x', '....', 'x-xx'] },
+    jazz: { nm: '재즈풍', bpm: [96, 150], modes: ['jazz'], sw: 1, kit: 'jazz', bass: 'upright', chord: 'piano', lead: 'reed', pad: null,
+      dr: [{ K: 'x.......x.......', S: '......x.......x.', H: '....x.......x...', O: 'x...x.x.x...x.x.' }, { K: 'x.......x.....x.', S: '....x.x.....x.x.', H: '....x.......x...', O: 'x...x.x.x...x.x.' }],
+      bp: ['W...W...W...W...', 'W...W...W...W.W.'], cp: ['..x.....x.....x.', 'x.....x...x.....'],
+      cells: ['x.x.', 'x--x', '..xx', 'x---', '.x.x', 'xxx.', '....', 'x.xx'] },
+    cine: { nm: '시네마틱', bpm: [90, 120], modes: ['min', 'min', 'maj'], sw: 0, kit: 'cine', bass: 'sub', chord: 'strings', lead: 'horn', pad: 'strings',
+      dr: [{ K: 'x.........x.....', S: '........x.......', H: '', O: '' }, { K: 'x.....x...x.x...', S: '........x.....x.', H: 'x...x...x...x...', O: '' }],
+      bp: ['R---------------', 'R-------F-------'], cp: ['x---------------', 'x-------x-------'],
+      cells: ['x---', 'x---', 'x-x-', 'x--x', '....', 'x.x.', '----'] },
+    wave: { nm: '신스웨이브', bpm: [96, 124], modes: ['min', 'maj'], sw: 0, kit: 'wave', bass: 'saw8', chord: 'synth', lead: 'saw', pad: 'synth',
+      dr: [{ K: 'x.......x.......', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: '' }, { K: 'x...x...x...x...', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: '......x.......x.' }],
+      bp: ['R.R.R.R.R.R.R.R.', 'R.R.O.R.R.R.O.R.'], cp: ['x-------x-------', 'x-------x---x---'],
+      cells: ['x---', 'x-x-', 'x.x.', 'xxx-', '..x-', '....', 'x--x'] },
+    lofi: { nm: '로파이 힙합', bpm: [90, 100], modes: ['jazz', 'dor'], sw: 0.6, kit: 'lofi', bass: 'sine', chord: 'rhodes', lead: 'bell', pad: null,
+      dr: [{ K: 'x.....x...x.....', S: '....x.......x...', H: 'x.x.x.x.x.x.x.x.', O: '' }, { K: 'x.....x..xx.....', S: '....x.......x..x', H: 'x.x.x.x.x.x.xxx.', O: '' }],
+      bp: ['R-----R...F-----', 'R-----R.O.F---T-'], cp: ['x-------x-------', 'x-----x-x-------'],
+      cells: ['x.x.', '..x.', 'x---', '.x..', '....', 'x..x', 'xx..'] },
+  };
+  const GKEYS = Object.keys(GEN);
+  const SECN = { I: '인트로', A: '벌스', B: '후렴', D: '브레이크', O: '엔딩' };
+
+  /* ======================= song generation ======================= */
+  const songCache = {};
+  function song(seed, gk) {
+    const ck = seed + ':' + gk;
+    if (songCache[ck]) return songCache[ck];
+    const G = GEN[gk], r = rng(seed * 31 + GKEYS.indexOf(gk) * 977 + 5);
+    const bpm = G.bpm[0] + Math.floor(r() * (G.bpm[1] - G.bpm[0] + 1));
+    const beat = 60 / bpm, sd = beat / 4, barLen = beat * 4, key = Math.floor(r() * 12);
+    const mode = G.modes[Math.floor(r() * G.modes.length)], sc = SC[mode === 'jazz' ? 'maj' : mode], n = sc.length;
+    const bank = PROG[mode], pa = Math.floor(r() * bank.length); let pb = Math.floor(r() * bank.length); if (pb === pa) pb = (pb + 1) % bank.length;
+    const progA = bank[pa], progB = bank[pb], seventh = mode === 'jazz' || gk === 'lofi';
+    const deg = (o, d) => { const k = Math.floor(d / n), i = d - k * n; return o + k * 12 + sc[i]; };
+    const bassO = 33 + key + (key > 6 ? -12 : 0) + 12, chordO = 48 + key + (key > 6 ? -12 : 0), leadO = 60 + key + (key > 6 ? -12 : 0);
+    const tOf = (st) => { const b = Math.floor(st / 4), q = st % 4; let f = q * 0.25; if (G.sw) { if (q === 2) f = 0.5 + G.sw / 6; else if (q === 1) f = 0.25 + G.sw * 0.05; else if (q === 3) f = 0.75 + G.sw * 0.1; } return (b + f) * beat; };
+    const form = bpm >= 128 ? 'I4 A8 B8 A8 B8 D4 B8 O2' : 'I4 A8 B8 D4 B8 O2';
+    const bars = []; form.split(' ').forEach((w) => { const k = w[0], m = +w.slice(1); for (let j = 0; j < m; j++) bars.push({ k, j, m }); });
+    // seeded drum variation: a few extra kicks in the chorus
+    const drV = G.dr.map((d) => ({ K: d.K.split(''), S: d.S, H: d.H, O: d.O }));
+    for (let s = 2; s < 16; s += 2) if (drV[1].K[s] === '.' && r() < 0.1 && gk !== 'cine') drV[1].K[s] = 'x';
+    // lead motifs per section kind (2 bars = 8 beats), realised against each bar's chord
+    const motifs = {};
+    const mkMotif = (kind) => {
+      const rr = rng(seed * 7 + kind.charCodeAt(0) * 131), out = [];
+      const cells = kind === 'D' ? ['x---', 'x---', '----', 'x-x-'] : G.cells;
+      for (let b = 0; b < 8; b++) {
+        let c = cells[Math.floor(rr() * cells.length)];
+        if (kind === 'B' && c === '....' && rr() < 0.6) c = 'x-x-';
+        if (b === 7 && kind !== 'D') c = rr() < 0.5 ? 'x---' : 'x...';
+        for (let q = 0; q < 4; q++) if (c[q] === 'x') { let len = 1; while (q + len < 4 && c[q + len] === '-') len++; if (q + len === 4 && b < 7 && cells === G.cells && c === 'x---' && rr() < 0.4) len += 2; out.push({ st: b * 4 + q, len, dl: Math.round((rr() - 0.5) * 5) }); }
+      }
+      return out;
+    };
+    const ev = [], cand = [];   // ev: {t,i,k,n,d,v}; cand: chart candidates {t,src,p,imp,d}
+    const push = (t, i, k, nn, d, v) => ev.push({ t, i, k, n: nn, d, v: v == null ? 1 : v });
+    const cnd = (t, src, p, imp, d) => cand.push({ t, src, p, imp, d: d || 0 });
+    const bsOf = (st) => (st % 16 === 0 ? 4 : st % 4 === 0 ? 3 : st % 2 === 0 ? 2 : 1);
+    let leadDeg = n + 2;
+    bars.forEach((b, bi) => {
+      const t0 = bi * barLen, prog = b.k === 'B' ? progB : progA, cr = b.k === 'O' ? 0 : prog[b.j % 4];
+      const secB = b.k === 'B' ? 0.5 : b.k === 'I' ? -0.6 : 0, v = b.k === 'B' ? 1 : 0;
+      const triad = (o) => { const a = [deg(o, cr), deg(o, cr + 2), deg(o, cr + 4)]; if (seventh) a.push(deg(o, cr + 6)); return a; };
+      if (b.k === 'O') {
+        if (b.j === 0) {
+          push(t0, 0, 'K', null, 0.5); push(t0, 0, 'C', null, 1.6); push(t0, 1, 'b', [deg(bassO, 0)], barLen * 1.5);
+          push(t0, 2, 'c', triad(chordO), barLen * 1.6, 1); if (G.pad) push(t0, 4, 'p', triad(chordO), barLen * 1.8, 0.8);
+          push(t0, 3, 'l', [deg(leadO, n)], barLen * 1.5);
+          cnd(t0, 'chord', deg(chordO, 0), 7, 0); cnd(t0, 'lead', deg(leadO, n), 7, barLen * 1.2);
+        }
+        return;
+      }
+      // drums
+      const dp = b.k === 'B' ? drV[1] : drV[0], fill = (b.k === 'A' || b.k === 'B') && b.j === b.m - 1, build = b.k === 'D' && b.j === b.m - 1;
+      const crash = (b.k === 'B' || b.k === 'A') && b.j === 0;
+      if (b.k !== 'D' || build) for (let st = 0; st < 16; st++) {
+        const tt = t0 + tOf(st), bs = bsOf(st);
+        if (build) { if (st % 2 === 0 || st >= 8) { push(tt, 0, 'S', null, 0.12, 0.4 + st / 26); cnd(tt, 'snare', 0, (st % 4 === 0 ? 2.6 : 1.2) + st * 0.05); } continue; }
+        if (b.k === 'I') { if (st % 4 === 0 && (gk !== 'cine' || st % 8 === 0)) { push(tt, 0, 'K', null, 0.3, 0.8); cnd(tt, 'kick', 0, bs + 0.2); } if (dp.H[st] === 'x' && b.j >= 2) push(tt, 0, 'H', null, 0.05, 0.6); continue; }
+        if (fill && st >= 12) { push(tt, 0, gk === 'cine' ? 'T' : 'S', null, 0.15, 0.7 + (st - 12) * 0.1); cnd(tt, 'snare', 0, bs + 0.8 + secB); continue; }
+        if (dp.K[st] === 'x') { push(tt, 0, 'K', null, 0.3); cnd(tt, 'kick', 0, bs + 0.8 + secB); }
+        if (dp.S[st] === 'x') { push(tt, 0, 'S', null, 0.15); cnd(tt, 'snare', 0, bs + 1.1 + secB); }
+        if (crash && st === 0) { push(tt, 0, 'C', null, 1.4); cnd(tt, 'crash', 0, 5); }
+        else if (dp.O[st] === 'x') { push(tt, 0, 'O', null, 0.25, 0.8); cnd(tt, 'hat', 0, bs - 0.6 + secB); }
+        else if (dp.H[st] === 'x') { push(tt, 0, 'H', null, 0.04, st % 4 === 0 ? 0.9 : 0.6); cnd(tt, 'hat', 0, bs - 1.3 + secB); }
+      }
+      // pad
+      if (G.pad && (b.k === 'D' || b.k === 'B' || (b.k === 'I' && gk === 'cine') || gk === 'cine')) push(t0, 4, 'p', triad(chordO), barLen * 1.02, b.k === 'D' ? 1 : 0.7);
+      // bass
+      if (b.k !== 'D' && !(b.k === 'I' && b.j < 2)) {
+        const bp = b.k === 'I' ? 'R---------------' : G.bp[v];
+        for (let st = 0; st < 16; st++) {
+          const c = bp[st]; if (!'RFTOW'.includes(c)) continue;
+          let ds = 0; while (st + 1 + ds < 16 && bp[st + 1 + ds] === '-') ds++;
+          const d = (1 + ds) * sd;
+          let pt;
+          if (c === 'W') { const bt = st / 4; pt = bt === 0 ? deg(bassO, cr) : bt === 3 ? deg(bassO, (b.j % 4 === 3 ? prog[0] : prog[(b.j + 1) % 4]) + 1) - 1 : deg(bassO, cr + [0, 2, 4, 5][bt] + (r() < 0.3 ? 1 : 0)); }
+          else pt = c === 'R' ? deg(bassO, cr) : c === 'F' ? deg(bassO, cr + 4) : c === 'T' ? deg(bassO, cr + 2) : deg(bassO, cr) + 12;
+          push(t0 + tOf(st), 1, 'b', [pt], Math.max(d * 0.9, 0.1));
+          cnd(t0 + tOf(st), 'bass', pt, bsOf(st) + 0.2 + secB, d);
+        }
+      }
+      // chords
+      if (b.k !== 'I' || b.j >= 2) {
+        const cp = b.k === 'D' ? 'x---------------' : b.k === 'I' ? 'x-------x-------' : G.cp[v];
+        for (let st = 0; st < 16; st++) {
+          if (cp[st] !== 'x') continue;
+          let ds = 0; while (st + 1 + ds < 16 && cp[st + 1 + ds] === '-') ds++;
+          const d = (1 + ds) * sd, tr = triad(chordO);
+          push(t0 + tOf(st), 2, 'c', G.chord === 'power' ? [tr[0] - 12, tr[0] - 5, tr[0]] : tr, Math.max(d * 0.92, 0.12), b.k === 'D' ? 0.6 : 1);
+          if (b.k !== 'D') cnd(t0 + tOf(st), 'chord', tr[0] + 12, bsOf(st) + 0.4 + secB, d);
+        }
+      }
+      // lead melody
+      if (b.k === 'A' || b.k === 'B' || b.k === 'D') {
+        const mk = b.k + (Math.floor(b.j / 2) % 2 === 1 && b.k !== 'D' ? '2' : '');
+        const mo = motifs[mk] || (motifs[mk] = mkMotif(mk === 'A2' ? 'a' : mk === 'B2' ? 'b' : mk));
+        const half = b.j % 2;
+        if (b.k === 'A' && b.j === 0) leadDeg = n + 2;
+        for (const m of mo) {
+          if ((m.st >> 4) !== half) continue;
+          const st = m.st & 15;
+          let dg = leadDeg + m.dl;
+          if (st % 4 === 0) { let best = dg, bd = 99; for (let o = 0; o < 3; o++) for (const x of [0, 2, 4]) { const c = cr + x + o * n; if (Math.abs(c - dg) < bd) { bd = Math.abs(c - dg); best = c; } } dg = best; }
+          dg = clamp(dg, 2, 2 * n + 3); leadDeg = dg;
+          const pt = deg(leadO, dg), d = m.len * sd;
+          push(t0 + tOf(st), 3, 'l', [pt], d * 0.95, b.k === 'D' ? 0.8 : 1);
+          cnd(t0 + tOf(st), 'lead', pt, bsOf(st) + 1.6 + secB + (b.k === 'D' ? 1 : 0), d);
+        }
+      }
+    });
+    ev.sort((a, b) => a.t - b.t);
+    cand.sort((a, b) => a.t - b.t);
+    const len = bars.length * barLen + barLen * 0.6, lead = 4 * beat + 1.0;
+    const clk = [4, 3, 2, 1].map((k) => -k * beat);
+    const kicks = ev.filter((e) => e.i === 0 && e.k === 'K').map((e) => e.t);
+    return (songCache[ck] = { seed, gk, G, bpm, beat, barLen, key, mode, ev, cand, len, lead, clk, kicks, secAt: bars.map((b) => b.k), secT: bars.map((b, i) => (b.j === 0 ? [i * barLen, b.k] : null)).filter(Boolean), nBars: bars.length, charts: {} });
+  }
+
+  /* ======================= chart: musical events → playable notes =======================
+     event: {t, kind:'tap'|'hold'|'slide'|'flick', crit, pos(0 left … 1 right), d(s), pp([[dt,pos]…] slide contour), imp, src, fd}
+     note:  {t, x, w, ty(0 tap 1 hold 2 slide 3 flick), c(critical), len, p([[t,x]…] slide path), k([tick times]), fd(-1 ← 0 ↑ 1 →)} */
+  const DENS = [0, 0.55, 1.0, 1.55, 2.35];        // 목표 밀도: 박자당 음표 수
+  const MGAP = [0, 0.34, 0.19, 0.125, 0.085];     // 서로 다른 시각 음표 사이 최소 간격(초)
+  const CHMAX = [0, 1, 2, 2, 2];                  // 동시 음표 최대(두 손)
+  const HOLDB = [0, 1.5, 1, 0.75, 0.75];             // 긴 음표 최소 길이(박자)
+  const WBASE = [0, 5, 4.2, 3.5, 3];              // 기본 너비(칸)
+  const JACK = [0, 0.8, 0.45, 0.28, 0.19];        // 같은 손이 같은 자리를 다시 치기까지 최소 간격(초)
+  const ALTS = [0, 0.8, 0.62, 0.5, 0.42];         // 이보다 빠르게 이어지면 손을 번갈아
+  const SLV = [0, 3, 5, 8, 11];                   // 미끄럼 최대 속도(칸/초)
+  const TY = ['tap', 'hold', 'slide', 'flick'];
+  const ZONE = [[0, 7.5], [4.5, 12]];             // 왼손·오른손이 주로 쓰는 범위(칸)
+  function xAt(nt, t) {
+    const p = nt.p; if (!p) return nt.x;
+    if (t <= p[0][0]) return p[0][1];
+    for (let i = 1; i < p.length; i++) if (t <= p[i][0]) { const a = p[i - 1], b = p[i], u = (t - a[0]) / Math.max(1e-6, b[0] - a[0]), s = u * u * (3 - 2 * u); return a[1] + (b[1] - a[1]) * s; }
+    return p[p.length - 1][1];
+  }
+  const r4 = (v) => Math.round(v * 10000) / 10000, r1 = (v) => Math.round(v * 10) / 10;
+  function build(evs, o) {
+    const lvl = o.lvl, beat = o.beat, r = rng(o.seed >>> 0), gap = Math.max(MGAP[lvl], lvl === 4 ? beat / 4 - 0.002 : 0);
+    // 0) 난이도에 맞게 종류 낮추기
+    const E = [];
+    for (const e of evs) {
+      if (!(e.t >= o.t0 && e.t <= o.t1)) continue;
+      let k = e.kind;
+      if (lvl === 1 && k === 'slide') k = 'hold';
+      if (lvl === 1 && k === 'flick') k = 'tap';
+      if ((k === 'hold' || k === 'slide') && !(e.d >= HOLDB[lvl] * beat - 0.01)) k = 'tap';
+      E.push(Object.assign({}, e, { kind: k }));
+    }
+    const imps = E.map((e) => e.imp).sort((a, b) => a - b), chImp = imps[Math.min(imps.length - 1, Math.floor(imps.length * [0, 0.9, 0.8, 0.74, 0.62][lvl]))] || 0;   // 동시 음표는 중요한 소리만(어려움은 조금 덜)
+    // 1) 중요도 순으로 목표 밀도까지 고르기 (간격·동시 음표 제한)
+    const target = Math.round(Math.max(0, o.t1 - o.t0) / beat * DENS[lvl]);
+    E.sort((a, b) => b.imp - a.imp || a.t - b.t);
+    const acc = [], bins = new Map(), BIN = 0.05;
+    for (const c of E) {
+      if (acc.length >= target) break;
+      const b0 = Math.floor((c.t - gap) / BIN), b1 = Math.floor((c.t + gap) / BIN);
+      let ok = true, same = 0;
+      for (let b = b0; b <= b1 && ok; b++) {
+        const arr = bins.get(b); if (!arr) continue;
+        for (const a of arr) {
+          const d = Math.abs(a.t - c.t);
+          if (d < 0.004) { same++; if (same >= CHMAX[lvl] || (a.src === c.src && c.src !== 'chord') || c.imp < chImp) ok = false; }
+          else if (d < gap) ok = false;
+          if (!ok) break;
+        }
+      }
+      if (!ok) continue;
+      acc.push(c); const bk = Math.floor(c.t / BIN); if (!bins.has(bk)) bins.set(bk, []); bins.get(bk).push(c);
+    }
+    acc.sort((a, b) => a.t - b.t || b.imp - a.imp);
+    // 2) 두 손 모델로 자리 정하기: 교차 금지, 연타 제한, 번갈아 치기, 긴 음표 중엔 다른 손만
+    const H = [{ c: 3, x: 1.5, w: 3, until: -9, last: -9, note: null }, { c: 9, x: 7.5, w: 3, until: -9, last: -9, note: null }];
+    const out = []; let lastHand = 1, lastT = -9, lastCh = -9;
+    for (let i = 0; i < acc.length;) {
+      let j = i; while (j < acc.length && acc[j].t - acc[i].t < 0.004) j++;
+      let grp = acc.slice(i, j); i = j;
+      const t = grp[0].t, free = H.map((h) => h.until < t - 0.03), nFree = (free[0] ? 1 : 0) + (free[1] ? 1 : 0);
+      if (!nFree || (lvl === 1 && nFree < 2)) continue;
+      if (grp.length > nFree) grp = grp.sort((a, b) => b.imp - a.imp).slice(0, nFree);
+      if (grp.length === 2 && lvl === 3 && t - lastCh < beat * 1.99 && !grp.some((e) => e.src === 'crash')) grp = [grp.sort((a, b) => b.imp - a.imp)[0]];   // 어려움: 동시 치기가 박마다 몰리지 않게
+      if (grp.length === 2) lastCh = t;
+      if (grp.length === 2) {
+        let longs = grp.filter((e) => e.kind === 'hold' || e.kind === 'slide');
+        // 쉬움·보통: 긴 음표와 동시 탭은 안 둬요 → 긴 음표를 살리고 같이 오는 탭은 빼요(긴 음표가 사라지지 않게)
+        if (lvl <= 2 && longs.length) { grp = [longs.sort((a, b) => b.imp - a.imp)[0]]; longs = grp; }
+        if (grp.length === 2 && longs.length > (lvl >= 3 ? 1 : 0)) longs.sort((a, b) => a.imp - b.imp).slice(0, longs.length - (lvl >= 3 ? 1 : 0)).forEach((e) => { e.kind = 'tap'; });
+        if (grp.length === 2 && grp[0].kind === 'flick' && grp[1].kind === 'flick' && lvl < 4) grp[1].kind = 'tap';
+        grp.sort((a, b) => a.pos - b.pos);
+      }
+      let hands;
+      if (grp.length === 2) hands = [0, 1];
+      else if (nFree === 1) hands = [free[0] ? 0 : 1];
+      else if (t - lastT < ALTS[lvl]) hands = [1 - lastHand];
+      else hands = [grp[0].pos < 0.5 ? 0 : 1];
+      const placed = [];
+      for (let gi = 0; gi < grp.length; gi++) {
+        const e = grp[gi], hi = hands[gi], h = H[hi], oh = H[1 - hi], z = ZONE[hi];
+        const long = e.kind === 'hold' || e.kind === 'slide';
+        let w = clamp(Math.round(WBASE[lvl] + (e.crit ? 1 : 0) + (r() - 0.5) * 1.8), 2, 6);
+        if (e.kind === 'slide') w = Math.min(w, 4);
+        let lo = z[0], hiB = z[1];
+        // 다른 손: 지금 누르고 있거나 동시에 치는 음표와는 겹치지 않게, 방금 친 자리와는 엇갈리지 않게
+        let os = null, strict = false;
+        if (placed.length) { os = [placed[0].x, placed[0].w]; strict = true; }
+        else if (oh.until >= t - 0.03 && oh.note) { os = [xAt(oh.note, t), oh.note.w]; strict = true; }
+        else if (t - oh.last < 0.6) os = [oh.x, oh.w];
+        if (os) {
+          const oc = os[0] + os[1] / 2;
+          const sep = t - oh.last < 0.35 ? 2.5 : 1;   // 방금 다른 손이 친 자리와 거의 같은 곳이면 한 손 연타처럼 보여요 → 조금 떨어뜨려요
+          if (hi) lo = Math.max(lo, strict ? os[0] + os[1] : oc + sep - w / 2);
+          else hiB = Math.min(hiB, strict ? os[0] : oc - sep + w / 2);
+        }
+        if (hiB - lo < w) { w = Math.floor(hiB - lo); if (w < 2) continue; }
+        const u = hi ? clamp((e.pos - 0.25) / 0.75, 0, 1) : clamp(e.pos / 0.75, 0, 1);
+        let x = lo + u * (hiB - lo - w);
+        if (t - h.last < 0.3) { const mj = 2 + lvl; x = clamp(x, h.c - mj - w / 2, h.c + mj - w / 2); }
+        x = clamp(Math.round(x), Math.ceil(lo), Math.floor(hiB - w));
+        if (t - h.last < JACK[lvl] && Math.abs(x - h.x) < 1) {   // 같은 자리 연타 → 옆으로
+          const a = x + w <= hiB - w ? x + w : -1, b = x - w >= lo ? x - w : -1;
+          x = a >= 0 && (b < 0 || e.pos >= 0.5) ? a : b >= 0 ? b : x;
+          if (Math.abs(x - h.x) < 1 && w > 2) { w = 2; x = clamp(x + (x + 4 <= hiB ? 2 : -2), Math.ceil(lo), Math.floor(hiB - 2)); }
+        }
+        const nt = { t: r4(e.t), x, w, ty: TY.indexOf(e.kind), c: e.crit ? 1 : 0, len: 0 };
+        if (long) {
+          nt.len = r4(Math.min(e.d, (lvl === 1 ? 2 : 4) * beat, Math.max(HOLDB[lvl] * beat, e.d)));   // 쉬움은 긴 음표도 2박까지(그동안 다른 음표가 못 나와서 너무 비어 보여요)
+          const end = e.t + nt.len, k = [];
+          if (e.kind === 'slide') {
+            const pp = (e.pp && e.pp.length >= 2 ? e.pp : [[0, e.pos], [nt.len, 1 - e.pos]]).filter((q) => q[0] <= nt.len + 1e-3);
+            const pts = [[nt.t, x]]; let px = x, pt = 0;
+            for (let q = 1; q < pp.length; q++) {
+              const dt = pp[q][0] - pt; if (dt < 0.1) continue;
+              const uu = hi ? clamp((pp[q][1] - 0.25) / 0.75, 0, 1) : clamp(pp[q][1] / 0.75, 0, 1);
+              let nx = z[0] + uu * (z[1] - z[0] - w); nx = clamp(nx, px - SLV[lvl] * dt, px + SLV[lvl] * dt); nx = clamp(nx, 0, NC - w);
+              pts.push([r4(e.t + pp[q][0]), r1(nx)]); px = nx; pt = pp[q][0];
+            }
+            if (pts[pts.length - 1][0] < end - 0.05) pts.push([r4(end), pts[pts.length - 1][1]]);
+            let mn = 99, mx = -99; pts.forEach((q) => { mn = Math.min(mn, q[1]); mx = Math.max(mx, q[1]); });
+            if (mx - mn < 1.5) { const d = x + w / 2 < 6 ? 1 : -1, amt = Math.min(3, SLV[lvl] * nt.len * 0.5); pts[pts.length - 1][1] = r1(clamp(x + d * amt, 0, NC - w)); if (pts.length === 2) pts.splice(1, 0, [r4(e.t + nt.len * 0.5), r1(clamp(x + d * amt * 0.5, 0, NC - w))]); }
+            nt.p = pts;
+            let lt = e.t; for (let q = 1; q < pts.length - 1; q++) if (pts[q][0] - lt >= 0.12 && end - pts[q][0] >= 0.12) { k.push(pts[q][0]); lt = pts[q][0]; }
+          } else { for (let q = 1; e.t + q * beat < end - 0.12; q++) k.push(r4(e.t + q * beat)); }
+          k.push(r4(end)); nt.k = k;
+          h.until = end + 0.03; h.note = nt; h.last = end; h.x = nt.p ? nt.p[nt.p.length - 1][1] : x;
+        } else { h.last = e.t; h.x = x; h.note = null; }
+        if (nt.ty === 3) nt.fd = lvl <= 2 ? 0 : e.fd != null ? e.fd : r() < 0.5 ? 0 : hi ? 1 : -1;
+        h.w = w; h.c = h.x + w / 2;
+        out.push(nt); placed.push(nt); lastHand = hi; lastT = e.t;
+      }
+    }
+    out.sort((a, b) => a.t - b.t || a.x - b.x);
+    let J = 0; out.forEach((nt) => { J += (nt.c ? 2 : 1) + (nt.k ? nt.k.length : 0); });
+    return { notes: out, J };
+  }
+  const secAtT = (so, t) => { const a = so.secT; let k = a.length ? a[0][1] : 'A'; for (let i = 0; i < a.length && a[i][0] <= t + 1e-3; i++) k = a[i][1]; return k; };
+
+  /* generated songs: candidates (drums, bass, chords, lead) → events */
+  function songEvents(so, lvl) {
+    const r = rng(so.seed * 13 + lvl * 7 + 1), beat = so.beat, bar = so.barLen, cand = so.cand, out = [];
+    // pitch → position over a sliding two-bar window
+    const mel = (c) => c.src === 'lead' || c.src === 'bass' || c.src === 'chord';
+    const pos = new Float32Array(cand.length);
+    let w0 = -1e9, lo = 60, hi = 72;
+    for (let i = 0; i < cand.length; i++) {
+      const c = cand[i];
+      if (c.t >= w0 + bar * 2) { w0 = c.t; lo = 200; hi = -1; for (let j = i; j < cand.length && cand[j].t < c.t + bar * 2; j++) if (mel(cand[j])) { lo = Math.min(lo, cand[j].p); hi = Math.max(hi, cand[j].p); } if (hi <= lo) { lo = 60; hi = 72; } }
+      pos[i] = c.src === 'kick' ? 0.15 : c.src === 'snare' ? 0.85 : c.src === 'hat' || c.src === 'crash' ? 0.5 : clamp((c.p - lo) / (hi - lo), 0, 1);
+    }
+    // melody runs → slides (their notes become the mid ticks)
+    const used = new Uint8Array(cand.length);
+    if (lvl >= 2) {
+      let run = [];
+      const flush = () => {
+        if (run.length >= 3) {
+          const a = cand[run[0]], zc = cand[run[run.length - 1]], span = zc.t + zc.d * 0.8 - a.t, sec = secAtT(so, a.t);
+          const pr = (sec === 'B' ? 0.62 : sec === 'D' ? 0.7 : 0.4) * (lvl === 4 ? 0.75 : 1);
+          if (span >= beat * 1.5 && span <= beat * 6 && r() < pr) {
+            run.forEach((i) => { used[i] = 1; });
+            out.push({ t: a.t, kind: 'slide', d: span, imp: Math.max.apply(null, run.map((i) => cand[i].imp)) + 0.5, pos: pos[run[0]], pp: run.map((i) => [cand[i].t - a.t, pos[i]]), src: 'lead' });
+          }
+        }
+        run = [];
+      };
+      for (let i = 0; i < cand.length; i++) {
+        if (cand[i].src !== 'lead') continue;
+        if (run.length && cand[i].t - cand[run[run.length - 1]].t > beat * 0.8) flush();
+        run.push(i); if (run.length >= 7) flush();
+      }
+      flush();
+    }
+    let alt = 1;
+    for (let i = 0; i < cand.length; i++) {
+      if (used[i]) continue;
+      const c = cand[i], sec = secAtT(so, c.t), ev = { t: c.t, kind: 'tap', crit: 0, d: c.d, imp: c.imp, pos: pos[i], src: c.src };
+      if (mel(c) && c.d >= HOLDB[lvl] * beat - 0.01) { ev.kind = 'hold'; ev.imp += lvl === 1 ? 0.6 : 0.5; }
+      if (c.src === 'crash') { ev.crit = 1; ev.imp += 1; if (sec === 'B' && lvl >= 2) { ev.kind = 'flick'; ev.fd = 0; } }
+      else if (c.src === 'lead' && sec === 'B' && c.imp >= 6 && r() < 0.5) ev.crit = 1;
+      else if (ev.kind === 'tap' && lvl >= 2 && c.src === 'lead' && c.imp >= 5.4 && r() < 0.3) { ev.kind = 'flick'; ev.imp += 0.3; }
+      if (c.src === 'snare' && lvl >= 2) {   // the last fill hit before a crash → sideways flick
+        let nx = i + 1; while (nx < cand.length && cand[nx].t - c.t < 0.004) nx++;
+        let crash = false; for (let q = nx; q < cand.length && cand[q].t - c.t < beat * 0.6; q++) if (cand[q].src === 'crash') crash = true;
+        if (crash) { ev.kind = 'flick'; ev.fd = (alt = -alt); ev.imp += 1.5; }
+      }
+      out.push(ev);
+    }
+    // 긴 음표가 너무 적은 곡이면(짧은 음 위주 멜로디) 길게 끄는 음(멜로디·화음)을 골라 긴 음표로 — 마디당 HMIN개 정도는 나오게
+    { const HMIN = [0, 0.25, 0.45, 0.5, 0.5], nb = so.len / so.barLen, have = out.filter((e) => e.kind === 'hold' || e.kind === 'slide');
+      let need = Math.round(nb * HMIN[lvl]) - have.length;
+      if (need > 0) {
+        const busy = have.map((e) => [e.t, e.t + e.d]), cs = out.filter((e) => e.kind === 'tap' && !e.crit && (e.src === 'lead' || e.src === 'chord' || e.src === 'bass') && e.d >= beat * (e.src === 'lead' ? 0.5 : 0.9)).sort((a, b) => b.d - a.d || b.imp - a.imp);
+        for (const e of cs) {
+          if (need <= 0) break;
+          const d = Math.min(beat * 3, Math.max(e.d, HOLDB[lvl] * beat));
+          if (busy.some((q) => e.t < q[1] + beat * 0.9 && q[0] < e.t + d + beat * 0.9)) continue;
+          e.kind = 'hold'; e.d = d; e.imp += 2.5; busy.push([e.t, e.t + d]); need--;
+        }
+      } }
+    return out;
+  }
+  function chart(seed, gk, lvl) {
+    const so = song(seed, gk), ck = 'L' + lvl;
+    if (so.charts[ck]) return so.charts[ck];
+    return (so.charts[ck] = build(songEvents(so, lvl), { beat: so.beat, lvl, seed: seed * 3 + lvl, t0: 0, t1: so.len - so.barLen * 0.5 }));
+  }
+
+  /* ======================= 내 음악: 기기 안에서만 분석 (업로드 없음) =======================
+     1) 11025Hz 모노  2) 512점 FFT(홉 128 ≈ 11.6ms): 8대역 스펙트럼 플럭스·대역 에너지  3) 2048점 FFT(4프레임마다):
+     화성 합으로 주된 음높이(멜로디 윤곽)·크로마  4) 플럭스 봉우리 = 온셋  5) 전체 자기상관 빠르기 + 8초 창 국소 빠르기 곡선
+     (빠르기가 흔들려도 따라감)  6) 국소 빠르기를 쓰는 동적 계획법 박자 추적  7) 저음 온셋·화음 변화로 마디 첫 박
+     8) 마디별 음색·크로마 자기유사 행렬 → 경계(노벨티) → 인트로/벌스/후렴/브레이크/엔딩.  조각조각 돌려서 폰이 멈추지 않게. */
+  const ASR = 11025, AHOP = 128, AN = 512, AMAX = 300, AFPS = ASR / AHOP, PN = 2048, PSTEP = 4, PFPS = AFPS / PSTEP, AVER = 2;
+  const BAND_HZ = [30, 90, 180, 360, 720, 1440, 2880, 4200, 5500];
+  const FTS = {};
+  function fftT(n) {
+    if (FTS[n]) return FTS[n];
+    const lg = Math.log2(n), rev = new Uint32Array(n), cs = new Float32Array(n / 2), sn = new Float32Array(n / 2), win = new Float32Array(n);
+    for (let i = 0; i < n; i++) { let r = 0; for (let b = 0; b < lg; b++) r |= ((i >> b) & 1) << (lg - 1 - b); rev[i] = r; win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / n); }
+    for (let i = 0; i < n / 2; i++) { cs[i] = Math.cos(2 * Math.PI * i / n); sn[i] = -Math.sin(2 * Math.PI * i / n); }
+    return (FTS[n] = { rev, cs, sn, win });
+  }
+  function fft(re, im, T) {
+    const n = re.length;
+    for (let i = 0; i < n; i++) { const j = T.rev[i]; if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (let size = 2; size <= n; size <<= 1) {
+      const half = size >> 1, step = n / size;
+      for (let i = 0; i < n; i += size) for (let j = 0, k = 0; j < half; j++, k += step) {
+        const a = i + j, b = a + half, tr = re[b] * T.cs[k] - im[b] * T.sn[k], ti = re[b] * T.sn[k] + im[b] * T.cs[k];
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+      }
+    }
+  }
+  const parab = (a, b, c) => { const d = a - 2 * b + c; return d < 0 ? clamp(0.5 * (a - c) / d, -0.5, 0.5) : 0; };
+  const median = (arr) => { const s = Array.from(arr).sort((a, b) => a - b); return s.length ? s[s.length >> 1] : 0; };
+  /* ch: 채널 배열(Float32Array), sr: 표본율. step(ms)를 반복해 부르면 진행률(0~1)을 돌려주고, 끝나면 .res */
+  function analyzer(ch, sr) {
+    const L0 = ch[0].length, dur = Math.min(L0 / sr, AMAX), r = sr / ASR, M = Math.max(0, Math.floor(dur * ASR));
+    const x = new Float32Array(M), NB = BAND_HZ.length - 1, NF = Math.max(0, Math.floor((M - AN) / AHOP) + 1), NP = Math.ceil(NF / PSTEP);
+    const fl = new Float32Array(NF * NB), be = new Float32Array(NF * NB), rms = new Float32Array(NF), T = fftT(AN), T2 = fftT(PN);
+    const pf = new Uint8Array(NP), ps = new Uint8Array(NP), chroma = new Uint8Array(NP * 12);
+    const re = new Float32Array(AN), im = new Float32Array(AN); let prev = new Float32Array(AN / 2 + 1), cur = new Float32Array(AN / 2 + 1);
+    const re2 = new Float32Array(PN), im2 = new Float32Array(PN), mag2 = new Float32Array(PN / 2 + 1);
+    const bin = BAND_HZ.map((f) => Math.max(1, Math.round(f / ASR * AN)));
+    const pcOf = new Int8Array(PN / 2 + 1); for (let k = 0; k <= PN / 2; k++) { const f = k * ASR / PN; pcOf[k] = f < 60 || f > 1800 ? -1 : ((Math.round(69 + 12 * Math.log2(f / 440)) % 12) + 12) % 12; }
+    const PM0 = 55, PM1 = 91, sk0 = Math.round(100 / ASR * PN), sk1 = Math.round(3000 / ASR * PN);
+    let ph = 0, di = 0, fi = 0;
+    const A = { res: null, done: false, prog: 0, step };
+    function pitchFrame(f) {
+      const c = f * AHOP + AN / 2, o = c - PN / 2;
+      for (let i = 0; i < PN; i++) { const j = o + i; re2[i] = (j >= 0 && j < M ? x[j] : 0) * T2.win[i]; im2[i] = 0; }
+      fft(re2, im2, T2);
+      let mean = 0; for (let k = 0; k <= PN / 2; k++) { mag2[k] = Math.sqrt(re2[k] * re2[k] + im2[k] * im2[k]); if (k >= sk0 && k <= sk1) mean += mag2[k]; }
+      mean /= (sk1 - sk0 + 1);
+      const at = (fq) => { const b = fq / ASR * PN, i0 = Math.floor(b); return i0 + 1 > PN / 2 ? 0 : Math.max(mag2[i0], mag2[i0 + 1]); };
+      let best = 0, bm = 0;
+      for (let m = PM0; m <= PM1; m += 0.5) {
+        const f0 = 440 * Math.pow(2, (m - 69) / 12); let s = 0, wgt = 1;
+        for (let hh = 1; hh <= 6; hh++, wgt *= 0.82) s += wgt * at(f0 * hh);
+        if (s > best) { best = s; bm = m; }
+      }
+      const p = f / PSTEP | 0, sal = best / (mean * 4.1 + 1e-9);
+      pf[p] = Math.round(bm * 2); ps[p] = Math.min(255, Math.round(48 * Math.log2(1 + sal)));
+      const cr = new Float32Array(12); let cm = 1e-9;
+      for (let k = 1; k <= PN / 2; k++) if (pcOf[k] >= 0) cr[pcOf[k]] += mag2[k];
+      for (let q = 0; q < 12; q++) if (cr[q] > cm) cm = cr[q];
+      for (let q = 0; q < 12; q++) chroma[p * 12 + q] = Math.round(255 * cr[q] / cm);
+    }
+    function frame(f) {
+      const o = f * AHOP; let e = 0;
+      for (let i = 0; i < AN; i++) { const v = x[o + i]; e += v * v; re[i] = v * T.win[i]; im[i] = 0; }
+      rms[f] = Math.sqrt(e / AN);
+      fft(re, im, T);
+      for (let k = 0; k <= AN / 2; k++) cur[k] = Math.log(1 + 20 * Math.sqrt(re[k] * re[k] + im[k] * im[k]));
+      for (let b = 0; b < NB; b++) { let s = 0, en = 0; for (let k = bin[b]; k < bin[b + 1]; k++) { const d = cur[k] - prev[k]; if (d > 0) s += d; en += cur[k]; } fl[f * NB + b] = s; be[f * NB + b] = en / Math.max(1, bin[b + 1] - bin[b]); }
+      const t = prev; prev = cur; cur = t;
+      if (f % PSTEP === 0) pitchFrame(f);
+    }
+    function step(ms) {
+      const t0 = Date.now();
+      while (!A.done && Date.now() - t0 < ms) {
+        if (ph === 0) {
+          const end = Math.min(M, di + 4096), nc = ch.length;
+          for (; di < end; di++) {
+            const i0 = Math.floor(di * r), i1 = Math.min(L0, Math.max(i0 + 1, Math.floor((di + 1) * r))); let s = 0;
+            for (let c = 0; c < nc; c++) { const C = ch[c]; for (let i = i0; i < i1; i++) s += C[i]; }
+            x[di] = s / ((i1 - i0) * nc);
+          }
+          if (di >= M) ph = 1;
+        } else if (ph === 1) { const end = Math.min(NF, fi + 48); for (; fi < end; fi++) frame(fi); if (fi >= NF) ph = 2; }
+        else { A.res = post(); A.done = true; }
+      }
+      A.prog = A.done ? 1 : ph === 0 ? 0.2 * di / Math.max(1, M) : ph === 1 ? 0.2 + 0.72 * fi / Math.max(1, NF) : 0.95;
+      return A.prog;
+    }
+    function post() {
+      const tOf = (f) => (f * AHOP) / ASR + A_OFF;
+      const O = new Float32Array(NF), LO = new Float32Array(NF), mB = new Float64Array(NB);
+      const OT = new Float32Array(NF);
+      for (let f = 0; f < NF; f++) { let s = 0; for (let b = 0; b < NB; b++) { const v = fl[f * NB + b]; s += v; mB[b] += v; } O[f] = s; LO[f] = fl[f * NB] + fl[f * NB + 1]; }
+      for (let b = 0; b < NB; b++) mB[b] = mB[b] / Math.max(1, NF) + 1e-6;
+      for (let f = 0; f < NF; f++) { let s = 0; for (let b = 0; b < 5; b++) s += fl[f * NB + b] / mB[b]; OT[f] = s; }
+      let tm = 0, tsd = 0; for (let f = 0; f < NF; f++) tm += OT[f] / Math.max(1, NF); for (let f = 0; f < NF; f++) tsd += (OT[f] - tm) * (OT[f] - tm) / Math.max(1, NF); tsd = Math.sqrt(tsd) || 1;
+      const srt = Array.from(O).sort((a, b) => a - b), p95 = srt[Math.floor(srt.length * 0.95)] || 1e-6, p99 = srt[Math.floor(srt.length * 0.995)] || 1e-6;
+      let mean = 0; for (let f = 0; f < NF; f++) mean += O[f]; mean /= Math.max(1, NF);
+      let sd = 0; for (let f = 0; f < NF; f++) sd += (O[f] - mean) * (O[f] - mean); sd = Math.sqrt(sd / Math.max(1, NF)) || 1;
+      // 온셋
+      const W = 16, cs = new Float64Array(NF + 1); for (let f = 0; f < NF; f++) cs[f + 1] = cs[f] + O[f];
+      const on = []; let lastF = -99;
+      for (let f = 1; f < NF - 1; f++) {
+        const v = O[f]; if (v < 0.06 * p95) continue;
+        let mx = true; for (let k = -3; k <= 3 && mx; k++) if (k && f + k >= 0 && f + k < NF && O[f + k] > v) mx = false;
+        if (!mx) continue;
+        const a = Math.max(0, f - W), b = Math.min(NF, f + W + 1), lm = (cs[b] - cs[a]) / (b - a);
+        if (v < lm * 1.35 + 0.08 * sd) continue;
+        if (f - lastF < 4) continue;
+        lastF = f;
+        let tot = 0, cen = 0, lo = 0, hi = 0;
+        for (let bb = 0; bb < NB; bb++) { const w = fl[f * NB + bb] / mB[bb]; tot += w; cen += w * bb; if (bb <= 2) lo += w; if (bb >= 5) hi += w; }
+        tot = tot || 1;
+        on.push(tOf(f + parab(O[f - 1], v, O[f + 1])), Math.min(1.5, v / p99), cen / tot / (NB - 1), lo / tot, hi / tot);
+      }
+      // 빠르기: 전체 자기상관 × 120 BPM 근처 선호
+      const Oc = new Float32Array(NF); for (let f = 0; f < NF; f++) Oc[f] = 0.7 * (OT[f] - tm) / tsd + 0.3 * (O[f] - mean) / sd;
+      const Os = new Float32Array(NF); for (let f = 0; f < NF; f++) Os[f] = (Oc[Math.max(0, f - 2)] + 2 * Oc[Math.max(0, f - 1)] + 3 * Oc[f] + 2 * Oc[Math.min(NF - 1, f + 1)] + Oc[Math.min(NF - 1, f + 2)]) / 9;
+      const Lmin = Math.floor(60 * AFPS / 200), Lmax = Math.ceil(60 * AFPS / 60);
+      const acf = (s0, s1, L) => { let s = 0; for (let i = s0; i + L < s1; i++) s += Os[i] * Os[i + L]; return s / Math.max(1, s1 - s0 - L); };
+      const ac = new Float64Array(Lmax + 2); for (let Lg = Lmin - 1; Lg <= Lmax + 1; Lg++) ac[Lg] = acf(0, NF, Lg);
+      let bestL = 0, bestS = -1e9;
+      for (let Lg = Lmin; Lg <= Lmax; Lg++) {
+        if (!(ac[Lg] >= ac[Lg - 1] && ac[Lg] >= ac[Lg + 1])) continue;
+        const bpm = 60 * AFPS / Lg, pr = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.9, 2)), s = (ac[Lg] + 0.5 * (ac[2 * Lg] || 0)) * pr;
+        if (s > bestS) { bestS = s; bestL = Lg; }
+      }
+      // 두 배 빠르기 오인(8분 하이햇을 박으로) 막기: 빠르면 저음(킥) 주기가 두 배 간격에서 훨씬 뚜렷한지 봐요
+      if (bestL && 60 * AFPS / bestL > 150 && 2 * bestL + 1 <= NF / 3) {
+        let lm = 0; for (let f = 0; f < NF; f++) lm += LO[f]; lm /= Math.max(1, NF);
+        const la = (L) => { let v = 0; for (let k = -1; k <= 1; k++) { let q = 0; for (let i = 0; i + L + k < NF; i++) q += (LO[i] - lm) * (LO[i + L + k] - lm); v = Math.max(v, q); } return v; };
+        const a1 = la(bestL), a2 = la(2 * bestL);
+        if (a2 > 0 && a1 < 0.6 * a2) bestL = 2 * bestL;
+      }
+      const P0 = bestL ? bestL + parab(ac[bestL - 1], ac[bestL], ac[bestL + 1]) : 60 * AFPS / 120;
+      // 국소 빠르기 곡선 (8초 창, 2초 간격, P0의 ±14% 안) → 중앙값으로 다듬기
+      const WL = Math.round(AFPS * 5), WH = Math.round(AFPS * 2), loc = [];
+      for (let c0 = 0; c0 < NF; c0 += WH) {
+        const s0 = Math.max(0, c0 - WL / 2), s1 = Math.min(NF, c0 + WL / 2);
+        if (s1 - s0 < WL / 2) { loc.push(loc.length ? loc[loc.length - 1] : P0); continue; }
+        const l0 = Math.max(2, Math.floor(P0 * 0.86)), l1 = Math.ceil(P0 * 1.14), v = [];
+        for (let Lg = l0 - 1; Lg <= l1 + 1; Lg++) v.push(acf(s0, s1, Lg));
+        let bi = 1; for (let q = 1; q < v.length - 1; q++) if (v[q] > v[bi]) bi = q;
+        loc.push(bi > 0 && bi < v.length - 1 && v[bi] > 0 ? l0 - 1 + bi + parab(v[bi - 1], v[bi], v[bi + 1]) : P0);
+      }
+      const locS = loc.map((_, i) => median(loc.slice(Math.max(0, i - 2), i + 3)));
+      const Pf = new Float32Array(NF); for (let f = 0; f < NF; f++) { const u = f / WH, i0 = Math.min(locS.length - 1, Math.floor(u)), i1 = Math.min(locS.length - 1, i0 + 1), a = u - i0; Pf[f] = locS[i0] * (1 - a) + locS[i1] * a; }
+      // 박자 추적 (동적 계획법, 국소 빠르기 사용)
+      const sc = new Float32Array(NF), bk = new Int32Array(NF).fill(-1), A2 = 50;
+      for (let t = 0; t < NF; t++) {
+        const P = Pf[t]; let best = -1e9, bi = -1;
+        for (let tau = t - Math.round(2 * P); tau <= t - Math.round(P / 2); tau++) { if (tau < 0) continue; const lr = Math.log((t - tau) / P), v = sc[tau] - A2 * lr * lr; if (v > best) { best = v; bi = tau; } }
+        if (bi >= 0) { sc[t] = Oc[t] + best; bk[t] = bi; } else sc[t] = Oc[t];
+      }
+      let st = -1, sv = -1e9; for (let t = Math.max(0, NF - Math.ceil(Pf[NF - 1] || P0)); t < NF; t++) if (sc[t] > sv) { sv = sc[t]; st = t; }
+      const bf = []; for (let t = st; t >= 0; t = bk[t]) bf.push(t); bf.reverse();
+      const bl = bf.map((f) => { let d = 0; if (f > 0 && f < NF - 1 && O[f] >= O[f - 1] && O[f] >= O[f + 1]) d = parab(O[f - 1], O[f], O[f + 1]); return tOf(f + d); });
+      // 조용한 처음·끝도 박자를 이어 붙여요(국소 빠르기로)
+      while (bl.length && bl[0] - Pf[0] / AFPS > 0.15) bl.unshift(bl[0] - Pf[clamp(Math.round(bl[0] * AFPS), 0, NF - 1)] / AFPS);
+      while (bl.length && bl[bl.length - 1] + Pf[NF - 1] / AFPS < dur - 0.3) bl.push(bl[bl.length - 1] + Pf[clamp(Math.round(bl[bl.length - 1] * AFPS), 0, NF - 1)] / AFPS);
+      const beats = new Float32Array(bl);
+      const ivs = []; for (let i = 1; i < beats.length; i++) ivs.push(beats[i] - beats[i - 1]);
+      const bpm = ivs.length >= 8 ? 60 / median(ivs) : 60 * AFPS / P0;
+      const q5 = Math.max(1, Math.floor(ivs.length * 0.2)), bpmA = ivs.length >= 10 ? 60 / median(ivs.slice(0, q5)) : bpm, bpmB = ivs.length >= 10 ? 60 / median(ivs.slice(-q5)) : bpm;
+      // 마디 첫 박: 저음 온셋 + 화음 변화가 4박마다 가장 센 자리
+      const fOf = (t) => clamp(Math.round((t - A_OFF) * AFPS), 0, NF - 1), pOf = (t) => clamp(Math.round((t - A_OFF) * PFPS), 0, NP - 1);
+      const chromaAvg = (t0, t1) => { const v = new Float32Array(12), a = pOf(t0), b = Math.max(a + 1, pOf(t1)); for (let p = a; p < b; p++) for (let q = 0; q < 12; q++) v[q] += chroma[p * 12 + q]; return v; };
+      const cosv = (a, b) => { let s = 0, na = 0, nb = 0; for (let q = 0; q < a.length; q++) { s += a[q] * b[q]; na += a[q] * a[q]; nb += b[q] * b[q]; } return s / (Math.sqrt(na * nb) + 1e-9); };
+      let loM = 1e-9; for (let f = 0; f < NF; f++) loM += LO[f]; loM /= Math.max(1, NF);
+      const phs = [0, 0, 0, 0];
+      for (let i = 1; i + 1 < beats.length; i++) {
+        const f = fOf(beats[i]); let lo = 0; for (let k = -2; k <= 2; k++) lo = Math.max(lo, LO[clamp(f + k, 0, NF - 1)]);
+        const per = beats[i + 1] - beats[i], chg = 1 - cosv(chromaAvg(beats[i] - per, beats[i]), chromaAvg(beats[i], beats[i] + per));
+        phs[i % 4] += lo / loM + 4 * chg;
+      }
+      let db = 0; for (let k = 1; k < 4; k++) if (phs[k] > phs[db]) db = k;
+      // 구간: 마디별 특징(세기·대역 에너지·온셋 밀도·크로마) → 자기유사 행렬 → 체커보드 노벨티 → 경계 → 이름 붙이기
+      const barT = []; for (let i = db; i < beats.length; i += 4) barT.push(beats[i]);
+      if (barT.length && barT[barT.length - 1] < dur - 0.5) barT.push(Math.min(dur, barT[barT.length - 1] + 4 * 60 / bpm));
+      const NBr = Math.max(0, barT.length - 1), tim = [], chv = [], eng = [];
+      const onT = []; for (let i = 0; i < on.length; i += 5) if (on[i + 1] > 0.25) onT.push(on[i]);
+      for (let j = 0; j < NBr; j++) {
+        const a = fOf(barT[j]), b = Math.max(a + 1, fOf(barT[j + 1])), v = new Float32Array(NB + 2); let e = 0;
+        for (let f = a; f < b; f++) { e += rms[f]; for (let q = 0; q < NB; q++) v[q] += be[f * NB + q]; }
+        for (let q = 0; q < NB; q++) v[q] /= (b - a);
+        e /= (b - a); eng.push(e); v[NB] = Math.log(1e-4 + e) * 2;
+        let n = 0; for (const t of onT) if (t >= barT[j] && t < barT[j + 1]) n++; v[NB + 1] = n / 4;
+        tim.push(v); chv.push(chromaAvg(barT[j], barT[j + 1]));
+      }
+      const dim = NB + 2, mu = new Float32Array(dim), sg = new Float32Array(dim);
+      tim.forEach((v) => { for (let q = 0; q < dim; q++) mu[q] += v[q] / Math.max(1, NBr); });
+      tim.forEach((v) => { for (let q = 0; q < dim; q++) sg[q] += (v[q] - mu[q]) * (v[q] - mu[q]) / Math.max(1, NBr); });
+      tim.forEach((v) => { for (let q = 0; q < dim; q++) v[q] = (v[q] - mu[q]) / (Math.sqrt(sg[q]) + 1e-6); });
+      const S = (i, j) => { let d = 0; for (let q = 0; q < dim; q++) { const z = tim[i][q] - tim[j][q]; d += z * z; } return 0.4 * cosv(chv[i], chv[j]) + 0.6 * Math.exp(-d / (2 * dim) * 1.5); };
+      const K = 4, nov = new Float32Array(NBr);
+      for (let i = 1; i < NBr; i++) {
+        let s = 0, wsum = 0;
+        for (let a = -K; a < K; a++) for (let b = -K; b < K; b++) {
+          const ia = i + a, ib = i + b; if (ia < 0 || ib < 0 || ia >= NBr || ib >= NBr) continue;
+          const g = Math.exp(-((a + 0.5) * (a + 0.5) + (b + 0.5) * (b + 0.5)) / (2 * (K * 0.6) * (K * 0.6))), sgn = (a < 0) === (b < 0) ? 1 : -1;
+          s += sgn * g * S(ia, ib); wsum += g;
+        }
+        nov[i] = s / (wsum || 1);
+      }
+      let nm = 0, ns = 0; for (let i = 1; i < NBr; i++) nm += nov[i] / Math.max(1, NBr - 1); for (let i = 1; i < NBr; i++) ns += (nov[i] - nm) * (nov[i] - nm) / Math.max(1, NBr - 1); ns = Math.sqrt(ns);
+      const candB = []; for (let i = 2; i < NBr - 1; i++) { let mx = true; for (let k = -2; k <= 2; k++) if (k && i + k > 0 && i + k < NBr && nov[i + k] > nov[i]) mx = false; if (mx && nov[i] > nm + 0.4 * ns) candB.push([i, nov[i] * (i % 4 === 0 ? 1.15 : i % 2 === 0 ? 1 : 0.9)]); }
+      candB.sort((a, b) => b[1] - a[1]);
+      const bnd = [0]; for (const [i] of candB) if (bnd.every((b) => Math.abs(b - i) >= 4) && i <= NBr - 3) bnd.push(i); bnd.sort((a, b) => a - b); bnd.push(NBr);
+      const segs = []; for (let s = 0; s + 1 < bnd.length; s++) { const a = bnd[s], b = bnd[s + 1]; let e = 0, dn = 0; for (let j = a; j < b; j++) { e += eng[j]; dn += tim[j][NB + 1]; } segs.push({ a, b, e: e / (b - a), dn: dn / (b - a) }); }
+      const es = segs.map((g) => g.e).sort((a, b) => a - b), eMed = es[es.length >> 1] || 0, eHi = es[Math.floor(es.length * 0.7)] || 0, eMax = es[es.length - 1] || 1;
+      segs.forEach((g, s) => {
+        let rep = 0; segs.forEach((h2, s2) => { if (Math.abs(s2 - s) < 2) return; let sm = 0, n = 0; for (let j = g.a; j < g.b; j++) for (let k = h2.a; k < h2.b; k++) { sm += S(j, k); n++; } if (n) rep = Math.max(rep, sm / n); });
+        g.rep = rep;
+        if (s === 0 && segs.length > 2 && g.e < eMed * 0.95) g.k = 'I';
+        else if (s === segs.length - 1 && segs.length > 2 && g.e < eMed * 0.9) g.k = 'O';
+        else if (g.e >= eHi * 0.98 && g.e > eMed * 1.08 && g.e > eMax * 0.75) g.k = 'B';
+        else if (g.e < eMed * 0.62 || (g.dn < 0.35 && g.e < eMed)) g.k = 'D';
+        else g.k = 'A';
+      });
+      let sec = ''; segs.forEach((g) => { sec += g.k.repeat(g.b - g.a); });
+      let rmx = 1e-6; for (let f = 0; f < NF; f++) if (rms[f] > rmx) rmx = rms[f];
+      const rq = new Uint8Array(NF); for (let f = 0; f < NF; f++) rq[f] = Math.round(255 * rms[f] / rmx);
+      return { v: AVER, dur, bpm, bpmA, bpmB, beats, db, bars: new Float32Array(barT), sec, on: new Float32Array(on), rms: rq, fps: AFPS, pf, ps, pfps: PFPS };
+    }
+    return A;
+  }
+  let A_OFF = 0.032;   // 플럭스 봉우리 → 실제 소리 시작 보정(초)
+
+  /* 분석 → 음악 사건: 드럼 온셋 → 탭(킥 왼쪽·스네어 오른쪽), 길게 이어지는 음 → 긴 음표, 멜로디가 움직이며 이어지면 미끄럼(윤곽대로),
+     센 강세(마디 첫 박·구간 시작) → 크리티컬·튕기기. 이후 build()가 두 손 배치·밀도·간격을 맞춰요 */
+  function customEvents(an, lvl) {
+    const per = 60 / an.bpm, beats = an.beats, B = beats.length, on = an.on, NO = on.length / 5, end = an.dur - 0.25;
+    const r = rng(Math.round(an.bpm * 100) + B * 7 + lvl), db = an.db || 0, bars = an.bars || [], secS = an.sec || '';
+    const grid = [];   // 16분 격자 [t, 등급: 3 마디 첫 박 · 2 박 · 1 8분 · 0 16분]
+    for (let i = 0; i < B; i++) { const b0 = beats[i], b1 = i + 1 < B ? beats[i + 1] : b0 + per; for (let q = 0; q < 4; q++) grid.push([b0 + (b1 - b0) * q / 4, q === 0 ? (((i - db) % 4 + 4) % 4 === 0 ? 3 : 2) : q === 2 ? 1 : 0]); grid.push([b0 + (b1 - b0) / 3, 0], [b0 + (b1 - b0) * 2 / 3, 0]); }   // 셋잇단(스윙) 자리도
+    grid.sort((a, b) => a[0] - b[0]);
+    const barIx = (t) => { let lo = 0, hi = bars.length - 1; if (!bars.length || t < bars[0]) return -1; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (bars[m] <= t) lo = m; else hi = m - 1; } return lo; };
+    const secAt = (t) => { const j = barIx(t); return j < 0 ? (secS[0] || 'A') : secS[Math.min(j, secS.length - 1)] || 'A'; };
+    const secStart = (t) => { const j = barIx(t); if (j < 0) return false; return Math.abs(bars[j] - t) < 0.06 && (j === 0 || secS[j] !== secS[j - 1]); };
+    const pfps = an.pfps || AFPS / 4, NP = an.pf ? an.pf.length : 0;
+    const pAt = (t) => { const p = clamp(Math.round((t - A_OFF) * pfps), 0, NP - 1); return NP ? [an.pf[p] / 2, an.ps[p]] : [0, 0]; };
+    const rq = an.rms, fps = an.fps, rAt = (t) => rq[clamp(Math.round((t - A_OFF) * fps), 0, rq.length - 1)] || 0;
+    const sv = []; for (let i = 0; i < NO; i++) sv.push(on[i * 5 + 1]); sv.sort((a, b) => a - b);
+    const s90 = sv[Math.floor(sv.length * 0.9)] || 1, s97 = sv[Math.floor(sv.length * 0.97)] || 1;
+    // 음높이 위치: 앞뒤 8초 창의 음높이 범위로 정규화
+    const psS = NP ? Array.from(an.ps).sort((a, b) => a - b) : [0], tonalTh = clamp(psS[Math.floor(psS.length * 0.35)], 70, 150);   // 이 곡에서 음높이가 또렷한 편
+    const pitchPos = (t, m) => { let lo = 200, hi = 0; for (let u = t - 8; u <= t + 8; u += 0.25) { const q = pAt(u); if (q[1] >= tonalTh) { lo = Math.min(lo, q[0]); hi = Math.max(hi, q[0]); } } return hi - lo >= 3 ? clamp((m - lo) / (hi - lo), 0, 1) : 0.5; };
+    const RB = [0.2, 0.8, 1.5, 1.9], SB = { I: -0.5, A: 0, B: 0.6, D: -0.35, O: -0.4 };
+    const out = [], snapW = Math.min(0.06, per / 4 * 0.45); let g = 0, alt = 1;
+    for (let i = 0; i < NO; i++) {
+      let t = on[i * 5]; const s = on[i * 5 + 1], cen = on[i * 5 + 2], lo = on[i * 5 + 3], hi = on[i * 5 + 4];
+      if (t < 0.3 || t > end) continue;
+      while (g + 1 < grid.length && Math.abs(grid[g + 1][0] - t) <= Math.abs(grid[g][0] - t)) g++;
+      let rk = -1; if (grid.length && Math.abs(grid[g][0] - t) < snapW) { t = grid[g][0]; rk = grid[g][1]; }
+      if (rk < 0) continue;   // 16분 격자에서 벗어난 온셋(장식음·잡음·박자 추적 오차)은 음표로 안 써요
+      const sec = secAt(t), pt = pAt(t + 0.06), tonal = pt[1] >= tonalTh;
+      // 악기 종류 추정
+      let src = tonal && lo < 0.55 && hi < 0.5 ? 'tone' : lo >= 0.45 ? 'kick' : hi >= 0.42 && s < 0.45 ? 'hat' : 'snare';
+      if (src === 'tone' && s < s90 && rAt(t + 0.04) < rAt(t - 0.05) * 1.04) continue;   // 소리가 커지지 않는 음 온셋(음이 끝나며 생긴 잡음·잔향)은 빼요
+      const ev = { t, kind: 'tap', crit: 0, d: 0, imp: s * 3 + (rk >= 0 ? RB[rk] : -0.6) + (SB[sec] || 0), pos: 0.5, src };
+      if (src === 'kick') ev.pos = 0.12 + 0.2 * cen; else if (src === 'snare') ev.pos = 0.72 + 0.25 * cen; else if (src === 'hat') ev.pos = 0.45 + 0.2 * cen;
+      if (tonal) {
+        ev.pos = pitchPos(t, pt[0]);
+        // 이어지는 음: 음높이가 또렷하고 소리가 이어지는 동안
+        const r0 = Math.min(rAt(t + 0.05), rAt(t + 0.14)); let u = t + 0.05, mn = pt[0], mx = pt[0], moves = 0, rev = 0, dir = 0, jump = 0, dip = 0, lastM = pt[0], pp = [[0, ev.pos]];
+        const pm = (v) => { const a = pAt(v - 1 / pfps)[0], b = pAt(v)[0], c = pAt(v + 1 / pfps)[0]; return Math.max(Math.min(a, b), Math.min(Math.max(a, b), c)); };   // 3점 중앙값
+        const nextOn = i + 1 < NO ? on[(i + 1) * 5] : end;
+        const medP = (a, b) => { const v = []; for (let w = a; w <= b; w += 1 / pfps) { const q = pAt(w); if (q[1] >= tonalTh * 0.7) v.push(q[0]); } return v.length >= 2 ? median(v) : 0; };
+        let ni = i + 1;
+        hl: for (; u < Math.min(end, t + 4 * per); u += 1 / pfps) {
+          // 사이에 새 온셋이 있고 그 앞뒤로 음높이가 바뀌면 → 다음 음으로 넘어간 것(긴 음 끝)
+          while (ni < NO && on[ni * 5] <= u) { const tn = on[ni * 5], qb = medP(tn - 0.13, tn - 0.02), qa = medP(tn + 0.04, tn + 0.15); ni++; if (tn > t + 0.1 && qb && qa && Math.abs(qa - qb) >= 1) { u = tn - 0.03; break hl; } }
+          const q = pAt(u); if (q[1] < tonalTh * 0.7 || rAt(u) < r0 * 0.35) { if ((dip += 1 / pfps) > 0.13) { u -= dip; break; } continue; } dip = 0;
+          const m = pm(u);
+          if (Math.abs(m - lastM) > 5) { if ((jump += 1 / pfps) > 0.3) { u -= jump; break; } continue; }   // 큰 도약은 다른 악기가 끼어든 것 → 건너뜀
+          jump = 0;
+          if (Math.abs(m - lastM) >= 1) { const dd = Math.sign(m - lastM); if (dir && dd !== dir) rev++; dir = dd; moves++; lastM = m; if (u - t - pp[pp.length - 1][0] >= per * 0.45) pp.push([u - t, pitchPos(u, m)]); }
+          mn = Math.min(mn, m); mx = Math.max(mx, m);
+          if (moves === 0 && u > nextOn + 0.02 && on[(i + 1) * 5 + 1] > s * 0.9) break;   // 같은 음에 새로 센 온셋 → 끊김
+        }
+        let d = u - t;
+        { // 끝을 8분 격자에 맞춰요(조금 이른 쪽 선호 → 떼기 편하게)
+          let bg = -1, bd = 0.13; for (let q = g; q < grid.length && grid[q][0] < t + d + 0.15; q++) if (grid[q][1] >= 1 && grid[q][0] > t) { const dd = Math.abs(grid[q][0] - (t + d)) + (grid[q][0] > t + d ? 0.03 : 0); if (dd < bd) { bd = dd; bg = q; } }
+          if (bg >= 0) d = grid[bg][0] - t;
+        }
+        if (d >= HOLDB[lvl] * per - 0.01) { ev.d = Math.round(d * 1000) / 1000; ev.kind = moves >= 2 && mx - mn >= 2 && rev <= Math.max(1, moves * 0.34) && d >= 1.5 * per ? 'slide' : 'hold'; if (ev.kind === 'slide') { pp.push([d, pitchPos(t + d, lastM)]); ev.pp = pp; } ev.imp += 0.5; }
+        ev.src = 'tone';
+      }
+      // 강세 → 크리티컬 / 튕기기
+      const accent = s >= s90 && rk >= 2;
+      if ((accent && rk === 3) || (secStart(t) && s >= s90 * 0.6 && sec !== 'D')) { ev.crit = 1; ev.imp += 1; }
+      if (ev.kind === 'tap' && lvl >= 2 && (secStart(t) && sec === 'B' && s >= s90 * 0.8 || s >= s97 && rk >= 1 && r() < 0.35)) { ev.kind = 'flick'; ev.fd = secStart(t) ? 0 : (alt = -alt); ev.imp += 0.8; }
+      if (lvl === 1 && rk < 1) continue;
+      if (lvl === 2 && rk < 0 && s < 0.6) continue;
+      out.push(ev);
+    }
+    // 긴 음표가 너무 많으면(멜로디가 계속 이어지는 곡) 길고 중요한 것만 남겨요: 박자당 HR개까지, 바로 이어 붙는 긴 음표는 덜
+    { const HR = [0, 0.1, 0.14, 0.17, 0.2], lg = out.filter((e) => e.kind === 'hold' || e.kind === 'slide').sort((a, b) => b.d * (1 + 0.15 * b.imp) - a.d * (1 + 0.15 * a.imp));
+      const cap = Math.max(2, Math.round(B * HR[lvl])), kept = [];
+      for (const e of lg) { if (kept.length < cap && !kept.some((k) => e.t < k.t + k.d + per * 0.9 && k.t < e.t + e.d + per * 0.9)) kept.push(e); else { e.kind = 'tap'; e.d = 0; delete e.pp; } } }
+    // 긴 음 안에서 음높이만 바뀌는 자리(미끄럼 중간 등)는 새 음표로 덜 뽑히게
+    out.sort((a, b) => a.t - b.t);
+    for (let i = 0; i < out.length; i++) { const e = out[i]; if (e.kind !== 'hold' && e.kind !== 'slide') continue; for (let j = i + 1; j < out.length && out[j].t < e.t + e.d - 0.05; j++) if (out[j].src === 'tone') out[j].imp -= 1.6; }
+    // 온셋이 없는 박자(길게 끄는 소리)도 약하게 후보로
+    const ct = out.map((o) => o.t).sort((a, b) => a - b); let q2 = 0;
+    for (let i = 0; i < B; i++) {
+      const t = beats[i]; if (t < 0.3 || t > end) continue;
+      while (q2 + 1 < ct.length && ct[q2 + 1] < t) q2++;
+      // 박에 온셋이 없을 때: 앞뒤 ¾박 안에 다른 음표 후보가 없고 소리가 실제로 나고 있을 때만(조용한 곳·꽉 찬 곳엔 안 넣어요)
+      const near = Math.min(Math.abs((ct[q2] == null ? -99 : ct[q2]) - t), Math.abs((ct[q2 + 1] == null ? -99 : ct[q2 + 1]) - t));
+      if (near >= per * 0.75 && rAt(t + 0.03) >= 60 && ((i - db) % 2 + 2) % 2 === 0) out.push({ t, kind: 'tap', crit: 0, d: 0, imp: 0.6 + (SB[secAt(t)] || 0), pos: 0.5, src: 'beat' });
+    }
+    return out;
+  }
+  function customChart(an, lvl) {
+    const per = 60 / an.bpm, B = an.beats.length;
+    return build(customEvents(an, lvl), { beat: per, lvl, seed: Math.round(an.bpm * 1000) + B + lvl * 17, t0: B ? Math.max(0.3, an.beats[0] - 0.05) : 0.3, t1: Math.min(an.dur - 0.25, B ? an.beats[B - 1] + 0.05 : an.dur) });
+  }
+
+  /* ----- 내 음악: 지금 고른 곡(이 폰 메모리에만) + 마지막 곡 분석 캐시(IndexedDB) ----- */
+  const CUS = { st: 'none', h: '', name: '', an: null, buf: null, prog: 0, err: '', charts: {}, so: null, last: null, subs: new Set(), job: 0 };
+  const cusNotify = () => CUS.subs.forEach((f) => { try { f(); } catch (e) {} });
+  const cusReady = (s) => !!(s && s.cu && CUS.st === 'ok' && CUS.an && (!s.ch || s.ch === CUS.h));
+  function cusSong() {
+  function secRuns(an) { const out = [], b = an.bars || [], s = an.sec || ""; for (let j = 0; j < s.length && j < b.length; j++) if (!j || s[j] !== s[j - 1]) out.push([j ? b[j] : 0, s[j]]); return out.length ? out : [[0, "A"]]; }
+    if (CUS.so) return CUS.so;
+    if (CUS.pack) { const pk = CUS.pack, beat = 60 / pk.bpm, clk = [4, 3, 2, 1].map((k) => pk.offset - k * beat), len = Math.min(CUS.buf.duration, pk.dur || CUS.buf.duration) + 0.3, kicks = [];
+      for (let t = pk.offset; t < len; t += beat) kicks.push(t);
+      return (CUS.so = { seed: 0, gk: 'cu', G: { nm: pk.title }, bpm: pk.bpm, beat, barLen: beat * 4, key: 0, mode: '', ev: [], cand: [], len, lead: Math.max(1.2, -clk[0] + 0.8), clk, kicks, secAt: [], secT: pk.sec, nBars: Math.ceil(len / (beat * 4)), charts: {}, cu: 1, pk: 1 }); }
+    const an = CUS.an, beat = 60 / an.bpm, b0 = an.beats.length ? an.beats[0] : 0;
+    const clk = [4, 3, 2, 1].map((k) => b0 - k * beat), len = Math.min(an.dur, AMAX) + 0.3;
+    return (CUS.so = { seed: 0, gk: 'cu', G: { nm: CUS.name || '내 음악' }, bpm: Math.round(an.bpm * 10) / 10, beat, barLen: beat * 4, key: 0, mode: '', ev: [], cand: [],
+      len, lead: Math.max(1.2, -clk[0] + 0.8), clk, kicks: Array.from(an.beats), secAt: [], secT: secRuns(an), nBars: Math.ceil(len / (beat * 4)), charts: {}, cu: 1 });
+  }
+  function cusChart(lvl) { const k = 'L' + lvl; return CUS.charts[k] || (CUS.charts[k] = CUS.pack ? packChart(CUS.pack, lvl) : customChart(CUS.an, lvl)); }
+  function hashBytes(ab) {   // FNV-1a (큰 파일은 띄엄띄엄) + 길이
+    const u = new Uint8Array(ab), n = u.length, st = n > 8e6 ? Math.ceil(n / 4e6) : 1; let h = 0x811c9dc5;
+    for (let i = 0; i < n; i += st) { h ^= u[i]; h = Math.imul(h, 16777619); }
+    return ((h >>> 0).toString(36) + (n % 46656).toString(36)).slice(0, 10);
+  }
+  const IDB = {
+    open() { return new Promise((res, rej) => { try { const rq = indexedDB.open('lounge-rhythm', 1); rq.onupgradeneeded = () => rq.result.createObjectStore('c'); rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); } catch (e) { rej(e); } }); },
+    async get(k) { try { const db = await this.open(); return await new Promise((res) => { const rq = db.transaction('c').objectStore('c').get(k); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => res(null); }); } catch (e) { return null; } },
+    async del(k) { try { const db = await this.open(); await new Promise((res) => { const tx = db.transaction('c', 'readwrite'); tx.objectStore('c').delete(k); tx.oncomplete = res; tx.onerror = res; tx.onabort = res; }); } catch (e) {} },
+    async put(k, v) { try { const db = await this.open(); await new Promise((res) => { const tx = db.transaction('c', 'readwrite'); tx.objectStore('c').put(v, k); tx.oncomplete = res; tx.onerror = res; tx.onabort = res; }); } catch (e) {} },
+  };
+  const KEEP_BYTES = 12e6;   // 이보다 작은 파일은 원본도 이 폰에 남겨 「지난 곡」으로 바로 다시
+  function decodeBytes(ab) {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) return Promise.reject(new Error('no audio'));
+    const oc = new OAC(2, 44100, 44100);
+    return new Promise((res, rej) => { const p = oc.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); }).then((buf) => {
+      if (buf.duration <= AMAX + 1) return buf;
+      const n = Math.floor((AMAX + 1) * buf.sampleRate), b2 = oc.createBuffer(buf.numberOfChannels, n, buf.sampleRate);   // 5분 넘는 곡은 앞 5분만
+      for (let c = 0; c < buf.numberOfChannels; c++) b2.getChannelData(c).set(buf.getChannelData(c).subarray(0, n));
+      return b2;
+    });
+  }
+  async function cusLoad(ab, name) {
+    const job = ++CUS.job;
+    Object.assign(CUS, { pack: null, st: 'dec', name: String(name || '내 음악').replace(/\.[a-z0-9]{2,5}$/i, '').slice(0, 30), err: '', prog: 0, an: null, buf: null, charts: {}, so: null });
+    cusNotify();
+    try {
+      const h = hashBytes(ab), keep = ab.byteLength <= KEEP_BYTES ? ab.slice(0) : null;
+      const buf = await decodeBytes(ab);
+      if (job !== CUS.job) return;
+      CUS.h = h; CUS.buf = buf;
+      if (buf.duration < 15) throw new Error('short');
+      const old = await IDB.get('last');
+      let an = old && old.h === h && old.an && old.an.v === AVER ? old.an : null;
+      if (!an) {
+        CUS.st = 'ana'; cusNotify();
+        const chs = []; for (let c = 0; c < Math.min(2, buf.numberOfChannels); c++) chs.push(buf.getChannelData(c));
+        const A = analyzer(chs, buf.sampleRate);
+        await new Promise((res) => { const pump = () => { if (job !== CUS.job) return res(); A.step(14); CUS.prog = A.prog; cusNotify(); if (A.done) res(); else setTimeout(pump, 0); }; pump(); });
+        if (job !== CUS.job) return;
+        an = A.res;
+        if (!an || an.beats.length < 8 || !(an.bpm > 40)) throw new Error('beat');
+      }
+      CUS.an = an; CUS.st = 'ok'; CUS.prog = 1;
+      const rec = { h, name: CUS.name, an, bytes: keep || (old && old.h === h ? old.bytes : null), t: Date.now() };
+      IDB.put('last', rec); CUS.last = { h, name: CUS.name, has: !!rec.bytes };
+    } catch (e) {
+      if (job !== CUS.job) return;
+      CUS.st = 'err'; CUS.err = e && e.message === 'short' ? '15초보다 짧은 곡은 못 써요.' : e && e.message === 'beat' ? '박자를 찾지 못했어요. 박자가 뚜렷한 곡으로 골라 주세요.' : '이 파일은 열 수 없어요(mp3·m4a·wav·ogg 등 소리 파일만).';
+    }
+    cusNotify();
+  }
+  async function cusPeekLast() {
+    if (CUS.last !== null) return;
+    CUS.last = false;
+    const r = await IDB.get('last');
+    if (r && r.h) { CUS.last = { h: r.h, name: r.name || '지난 곡', has: !!r.bytes }; cusNotify(); }
+  }
+  async function cusLoadLast() { const r = await IDB.get('last'); if (r && r.bytes) cusLoad(r.bytes.slice(0), r.name); }
+
+  /* ======================= 곡 묶음(.hlsong): 음원 + 손으로 만든 채보 =======================
+     이 폰에서 「📦 곡 묶음 가져오기」로 고른 파일을 IndexedDB(lounge-rhythm)에 넣어 두고 「내 음악」 칸에서 기본 곡처럼 골라요.
+     파일은 UTF-8 JSON 한 덩어리:
+       { "fmt": "hanpan-rhythm-pack", "v": 1, "title": "곡 이름", "artist": "(선택)", "bpm": 134, "offset": 0.33,  ← 첫 박 시각(초)
+         "dur": 199.6 (선택, 곡 끝·초), "sec": [[0,"I"],[20.03,"A"],[55.85,"B"],…] (선택, 구간 시작 초 + I/A/B/D/O),
+         "mime": "audio/mpeg", "audio": "<음원 파일 전체 base64>",
+         "charts": { "easy": [노트…], "normal": […], "hard": […], "expert": […] (expert 없으면 지옥은 hard를 그대로) } }
+     노트는 게임 안 형식 그대로(위 「chart」 주석): {t, x(0~12 왼쪽 칸), w(1~12 너비), ty(0 탭 1 긴 2 미끄럼 3 튕기기), c(1 금색),
+       len(긴/미끄럼 길이 초), p([[t,x]…] 미끄럼 경유점, 절대 시각), k([틱 시각…], 마지막은 끝 — 없으면 박마다 자동), fd(튕기기 -1 ← 0 ↑ 1 →)}
+     자동 생성기를 거치지 않고 그대로 재생해요. 시각은 음원 0초 기준. 혼자 하기(「내 음악」)에서만 써요(다른 폰엔 음원이 없으니까). */
+  const PACK_FMT = 'hanpan-rhythm-pack', PACK_LV = ['', 'easy', 'normal', 'hard', 'expert'];
+  function packNotes(arr, dur, beat) {
+    if (!Array.isArray(arr)) return null;
+    const fin = (v) => typeof v === 'number' && isFinite(v), out = [];
+    for (const n of arr.slice(0, 6000)) {
+      if (!n || !fin(n.t) || n.t < 0 || n.t > dur + 1) continue;
+      const w = clamp(Math.round(fin(n.w) ? n.w : 3), 1, NC), x = clamp(fin(n.x) ? n.x : 0, 0, NC - w);
+      let ty = [0, 1, 2, 3].includes(n.ty) ? n.ty : 0;
+      const o = { t: r4(n.t), x, w, ty, c: n.c ? 1 : 0, len: 0 };
+      if (ty === 1 || ty === 2) {
+        const len = fin(n.len) ? clamp(n.len, 0, 30) : 0;
+        if (len < 0.1) { o.ty = ty = 0; }
+        else {
+          o.len = r4(len); const end = r4(n.t + len);
+          if (ty === 2) {
+            const p = Array.isArray(n.p) ? n.p.filter((q) => Array.isArray(q) && fin(q[0]) && fin(q[1])).map((q) => [r4(clamp(q[0], n.t, end)), clamp(q[1], 0, NC - w)]).sort((a, b) => a[0] - b[0]) : [];
+            if (p.length < 2) { o.ty = ty = 1; } else { if (p[0][0] > n.t) p.unshift([o.t, x]); if (p[p.length - 1][0] < end - 0.01) p.push([end, p[p.length - 1][1]]); o.p = p; }
+          }
+          let k = Array.isArray(n.k) ? n.k.filter((v) => fin(v) && v > n.t + 0.05 && v <= end + 1e-3).map(r4).sort((a, b) => a - b) : [];
+          if (!k.length) { if (ty === 2) { let lt = n.t; for (let q = 1; q < o.p.length - 1; q++) if (o.p[q][0] - lt >= 0.12 && end - o.p[q][0] >= 0.12) { k.push(o.p[q][0]); lt = o.p[q][0]; } } else for (let q = 1; n.t + q * beat < end - 0.12; q++) k.push(r4(n.t + q * beat)); }
+          if (!k.length || Math.abs(k[k.length - 1] - end) > 1e-3) k.push(end);
+          o.k = k;
+        }
+      }
+      if (ty === 3) o.fd = [-1, 0, 1].includes(n.fd) ? n.fd : 0;
+      out.push(o);
+    }
+    out.sort((a, b) => a.t - b.t || a.x - b.x);
+    return out;
+  }
+  /* 문자열(파일 내용) → { meta, bytes } 또는 throw Error(한국어 이유) */
+  function packParse(txt) {
+    let j; try { j = JSON.parse(txt); } catch (e) { throw new Error('곡 묶음 파일이 아니에요(.hlsong).'); }
+    if (!j || j.fmt !== PACK_FMT) throw new Error('곡 묶음 파일이 아니에요(.hlsong).');
+    if (!(j.v >= 1) || j.v > 1) throw new Error('더 새 버전의 곡 묶음이에요. 앱을 업데이트해 주세요.');
+    const bpm = +j.bpm, off = +j.offset || 0;
+    if (!(bpm >= 40 && bpm <= 300)) throw new Error('곡 묶음의 BPM이 이상해요.');
+    if (typeof j.audio !== 'string' || j.audio.length < 1000) throw new Error('곡 묶음에 음원이 없어요.');
+    let bin; try { bin = atob(j.audio.replace(/^data:[^,]*,/, '').replace(/\s+/g, '')); } catch (e) { throw new Error('곡 묶음의 음원이 깨졌어요.'); }
+    const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const dur = +j.dur > 0 ? +j.dur : AMAX, beat = 60 / bpm, charts = {};
+    for (let l = 1; l <= 4; l++) { const a = packNotes(j.charts && j.charts[PACK_LV[l]], dur, beat); if (a && a.length) charts[PACK_LV[l]] = a; }
+    if (!charts.hard && !charts.normal && !charts.easy && !charts.expert) throw new Error('곡 묶음에 채보가 없어요.');
+    const sec = Array.isArray(j.sec) ? j.sec.filter((q) => Array.isArray(q) && +q[0] >= 0 && SECN[q[1]]).map((q) => [+q[0], q[1]]).sort((a, b) => a[0] - b[0]) : [];
+    const title = String(j.title || '이름 없는 곡').slice(0, 30), artist = String(j.artist || '').slice(0, 30);
+    const id = hashBytes(bytes.buffer).slice(0, 8) + (title.length % 36).toString(36);
+    return { meta: { id, title, artist, bpm: Math.round(bpm * 100) / 100, offset: off, dur: +j.dur > 0 ? +j.dur : 0, sec: sec.length ? sec : [[0, 'A']], charts, mime: String(j.mime || 'audio/mpeg') }, bytes: bytes.buffer };
+  }
+  function packChart(pk, lvl) {
+    const c = pk.charts, a = c[PACK_LV[lvl]] || (lvl === 4 ? c.hard : null) || c.hard || c.normal || c.easy || c.expert;
+    const notes = a.map((n) => Object.assign({}, n, n.p ? { p: n.p.map((q) => q.slice()) } : {}, n.k ? { k: n.k.slice() } : {}));
+    let J = 0; notes.forEach((nt) => { J += (nt.c ? 2 : 1) + (nt.k ? nt.k.length : 0); });
+    return { notes, J: Math.max(1, J) };
+  }
+  const PK = { list: null, busy: '', err: '', del: '' };
+  async function packList() { if (PK.list) return PK.list; const l = await IDB.get('packs'); PK.list = Array.isArray(l) ? l : []; cusNotify(); return PK.list; }
+  async function packImport(file) {
+    PK.busy = '「' + String(file.name || '').slice(0, 20) + '」 가져오는 중…'; PK.err = ''; cusNotify();
+    try {
+      if (file.size > 80e6) throw new Error('곡 묶음 파일이 너무 커요(80MB까지).');
+      const { meta, bytes } = packParse(await file.text());
+      await decodeBytes(bytes.slice(0));   // 이 폰에서 음원이 열리는지 미리 확인
+      await IDB.put('pk:' + meta.id, { meta, bytes });
+      const l = (await packList()).filter((q) => q.id !== meta.id);
+      l.unshift({ id: meta.id, title: meta.title, artist: meta.artist, bpm: meta.bpm, lv: Object.keys(meta.charts) });
+      PK.list = l; await IDB.put('packs', l);
+      PK.busy = ''; await packLoad(meta.id); return;
+    } catch (e) { PK.err = e && /[가-힣]/.test(e.message || '') ? e.message : '이 곡 묶음의 음원을 이 폰에서 열 수 없어요.'; }
+    PK.busy = ''; cusNotify();
+  }
+  async function packDelete(id) {
+    PK.list = (await packList()).filter((q) => q.id !== id); PK.del = ''; await IDB.put('packs', PK.list); await IDB.del('pk:' + id);
+    if (CUS.pack && CUS.pack.id === id) Object.assign(CUS, { pack: null, st: 'none', an: null, buf: null, h: '', charts: {}, so: null });
+    cusNotify();
+  }
+  async function packLoad(id) {
+    const job = ++CUS.job;
+    const r = await IDB.get('pk:' + id);
+    if (job !== CUS.job) return;
+    if (!r || !r.meta || !r.bytes) { CUS.st = 'err'; CUS.err = '저장된 곡 묶음을 찾지 못했어요. 다시 가져와 주세요.'; cusNotify(); return; }
+    Object.assign(CUS, { pack: null, st: 'dec', name: r.meta.title, err: '', prog: 0, an: null, buf: null, charts: {}, so: null }); cusNotify();
+    try {
+      const buf = await decodeBytes(r.bytes.slice(0));
+      if (job !== CUS.job) return;
+      const ch = buf.getChannelData(0), sr = buf.sampleRate, hop = Math.round(sr / AFPS), nf = Math.ceil(ch.length / hop), rms = new Float32Array(nf); let mx = 1e-9;
+      for (let f = 0; f < nf; f++) { let s = 0, c = 0; for (let i = f * hop, e = Math.min(ch.length, i + hop); i < e; i += 4) { s += ch[i] * ch[i]; c++; } rms[f] = Math.sqrt(s / Math.max(1, c)); if (rms[f] > mx) mx = rms[f]; }
+      const rq = new Uint8Array(nf); for (let f = 0; f < nf; f++) rq[f] = Math.round(255 * rms[f] / mx);
+      CUS.pack = r.meta; CUS.buf = buf; CUS.h = 'pk' + r.meta.id;
+      CUS.an = { v: AVER, pk: 1, dur: buf.duration, bpm: r.meta.bpm, beats: [], rms: rq, fps: sr / hop };
+      CUS.st = 'ok'; CUS.prog = 1;
+    } catch (e) { if (job !== CUS.job) return; CUS.st = 'err'; CUS.err = '이 곡 묶음의 음원을 이 폰에서 열 수 없어요.'; }
+    cusNotify();
+  }
+
+  /* ----- 곡 묶음 보내기·받기(시험 기능, 라운드 41): core L.xfer(PeerJS P2P, 서버 저장 없음) ----- */
+  function packMetaOk(m) {
+    return m && typeof m.id === 'string' && m.id.length <= 40 && typeof m.title === 'string' && m.bpm >= 40 && m.bpm <= 300 && m.charts && typeof m.charts === 'object' && Object.keys(m.charts).every((k) => PACK_LV.includes(k) && Array.isArray(m.charts[k]));
+  }
+  async function packSave(meta, bytes) {
+    await IDB.put('pk:' + meta.id, { meta, bytes });
+    const l = (await packList()).filter((q) => q.id !== meta.id);
+    l.unshift({ id: meta.id, title: meta.title, artist: meta.artist, bpm: meta.bpm, lv: Object.keys(meta.charts) });
+    PK.list = l; await IDB.put('packs', l); cusNotify();
+  }
+  function xferSheet(mode, id) {
+    const X = L.xfer, mb = (b) => (b / 1048576).toFixed(1) + 'MB';
+    const BTN = 'min-height:46px;padding:0 16px;border-radius:12px;border:1px solid #2b3d55;background:#16233a;color:#e9f2ff;font:inherit;font-size:15px';
+    const box = L.h('div', { role: 'dialog', 'aria-label': mode === 'send' ? '곡 묶음 보내기' : '곡 묶음 받기', style: 'position:fixed;inset:0;z-index:80;background:rgba(4,7,13,.88);display:flex;align-items:center;justify-content:center;padding:16px' });
+    const card = L.h('div', { style: 'width:100%;max-width:340px;background:#0e1626;border:1px solid #2b3d55;border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:12px;color:#e9f2ff;font-size:14px;line-height:1.45' });
+    const title = L.h('div', { style: 'font-weight:700;font-size:16px', text: (mode === 'send' ? '📤 곡 묶음 보내기' : '📥 곡 묶음 받기') + ' · 시험 기능' });
+    const msg = L.h('div', { style: 'color:#b7c6dc' }), big = L.h('div', { style: 'font:700 40px/1.1 monospace;letter-spacing:8px;text-align:center;color:#3ee8ff;display:none' });
+    const barIn = L.h('div', { style: 'height:100%;width:0;background:#3ee8ff;border-radius:6px;transition:width .2s' });
+    const bar = L.h('div', { style: 'height:10px;background:#1c2a40;border-radius:6px;overflow:hidden;display:none' }, barIn);
+    const row = L.h('div', { style: 'display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap' });
+    card.append(title, msg, big, bar, row); box.append(card); document.body.appendChild(box);
+    let job = null, closed = false;
+    const close = () => { if (closed) return; closed = true; if (job) job.cancel(); box.remove(); removeEventListener('keydown', esc, true); };
+    const esc = (e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); } };
+    addEventListener('keydown', esc, true);
+    const btns = (...l) => { row.innerHTML = ''; l.forEach(([t, f, main]) => row.append(L.h('button', { 'data-key': t === '닫기' || t === '취소' ? 'Escape' : t === '받기' ? 'Enter' : null, style: BTN + (main ? ';background:#1f6f86;border-color:#3ee8ff' : ''), onclick: f }, t))); };
+    const prog = (got, tot, ph) => { bar.style.display = ''; barIn.style.width = Math.round(100 * got / Math.max(1, tot)) + '%'; msg.textContent = (ph === 'wait' ? '연결됐어요. 받는 쪽 준비 중…' : (ph === 'recv' ? '받는 중 ' : '보내는 중 ') + mb(got) + ' / ' + mb(tot)); };
+    const fail = (e) => { if (closed || (e && e.message === 'mine')) return; job = null; big.style.display = 'none'; msg.style.color = '#ff9a86'; msg.textContent = e && e.message === 'badpack' ? '곡 묶음이 아니거나 더 새 버전이에요.' : e && e.message === 'none' ? '저장된 곡 묶음을 찾지 못했어요.' : X.err(e); btns(['닫기', close, true]); };
+    if (!X || !X.available()) { msg.textContent = X ? X.why() : '앱을 업데이트해 주세요.'; btns(['닫기', close, true]); return; }
+    if (mode === 'send') {
+      msg.textContent = '보낼 준비 중…'; btns(['취소', close]);
+      IDB.get('pk:' + id).then((r) => {
+        if (closed) return;
+        if (!r || !r.meta || !r.bytes) return fail(new Error('none'));
+        job = X.send(new Uint8Array(r.bytes), r.meta, {
+          onCode(code) { big.textContent = code; big.style.display = ''; msg.textContent = '받을 기기에서 리듬 레인 → 「📥 받기」를 누르고 이 코드를 넣어 주세요. 「' + r.meta.title + '」 ' + mb(r.bytes.byteLength) + '. 이 화면을 켜 두세요.'; },
+          onProgress(g, t, ph) { big.style.display = 'none'; prog(g, t, ph); },
+        });
+        job.done.then(() => { if (closed) return; job = null; msg.style.color = '#7dffb0'; msg.textContent = '다 보냈어요. 받은 기기에서 검사까지 끝났어요.'; btns(['닫기', close, true]); }, fail);
+      });
+      return;
+    }
+    const inp = L.h('input', { type: 'text', inputmode: 'text', autocomplete: 'off', maxlength: '4', placeholder: 'ABCD', 'aria-label': '보내는 기기의 코드 4글자', style: 'min-height:52px;font:700 28px monospace;letter-spacing:8px;text-align:center;text-transform:uppercase;background:#16233a;color:#e9f2ff;border:1px solid #2b3d55;border-radius:12px' });
+    msg.textContent = '보내는 기기에 뜬 4글자 코드를 넣어 주세요. 두 기기 모두 인터넷이 필요해요. 같은 와이파이가 아니어도 되고, 기기끼리 직접 보내요(서버에 저장 안 함).';
+    card.insertBefore(inp, bar);
+    const go = () => {
+      const code = inp.value.toUpperCase().replace(/[^A-Z]/g, '');
+      if (code.length !== 4) { msg.style.color = '#ff9a86'; msg.textContent = '코드는 영어 4글자예요.'; return; }
+      msg.style.color = ''; msg.textContent = '연결하는 중…'; inp.style.display = 'none'; btns(['취소', close]);
+      let meta = null;
+      job = X.recv(code, { onMeta(m) { meta = m; if (!packMetaOk(m)) { job.cancel(); fail(new Error('badpack')); } }, onProgress: prog });
+      job.done.then(async (res) => {
+        if (closed) return;
+        job = null; msg.textContent = '검사 통과. 이 기기에서 음원이 열리는지 확인 중…'; btns();
+        const bytes = res.bytes.buffer.slice(res.bytes.byteOffset, res.bytes.byteOffset + res.bytes.byteLength);
+        try { await decodeBytes(bytes.slice(0)); } catch (e) { msg.style.color = '#ff9a86'; msg.textContent = '받았지만 이 기기에서 음원을 열 수 없어요.'; btns(['닫기', close, true]); return; }
+        await packSave(res.meta || meta, bytes);
+        if (closed) return;
+        msg.style.color = '#7dffb0'; msg.textContent = '「' + (res.meta || meta).title + '」을(를) 받아서 「내 곡 묶음」에 넣었어요.'; btns(['닫기', close, true]);
+      }, (e) => { if (e && e.message === 'badpack') return; fail(e); });
+    };
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    btns(['닫기', close], ['받기', go, true]);
+    setTimeout(() => inp.focus(), 50);
+  }
+
+  /* ======================= coarse state ======================= */
+  const DIFF = ['', '쉬움', '보통', '어려움', '지옥'];
+  const FIXED = [48217, 913344, 220871, 1337007, 655321];
+  function dailySeed() { const d = new Date(); let h = d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(); h = Math.imul(h ^ (h >>> 13), 0x5bd1e995) >>> 0; return 1 + (h % 1679615); }
+  function init(players, opts) {
+    const o = opts || {}, n = clamp(players.length, 1, 4);
+    let seed;
+    if (o.song === 'daily') seed = dailySeed();
+    else if (/^f\d$/.test(o.song || '') && FIXED[+o.song[1]] != null) seed = FIXED[+o.song[1]];
+    else seed = 1 + U.rand(1679614);
+    const gk = GEN[o.gen] ? o.gen : GKEYS[seed % GKEYS.length];
+    const lvl = [1, 2, 3, 4].includes(+o.lvl) ? +o.lvl : 2;
+    const s = { rid: 0, n, nm: players.slice(0, n).map((p) => String((p && p.name) || '').slice(0, 10)), ai: players.slice(0, n).map((p) => (p && p.ai ? 1 : 0)),
+      rdy: players.slice(0, n).map((p) => (p && p.ai ? 1 : 0)), seed, gk, fixed: o.song && o.song !== 'rand' && o.song !== 'mine' ? 1 : 0, lvl, ph: 'ready', fin: null };
+    if (o.song === 'mine' && n === 1 && !(players[0] && players[0].ai)) { s.cu = 1; s.cn = ''; s.ch = ''; s.cb = 0; }
+    if (!s.rdy.includes(0)) start(s);
+    return s;
+  }
+  function start(s) { s.ph = 'play'; s.rid = 1 + U.rand(99999); }
+  function actor(s) {
+    if (!s || s.ph !== 'ready') return null;
+    const a = []; for (let i = 0; i < s.n; i++) if (!s.rdy[i]) a.push(i);
+    return a.length ? a : null;
+  }
+  function apply(s, seat, a) {
+    if (!a || a.t !== 'go' || s.ph !== 'ready' || s.rdy[seat]) throw new Error('bad action');
+    s.rdy[seat] = 1;
+    if (s.cu) { s.cn = String(a.cn || '').slice(0, 30); s.ch = String(a.ch || '').slice(0, 12); s.cb = Math.round((+a.bpm || 0) * 10) / 10; }
+    if (!actor(s)) start(s);
+    return s;
+  }
+  function ai(s, seat) { return s && s.ph === 'ready' && !s.rdy[seat] ? { t: 'go' } : null; }
+  const GRADES = [[98, 'S+'], [95, 'S'], [90, 'A'], [80, 'B'], [70, 'C'], [0, 'D']];
+  const gradeOf = (acc) => GRADES.find(([v]) => acc >= v)[1];
+  const fmt = (v) => Math.round(v).toLocaleString('ko-KR');
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.fin) return null;
+    const head = (s.cu ? '내 음악 「' + (s.cn || '?') + '」 · ' + s.cb + ' BPM' : GEN[s.gk].nm + ' · 곡 ' + code(s.seed)) + ' · ' + DIFF[s.lvl];
+    const lines = [head];
+    const order = []; for (let i = 0; i < s.n; i++) if (s.fin[i]) order.push(i);
+    order.sort((a, b) => s.fin[b][0] - s.fin[a][0]);
+    order.forEach((i, r) => { const f = s.fin[i]; lines.push((s.n > 1 ? (r + 1) + '위 ' : '') + s.nm[i] + ' — ' + fmt(f[0]) + '점 · ' + (f[1] / 10).toFixed(1) + '% (' + gradeOf(f[1] / 10) + ') · 최고 콤보 ' + f[2]); });
+    if (order.length) { const f = s.fin[order[0]]; lines.push('완벽 ' + f[3] + ' · 좋음 ' + f[4] + ' · 아쉬움 ' + f[5] + ' · 놓침 ' + f[6] + (s.n > 1 ? ' (1위)' : '')); }
+    const per = (fn) => { const v = []; for (let i = 0; i < s.n; i++) v.push(s.fin[i] ? fn(s.fin[i]) : '-'); return v; };
+    const stats = [
+      { label: '정확도', values: per((f) => (f[1] / 10).toFixed(1) + '%') },
+      { label: '최장 콤보', values: per((f) => String(f[2])) },
+      { label: '완벽', values: per((f) => String(f[3])) },
+      { label: '좋음', values: per((f) => String(f[4])) },
+      { label: '아쉬움', values: per((f) => String(f[5])) },
+      { label: '놓침', values: per((f) => String(f[6])) },
+    ];
+    if (s.n === 1) {
+      const f = s.fin[0], g = gradeOf(f[1] / 10);
+      return { winners: f[1] >= 700 ? [0] : [], title: '등급 ' + g + ' · ' + fmt(f[0]) + '점', text: lines.join('\n'), stats };
+    }
+    const top = order.length ? s.fin[order[0]][0] : 0;
+    return { winners: order.filter((i) => s.fin[i][0] === top), title: s.nm[order[0]] + ' 1위 · ' + fmt(top) + '점', text: lines.join('\n'), stats };
+  }
+
+  /* ======================= run (pure: judging, scoring, AI) ======================= */
+  const AIC = { 1: { miss: 0.07, sd: 0.05, brk: 0.18 }, 2: { miss: 0.025, sd: 0.03, brk: 0.06 }, 3: { miss: 0.006, sd: 0.015, brk: 0.01 } };
+  function newRun(s, isHost) {
+    const cu = cusReady(s), so = cu ? cusSong() : song(s.seed, s.gk), C = cu ? cusChart(s.lvl) : chart(s.seed, s.gk, s.lvl), nn = C.notes.length;
+    let U2 = 0; C.notes.forEach((nt) => { U2 += 1 + (nt.k ? nt.k.length : 0); });
+    const seats = [];
+    for (let i = 0; i < s.n; i++) seats.push({ P: 0, G: 0, B: 0, M: 0, c: 0, mc: 0, sum: 0, den: 0, ptr: 0, aP: 0, act: [], jd: new Uint8Array(nn), pg: new Uint8Array(nn), pd: new Float32Array(nn), ds: 0, dn: 0, tk: new Uint8Array(nn), cov: new Float32Array(nn).fill(-99), brk: new Uint8Array(nn), ai: { k: -1, p: 0 } });
+    return { T: -so.lead, so, C, ch: C.notes, J: C.J, U: Math.max(1, U2), seats, host: !!isHost, len: so.len };
+  }
+  const W8 = [0, 1, 0.7, 0.3, 0];
+  const scoreOf = (R, se) => Math.round(900000 * se.sum / R.J + 100000 * se.mc / R.U);
+  const accOf = (se) => (se.remote && se.acc != null ? se.acc : se.den ? se.sum / se.den * 100 : 100);
+  /* kind: 'head' | 'flick' | 'tick' | 'end' — 크리티컬 머리는 두 배로 세요 */
+  function judge(R, i, g, nt, kind, hooks, dt) {
+    const se = R.seats[i], w = (kind === 'head' || kind === 'flick') && nt.c ? 2 : 1;
+    if (dt != null && g <= 3 && kind !== 'end') { se.ds += dt; se.dn++; }
+    if (g === 1) se.P++; else if (g === 2) se.G++; else if (g === 3) se.B++; else se.M++;
+    se.sum += W8[g] * w; se.den += w;
+    if (g <= 2) { se.c++; if (se.c > se.mc) se.mc = se.c; } else se.c = 0;
+    if (hooks && hooks.judge) hooks.judge(i, g, nt, kind, dt);
+  }
+  const gOf = (d) => (d <= PW ? 1 : d <= GW ? 2 : d <= BW ? 3 : 4);
+  /* 놓친 머리, 튕기기 대기 시간 초과, 긴 음표 틱(그 시각에 손이 음표 위에 있었는지: cov) */
+  function sweep(R, i, Te, hooks, cov) {
+    const se = R.seats[i], ch = R.ch;
+    for (let k = se.ptr; k < ch.length && ch[k].t + BW < Te; k++) {
+      const j = se.jd[k];
+      if (!j) { se.jd[k] = 4; judge(R, i, 4, ch[k], ch[k].ty === 3 ? 'flick' : 'head', hooks); }
+      else if (j === 9 && Te > ch[k].t + BW + 0.35) { se.jd[k] = 4; judge(R, i, 4, ch[k], 'flick', hooks); }
+    }
+    while (se.ptr < ch.length && se.jd[se.ptr] && se.jd[se.ptr] !== 9) se.ptr++;
+    while (se.aP < ch.length && ch[se.aP].t - BW <= Te) { if (ch[se.aP].k) se.act.push(se.aP); se.aP++; }
+    for (let a = se.act.length - 1; a >= 0; a--) {
+      const k = se.act[a], nt = ch[k], end = nt.t + nt.len, ks = nt.k;
+      if (Te >= nt.t - 0.08 && Te <= end + RW[3] + 0.05) { const x = xAt(nt, clamp(Te, nt.t, end)); if (cov(k, x - 0.6, x + nt.w + 0.6)) se.cov[k] = Te; }
+      while (se.tk[k] < ks.length) {
+        const tt = ks[se.tk[k]], last = se.tk[k] === ks.length - 1;
+        let g = 0, rd = null;
+        if (!last) { if (tt > Te) break; g = se.cov[k] >= tt - 0.16 ? 1 : 4; }
+        else {   // 떼기 판정: 손을 뗀 시각(마지막으로 덮은 시각)과 끝 시각의 차이. 너무 오래 누르고 있어도 하락
+          const held = se.cov[k] >= Te - 0.06;
+          if (!held && Te >= tt - RW[3]) { const d = Math.abs(se.cov[k] - tt); g = d <= RW[1] ? 1 : d <= RW[2] ? 2 : d <= RW[3] ? 3 : 4; rd = se.cov[k] - tt; }
+          else if (held && Te > tt + RW[3]) g = 3;
+          if (!g) break;
+        }
+        judge(R, i, g, { t: tt, x: xAt(nt, tt), w: nt.w, ty: nt.ty, c: 0, tick: 1 }, last ? 'end' : 'tick', hooks, rd);
+        se.tk[k]++;
+      }
+      if (se.tk[k] >= ks.length) se.act.splice(a, 1);
+    }
+  }
+  /* 판정선 위 [lo, hi] 칸 범위를 누름 → 시각이 가장 가까운 겹치는 음표. 튕기기는 손을 밀 때까지 대기(jd 9), 키보드는 바로 */
+  function press(R, i, lo, hi, Te, hooks, kb) {
+    const se = R.seats[i], ch = R.ch; let best = -1, bd = 9;
+    for (let k = se.ptr; k < ch.length && ch[k].t <= Te + BW; k++) {
+      const nt = ch[k]; if (se.jd[k]) continue;
+      const d = Math.abs(nt.t - Te); if (d > BW) continue;
+      if (hi < nt.x - 0.5 || lo > nt.x + nt.w + 0.5) continue;   // 음표 너비 + 양옆 반 칸까지 인정
+      const sc = d + Math.max(0, nt.x - hi, lo - nt.x - nt.w) * 0.03 + Math.abs((lo + hi) / 2 - nt.x - nt.w / 2) * 0.002;
+      if (sc < bd) { bd = sc; best = k; }
+    }
+    if (best < 0) return null;
+    const nt = ch[best], g = gOf(Math.abs(nt.t - Te));
+    if (nt.ty === 3 && !kb) { se.jd[best] = 9; se.pg[best] = g; se.pd[best] = Te - nt.t; return { k: best, flick: 1, g }; }
+    se.jd[best] = g; judge(R, i, g, nt, nt.ty === 3 ? 'flick' : 'head', hooks, Te - nt.t);
+    return { k: best, g };
+  }
+  function flickDone(R, i, k, ok, hooks) {
+    const se = R.seats[i]; if (se.jd[k] !== 9) return;
+    const g = ok ? se.pg[k] : 4; se.jd[k] = g; judge(R, i, g, R.ch[k], 'flick', hooks, ok ? se.pd[k] : null);
+  }
+  function aiSeat(R, i, lv, hooks) {
+    const se = R.seats[i], C = AIC[lv] || AIC[2], ch = R.ch, m = se.ai;
+    while (m.p < ch.length) {
+      const k = m.p, nt = ch[k];
+      if (se.jd[k]) { m.p++; continue; }
+      if (m.k !== k) { m.k = k; m.miss = Math.random() < C.miss * (nt.ty === 2 || nt.ty === 3 ? 1.6 : 1); m.off = gauss() * C.sd; se.brk[k] = nt.k && Math.random() < C.brk * (nt.ty === 2 ? 1.5 : 1) ? 1 : 0; }
+      if (m.miss) { m.p++; continue; }
+      if (R.T < nt.t + m.off) break;
+      const g = gOf(Math.abs(m.off)); se.jd[k] = g; m.p++;
+      judge(R, i, g, nt, nt.ty === 3 ? 'flick' : 'head', hooks);
+    }
+    sweep(R, i, R.T, hooks, (k) => se.jd[k] >= 1 && se.jd[k] <= 3 && !(se.brk[k] && R.T > ch[k].t + ch[k].len * 0.5) && R.T <= ch[k].t + ch[k].len + ((((k * 2654435761) >>> 0) % 1000) / 1000 - 0.5) * 3 * C.sd);
+  }
+  const pack = (R, se) => [scoreOf(R, se), Math.round(accOf(se) * 10), se.mc, se.P, se.G, se.B, se.M, se.c];
+  function unpack(se, a) { if (!Array.isArray(a)) return; se.sc = +a[0] || 0; se.acc = (+a[1] || 0) / 10; se.mc = a[2] | 0; se.P = a[3] | 0; se.G = a[4] | 0; se.B = a[5] | 0; se.M = a[6] | 0; se.c = a[7] | 0; }
+  function finalize(s, R) {
+    const fin = R.seats.map((se) => { const p = pack(R, se); if (se.sc != null && se.remote) p[0] = se.sc; return p.slice(0, 7); });
+    return Object.assign({}, s, { ph: 'done', fin });
+  }
+  function simulate(s, lvs, dt) {
+    const R = newRun(s, true); let guard = 0;
+    while (R.T < R.len + 0.5 && guard++ < 1e6) { R.T += dt || 1 / 60; for (let i = 0; i < s.n; i++) aiSeat(R, i, lvs[i] || 2); }
+    return finalize(s, R);
+  }
+
+  /* ======================= audio ======================= */
+  /* 소리 크기(라운드 24): 곡은 음악 크기, 박자 「딱」은 효과음 크기 */
+  const musV = () => { try { return L.audio ? clamp(+L.audio.music() || 0, 0, 1) : 1; } catch (e) { return 1; } };
+  const sfxV = () => { try { return L.audio ? clamp(+L.audio.sfx() || 0, 0, 1) : 1; } catch (e) { return 1; } };
+  const Aud = {
+    ac: null, master: null, bus: null, rev: null, noise: null, curve: null,
+    on() { try { return !!U.store.get('sound', true); } catch (e) { return true; } },
+    ctx(noResume) {
+      if (!this.on()) return null;
+      try {
+        if (!this.ac) {
+          const ac = this.ac = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+          const comp = ac.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.004;
+          this.master = ac.createGain(); this.master.gain.value = 0.75; this.master.connect(comp); comp.connect(ac.destination);
+          this.mus = ac.createGain(); this.mus.gain.value = musV(); this.mus.connect(this.master);
+          this.bus = ac.createGain(); this.bus.connect(this.mus);
+          const len = Math.floor(ac.sampleRate * 2.2), ir = ac.createBuffer(2, len, ac.sampleRate);
+          for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3); }
+          this.rev = ac.createConvolver(); this.rev.buffer = ir; const rg = ac.createGain(); rg.gain.value = 0.32; this.rev.connect(rg).connect(this.mus);
+          const nb = ac.createBuffer(1, ac.sampleRate, ac.sampleRate), d = nb.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; this.noise = nb;
+          const cv = new Float32Array(256); for (let i = 0; i < 256; i++) { const x = i / 128 - 1; cv[i] = Math.tanh(x * 5); } this.curve = cv;
+        }
+        if (!noResume && this.ac.state === 'suspended' && !this.held) this.ac.resume();
+        return this.ac;
+      } catch (e) { return null; }
+    },
+    held: false,
+    vol() { try { if (this.mus) this.mus.gain.setTargetAtTime(musV(), this.ac.currentTime, 0.03); } catch (e) {} },
+    close() { try { this.ac && this.ac.close(); } catch (e) {} this.ac = null; this.master = null; this.mus = null; this.bus = null; this.rev = null; },
+  };
+  const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+  function envG(ac, t, peak, a, dec, out) { const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(peak, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + dec); g.connect(out); return g; }
+  function sustG(ac, t, peak, a, hold, rel, out) { const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(peak, t + a); g.gain.setValueAtTime(peak, t + Math.max(a, hold)); g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(a, hold) + rel); g.connect(out); return g; }
+  function noiseHit(ac, t, out, type, f, q, peak, dec) { const s = ac.createBufferSource(), fl = ac.createBiquadFilter(); s.buffer = Aud.noise; s.loopStart = 0; fl.type = type; fl.frequency.value = f; fl.Q.value = q || 1; s.connect(fl).connect(envG(ac, t, peak, 0.002, dec, out)); s.start(t, Math.random() * 0.5); s.stop(t + dec + 0.05); }
+  function tone(ac, t, out, type, f, peak, a, dec, f2) { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + Math.min(dec, 0.18)); o.connect(envG(ac, t, peak, a, dec, out)); o.start(t); o.stop(t + a + dec + 0.05); }
+  function send(ac, out, amt) { const g = ac.createGain(); g.gain.value = 1; g.connect(out); if (amt > 0) { const s = ac.createGain(); s.gain.value = amt; g.connect(s).connect(Aud.rev); } return g; }
+  function playEv(ac, t, e, G) {
+    const out = Aud.bus, v = e.v, d = e.d;
+    if (e.i === 0) {
+      const kit = G.kit;
+      if (e.k === 'K') {
+        if (kit === 'cine') { tone(ac, t, send(ac, out, 0.5), 'sine', 90, 1.0 * v, 0.004, 0.7, 38); noiseHit(ac, t, out, 'lowpass', 300, 1, 0.3 * v, 0.2); }
+        else if (kit === 'elec' || kit === 'wave') tone(ac, t, out, 'sine', 155, 1.0 * v, 0.002, 0.34, 44);
+        else tone(ac, t, out, 'sine', 125, (kit === 'jazz' || kit === 'lofi' ? 0.65 : 0.95) * v, 0.002, 0.24, 46);
+      } else if (e.k === 'S' || e.k === 'T') {
+        if (e.k === 'T' || kit === 'cine') { tone(ac, t, send(ac, out, 0.6), 'sine', 160, 0.7 * v, 0.003, 0.35, 90); noiseHit(ac, t, send(ac, out, 0.5), 'bandpass', 700, 1, 0.35 * v, 0.25); }
+        else if (kit === 'elec') { for (let k = 0; k < 3; k++) noiseHit(ac, t + k * 0.011, send(ac, out, 0.15), 'bandpass', 1400, 1.1, 0.33 * v, 0.07); }
+        else if (kit === 'wave') { noiseHit(ac, t, send(ac, out, 0.7), 'bandpass', 1700, 0.7, 0.5 * v, 0.28); tone(ac, t, out, 'triangle', 200, 0.3 * v, 0.002, 0.1); }
+        else if (kit === 'jazz') noiseHit(ac, t, out, 'bandpass', 2400, 0.5, 0.22 * v, 0.18);
+        else if (kit === 'lofi') { noiseHit(ac, t, out, 'bandpass', 1500, 0.9, 0.3 * v, 0.12); tone(ac, t, out, 'triangle', 210, 0.18 * v, 0.002, 0.07); }
+        else { noiseHit(ac, t, send(ac, out, 0.2), 'bandpass', 1900, 0.9, 0.48 * v, 0.15); tone(ac, t, out, 'triangle', 190, 0.28 * v, 0.002, 0.08); }
+      } else if (e.k === 'H') noiseHit(ac, t, out, 'highpass', kit === 'lofi' ? 6000 : 8000, 1, (kit === 'lofi' ? 0.07 : 0.1) * v, 0.035);
+      else if (e.k === 'O') { if (kit === 'jazz') { tone(ac, t, out, 'triangle', 3200, 0.03 * v, 0.002, 0.4); noiseHit(ac, t, out, 'highpass', 7000, 1, 0.08 * v, 0.35); } else noiseHit(ac, t, out, 'highpass', 7000, 1, 0.1 * v, 0.2); }
+      else if (e.k === 'C') noiseHit(ac, t, send(ac, out, 0.4), 'highpass', 4200, 0.7, 0.22 * v, 1.2);
+      return;
+    }
+    if (e.i === 1) {
+      const f = mtof(e.n[0]), ty = G.bass;
+      if (ty === 'sine' || ty === 'sub') { const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = f; o.connect(sustG(ac, t, ty === 'sub' ? 0.7 : 0.6, 0.01, d, 0.1, out)); o.start(t); o.stop(t + d + 0.15); if (ty === 'sub') tone(ac, t, out, 'triangle', f * 2, 0.12, 0.01, Math.min(1.2, d)); return; }
+      const o = ac.createOscillator(), fl = ac.createBiquadFilter();
+      o.type = ty === 'upright' ? 'triangle' : 'sawtooth'; o.frequency.value = f;
+      fl.type = 'lowpass'; fl.Q.value = ty === 'saw' ? 6 : 1; fl.frequency.setValueAtTime(ty === 'saw' ? 1800 : ty === 'saw8' ? 1100 : 900, t); fl.frequency.exponentialRampToValueAtTime(ty === 'saw' ? 260 : 400, t + Math.min(0.25, d));
+      const pk = ty === 'upright' ? 0.8 : 0.4;
+      o.connect(fl).connect(sustG(ac, t, pk, 0.006, d, 0.07, out)); o.start(t); o.stop(t + d + 0.12);
+      return;
+    }
+    if (e.i === 2 || e.i === 4) {
+      const ty = e.i === 4 ? G.pad : G.chord, notes = e.n;
+      if (ty === 'power') {
+        const sh = ac.createWaveShaper(); sh.curve = Aud.curve; const fl = ac.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = 2800;
+        sh.connect(fl).connect(sustG(ac, t, 0.12 * v, 0.006, Math.max(0.08, d), 0.08, send(ac, out, 0.15)));
+        notes.forEach((m) => { for (const dt of [-7, 7]) { const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m); o.detune.value = dt; const pg = ac.createGain(); pg.gain.value = 0.3; o.connect(pg).connect(sh); o.start(t); o.stop(t + d + 0.12); } });
+        return;
+      }
+      if (ty === 'piano' || ty === 'rhodes') {
+        const o2 = send(ac, out, 0.25);
+        notes.forEach((m, k) => { const tt = t + k * 0.006; tone(ac, tt, o2, 'sine', mtof(m), (ty === 'rhodes' ? 0.11 : 0.1) * v, 0.004, Math.min(1.4, d + 0.5)); tone(ac, tt, o2, ty === 'rhodes' ? 'sine' : 'triangle', mtof(m) * 2, 0.03 * v, 0.003, 0.3); });
+        return;
+      }
+      const slow = ty === 'strings' || e.i === 4, a = slow ? Math.min(0.45, d * 0.3) : 0.008;
+      const fl = ac.createBiquadFilter(); fl.type = 'lowpass';
+      if (ty === 'stab') { fl.frequency.setValueAtTime(3200, t); fl.frequency.exponentialRampToValueAtTime(500, t + Math.min(0.25, d)); } else fl.frequency.value = ty === 'strings' ? 1800 : 2400;
+      const peak = (e.i === 4 ? 0.05 : ty === 'stab' ? 0.07 : 0.06) * v;
+      fl.connect(sustG(ac, t, peak, a, d, slow ? 0.5 : 0.1, send(ac, out, slow ? 0.5 : 0.3)));
+      notes.forEach((m) => { for (const dt of [-9, 9]) { const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = mtof(m); o.detune.value = dt; o.connect(fl); o.start(t); o.stop(t + d + (slow ? 0.6 : 0.15)); } });
+      return;
+    }
+    // lead
+    const f = mtof(e.n[0]), ty = G.lead;
+    if (ty === 'pluck') { const fl = ac.createBiquadFilter(); fl.type = 'lowpass'; fl.Q.value = 4; fl.frequency.setValueAtTime(4000, t); fl.frequency.exponentialRampToValueAtTime(700, t + 0.2); const o = ac.createOscillator(); o.type = 'square'; o.frequency.value = f; o.connect(fl).connect(envG(ac, t, 0.13 * v, 0.003, Math.min(0.6, d + 0.2), send(ac, Aud.bus, 0.35))); o.start(t); o.stop(t + 0.7); return; }
+    if (ty === 'bell') { const o2 = send(ac, Aud.bus, 0.4); tone(ac, t, o2, 'sine', f, 0.15 * v, 0.003, 1.0); tone(ac, t, o2, 'sine', f * 3.01, 0.03 * v, 0.003, 0.3); return; }
+    const o = ac.createOscillator(), lfo = ac.createOscillator(), lg = ac.createGain(), fl = ac.createBiquadFilter();
+    o.type = ty === 'horn' ? 'sawtooth' : ty === 'reed' ? 'sawtooth' : ty === 'drive' ? 'square' : 'sawtooth'; o.frequency.value = f;
+    lfo.frequency.value = 5.2; lg.gain.setValueAtTime(0, t); lg.gain.linearRampToValueAtTime(f * (ty === 'horn' ? 0.006 : 0.01), t + Math.min(0.4, d)); lfo.connect(lg).connect(o.frequency);
+    fl.type = ty === 'reed' ? 'bandpass' : 'lowpass'; fl.Q.value = ty === 'reed' ? 1.4 : 1;
+    if (ty === 'horn') { fl.frequency.setValueAtTime(500, t); fl.frequency.linearRampToValueAtTime(1800, t + 0.12); } else fl.frequency.value = ty === 'reed' ? 1500 : ty === 'drive' ? 2600 : 3000;
+    let node = fl;
+    if (ty === 'drive') { const sh = ac.createWaveShaper(); sh.curve = Aud.curve; o.connect(sh).connect(fl); } else o.connect(fl);
+    node.connect(sustG(ac, t, (ty === 'horn' ? 0.12 : ty === 'drive' ? 0.06 : 0.09) * v, ty === 'horn' ? 0.06 : 0.012, d, 0.12, send(ac, Aud.bus, ty === 'horn' ? 0.5 : 0.3)));
+    o.start(t); lfo.start(t); o.stop(t + d + 0.2); lfo.stop(t + d + 0.2);
+  }
+  function click(ac, t, acc) { const v = sfxV(); if (v > 0) tone(ac, t, Aud.master, 'sine', acc ? 2000 : 1500, 0.35 * v, 0.001, 0.05); }
+
+  /* 타격음: 음표 종류마다 다른 소리 (효과음 크기 × 게임 안 「타격음 크기」) */
+  const hsOn = () => U.store.get('rhythm.hs', true) !== false, hsVol = () => clamp(+U.store.get('rhythm.hsv', 70), 0, 100) / 100;
+  const hsLast = {};
+  function hitSound(kind) {
+    const ac = Aud.ac; if (!ac || ac.state !== 'running' || !Aud.master || !hsOn()) return;
+    const v = sfxV() * hsVol(); if (v <= 0.001) return;
+    const now = ac.currentTime; if (hsLast[kind] && now - hsLast[kind] < 0.03) return; hsLast[kind] = now;
+    const out = Aud.master, t = now + 0.004;
+    try {
+      if (kind === 'tap') { tone(ac, t, out, 'triangle', 1320, 0.2 * v, 0.001, 0.06, 760); noiseHit(ac, t, out, 'highpass', 5200, 0.8, 0.11 * v, 0.025); }
+      else if (kind === 'crit') { tone(ac, t, out, 'sine', 1568, 0.17 * v, 0.002, 0.34); tone(ac, t, out, 'sine', 2349, 0.1 * v, 0.002, 0.26); tone(ac, t, out, 'triangle', 784, 0.18 * v, 0.001, 0.12, 520); noiseHit(ac, t, out, 'highpass', 7000, 0.7, 0.13 * v, 0.18); }
+      else if (kind === 'flick') {
+        const s = ac.createBufferSource(), f = ac.createBiquadFilter(); s.buffer = Aud.noise; f.type = 'bandpass'; f.Q.value = 2.2;
+        f.frequency.setValueAtTime(900, t); f.frequency.exponentialRampToValueAtTime(5600, t + 0.11);
+        s.connect(f).connect(envG(ac, t, 0.32 * v, 0.008, 0.13, out)); s.start(t, Math.random() * 0.5); s.stop(t + 0.2);
+        tone(ac, t, out, 'sine', 880, 0.1 * v, 0.002, 0.09, 1760);
+      }
+      else if (kind === 'tick') tone(ac, t, out, 'sine', 2640, 0.08 * v, 0.001, 0.035);
+      else if (kind === 'stick') { tone(ac, t, out, 'sine', 2093, 0.09 * v, 0.001, 0.05); tone(ac, t, out, 'sine', 3136, 0.04 * v, 0.001, 0.04); }
+      else if (kind === 'end') tone(ac, t, out, 'triangle', 990, 0.13 * v, 0.001, 0.08, 660);
+    } catch (e) {}
+  }
+
+  /* ======================= view ======================= */
+  const FONT = '"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif';
+  const MONO = '"IBM Plex Mono",ui-monospace,Menlo,monospace';
+  const DISP = '"Black Han Sans","Apple SD Gothic Neo","Malgun Gothic",sans-serif';
+  const NCOL = ['#3ee8ff', '#5cffb4', '#b98bff', '#ff4fae'], GOLD = '#ffc94a';
+  const JUD = { 1: ['완벽', '#7ff6ff'], 2: ['좋음', '#8affc1'], 3: ['아쉬움', '#ffc66b'], 4: ['놓침', '#8c84a8'] };
+  /* 노트 속도 1.0~12.0 (기기 저장). 화면 아래 40%를 지나는 시간 = 3 ÷ 속도(초) → 시점·화면 크기와 상관없이 판정선 근처 체감 속도가 같아요 */
+  const NS_MIN = 1, NS_MAX = 12, NS_DEF = 5.5;
+  const nsGet = () => { const v = +U.store.get('rhythm.ns', NaN); if (isFinite(v) && v > 0) return clamp(Math.round(v * 10) / 10, NS_MIN, NS_MAX); const o = U.store.get('rhythm.spd', null); return o == null ? NS_DEF : [4.5, 5.5, 7, 9][clamp(o | 0, 0, 3)]; };
+  const nsSet = (v) => { U.store.set('rhythm.ns', clamp(Math.round(v * 10) / 10, NS_MIN, NS_MAX)); };
+  const fastOn = () => U.store.get('rhythm.fl', true) !== false;
+  const ZK = ['z1', 'z2', 'z3', 'z4', 'z5', 'z6'], ZL = ['S', 'D', 'F', 'J', 'K', 'L'];
+  const SKY = { I: ['#070a1e', '#14275a', '#3ee8ff'], A: ['#0d0820', '#33186a', '#a98bff'], B: ['#16061c', '#7a1a60', '#ffb547'], D: ['#03101a', '#0d4252', '#5cffb4'], O: ['#0a0716', '#2a1840', '#ff4fae'] };
+  const ENG = { I: 0.35, A: 0.62, B: 1, D: 0.28, O: 0.4 };
+  const rgb = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const mixC = (a, b, u) => a.map((v, i) => v + (b[i] - v) * u);
+  const css = (c, a) => 'rgba(' + (c[0] | 0) + ',' + (c[1] | 0) + ',' + (c[2] | 0) + ',' + (a == null ? 1 : a) + ')';
+  const SMIN = 0.16, SK = 1 / SMIN - 1;
+  const VIEWS = [['flat', '평면', 1, 0], ['weak', '약한 원근', 0.7, 0.3], ['strong', '강한 원근', 0, 1]];
+  const CSS = `
+.rl-ov{position:absolute;inset:0;z-index:8;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:8px 12px;align-content:center;padding:10px 14px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(90deg,rgba(7,6,14,.93),rgba(7,6,14,.84));box-sizing:border-box;overflow:auto}
+.rl-ov .col{display:flex;flex-direction:column;gap:7px;min-width:0}
+.rl-ov h3{margin:0;font:400 24px var(--f-display,sans-serif);color:#f2f0ff;letter-spacing:.5px;text-shadow:0 0 14px rgba(62,232,255,.45)}
+.rl-ov .card{border:1px solid rgba(62,232,255,.35);border-radius:12px;padding:8px 11px;background:rgba(18,14,34,.9);color:#d9d4f2;font:600 12.5px/1.45 var(--f-body,sans-serif)}
+.rl-ov .card b{color:#7ff6ff;font-family:var(--f-mono,monospace)}
+.rl-ov .card .bst{color:#ffb547}
+.rl-ov .tips{font:500 12px/1.45 var(--f-body,sans-serif);color:#a39cc4;margin:0}
+.rl-ov .grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.rl-ov .row{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.rl-ov button{min-height:44px;border-radius:11px;font:700 13px var(--f-body,sans-serif);touch-action:manipulation;border:1px solid rgba(169,139,255,.5);background:rgba(28,22,50,.95);color:#e6e1ff;padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rl-ov button.go{min-height:52px;font:400 21px var(--f-display,sans-serif);border:0;color:#0a0814;background:linear-gradient(90deg,#3ee8ff,#ff4fae);box-shadow:0 0 22px rgba(255,79,174,.35)}
+.rl-ov button.go[disabled]{opacity:.45;box-shadow:none}
+.rl-ov button:active{transform:scale(.97)}
+.rl-ov .sl{grid-column:1/-1;display:flex;align-items:center;gap:10px;min-height:44px;border:1px solid rgba(169,139,255,.35);border-radius:11px;padding:0 12px;background:rgba(20,16,38,.9);color:#d9d4f2;font:700 13px var(--f-body,sans-serif)}
+.rl-ov .sl input{flex:1;min-width:0;height:36px;accent-color:#ff4fae;touch-action:pan-x}
+.rl-ov .sl .v{font:700 13px var(--f-mono,monospace);color:#7ff6ff;min-width:38px;text-align:right}
+.rl-spd .fn{min-width:44px;min-height:44px;flex:none;padding:0;font:700 20px var(--f-mono,monospace)!important;border-radius:10px;border:1px solid rgba(169,139,255,.5);background:rgba(28,22,50,.95);color:#e6e1ff;touch-action:manipulation}
+.rl-spd{gap:6px!important;padding:0 6px 0 10px!important}
+.rl-spd input{flex:1;min-width:0;height:36px;accent-color:#ff4fae;touch-action:pan-x}
+.rl-spd .v{font:700 14px var(--f-mono,monospace);color:#7ff6ff;min-width:34px;text-align:right}
+.rl-pz{display:flex;align-items:center;min-height:48px;border:1px solid rgba(169,139,255,.35);border-radius:11px;background:rgba(20,16,38,.9);color:#d9d4f2;font:700 13px var(--f-body,sans-serif);box-sizing:border-box}
+.rl-pz .rl-spd{display:flex;align-items:center;width:100%;min-height:48px}
+.rl-ov .who{font:600 12px var(--f-body,sans-serif);color:#a39cc4;text-align:center}
+@media (max-aspect-ratio:1/1){.rl-ov{grid-template-columns:1fr;align-content:end}}
+.rl-cal,.rl-gd{position:absolute;inset:0;z-index:12;background:rgba(8,6,16,.98);display:flex;flex-direction:column;gap:10px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));box-sizing:border-box;overflow:auto}
+.rl-cal h3,.rl-gd h3{margin:0;font:400 22px var(--f-display,sans-serif);color:#f2f0ff}
+.rl-cal p{margin:0;font:500 13px/1.5 var(--f-body,sans-serif);color:#a39cc4}
+.rl-cal .pad{flex:1;min-height:96px;border-radius:20px;border:2px solid rgba(62,232,255,.6);background:#140f26;color:#f2f0ff;font:34px var(--f-display,sans-serif);touch-action:manipulation;transition:background .08s}
+.rl-cal .pad.flash{background:#2a1f4d}
+.rl-cal .res{font:700 15px var(--f-mono,monospace);color:#7ff6ff;text-align:center;min-height:22px}
+.rl-cal .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.rl-cal{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 14px!important;align-content:center}
+.rl-cal .cc{display:flex;flex-direction:column;gap:9px;min-width:0}
+@media (max-aspect-ratio:1/1){.rl-cal{grid-template-columns:1fr}}
+.rl-cal .nd button{min-height:44px;border-radius:12px;font:700 14px var(--f-mono,monospace);touch-action:manipulation;border:1px solid rgba(169,139,255,.5);background:#1c1632;color:#e6e1ff;padding:0}
+.rl-cal .row3 button,.rl-gd button{min-height:46px;border-radius:12px;font:700 14px var(--f-body,sans-serif);touch-action:manipulation;border:1px solid rgba(169,139,255,.5);background:#1c1632;color:#e6e1ff}
+.rl-cal .row3 button.p,.rl-gd button.p{background:linear-gradient(90deg,#3ee8ff,#ff4fae);color:#0a0814;border:0}
+.rl-gd .gg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+@media (max-aspect-ratio:1/1){.rl-gd .gg{grid-template-columns:1fr 1fr}}
+.rl-gd .it{border:1px solid rgba(169,139,255,.3);border-radius:12px;background:#140f26;padding:4px 8px 6px;display:flex;flex-direction:column;gap:3px}
+.rl-gd .it svg{width:100%;height:40px}
+.rl-gd .hd{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.rl-gd .hd button{min-width:120px}
+.rl-gd .it b{font:700 13px var(--f-body,sans-serif);color:#f2f0ff}
+.rl-gd .it span{font:500 11.5px/1.4 var(--f-body,sans-serif);color:#a39cc4}
+`;
+  /* 음표 그림(안내·도감 공용): 기울어진 판 위의 음표 */
+  function noteSVG(kind) {
+    const lane = '<path d="M30 4 L90 4 L116 60 L4 60 Z" fill="#120d24" stroke="#3a2f60"/><path d="M8 50 H112" stroke="#ff4fae" stroke-width="2.4"/>';
+    const q = (y, x0, x1, c, sw) => { const k = 0.5 + y / 120; const a = 60 - (60 - x0) * k, b = 60 + (x1 - 60) * k; return '<rect x="' + a.toFixed(1) + '" y="' + (y - 3.5 * k).toFixed(1) + '" width="' + (b - a).toFixed(1) + '" height="' + (7 * k).toFixed(1) + '" rx="' + (2.5 * k).toFixed(1) + '" fill="' + c + '"' + (sw ? ' stroke="#fff" stroke-width="1.2"' : '') + '/>'; };
+    let s = lane;
+    if (kind === 'tap') s += q(36, 42, 74, NCOL[0]);
+    else if (kind === 'hold') s += '<path d="M47 12 L71 12 L76 44 L42 44 Z" fill="' + NCOL[1] + '" opacity=".45"/>' + q(44, 42, 76, NCOL[1]) + q(12, 47, 71, NCOL[1]);
+    else if (kind === 'slide') s += '<path d="M40 44 C46 30 72 26 74 12 L88 12 C88 28 64 32 70 44 Z" fill="' + NCOL[2] + '" opacity=".45"/><path d="M66 22 l3 3 l-3 3 l-3 -3 z" fill="#fff"/>' + q(44, 40, 70, NCOL[2]);
+    else if (kind === 'flick') s += q(38, 44, 76, NCOL[3]) + '<path d="M52 30 L60 20 L68 30" fill="none" stroke="' + NCOL[3] + '" stroke-width="3" stroke-linecap="round"/>';
+    else if (kind === 'crit') s += q(36, 34, 86, GOLD, 1) + '<path d="M60 18 l3 6 l6 1 l-4.5 4 l1 6 l-5.5 -3 l-5.5 3 l1 -6 l-4.5 -4 l6 -1 z" fill="' + GOLD + '"/>';
+    else if (kind === 'chord') s += q(34, 22, 48, NCOL[0]) + q(34, 72, 98, NCOL[0]) + '<path d="M50 34 H70" stroke="#fff" stroke-width="1.6"/>';
+    return '<svg viewBox="0 0 120 64" xmlns="http://www.w3.org/2000/svg">' + s + '</svg>';
+  }
+  const GUIDE = [
+    ['tap', '탭', '판정선에 닿을 때 그 자리를 톡.'],
+    ['hold', '긴 음표', '머리에서 누르고 꾹 → 끝선에서 손 떼기. 박자마다 틱 점수, 너무 일찍·늦게 떼면 판정이 내려가요.'],
+    ['slide', '미끄럼', '누른 채로 손가락을 길 따라 좌우로. ◆ 틱마다 점수.'],
+    ['flick', '튕기기', '닿을 때 화살표 쪽(위·왼쪽·오른쪽)으로 휙 밀기.'],
+    ['crit', '크리티컬', '금색. 점수 두 배, 효과도 크게.'],
+    ['chord', '동시 음표', '선으로 이어진 음표는 두 손가락으로 함께.'],
+  ];
+
+  function mount(root, api) {
+    const styleEl = L.h('style', { text: CSS }); root.appendChild(styleEl);
+    const cv = U.canvas(root), ctx = cv.ctx;
+    const SPD = () => (L.debug && L.debug.speed) || 1;
+    const host = () => !api.online || api.isHost;
+    let st = null, key = null, R = null, mine = -1, ov = null, ovSig = '', cal = null, gd = null;
+    let lastAhead = -1e9, frameNow = performance.now(), acBase = null, aPtr = 0, cPtr = 0, endAt = 0, pubT = 0, hsQ = 0, lastQ = -1, clockBase = null, doneShown = false, paused = false;
+    const ptrs = {}, keyHeld = [0, 0, 0, 0, 0, 0], flash = new Float32Array(NC), fxs = [], parts = [];
+    let jt = null, pulse = 0, kPtr = 0, mileShown = 0, shake = 0, G = null, secK = 'I', secPrev = 'I', secU = 1, energy = 0.3, stars = null;
+    /* 소리 지연: 「박자 맞추기」로 잰 값이 있으면 그 값, 없으면 AudioContext가 알려 주는 출력 지연으로 자동 추정 */
+    const calLat = () => { const v = U.store.get('rhythm.lat', null); return v != null && isFinite(v) ? clamp(+v, -150, 400) / 1000 : null; };
+    const autoLat = () => { const ac = Aud.ac; if (!ac) return 0; return clamp((+ac.outputLatency || 0) + (+ac.baseLatency || 0), 0, 0.25); };
+    const myLat = () => { const c = calLat(); return c != null ? c : autoLat(); };
+    const visS = () => clamp(+U.store.get('rhythm.vis', 0) || 0, -100, 100) / 1000;
+    const VIS = [0, 20, 40, 60, -60, -40, -20];
+    let latS = myLat();
+    const vibOn = () => !!U.store.get('rhythm.vib', true);
+    const drive = (i) => { const p = api.players[i]; if (!p) return false; return host() ? (!!p.ai || !!p.local || !api.online) : (!!p.local && !p.ai); };
+    const lvOf = (i) => { const p = api.players[i]; return p && p.ai ? (p.lv || 2) : 3; };
+    const autoMine = () => !!(L.debug && L.debug.autoplay);
+    const fxK = () => (L.fx ? L.fx() : 1);
+    const viewSeat = () => (mine >= 0 ? mine : 0);
+
+    const hooks = {
+      judge(i, g, nt, kind, dt) {
+        if (i !== viewSeat()) return;
+        const tick = kind === 'tick' || kind === 'end';
+        if (!tick || g === 4 || (kind === 'end' && g >= 2)) jt = { g, t: 0.5, fl: i === mine && !autoMine() && dt != null && g >= 2 && g <= 3 ? (dt < 0 ? -1 : 1) : 0, end: kind === 'end' };
+        if (g <= 3) {
+          const x0 = nt.x, x1 = nt.x + nt.w, crit = !!nt.c && !tick;
+          for (let c = Math.max(0, Math.floor(x0)); c < Math.min(NC, Math.ceil(x1)); c++) flash[c] = Math.max(flash[c], tick ? 0.5 : 1);
+          fxs.push({ x0, x1, t: tick ? 0.25 : crit ? 0.6 : 0.42, T: tick ? 0.25 : crit ? 0.6 : 0.42, col: crit ? GOLD : NCOL[nt.ty] || NCOL[0], crit, tick, fd: kind === 'flick' ? (nt.fd || 0) : null });
+          const n = tick ? 3 : crit ? 22 : g === 1 ? 12 : 7;
+          for (let k = 0; k < n && parts.length < 220; k++) { const a = -Math.PI * (0.08 + 0.84 * Math.random()), sp = (crit ? 200 : 120) + Math.random() * 240; parts.push({ c: x0 + Math.random() * (x1 - x0), x: 0, y: 0, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0.4 + Math.random() * 0.25, col: crit ? GOLD : g === 1 ? '#ffffff' : NCOL[nt.ty] || NCOL[0] }); }
+          if (crit) shake = Math.max(shake, 1);
+          if (i === mine && !autoMine()) {
+            hitSound(tick ? (kind === 'end' ? 'end' : nt.ty === 2 ? 'stick' : 'tick') : crit ? 'crit' : kind === 'flick' ? 'flick' : 'tap');
+            if (vibOn() && !tick && (g === 1 || crit)) api.buzz(crit ? 16 : 8);
+          }
+        }
+        const c = R.seats[i].c;
+        if (g <= 2 && c >= 100 && c % 100 === 0 && c > mileShown) { mileShown = c; api.toast(c + ' 콤보!'); }
+      },
+    };
+
+    /* ----- layout: perspective highway ----- */
+    function geo() {
+      const W = cv.w, H = cv.h, vw = VIEWS[viewIx()]; VA = vw[2]; VP = vw[3];
+      if (G && G.W === W && G.H === H && G.n === (st ? st.n : 1)) return G;
+      const land = W >= H * 1.05, top = land ? 0 : (st && st.n > 1 ? 70 : 52);
+      const yH = land ? Math.round(H * 0.13) : top + Math.round((H - top) * 0.12);
+      const yJ = land ? H - Math.max(50, Math.round(H * 0.16)) : H - Math.max(96, Math.round(H * 0.17));
+      const lw = land ? Math.min(W - 20, 780) : W - 10;
+      G = { W, H, land, yH, yJ, cx: W / 2, cw: lw / NC, lw, n: st ? st.n : 1 };
+      return G;
+    }
+    /* 레인 시점(기기 저장): VA=세로 간격을 고르게 펴는 정도(1=평면), VP=멀수록 좁아지는 정도(0=평면) */
+    const viewIx = () => { const i = VIEWS.findIndex((q) => q[0] === U.store.get('rhythm.view', 'weak')); return i < 0 ? 1 : i; };
+    let VA = 0.7, VP = 0.3;
+    const sOf = (z) => { const zz = Math.max(z, -0.09), p = 1 / (1 + zz * SK), l = 1 - zz * (1 - SMIN); return p + (l - p) * VA; };
+    const wS = (s) => 1 - VP * (1 - s);
+    const yOfS = (s) => G.yH + (G.yJ - G.yH) * s;
+    const xOf = (col, s) => G.cx + (col - NC / 2) * G.cw * wS(s);
+    const colAt = (x) => (x - G.cx) / G.cw + NC / 2;
+    /* 보이는 시간: 판정선(s=1)에서 화면 아래 40%(s=0.6)까지의 z를 시점마다 구해 그 구간을 3÷속도 초에 지나게 */
+    let zv = -1, zvKey = '';
+    function lookNow() {
+      const k = VA + ':' + VP; if (k !== zvKey) { let a = 0, b = 1; for (let q = 0; q < 32; q++) { const m = (a + b) / 2; if (sOf(m) > 0.6) a = m; else b = m; } zv = (a + b) / 2; zvKey = k; }
+      return (3 / nsGet()) / zv;
+    }
+
+    /* ----- clock / input ----- */
+    /* 오디오 시계 ↔ performance.now 대응(acOff): currentTime은 오디오 버퍼 단위로 뚝뚝 오르니 매 프레임 표본의 위쪽 테두리를 천천히 따라가요.
+       → 그림·판정 모두 같은 매끈한 곡 시계(프레임 시각과 무관), 터치는 이벤트 timeStamp 시각으로 판정 */
+    let acOff = null, rafOff = 0;   // rafOff: 실제 시각(rAF·이벤트 timeStamp) − 코어가 멈춤만큼 늦춘 performance.now()
+    function acSync(ac) {
+      const o = ac.currentTime - performance.now() / 1000;
+      if (acOff == null || Math.abs(o - acOff) > 0.05) acOff = o; else acOff = o > acOff ? acOff + (o - acOff) * 0.25 : acOff + (o - acOff) * 0.02;
+    }
+    function tNow(ts) {
+      const pn = performance.now(); let at = pn; if (ts && Math.abs(ts - rafOff - pn) < 1000) at = Math.min(ts - rafOff, pn);
+      if (acRun() && acBase != null && acOff != null) return at / 1000 + acOff - acBase;
+      return R.T + (at - frameNow) / 1000 * SPD();
+    }
+    const canPlay = () => R && st && st.ph === 'play' && mine >= 0 && R.seats[mine] && !autoMine() && !paused;
+    const touchCov = (x0, x1) => { for (const id in ptrs) { const c = ptrs[id].col; if (c + 0.5 > x0 && c - 0.5 < x1) return true; } for (let z = 0; z < 6; z++) if (keyHeld[z] && 2 * z + 2 > x0 && 2 * z < x1) return true; return false; };
+    function flickOk(p, fd) {
+      const dx = p.x - p.x0, dy = p.y - p.y0, th = Math.max(16, Math.min(28, G.H * 0.05));
+      if (fd === 0) return dy < -th && -dy > Math.abs(dx) * 0.55;
+      return fd < 0 ? dx < -th && -dx > Math.abs(dy) * 0.6 : dx > th && dx > Math.abs(dy) * 0.6;
+    }
+    function onDown(e) {
+      e.preventDefault(); Aud.ctx();
+      if (!canPlay()) return;
+      geo();
+      const p = cv.local(e); if (p.y < G.yH + (G.yJ - G.yH) * 0.25) return;
+      const col = clamp(colAt(p.x), -0.4, NC + 0.4);
+      const pt = ptrs[e.pointerId] = { x: p.x, y: p.y, x0: p.x, y0: p.y, col, fk: -1 };
+      try { cv.cv.setPointerCapture(e.pointerId); } catch (er) {}
+      for (let c = Math.max(0, Math.floor(col - 0.5)); c < Math.min(NC, Math.ceil(col + 0.5)); c++) flash[c] = Math.max(flash[c], 0.3);
+      if (R.T < -0.3) return;
+      const r = press(R, mine, col - 0.5, col + 0.5, tNow(e.timeStamp) - latS, hooks, false);
+      if (r && r.flick) pt.fk = r.k;
+    }
+    function onMove(e) {
+      const pt = ptrs[e.pointerId]; if (!pt) return;
+      const p = cv.local(e); pt.x = p.x; pt.y = p.y; pt.col = clamp(colAt(p.x), -0.4, NC + 0.4);
+      if (pt.fk >= 0 && canPlay()) { const nt = R.ch[pt.fk]; if (flickOk(pt, nt.fd || 0)) { flickDone(R, mine, pt.fk, true, hooks); pt.fk = -1; } }
+    }
+    function onUp(e) {
+      const pt = ptrs[e.pointerId]; if (!pt) return;
+      if (canPlay() && R.T >= -0.3) { try { sweep(R, mine, tNow(e.timeStamp) - latS, hooks, (k, x0, x1) => touchCov(x0, x1)); } catch (er) {} }   // 뗀 바로 그 시각을 기록(프레임 단위 오차 없이)
+      delete ptrs[e.pointerId];
+      if (pt.fk >= 0 && canPlay()) { const p = cv.local(e); pt.x = p.x; pt.y = p.y; flickDone(R, mine, pt.fk, flickOk(pt, R.ch[pt.fk].fd || 0), hooks); }
+    }
+    const offIn = api.input ? api.input.on((type, id) => {
+      const z = ZK.indexOf(id); if (z < 0) return;
+      if (type === 'up') { if (canPlay() && R.T >= -0.3) { try { sweep(R, mine, tNow() - latS, hooks, (k, x0, x1) => touchCov(x0, x1)); } catch (er) {} } keyHeld[z] = 0; return; }
+      if (!canPlay() || keyHeld[z]) return;
+      keyHeld[z] = 1; Aud.ctx();
+      flash[2 * z] = Math.max(flash[2 * z], 0.3); flash[2 * z + 1] = Math.max(flash[2 * z + 1], 0.3);
+      if (R.T >= -0.3) press(R, mine, 2 * z, 2 * z + 2, tNow() - latS, hooks, true);
+    }) : () => {};
+    const noCtx = (e) => e.preventDefault();
+    const onVol = () => Aud.vol(); window.addEventListener('lounge-volume', onVol);
+    cv.cv.addEventListener('pointerdown', onDown); cv.cv.addEventListener('pointermove', onMove); cv.cv.addEventListener('pointerup', onUp); cv.cv.addEventListener('pointercancel', onUp); cv.cv.addEventListener('contextmenu', noCtx);
+
+    /* ----- ready screen ----- */
+    function bestKey() { return st.cu ? 'v2u' + (st.ch || CUS.h) + 'd' + st.lvl : 'v2d' + st.lvl; }
+    let fileIn = null, packIn = null, progEl = null;
+    function pickPack() {
+      if (!packIn) {
+        packIn = L.h('input', { type: 'file', accept: '.hlsong,application/json', style: 'display:none' });
+        packIn.addEventListener('change', () => { const f = packIn.files && packIn.files[0]; packIn.value = ''; if (f) { stopPreview(); packImport(f); } });
+        root.appendChild(packIn);
+      }
+      packIn.click();
+    }
+    function packCard() {
+      const l = PK.list || [], cur = CUS.pack ? CUS.pack.id : '', busy = !!PK.busy || CUS.st === 'dec' || CUS.st === 'ana';
+      const rows = l.map((q) => L.h('div', { class: 'row', style: 'grid-template-columns:minmax(0,1fr) 52px 52px' },
+        L.h('button', { disabled: busy, style: q.id === cur ? 'border-color:#3ee8ff;color:#3ee8ff' : '', onclick() { stopPreview(); PK.del = ''; packLoad(q.id); } }, (q.id === cur ? '✓ ' : '🎼 ') + q.title + ' · ' + q.bpm),
+        L.h('button', { disabled: busy, 'aria-label': '「' + q.title + '」 곡 묶음 다른 기기로 보내기(시험)', onclick() { stopPreview(); PK.del = ''; xferSheet('send', q.id); } }, '📤'),
+        L.h('button', { disabled: busy, 'aria-label': '「' + q.title + '」 곡 묶음 지우기', style: PK.del === q.id ? 'border-color:#ff7a6a;color:#ff9a86;font-size:11px' : '', onclick() { if (PK.del === q.id) packDelete(q.id); else { PK.del = q.id; ovSig = ''; syncOv(); } } }, PK.del === q.id ? '지우기?' : '🗑')));
+      return [!l.length || PK.busy || PK.err ? L.h('div', { class: 'card' }, '📦 내 곡 묶음 · ', l.length ? '' : '곡 묶음(.hlsong) 파일을 가져오면 여기 기본 곡처럼 나와요. 이 폰에만 저장돼요.',
+        PK.busy ? L.h('div', { style: 'color:#3ee8ff', text: PK.busy }) : null, PK.err ? L.h('div', { style: 'color:#ff9a86', text: PK.err }) : null) : null,
+        ...rows, L.h('div', { class: 'row', style: 'grid-template-columns:minmax(0,1fr) minmax(0,1fr)' },
+          L.h('button', { disabled: busy, onclick() { PK.err = ''; pickPack(); } }, '📦 곡 묶음 가져오기'),
+          L.h('button', { disabled: busy, 'aria-label': '다른 기기에서 곡 묶음 받기(시험 기능)', onclick() { stopPreview(); xferSheet('recv'); } }, '📥 받기 · 시험'))];
+    }
+    const onCus = () => { if (progEl && CUS.st === 'ana' && ovSig.indexOf('|ana|') >= 0) { progEl.style.width = Math.round(CUS.prog * 100) + '%'; return; } ovSig = ''; syncOv(); };
+    CUS.subs.add(onCus);
+    function pickFile() {
+      if (!fileIn) {
+        fileIn = L.h('input', { type: 'file', accept: 'audio/*', style: 'display:none' });
+        fileIn.addEventListener('change', () => {
+          const f = fileIn.files && fileIn.files[0]; fileIn.value = '';
+          if (!f) return;
+          if (f.size > 150e6) { CUS.st = 'err'; CUS.err = '파일이 너무 커요(150MB까지).'; cusNotify(); return; }
+          stopPreview();
+          f.arrayBuffer().then((ab) => cusLoad(ab, f.name), () => { CUS.st = 'err'; CUS.err = '파일을 읽지 못했어요.'; cusNotify(); });
+        });
+        root.appendChild(fileIn);
+      }
+      fileIn.click();
+    }
+    function cusCard() {
+      const busy = CUS.st === 'dec' || CUS.st === 'ana';
+      let info;
+      if (CUS.st === 'ok' && CUS.pack) { const so = cusSong(), C = cusChart(st.lvl), m = Math.floor(so.len / 60), s2 = Math.round(so.len % 60);
+        info = [L.h('b', { text: '「' + CUS.name + '」' }), CUS.pack.artist ? ' · ' + CUS.pack.artist : '', ' · 손으로 만든 채보', L.h('br'), so.bpm + ' BPM · ' + m + '분 ' + s2 + '초 · ' + DIFF[st.lvl] + ' · 음표 ' + C.notes.length + '개' + (CUS.pack.charts[PACK_LV[st.lvl]] ? '' : ' (어려움 채보)')]; }
+      else if (CUS.st === 'ok') { const so = cusSong(), C = cusChart(st.lvl), m = Math.floor(so.len / 60), s2 = Math.round(so.len % 60);
+        const drift = Math.abs((CUS.an.bpmB || so.bpm) - (CUS.an.bpmA || so.bpm)) >= 1.5 ? ' (' + Math.round(CUS.an.bpmA) + '→' + Math.round(CUS.an.bpmB) + ')' : '';
+        info = [L.h('b', { text: '「' + CUS.name + '」' }), L.h('br'), so.bpm + ' BPM' + drift + ' · ' + m + '분 ' + s2 + '초' + (CUS.an.dur >= AMAX ? '(앞 5분)' : '') + ' · ' + DIFF[st.lvl] + ' · 음표 ' + C.notes.length + '개', L.h('br'), '구간: ' + secSummary(so)]; }
+      else if (CUS.st === 'dec') info = ['「' + CUS.name + '」 여는 중…'];
+      else if (CUS.st === 'ana') info = ['「' + CUS.name + '」 박자·구간·멜로디 분석 중… (이 폰 안에서만)'];
+      else if (CUS.st === 'err') info = [L.h('span', { style: 'color:#ff9a86', text: CUS.err })];
+      else info = ['이 폰의 음악 파일을 고르면 박자·구간·멜로디를 분석해 악보를 만들어요. 파일은 어디에도 올리지 않아요.'];
+      progEl = busy ? L.h('div', { style: 'height:100%;width:' + Math.round(CUS.prog * 100) + '%;background:linear-gradient(90deg,#3ee8ff,#ff4fae);border-radius:4px;transition:width .1s' }) : null;
+      const last = CUS.last && CUS.last.has && CUS.st !== 'ok' && !busy ? CUS.last : null;
+      return [...packCard(), L.h('div', { class: 'card' }, CUS.pack ? '🎼 고른 곡 · ' : '🎵 내 음악 · ', ...info,
+        busy ? L.h('div', { style: 'height:8px;margin-top:8px;border-radius:4px;background:rgba(255,255,255,.1);overflow:hidden' }, progEl) : null),
+        L.h('div', { class: last ? 'row' : '' },
+          L.h('button', { style: last ? '' : 'width:100%', disabled: busy, onclick() { pickFile(); } }, busy ? '분석 중… ' + Math.round(CUS.prog * 100) + '%' : CUS.st === 'ok' ? '📂 다른 곡 고르기' : '📂 음악 파일 고르기'),
+          last ? L.h('button', { onclick() { cusLoadLast(); } }, '↺ 지난 곡: ' + (last.name.length > 9 ? last.name.slice(0, 9) + '…' : last.name)) : null)];
+    }
+    /* 노트 속도 줄: [−] 슬라이더(0.5 단위) [+](0.1 단위) 값 — 준비 화면·일시정지 메뉴 공용 */
+    function speedRow(onChange) {
+      const val = L.h('span', { class: 'v', text: nsGet().toFixed(1) });
+      const sl = L.h('input', { type: 'range', min: String(NS_MIN), max: String(NS_MAX), step: '0.5', value: String(nsGet()), 'aria-label': '노트 속도' });
+      const set = (v) => { nsSet(v); const n = nsGet(); val.textContent = n.toFixed(1); sl.value = String(n); if (onChange) onChange(n); };
+      sl.addEventListener('input', () => set(+sl.value));
+      const fine = (d) => L.h('button', { class: 'fn', 'aria-label': d < 0 ? '속도 0.1 느리게' : '속도 0.1 빠르게', onclick(e) { e.stopPropagation(); set(nsGet() + d); } }, d < 0 ? '−' : '+');
+      const row = L.h('div', { class: 'sl rl-spd' }, L.h('span', { text: '노트 속도' }), fine(-0.1), sl, fine(0.1), val);
+      row.addEventListener('pointerdown', (e) => e.stopPropagation());
+      return row;
+    }
+    function secSummary(so) { const a = so.secT || []; const s = a.map((q) => SECN[q[1]] || '').filter(Boolean); return s.length > 7 ? s.slice(0, 7).join('·') + '…' : s.join('·'); }
+    function syncOv() {
+      if (!st || st.ph !== 'ready') { if (ov) { ov.remove(); ov = null; } ovSig = ''; return; }
+      const me = mine >= 0 && !st.rdy[mine] ? mine : -1;
+      latS = myLat();
+      const sig = st.rdy.join(',') + '|' + me + '|' + Math.round(latS * 1000) + '|' + vibOn() + '|' + nsGet() + '|' + fastOn() + '|' + visS() + '|' + (calLat() != null) + '|' + previewOn + '|' + hsOn() + (st.cu ? '|' + CUS.st + '|' + CUS.h + '|' + PK.busy + '|' + PK.err + '|' + PK.del + '|' + (PK.list ? PK.list.map((q) => q.id).join() : '-') + '|' + !!CUS.last : '');
+      if (ov && sig === ovSig) return;
+      ovSig = sig; if (ov) ov.remove();
+      if (st.cu) { cusPeekLast(); if (!PK.list) packList(); }
+      const cuOk = !st.cu || cusReady(st);
+      const so = st.cu ? (cuOk ? cusSong() : null) : song(st.seed, st.gk), C = st.cu ? (cuOk ? cusChart(st.lvl) : null) : chart(st.seed, st.gk, st.lvl);
+      const all = (L.best && L.best.all) ? L.best.all('rhythm') : {}, b1 = all[bestKey()], b2 = st.fixed ? all[bestKey() + 's' + code(st.seed)] : null;
+      const waiting = []; for (let i = 0; i < st.n; i++) if (!st.rdy[i] && i !== mine) waiting.push(st.nm[i]);
+      const lat = Math.round(latS * 1000), m = so ? Math.floor(so.len / 60) : 0, s2 = so ? Math.round(so.len % 60) : 0, isCal = calLat() != null, vis = Math.round(visS() * 1000);
+      if (!isCal && !U.store.get('rhythm.calHint', 0)) { U.store.set('rhythm.calHint', 1); setTimeout(() => api.toast('처음이면 「⏱ 판정」에서 박자 맞추기를 한 번 해 보세요 (20초)'), 400); }
+      const cnt = C ? (() => { const n = [0, 0, 0, 0, 0]; C.notes.forEach((nt) => { n[nt.ty]++; if (nt.c) n[4]++; }); return '탭 ' + n[0] + ' · 긴 ' + n[1] + ' · 미끄럼 ' + n[2] + ' · 튕기기 ' + n[3] + ' · 금색 ' + n[4]; })() : '';
+      const vol = Math.round(hsVol() * 100), vLbl = L.h('span', { class: 'v', text: vol + '%' });
+      const slider = L.h('input', { type: 'range', min: '0', max: '100', step: '5', value: String(vol), 'aria-label': '타격음 크기' });
+      slider.addEventListener('input', () => { U.store.set('rhythm.hsv', +slider.value); vLbl.textContent = slider.value + '%'; });
+      slider.addEventListener('change', () => { Aud.ctx(); hsLast.tap = 0; hitSound('tap'); });
+      ov = L.h('div', { class: 'rl-ov' },
+        L.h('div', { class: 'col' },
+          L.h('h3', { text: st.n > 1 ? '리듬 레인 · 대결' : '리듬 레인' }),
+          ...(st.cu ? cusCard() : []),
+          st.cu ? (b1 ? L.h('div', { class: 'card' }, L.h('div', { class: 'bst', text: '이 곡 최고(' + DIFF[st.lvl] + '): ' + L.best.text(b1) + '점' })) : null) : L.h('div', { class: 'card' },
+            '곡 ', L.h('b', { text: code(st.seed) }), ' · ' + so.G.nm + ' · ', L.h('b', { text: so.bpm + ' BPM' }), ' · ' + m + '분 ' + s2 + '초 · ' + DIFF[st.lvl],
+            L.h('br'), cnt,
+            b1 ? L.h('div', { class: 'bst', text: '내 최고(' + DIFF[st.lvl] + '): ' + L.best.text(b1) + '점' + (b2 ? ' · 이 곡: ' + L.best.text(b2) + '점' : '') }) : null),
+          st.cu ? null : L.h('p', { class: 'tips', text: isCal ? '음표가 판정선에 닿을 때 그 자리를 톡! 판정선 어디든 여러 손가락으로 칠 수 있어요.' : '이 폰은 아직 박자를 안 맞췄어요(자동 추정값 사용). 「⏱ 판정」을 한 번 맞추면 더 정확해요.' }),
+          L.h('button', { class: 'go', disabled: me < 0 || !cuOk, onclick() { if (me < 0 || !(!st.cu || cusReady(st))) return; stopPreview(); Aud.ctx(); api.sfx('click'); api.actAs(me, st.cu ? { t: 'go', cn: CUS.name, ch: CUS.h, bpm: CUS.an.bpm } : { t: 'go' }); } }, me >= 0 ? (cuOk ? '시작' : '곡을 먼저 골라 주세요') : '준비 완료'),
+          st.n > 1 ? L.h('div', { class: 'who', text: waiting.length ? '기다리는 중: ' + waiting.join(', ') : '모두 준비되면 같이 시작해요' }) : null),
+        L.h('div', { class: 'col' },
+          L.h('div', { class: 'grid' },
+            L.h('button', { onclick() { openGuide(); } }, '📖 음표 안내'),
+            L.h('button', { disabled: !cuOk, onclick() { Aud.ctx(); previewToggle(); } }, previewOn ? '■ 미리 듣기 멈춤' : '▶ 미리 듣기'),
+            L.h('button', { onclick() { openCal(); } }, '⏱ 판정 ' + (lat >= 0 ? '+' : '') + lat + 'ms' + (isCal ? '' : '(자동)')),
+            L.h('button', { onclick() { U.store.set('rhythm.fl', !fastOn()); syncOv(); } }, 'FAST/LATE ' + (fastOn() ? '켬' : '끔')),
+            L.h('button', { onclick() { const i = VIS.indexOf(vis); U.store.set('rhythm.vis', VIS[(i + 1) % VIS.length]); syncOv(); } }, '화면 보정 ' + (vis > 0 ? '+' : '') + vis + 'ms'),
+            L.h('button', { onclick() { U.store.set('rhythm.vib', !vibOn()); syncOv(); } }, '진동 ' + (vibOn() ? '켬' : '끔')),
+            L.h('button', { onclick() { U.store.set('rhythm.view', VIEWS[(viewIx() + 1) % VIEWS.length][0]); G = null; syncOv(); } }, '시점: ' + VIEWS[viewIx()][1]),
+            L.h('button', { onclick() { U.store.set('rhythm.hs', !hsOn()); syncOv(); if (hsOn()) { Aud.ctx(); hitSound('tap'); } } }, '타격음 ' + (hsOn() ? '켬' : '끔')),
+            speedRow(),
+            L.h('label', { class: 'sl', style: hsOn() ? '' : 'opacity:.45' }, '타격음 크기', slider, vLbl))));
+      ov.addEventListener('pointerdown', (e) => e.stopPropagation());
+      root.appendChild(ov);
+      if (!U.store.get('rhythm.guide2', 0) && !(L.debug && L.debug.noTut) && !gd && !cal) { U.store.set('rhythm.guide2', 1); setTimeout(() => { if (st && st.ph === 'ready') openGuide(); }, 300); }
+    }
+    /* 음표 안내 (처음 한 번 자동, 「📖 음표 안내」로 다시) */
+    function openGuide() {
+      if (gd) return;
+      const gg = L.h('div', { class: 'gg' });
+      GUIDE.forEach(([k, nm, d]) => { const it = L.h('div', { class: 'it' }); it.innerHTML = noteSVG(k); it.appendChild(L.h('b', { text: nm })); it.appendChild(L.h('span', { text: d })); gg.appendChild(it); });
+      gd = L.h('div', { class: 'rl-gd' }, L.h('div', { class: 'hd' }, L.h('h3', { text: '📖 음표 안내' }), L.h('button', { class: 'p', onclick() { closeGuide(); } }, '알겠어요')), gg,
+        L.h('p', { style: 'margin:0;font:500 12px/1.5 var(--f-body,sans-serif);color:#a39cc4', text: '판정선(아래 빛나는 선) 어디든 눌러요 — 음표 너비 안이면 돼요. PC: S D F J K L이 왼쪽부터 두 칸씩, 튕기기는 그 자리 키만 눌러도 돼요.' }),
+        null);
+      gd.addEventListener('pointerdown', (e) => e.stopPropagation());
+      root.appendChild(gd);
+    }
+    function closeGuide() { if (gd) { gd.remove(); gd = null; } }
+    /* short preview of the chorus on the ready screen */
+    let previewOn = false, pvTimer = null, pvSrc = null, pvTo = null;
+    function stopPreview() { if (pvSrc) { try { pvSrc.stop(); } catch (e) {} pvSrc = null; } if (pvTimer) clearInterval(pvTimer); pvTimer = null; if (pvTo) clearTimeout(pvTo); pvTo = null; if (previewOn) { previewOn = false; try { Aud.bus.gain.setTargetAtTime(0, Aud.ac.currentTime, 0.05); setTimeout(() => { try { Aud.bus.gain.setTargetAtTime(1, Aud.ac.currentTime, 0.01); } catch (e) {} }, 300); } catch (e) {} } }
+    function previewToggle() {
+      if (previewOn) { stopPreview(); ovSig = ''; syncOv(); return; }
+      const ac = Aud.ctx(); if (!ac || !st) return;
+      if (st.cu) {
+        if (!cusReady(st) || !CUS.buf) return;
+        previewOn = true; ovSig = ''; syncOv();
+        const so = cusSong(), ch = (so.secT || []).find((q) => q[1] === 'B');
+        try { const src = ac.createBufferSource(); src.buffer = CUS.buf; src.connect(Aud.bus); const off = ch ? Math.min(ch[0], Math.max(0, CUS.buf.duration - 12)) : Math.min(CUS.buf.duration * 0.35, Math.max(0, CUS.buf.duration - 15)); src.start(ac.currentTime + 0.05, off, 12); pvSrc = src; } catch (e) {}
+        pvTo = setTimeout(() => { if (previewOn) { stopPreview(); ovSig = ''; syncOv(); } }, 12200);
+        return;
+      }
+      const so = song(st.seed, st.gk), bi = so.secAt.indexOf('B'), t0 = Math.max(0, bi) * so.barLen, t1 = t0 + so.barLen * 4;
+      previewOn = true; ovSig = ''; syncOv();
+      const base = ac.currentTime + 0.1 - t0; let p = 0; while (p < so.ev.length && so.ev[p].t < t0) p++;
+      pvTimer = setInterval(() => {
+        if (!Aud.ac) return stopPreview();
+        const ahead = Aud.ac.currentTime + 0.2 - base;
+        while (p < so.ev.length && so.ev[p].t < Math.min(ahead, t1)) { try { playEv(Aud.ac, base + so.ev[p].t, so.ev[p], so.G); } catch (e) {} p++; }
+        if (ahead > t1 + 0.5) { stopPreview(); ovSig = ''; syncOv(); }
+      }, 50);
+    }
+    /* ----- latency calibration: tap along to 12 clicks; median offset is stored on this phone ----- */
+    function openCal() {
+      if (cal) return;
+      stopPreview();
+      const ac = Aud.ctx(), N = 16, gap = 0.5;
+      let clicks = [], taps = [], timers = [], done = false;
+      const res = L.h('div', { class: 'res' }), padEl = L.h('button', { class: 'pad', text: '톡!' });
+      const info = L.h('p', { text: ac ? '「딱」 소리에 맞춰 큰 버튼을 톡 — 16번 울려요(처음 3번은 연습). 화면이 아니라 소리를 들으며 맞춰 주세요. 이어폰을 쓰면 그 상태로 맞추세요.' : '소리가 꺼져 있어요. 설정에서 소리를 켠 뒤 다시 열어 주세요.' });
+      function startCal() {
+        timers.forEach(clearTimeout); timers = []; clicks = []; taps = []; done = false; res.textContent = '준비…';
+        if (!ac) return;
+        // 오디오 시계 → performance.now 대응: currentTime은 버퍼 단위로 늦게 오르니 여러 번 재서 가장 앞선 값을 써요
+        let o = -1e9; for (let q = 0; q < 40; q++) o = Math.max(o, ac.currentTime - performance.now() / 1000);
+        const t0 = ac.currentTime + 0.8;
+        for (let k = 0; k < N; k++) {
+          click(ac, t0 + k * gap, k % 4 === 0); clicks.push((t0 + k * gap - o) * 1000);
+          timers.push(setTimeout(() => { padEl.classList.add('flash'); setTimeout(() => padEl.classList.remove('flash'), 90); }, 800 + k * gap * 1000));
+        }
+        timers.push(setTimeout(finish, 800 + N * gap * 1000 + 400));
+      }
+      function finish() {
+        done = true; const offs = [];
+        for (const tp of taps) { let b = null; for (let k = 3; k < clicks.length; k++) { const d = tp - clicks[k]; if (Math.abs(d) < 300 && (b == null || Math.abs(d) < Math.abs(b))) b = d; } if (b != null) offs.push(b); }
+        if (offs.length < 7) { res.textContent = '탭이 너무 적어요. 다시 해 볼까요?'; return; }
+        offs.sort((a, b) => a - b);
+        const md = offs[offs.length >> 1], q1 = offs[Math.floor(offs.length * 0.25)], q3 = offs[Math.floor(offs.length * 0.75)];
+        const v = Math.round(clamp(md, -150, 400));
+        U.store.set('rhythm.lat', v); latS = myLat(); showVal();
+        res.textContent = '판정 오프셋 ' + (v >= 0 ? '+' : '') + v + 'ms 저장 · 흔들림 ±' + Math.round((q3 - q1) / 2) + 'ms' + (q3 - q1 > 70 ? ' (들쭉날쭉해요 — 한 번 더 해 보면 좋아요)' : ''); api.sfx('pop');
+      }
+      padEl.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); if (!done && clicks.length) { taps.push(e.timeStamp && Math.abs(e.timeStamp - performance.now()) < 1000 ? e.timeStamp : performance.now()); res.textContent = taps.length + ' / ' + N; } });
+      const valEl = L.h('b', { style: 'font:700 16px var(--f-mono,monospace);color:#7ff6ff;min-width:92px;text-align:center' });
+      function showVal() { const v = Math.round(latS * 1000); valEl.textContent = (v >= 0 ? '+' : '') + v + 'ms' + (calLat() == null ? ' 자동' : ''); }
+      const nudge = (d) => L.h('button', { onclick() { const v = clamp(Math.round(latS * 1000) + d, -150, 400); U.store.set('rhythm.lat', v); latS = myLat(); showVal(); } }, (d > 0 ? '+' : '−') + Math.abs(d));
+      showVal();
+      cal = L.h('div', { class: 'rl-cal' },
+        L.h('div', { class: 'cc' }, L.h('h3', { text: '⏱ 판정 오프셋' }), info,
+          L.h('div', { class: 'nd', style: 'display:grid;grid-template-columns:1fr 1fr auto 1fr 1fr;gap:8px;align-items:center' }, nudge(-10), nudge(-1), valEl, nudge(1), nudge(10)),
+          L.h('p', { text: '+ = 판정을 늦게(소리·터치가 늦는 폰, 블루투스). 치다가 LATE가 자주 뜨면 +, FAST가 자주 뜨면 −로 몇 ms씩.' })),
+        L.h('div', { class: 'cc' }, padEl, res,
+        L.h('div', { class: 'row3' },
+          L.h('button', { onclick() { startCal(); } }, '다시 하기'),
+          L.h('button', { onclick() { U.store.set('rhythm.lat', null); latS = myLat(); showVal(); res.textContent = '자동 추정 ' + Math.round(latS * 1000) + 'ms로 바꿨어요'; } }, '자동으로'),
+          L.h('button', { class: 'p', onclick() { closeCal(); } }, '닫기'))));
+      cal.addEventListener('pointerdown', (e) => e.stopPropagation());
+      cal._stop = () => timers.forEach(clearTimeout);
+      root.appendChild(cal); startCal();
+    }
+    function closeCal() { if (!cal) return; cal._stop(); cal.remove(); cal = null; ovSig = ''; syncOv(); }
+
+    /* 일시정지 메뉴(코어 시트)에 노트 속도 줄을 끼워 넣어요 — 바꾸면 바로 적용 */
+    function injectPause(tries) {
+      setTimeout(() => {
+        if (!paused) return;
+        const sh = document.querySelector('.overlay.pause-ov .sheet');
+        if (!sh) { if ((tries || 0) < 5) injectPause((tries || 0) + 1); return; }
+        if (sh.querySelector('.rl-pz')) return;
+        const box = L.h('div', { class: 'rl-pz' }, speedRow());
+        const first = sh.querySelector('.btn.primary');
+        if (first && first.nextSibling) sh.insertBefore(box, first.nextSibling); else sh.appendChild(box);
+      }, 40);
+    }
+
+    /* ----- online ----- */
+    function pollHost() {
+      if (!api.online || !api.isHost || !R) return;
+      let rem = null; try { rem = api.net.remote(); } catch (e) { rem = null; }
+      if (!rem) return;
+      for (const k in rem) { const s = +k, o = rem[k]; if (s >= 0 && s < R.seats.length && !drive(s) && o && o.k === key) { R.seats[s].remote = 1; unpack(R.seats[s], o.s); } }
+    }
+    function pollGuest(now) {
+      if (!api.online || api.isHost || !R) return;
+      let hs = null; try { hs = api.net.hostState(); } catch (e) { hs = null; }
+      if (!hs || hs.k !== key || hs.q === lastQ) return;
+      lastQ = hs.q;
+      const base = (+hs.t || 0) - now / 1000 * SPD();
+      if (clockBase == null || base > clockBase || base < clockBase - 0.5) clockBase = base;
+      if (Array.isArray(hs.s)) hs.s.forEach((a, i) => { if (i !== mine && R.seats[i]) { R.seats[i].remote = 1; unpack(R.seats[i], a); } });
+    }
+    function guestClock(now) {
+      if (clockBase == null) return;
+      const est = clockBase + now / 1000 * SPD(), d = est - R.T;
+      if (Math.abs(d) > (R.T < 0 ? 0.06 : 0.3)) { R.T = est; acBase = null; }
+      else if (acBase != null) acBase -= d * 0.04; else R.T += d * 0.04;
+    }
+    function publish(rdt, force) {
+      if (!api.online || !R) return;
+      pubT -= rdt; if (pubT > 0 && !force) return;
+      try {
+        if (api.isHost) { pubT = 0.12; hsQ = (hsQ + 1) % 100000; api.net.hostSend({ k: key, q: hsQ, t: Math.round(R.T * 1000) / 1000, s: R.seats.map((se) => pack(R, se)) }); }
+        else if (mine >= 0 && R.seats[mine]) { pubT = 0.25; api.net.publish({ k: key, s: pack(R, R.seats[mine]) }); }
+      } catch (e) {}
+    }
+
+    /* ----- audio: scheduled on the AudioContext clock ----- */
+    function seekAudio() { const so = R.so, from = lastAhead > R.T - 1 && lastAhead < R.T + 1 ? Math.max(R.T, lastAhead) : R.T; aPtr = 0; while (aPtr < so.ev.length && so.ev[aPtr].t < from) aPtr++; cPtr = 0; while (cPtr < so.clk.length && so.clk[cPtr] < from) cPtr++; }
+    const acRun = () => { const ac = Aud.ac; return ac && ac.state === 'running' && SPD() === 1 && !paused ? ac : null; };
+    function audio() {
+      const ac = acRun(); if (!ac || acBase == null || !R || st.ph !== 'play') return;
+      const so = R.so, ahead = R.T + 0.16; lastAhead = ahead;
+      while (aPtr < so.ev.length && so.ev[aPtr].t < ahead) { const e = so.ev[aPtr++]; if (e.t >= R.T - 0.03) { try { playEv(ac, acBase + e.t, e, so.G); } catch (er) {} } }
+      while (cPtr < so.clk.length && so.clk[cPtr] < ahead) { const t = so.clk[cPtr++]; if (t >= R.T - 0.03) click(ac, acBase + t, cPtr === 1); }
+    }
+    function silence() { try { Aud.bus.gain.setTargetAtTime(0, Aud.ac.currentTime + 0.4, 0.3); } catch (e) {} const s0 = cuSrc; cuSrc = null; if (s0) setTimeout(() => { try { s0.stop(); } catch (e) {} }, 1500); }
+    let cuSrc = null;
+    function cuStop() { if (cuSrc) { try { cuSrc.stop(); } catch (e) {} cuSrc = null; } }
+    function cuStart(ac) {
+      cuStop();
+      if (!R || !R.so.cu || !CUS.buf || st.ph !== 'play') return;
+      const off = Math.max(0, R.T), end = Math.min(CUS.buf.duration, R.len);
+      if (off >= end - 0.05) return;
+      try {
+        const src = ac.createBufferSource(), g = ac.createGain(); src.buffer = CUS.buf; src.connect(g).connect(Aud.bus);
+        const when = Math.max(ac.currentTime, acBase + off);
+        if (CUS.buf.duration > R.len + 0.5) { g.gain.setValueAtTime(1, acBase + R.len - 2); g.gain.linearRampToValueAtTime(0.0001, acBase + R.len); }
+        src.start(when, off + (when - (acBase + off)), end - off); cuSrc = src;
+      } catch (e) {}
+    }
+
+    /* ----- main loop ----- */
+    function frame(rdt, now) {
+      const pq = now - performance.now(); if (Math.abs(pq - rafOff) > 40) rafOff = pq; else if (pq > rafOff) rafOff = pq;
+      frameNow = now - rafOff;
+      if (!R || st.ph !== 'play') return;
+      const ac = acRun();
+      if (ac) {
+        acSync(ac);
+        if (acBase == null) { acBase = ac.currentTime - R.T; seekAudio(); if (R.T < 0) latS = myLat(); if (R.so.cu) cuStart(ac); }
+        R.T = performance.now() / 1000 + acOff - acBase;
+      } else { if (acBase != null) cuStop(); acBase = null; R.T += Math.min(rdt, 0.25) * SPD(); }
+      if (!host()) { pollGuest(now); guestClock(now); }
+      if (mine >= 0 && R.seats[mine] && drive(mine)) { if (autoMine()) aiSeat(R, mine, 3, hooks); else sweep(R, mine, R.T - latS, hooks, (k, x0, x1) => touchCov(x0, x1)); }
+      if (host()) {
+        pollHost();
+        for (let i = 0; i < R.seats.length; i++) if (i !== mine && drive(i) && api.players[i] && api.players[i].ai) aiSeat(R, i, lvOf(i), hooks);
+        if (!endAt) { if (R.T >= R.len + 0.3) endAt = now + Math.max(300, (api.online ? 1500 : 600) / SPD()); }
+        else if (now >= endAt) { endAt = 1e15; pollHost(); api.setState(finalize(st, R)); }
+      } else if (R.T >= R.len + 0.3 && !endAt) { endAt = 1; publish(0, true); }
+      publish(rdt);
+      audio();
+      const ks = R.so.kicks; while (kPtr < ks.length && ks[kPtr] <= R.T - latS) { kPtr++; pulse = 1; }
+      // 배경이 반응하는 구간·세기
+      const sk = R.T < 0 ? 'I' : secAtT(R.so, R.T - latS);
+      if (sk !== secK) { secPrev = secK; secK = sk; secU = 0; }
+      secU = Math.min(1, secU + rdt / 1.2);
+      let eTarget = ENG[secK] || 0.5;
+      if (R.so.cu && CUS.an) { const rq = CUS.an.rms, f = clamp(Math.round((R.T - latS) * CUS.an.fps), 0, rq.length - 1); eTarget = 0.15 + 0.85 * (rq[f] || 0) / 255; }
+      energy += (eTarget - energy) * Math.min(1, rdt * 3);
+    }
+
+    /* ----- drawing ----- */
+    function txt(t, x, y, col, font, al, glow) { ctx.font = font; ctx.textAlign = al || 'center'; ctx.textBaseline = 'middle'; if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = 12; } ctx.fillStyle = col; ctx.fillText(t, x, y); ctx.shadowBlur = 0; }
+    function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, Math.max(0, Math.min(r, w / 2, h / 2))); else ctx.rect(x, y, w, h); }
+    function fit(t, maxW) { let s = String(t); while (s.length > 1 && ctx.measureText(s).width > maxW) s = s.slice(0, -2) + '…'; return s; }
+    function background(now) {
+      const W = cv.w, H = cv.h, g0 = G;
+      const A = SKY[secPrev] || SKY.A, B = SKY[secK] || SKY.A, u = secU;
+      const c0 = mixC(rgb(A[0]), rgb(B[0]), u), c1 = mixC(rgb(A[1]), rgb(B[1]), u), ca = mixC(rgb(A[2]), rgb(B[2]), u);
+      const sky = ctx.createLinearGradient(0, 0, 0, g0.yH + 6); sky.addColorStop(0, css(c0)); sky.addColorStop(1, css(c1));
+      ctx.fillStyle = sky; ctx.fillRect(0, 0, W, g0.yH + 6);
+      const gr = ctx.createLinearGradient(0, g0.yH, 0, H); gr.addColorStop(0, css(mixC(c1, [0, 0, 0], 0.55))); gr.addColorStop(1, '#040309'); ctx.fillStyle = gr; ctx.fillRect(0, g0.yH, W, H - g0.yH);
+      if (!stars) { const r = rng(7); stars = []; for (let i = 0; i < 70; i++) stars.push([r(), r(), r()]); }
+      for (const s of stars) { const a = 0.15 + 0.35 * Math.abs(Math.sin(now / 900 + s[2] * 9)); ctx.fillStyle = 'rgba(230,225,255,' + a.toFixed(2) + ')'; ctx.fillRect(s[0] * W, s[1] * g0.yH * 0.95, 1.5, 1.5); }
+      // 지평선 빛 + 박자에 맞춰 커지는 해
+      const pr = 1 + pulse * 0.12 * fxK(), sr = (g0.land ? H * 0.22 : W * 0.3) * (0.7 + energy * 0.5) * pr;
+      const sun = ctx.createRadialGradient(g0.cx, g0.yH, 2, g0.cx, g0.yH, sr * 2.2); sun.addColorStop(0, css(ca, 0.55)); sun.addColorStop(0.35, css(ca, 0.16)); sun.addColorStop(1, css(ca, 0));
+      ctx.fillStyle = sun; ctx.fillRect(0, 0, W, g0.yH + sr);
+      // 후렴: 회전하는 빛줄기
+      const beams = secK === 'B' ? u : secPrev === 'B' ? 1 - u : 0;
+      if (beams > 0.02) {
+        ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.translate(g0.cx, g0.yH);
+        for (let k = 0; k < 7; k++) { const a = -Math.PI / 2 + Math.sin(now / 1700 + k * 0.9) * 1.25; ctx.rotate(0); ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, W, a - 0.04, a + 0.04); ctx.closePath(); ctx.fillStyle = css(ca, 0.07 * beams * (0.6 + pulse * 0.4)); ctx.fill(); }
+        ctx.restore();
+      }
+      // 지평선 막대(음악 세기에 반응)
+      const nb = 44, bw = W / nb, t = now / 1000;
+      ctx.fillStyle = css(mixC(ca, [20, 10, 40], 0.45), 0.55);
+      for (let k = 0; k < nb; k++) { const d = Math.abs(k + 0.5 - nb / 2) / (nb / 2); const h = (4 + 22 * energy * (0.5 + 0.5 * Math.sin(t * 2.3 + k * 1.7) * Math.sin(t * 1.1 + k * 0.6)) + pulse * 8 * energy) * (0.4 + d); ctx.fillRect(k * bw + 1, g0.yH - h, bw - 2, h); }
+      ctx.fillStyle = css(ca, 0.5); ctx.fillRect(0, g0.yH - 1, W, 1.5);
+      return ca;
+    }
+    function highway(ca, Tv, look) {
+      const g = G, sB = 1 + (g.H - g.yJ) / (g.yJ - g.yH), yF = yOfS(SMIN), yB = g.H;
+      // 지평선까지 이어지는 흐린 길
+      { const yE = yOfS(0.03); ctx.beginPath(); ctx.moveTo(xOf(0, 0.03), yE); ctx.lineTo(xOf(NC, 0.03), yE); ctx.lineTo(xOf(NC, SMIN), yF); ctx.lineTo(xOf(0, SMIN), yF); ctx.closePath(); const eg = ctx.createLinearGradient(0, yE, 0, yF); eg.addColorStop(0, 'rgba(10,8,22,0)'); eg.addColorStop(1, 'rgba(10,8,22,.55)'); ctx.fillStyle = eg; ctx.fill();
+        ctx.strokeStyle = css(ca, 0.35); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(xOf(0, 0.03), yE); ctx.lineTo(xOf(0, SMIN), yF); ctx.moveTo(xOf(NC, 0.03), yE); ctx.lineTo(xOf(NC, SMIN), yF); ctx.stroke(); }
+      // 바닥
+      ctx.beginPath(); ctx.moveTo(xOf(0, SMIN), yF); ctx.lineTo(xOf(NC, SMIN), yF); ctx.lineTo(xOf(NC, sB), yB); ctx.lineTo(xOf(0, sB), yB); ctx.closePath();
+      const hg = ctx.createLinearGradient(0, yF, 0, yB); hg.addColorStop(0, 'rgba(10,8,22,.55)'); hg.addColorStop(0.7, 'rgba(12,9,26,.88)'); hg.addColorStop(1, 'rgba(6,5,14,.95)'); ctx.fillStyle = hg; ctx.fill();
+      // 칸 번쩍임 / 누르고 있는 자리
+      for (let c = 0; c < NC; c++) if (flash[c] > 0.02) {
+        ctx.beginPath(); ctx.moveTo(xOf(c, SMIN), yF); ctx.lineTo(xOf(c + 1, SMIN), yF); ctx.lineTo(xOf(c + 1, 1), g.yJ); ctx.lineTo(xOf(c, 1), g.yJ); ctx.closePath();
+        const fg = ctx.createLinearGradient(0, g.yJ, 0, yF); fg.addColorStop(0, css(ca, 0.5 * flash[c])); fg.addColorStop(1, css(ca, 0)); ctx.fillStyle = fg; ctx.fill();
+      }
+      const tl = []; for (const id in ptrs) tl.push(ptrs[id].col); for (let z = 0; z < 6; z++) if (keyHeld[z]) tl.push(2 * z + 1);
+      for (const c of tl) { const a = c - 0.6, b = c + 0.6; ctx.fillStyle = 'rgba(255,255,255,.10)'; ctx.beginPath(); ctx.moveTo(xOf(a, 0.8), yOfS(0.8)); ctx.lineTo(xOf(b, 0.8), yOfS(0.8)); ctx.lineTo(xOf(b, sB), yB); ctx.lineTo(xOf(a, sB), yB); ctx.closePath(); ctx.fill(); }
+      // 칸 선
+      for (let c = 0; c <= NC; c++) {
+        const edge = c === 0 || c === NC, mid = c === NC / 2;
+        ctx.strokeStyle = edge ? css(ca, 0.85) : mid ? 'rgba(200,190,255,.22)' : 'rgba(169,139,255,' + (c % 2 ? 0.07 : 0.13) + ')'; ctx.lineWidth = edge ? 2 : 1;
+        if (edge) { ctx.shadowColor = css(ca); ctx.shadowBlur = 10 * (0.6 + pulse * 0.4); }
+        ctx.beginPath(); ctx.moveTo(xOf(c, SMIN), yF); ctx.lineTo(xOf(c, sB), yB); ctx.stroke(); ctx.shadowBlur = 0;
+      }
+      // 박자선
+      if (R) {
+        const bd = R.so.beat, k0 = Math.max(0, Math.ceil((Tv - 0.05) / bd));
+        for (let k = k0; k * bd < Tv + look; k++) { const z = (k * bd - Tv) / look, s = sOf(z), y = yOfS(s); ctx.fillStyle = k % 4 === 0 ? 'rgba(242,240,255,' + (0.2 * s + 0.04).toFixed(3) + ')' : 'rgba(242,240,255,' + (0.07 * s + 0.02).toFixed(3) + ')'; ctx.fillRect(xOf(0, s), y, g.lw * wS(s), k % 4 === 0 ? 2 : 1); }
+      }
+    }
+    function quad(x0, x1, s0, s1) { ctx.beginPath(); ctx.moveTo(xOf(x0, s0), yOfS(s0)); ctx.lineTo(xOf(x1, s0), yOfS(s0)); ctx.lineTo(xOf(x1, s1), yOfS(s1)); ctx.lineTo(xOf(x0, s1), yOfS(s1)); ctx.closePath(); }
+    /* 음표 머리: 판정선에서 일정한 화면 두께(가로 화면 높이 기준), 위가 밝은 띠 + 양 끝 마디 + 가운데 흰 줄. 금색은 흰 테·반짝임 */
+    const NH = () => (G.land ? clamp(G.H * 0.045, 12, 22) : 16);
+    function drawHead(xa, xb, y0, hh, col, crit, miss, ty) {
+      const w = xb - xa, r = Math.min(hh * 0.5, w / 2), top = y0 - hh;
+      rr(xa, top, w, hh, r);
+      const gr = ctx.createLinearGradient(0, top, 0, y0); gr.addColorStop(0, miss ? col : '#ffffff'); gr.addColorStop(0.28, col); gr.addColorStop(1, css(mixC(rgb(col), [0, 0, 0], 0.35)));
+      ctx.fillStyle = gr; if (!miss) { ctx.shadowColor = col; ctx.shadowBlur = Math.min(14, hh); } ctx.fill(); ctx.shadowBlur = 0;
+      ctx.lineWidth = crit ? Math.max(1.5, hh * 0.16) : 1; ctx.strokeStyle = crit ? '#fff6d8' : 'rgba(10,6,20,.75)'; ctx.stroke();
+      if (miss || w < 10) return;
+      const cap = Math.min(w * 0.18, Math.max(5, hh * 0.9));   // 양 끝 마디(넓이가 한눈에 보이게)
+      ctx.fillStyle = 'rgba(255,255,255,.32)'; rr(xa + 2, top + 2, cap, hh - 4, r * 0.6); ctx.fill(); rr(xb - 2 - cap, top + 2, cap, hh - 4, r * 0.6); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.fillRect(xa + cap + 4, top + hh * 0.42, Math.max(0, w - 2 * cap - 8), Math.max(1, hh * 0.16));
+      if (crit) { const t = performance.now() / 300; ctx.fillStyle = '#fffbe8'; for (let q = 0; q < 2; q++) { const px = xa + w * (0.25 + 0.5 * q) + Math.sin(t + q * 2) * w * 0.08, py = top + hh * 0.2, sz = Math.max(1.5, hh * 0.22); ctx.beginPath(); ctx.moveTo(px, py - sz); ctx.lineTo(px + sz * 0.35, py); ctx.lineTo(px, py + sz); ctx.lineTo(px - sz * 0.35, py); ctx.closePath(); ctx.fill(); } }
+    }
+    function drawNotes(Tv, look) {
+      if (!R) return;
+      const se = R.seats[viewSeat()], ch = R.ch, sp = autoMine() || mine < 0;
+      const zt = (t) => (t - Tv) / look;
+      let lo = 0, hi = ch.length; const t0 = Tv - 4.2;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (ch[m].t < t0) lo = m + 1; else hi = m; }
+      let k1 = lo; while (k1 < ch.length && ch[k1].t < Tv + look) k1++;
+      const heads = [];
+      for (let k = k1 - 1; k >= lo; k--) {
+        const nt = ch[k], jd = se ? se.jd[k] : 0, end = nt.t + nt.len;
+        if (end < Tv - 0.25) continue;
+        const done = jd >= 1 && jd <= 3, miss = jd === 4, col = miss ? '#4a4566' : nt.c ? GOLD : NCOL[nt.ty];
+        if (nt.len > 0) {
+          const ta = Math.max(nt.t, done || sp ? Tv : nt.t), tb = Math.min(end, Tv + look);
+          if (tb > ta) {
+            const cov = se && (se.cov[k] >= R.T - latS - 0.1 || (sp && done));
+            const n = nt.p ? Math.max(2, Math.ceil((tb - ta) / 0.035)) : 1, L0 = [], R0 = [];
+            for (let q = 0; q <= n; q++) { const tt = ta + (tb - ta) * q / n, s = sOf(zt(tt)), x = xAt(nt, tt), y = yOfS(s); L0.push([xOf(x + 0.12, s), y]); R0.push([xOf(x + nt.w - 0.12, s), y]); }
+            ctx.beginPath(); ctx.moveTo(L0[0][0], L0[0][1]); for (const p of L0) ctx.lineTo(p[0], p[1]); for (let q = R0.length - 1; q >= 0; q--) ctx.lineTo(R0[q][0], R0[q][1]); ctx.closePath();
+            ctx.globalAlpha = miss ? 0.25 : cov ? 0.62 : 0.38; ctx.fillStyle = col; ctx.fill(); ctx.globalAlpha = miss ? 0.3 : 0.9; ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.stroke(); ctx.globalAlpha = 1;
+            if (!miss) {   // 가운데 빛줄(미끄럼 길이 어디로 휘는지 한눈에)
+              ctx.beginPath(); for (let q = 0; q < L0.length; q++) { const mx = (L0[q][0] + R0[q][0]) / 2; if (q) ctx.lineTo(mx, L0[q][1]); else ctx.moveTo(mx, L0[q][1]); }
+              ctx.strokeStyle = 'rgba(255,255,255,' + (cov ? 0.55 : 0.3) + ')'; ctx.lineWidth = nt.p ? 2.5 : 1.5; ctx.stroke();
+            }
+            if (end <= Tv + look) {   // 끝 표시(여기서 손을 떼요)
+              const se2 = sOf(zt(end)), xe = xAt(nt, end), ye = yOfS(se2), he = Math.max(2, NH() * 0.5 * wS(se2));
+              ctx.globalAlpha = miss ? 0.3 : 1; rr(xOf(xe + 0.1, se2), ye - he, xOf(xe + nt.w - 0.1, se2) - xOf(xe + 0.1, se2), he, he / 2); ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 1; ctx.stroke(); ctx.globalAlpha = 1;
+            }
+            // 틱 표시
+            if (nt.k && se) for (let q = se.tk[k]; q < nt.k.length - 1; q++) { const tt = nt.k[q]; if (tt < ta || tt > tb) continue; const s = sOf(zt(tt)), x = xAt(nt, tt) + nt.w / 2, y = yOfS(s), r = 5 * wS(s) + 1.5; ctx.fillStyle = '#ffffff'; ctx.globalAlpha = miss ? 0.3 : 0.9; ctx.beginPath(); if (nt.ty === 2) { ctx.moveTo(xOf(x, s), y - r); ctx.lineTo(xOf(x, s) + r, y); ctx.lineTo(xOf(x, s), y + r); ctx.lineTo(xOf(x, s) - r, y); } else ctx.rect(xOf(x - nt.w / 2 + 0.3, s), y - 1, (nt.w - 0.6) * G.cw * wS(s), 2); ctx.fill(); ctx.globalAlpha = 1; }
+            if (cov && !miss && Tv >= nt.t && Tv <= end) { const x = xAt(nt, Tv); ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.shadowColor = col; ctx.shadowBlur = 18; quad(x + 0.05, x + nt.w - 0.05, 1.03, 0.97); ctx.fillStyle = col; ctx.globalAlpha = 0.85; ctx.fill(); ctx.restore(); }
+          }
+        }
+        if (done || (jd === 9 && false)) continue;
+        const z = zt(nt.t); if (z < -0.06 || z > 1) continue;
+        const s0 = sOf(z), ws = wS(s0), x0 = nt.x + 0.06, x1 = nt.x + nt.w - 0.06, y0 = yOfS(s0), hh = Math.max(3, NH() * ws);
+        const xa = xOf(x0, s0), xb = xOf(x1, s0), fade = miss ? 0.45 : z > 0.85 ? (1 - z) / 0.15 : 1;
+        ctx.globalAlpha = fade;
+        drawHead(xa, xb, y0, hh, col, !!nt.c && !miss, miss, nt.ty);
+        if (nt.ty === 3 && !miss) {   // 튕기기 화살표: 음표 위에 크게, 위로 살짝 들썩
+          const cx = (xa + xb) / 2, bob = (Math.sin(Tv * 14 + k) * 0.5 + 0.5) * 4 * ws, a = Math.max(5, Math.min(18 * ws + 2, (xb - xa) * 0.28)), fd = nt.fd || 0, cy = y0 - hh - a * 0.55 - bob;
+          ctx.fillStyle = nt.c ? GOLD : NCOL[3]; ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.lineWidth = Math.max(1, 1.6 * ws); ctx.lineJoin = 'round'; ctx.beginPath();
+          if (fd === 0) { ctx.moveTo(cx, cy - a); ctx.lineTo(cx + a, cy + a * 0.15); ctx.lineTo(cx + a * 0.38, cy + a * 0.15); ctx.lineTo(cx + a * 0.38, cy + a * 0.55); ctx.lineTo(cx - a * 0.38, cy + a * 0.55); ctx.lineTo(cx - a * 0.38, cy + a * 0.15); ctx.lineTo(cx - a, cy + a * 0.15); }
+          else { const d = fd, bx = cx - d * a * 0.2; ctx.moveTo(bx + d * a * 1.1, cy); ctx.lineTo(bx + d * a * 0.15, cy - a * 0.75); ctx.lineTo(bx + d * a * 0.15, cy - a * 0.3); ctx.lineTo(bx - d * a * 0.75, cy - a * 0.3); ctx.lineTo(bx - d * a * 0.75, cy + a * 0.3); ctx.lineTo(bx + d * a * 0.15, cy + a * 0.3); ctx.lineTo(bx + d * a * 0.15, cy + a * 0.75); }
+          ctx.closePath(); ctx.fill(); ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+        if (!miss && jd !== 9) heads.push([nt.t, xa, xb, y0 - hh / 2, ws]);
+      }
+      // 동시 음표 잇는 선
+      heads.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      for (let i = 0; i + 1 < heads.length; i++) { const a = heads[i], b = heads[i + 1]; if (Math.abs(a[0] - b[0]) > 0.004 || b[1] <= a[2]) continue; ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = Math.max(1.2, 3 * a[4]); ctx.beginPath(); ctx.moveTo(a[2], a[3]); ctx.lineTo(b[1], a[3]); ctx.stroke(); }
+    }
+    function judgeLine(ca) {
+      const g = G, pg = 0.55 + pulse * 0.45, x0 = xOf(0, 1), x1 = xOf(NC, 1);
+      ctx.save(); ctx.globalCompositeOperation = 'lighter';
+      const gl = ctx.createLinearGradient(x0, 0, x1, 0); gl.addColorStop(0, '#3ee8ff'); gl.addColorStop(0.5, css(ca)); gl.addColorStop(1, '#ff4fae');
+      ctx.shadowColor = css(ca); ctx.shadowBlur = 16 * pg; ctx.fillStyle = gl; ctx.globalAlpha = 0.75 + 0.25 * pg; ctx.fillRect(x0, g.yJ - 2, x1 - x0, 4); ctx.shadowBlur = 0;
+      const glow = ctx.createLinearGradient(0, g.yJ - 26, 0, g.yJ + 4); glow.addColorStop(0, css(ca, 0)); glow.addColorStop(1, css(ca, 0.18 * pg)); ctx.fillStyle = glow; ctx.globalAlpha = 1; ctx.fillRect(x0, g.yJ - 26, x1 - x0, 30);
+      // 판정 효과: 빛기둥 + 퍼지는 테
+      for (const f of fxs) {
+        const u = 1 - f.t / f.T, a = (1 - u), xa = xOf(f.x0, 1), xb = xOf(f.x1, 1), grow = (f.crit ? 16 : 9) * u;
+        ctx.globalAlpha = a * (f.tick ? 0.5 : 0.9); ctx.strokeStyle = f.col; ctx.lineWidth = f.crit ? 3 : 2;
+        rr(xa - grow, g.yJ - 8 - grow * 0.6, xb - xa + grow * 2, 16 + grow * 1.2, 8); ctx.stroke();
+        if (!f.tick) { const pl = ctx.createLinearGradient(0, g.yJ, 0, g.yJ - (f.crit ? 150 : 90)); pl.addColorStop(0, f.col); pl.addColorStop(1, 'rgba(0,0,0,0)'); ctx.globalAlpha = a * 0.45; ctx.fillStyle = pl; ctx.fillRect(xa, g.yJ - (f.crit ? 150 : 90), xb - xa, f.crit ? 150 : 90); }
+        if (f.fd != null && !f.tick) { const cx = (xa + xb) / 2, dy = -30 * u; ctx.globalAlpha = a; ctx.strokeStyle = f.col; ctx.lineWidth = 3; ctx.beginPath(); if (f.fd === 0) { ctx.moveTo(cx - 10, g.yJ - 14 + dy); ctx.lineTo(cx, g.yJ - 24 + dy); ctx.lineTo(cx + 10, g.yJ - 14 + dy); } else { const d = f.fd, ox = 26 * u * d; ctx.moveTo(cx + ox - d * 4, g.yJ - 28); ctx.lineTo(cx + ox + d * 8, g.yJ - 18); ctx.lineTo(cx + ox - d * 4, g.yJ - 8); } ctx.stroke(); }
+      }
+      for (const p of parts) { ctx.globalAlpha = clamp(p.t * 2.2, 0, 1); ctx.fillStyle = p.col; ctx.fillRect(xOf(p.c, 1) + p.x - 1.5, g.yJ + p.y - 1.5, 3, 3); }
+      ctx.restore(); ctx.globalAlpha = 1;
+      // PC 키 표시(판정선 아래)
+      if (G.land && G.H - G.yJ > 30 && !api.online) for (let z = 0; z < 6; z++) { const cx = xOf(2 * z + 1, 1.0 + 0.5 * (G.H - G.yJ) / (G.yJ - G.yH)); const kl = L.ui.keyLabel('rhythm', ZK[z]); if (kl) txt(kl, cx, (G.yJ + G.H) / 2 + 4, keyHeld[z] ? '#fff' : 'rgba(230,225,255,.22)', '600 12px ' + MONO); }
+    }
+    function drawHUD() {
+      const W = cv.w, vs = viewSeat(), se = R ? R.seats[vs] : null;
+      const sc = se ? scoreOf(R, se) : 0, acc = se ? accOf(se) : 100;
+      if (R) { const pr = clamp(R.T / R.len, 0, 1); ctx.fillStyle = 'rgba(255,255,255,.08)'; ctx.fillRect(0, 0, W, 3); const g = ctx.createLinearGradient(0, 0, W, 0); g.addColorStop(0, '#3ee8ff'); g.addColorStop(1, '#ff4fae'); ctx.fillStyle = g; ctx.fillRect(0, 0, W * pr, 3); }
+      txt(String(sc).padStart(7, '0'), 12, 22, '#f2f0ff', '700 21px ' + MONO, 'left', 'rgba(62,232,255,.6)');
+      txt(acc.toFixed(1) + '%', W - 12, 20, '#7ff6ff', '700 17px ' + MONO, 'right');
+      if (R) {
+        const sec = R.T < 0 ? '준비' : SECN[secK] || '';
+        ctx.font = '600 11px ' + FONT; ctx.fillStyle = '#d0c8ea'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.shadowColor = '#000'; ctx.shadowBlur = 4;
+        ctx.fillText(fit(DIFF[st.lvl] + ' · ' + R.so.bpm + ' BPM' + (sec ? ' · ' + sec : ''), G.land ? W * 0.3 : W - 90), 12, 43); ctx.shadowBlur = 0;
+        txt(se ? gradeOf(acc) : '', W - 12, 42, '#ffb547', '15px ' + DISP, 'right');
+      }
+      if (st.n > 1 && R) {   // live versus board (왼쪽 위, 판 바깥)
+        const order = R.seats.map((s2, i) => [i, mine === i || !s2.remote ? scoreOf(R, s2) : s2.sc || 0]).sort((a, b) => b[1] - a[1]);
+        const bw = G.land ? Math.min(150, W * 0.22) : (W - 12 - (st.n - 1) * 5) / st.n;
+        order.forEach(([i, v], r) => {
+          const x = G.land ? 8 : 6 + r * (bw + 5), y = G.land ? 54 + r * 24 : 52, me = i === mine;
+          rr(x, y, bw, 21, 7); ctx.fillStyle = me ? 'rgba(62,232,255,.16)' : 'rgba(10,8,20,.6)'; ctx.fill();
+          ctx.strokeStyle = me ? 'rgba(62,232,255,.7)' : 'rgba(255,255,255,.1)'; ctx.lineWidth = 1; ctx.stroke();
+          ctx.fillStyle = (api.players[i] && api.players[i].color) || '#fff'; ctx.beginPath(); ctx.arc(x + 9, y + 10.5, 3.5, 0, 7); ctx.fill();
+          ctx.font = '700 11px ' + MONO; const vt = Math.round(v / 1000) + 'k', vw = ctx.measureText(vt).width;
+          ctx.textAlign = 'right'; ctx.fillStyle = '#f2f0ff'; ctx.textBaseline = 'middle'; ctx.fillText(vt, x + bw - 6, y + 11);
+          ctx.font = '600 11px ' + FONT; ctx.textAlign = 'left'; ctx.fillStyle = me ? '#7ff6ff' : '#c9c3e6'; ctx.fillText(fit((r + 1) + ' ' + st.nm[i], bw - vw - 26), x + 16, y + 11);
+        });
+      }
+    }
+    function draw(now) {
+      if (!st) { ctx.fillStyle = '#05040b'; ctx.fillRect(0, 0, cv.w, cv.h); return; }
+      geo();
+      const k = fxK(), sx = shake > 0 ? (Math.random() - 0.5) * shake * 7 * k : 0, sy = shake > 0 ? (Math.random() - 0.5) * shake * 5 * k : 0;
+      ctx.save(); ctx.translate(sx, sy);
+      const ca = background(now);
+      const Tv = R ? (autoMine() || mine < 0 ? R.T : R.T - latS - visS()) : -9, look = lookNow();
+      highway(ca, Tv, look);
+      drawNotes(Tv, look);
+      judgeLine(ca);
+      ctx.restore();
+      drawHUD();
+      if (!R) return;
+      const se = R.seats[viewSeat()], cx = G.cx, cy = G.yH + (G.yJ - G.yH) * 0.36;
+      if (se && se.c >= 5) { const big = 1 + pulse * 0.06; ctx.globalAlpha = 0.55; txt(String(se.c), cx, cy, '#f2f0ff', Math.round((G.land ? 46 : 52) * big) + 'px ' + DISP, 'center', css(ca, 0.8)); ctx.globalAlpha = 0.7; txt('콤보', cx, cy + (G.land ? 30 : 34), '#d9d4f2', '600 12px ' + FONT); ctx.globalAlpha = 1; }
+      if (jt && jt.t > 0) {
+        const J = JUD[jt.g], s = 1 + Math.max(0, jt.t - 0.4) * 2; ctx.globalAlpha = Math.min(1, jt.t * 4); txt(J[0], cx, G.yJ - 42, J[1], '700 ' + Math.round(20 * s) + 'px ' + FONT, 'center', J[1]);
+        if (jt.fl && fastOn()) txt(jt.fl < 0 ? 'FAST' : 'LATE', cx, G.yJ - 64, jt.fl < 0 ? '#6fb8ff' : '#ff9a5c', '800 12px ' + MONO, 'center', jt.fl < 0 ? '#2f7dff' : '#ff6a2f');
+        ctx.globalAlpha = 1;
+      }
+      if (R.T < 0 && st.ph === 'play') {
+        const k2 = Math.ceil(-R.T / R.so.beat);
+        txt(k2 <= 4 ? String(k2) : '준비', cx, cy - 6, '#f2f0ff', (k2 <= 4 ? 52 : 34) + 'px ' + DISP, 'center', '#ff4fae');
+        txt(R.so.cu ? fit('「' + R.so.G.nm + '」', G.lw * 0.6) : '곡 ' + code(st.seed) + ' · ' + R.so.G.nm, cx, cy + 36, '#d9d4f2', '600 13px ' + FONT);
+      }
+      if (st.ph === 'done') txt('곡 끝!', cx, cy, '#ffe9ff', '42px ' + DISP, 'center', '#ff4fae');
+    }
+
+    const stopLoop = U.loop((rdt, now) => {
+      try { if (st) frame(rdt, now); } catch (e) { console.error(e); }
+      for (let c = 0; c < NC; c++) if (flash[c] > 0) flash[c] = Math.max(0, flash[c] - rdt * 3.5);
+      pulse = Math.max(0, pulse - rdt * 5); shake = Math.max(0, shake - rdt * 4);
+      for (let k = fxs.length - 1; k >= 0; k--) { fxs[k].t -= rdt; if (fxs[k].t <= 0) fxs.splice(k, 1); }
+      for (let k = parts.length - 1; k >= 0; k--) { const p = parts[k]; p.t -= rdt; p.x += p.vx * rdt; p.y += p.vy * rdt; p.vy += 520 * rdt; if (p.t <= 0) parts.splice(k, 1); }
+      if (jt) jt.t -= rdt;
+      try { draw(now); } catch (e) { console.error(e); }
+    });
+
+    return {
+      update(next) {
+        if (!next) return;
+        st = next; G = null;
+        const ms = api.mySeats(); mine = ms.length ? ms[0] : -1;
+        syncOv();
+        if (st.ph === 'ready') { R = null; key = null; return; }
+        if (cal) closeCal();
+        closeGuide();
+        stopPreview();
+        if (st.rid !== key) {
+          cuStop(); key = st.rid; R = newRun(st, host()); lastAhead = -1e9; endAt = 0; acBase = null; clockBase = null; lastQ = -1; doneShown = false; kPtr = 0; mileShown = 0;
+          latS = myLat(); seekAudio(); jt = null; parts.length = 0; fxs.length = 0; secK = secPrev = 'I'; secU = 1;
+          try { if (Aud.bus) Aud.bus.gain.setTargetAtTime(1, Aud.ac.currentTime, 0.01); } catch (e) {}
+          Aud.ctx();
+        }
+        if (st.ph === 'done' && !doneShown) {
+          doneShown = true; silence();
+          if (R && st.fin) st.fin.forEach((f, i) => { if (f && R.seats[i] && i !== mine) { R.seats[i].remote = 1; unpack(R.seats[i], f.concat([0])); } });
+          if (mine >= 0 && st.fin && st.fin[mine] && !api.players[mine].ai && !autoMine() && st.n === 1) {
+            const f = st.fin[mine], lbl = DIFF[st.lvl];
+            let nb = st.cu ? (R && R.so.cu ? api.best(bestKey(), f[0], { label: '「' + (st.cn.length > 12 ? st.cn.slice(0, 12) + '…' : st.cn) + '」 ' + lbl }) : false) : api.best(bestKey(), f[0], { label: lbl + ' 점수' });
+            if (st.fixed) nb = api.best(bestKey() + 's' + code(st.seed), f[0], { label: lbl + ' · 곡 ' + code(st.seed) }) || nb;
+            if (nb) setTimeout(() => api.toast('🏆 새 최고 기록!'), 300);
+          }
+          // 평균적으로 한쪽으로 치우쳐 쳤으면 오프셋 조정을 권해요
+          const me2 = mine >= 0 && R ? R.seats[mine] : null;
+          if (me2 && !autoMine() && api.players[mine] && !api.players[mine].ai && me2.dn >= 30) { const av = Math.round(me2.ds / me2.dn * 1000); if (Math.abs(av) >= 18) setTimeout(() => api.toast('평균 ' + Math.abs(av) + 'ms ' + (av > 0 ? '늦게' : '빠르게') + ' 쳤어요 — ⏱ 판정 오프셋을 ' + (av > 0 ? '+' : '−') + Math.abs(av) + 'ms 해 보세요'), 1400); }
+        }
+      },
+      pause() { paused = true; Aud.held = true; stopPreview(); injectPause(); try { if (Aud.ac && Aud.ac.state === 'running') Aud.ac.suspend(); } catch (e) {} for (const k in ptrs) delete ptrs[k]; },
+      resume() { paused = false; Aud.held = false; try { if (Aud.ac && Aud.ac.state === 'suspended') Aud.ac.resume(); } catch (e) {} },
+      destroy() {
+        stopLoop(); offIn(); stopPreview(); cuStop(); CUS.subs.delete(onCus); CUS.job++; if (CUS.st === 'dec' || CUS.st === 'ana') CUS.st = 'none'; if (fileIn) fileIn.remove(); if (packIn) packIn.remove(); PK.del = ''; window.removeEventListener('lounge-volume', onVol);
+        cv.cv.removeEventListener('pointerdown', onDown); cv.cv.removeEventListener('pointermove', onMove); cv.cv.removeEventListener('pointerup', onUp); cv.cv.removeEventListener('pointercancel', onUp); cv.cv.removeEventListener('contextmenu', noCtx);
+        if (ov) ov.remove(); if (cal) { cal._stop(); cal.remove(); } closeGuide();
+        styleEl.remove(); cv.destroy(); Aud.held = false; Aud.close();
+      },
+      _dbg: () => ({ R, st, mine, latS, acBase, CUS }),
+    };
+  }
+
+  /* 도감: 음표 종류 · 장르 · 난이도 (수치는 위 표에서) */
+  const CODEX = [
+    { h: '음표', p: ['판정선 어디든 여러 손가락으로 눌러요. 음표 너비(2~6칸) 안이면 맞아요.'], rows: GUIDE.map(([k, nm, d]) => ({ icon: noteSVG(k), name: nm, tag: k === 'crit' ? '점수 ×2' : k === 'hold' || k === 'slide' ? '틱 점수' : k === 'flick' ? '↑ ← →' : k === 'chord' ? '두 손' : '기본', desc: d })) },
+    { h: '장르', p: ['곡은 판마다 직접 합성해요. 빠르기는 장르 범위 안에서 무작위.'], rows: GKEYS.map((k) => ({ icon: '🎵', name: GEN[k].nm, tag: GEN[k].bpm[0] + '~' + GEN[k].bpm[1] + ' BPM', desc: '조성: ' + GEN[k].modes.map((m) => ({ min: '단조', maj: '장조', dor: '도리안', jazz: '재즈 화음' })[m]).filter((v, i, a) => a.indexOf(v) === i).join('·') + ' · 드럼 ' + ({ elec: '전자', rock: '록', jazz: '브러시·라이드', cine: '팀파니', wave: '80년대 전자', lofi: '먼지 낀 샘플' })[GEN[k].kit] })) },
+    { h: '난이도', p: ['밀도는 「박자당 음표 수」 목표예요. 동시 음표는 최대 두 개(두 손).'], rows: [1, 2, 3, 4].map((l) => ({ icon: ['', '①', '②', '③', '④'][l], name: DIFF[l], tag: '박자당 ' + DENS[l] + '개', desc: '최소 간격 ' + Math.round(MGAP[l] * 1000) + 'ms · 동시 ' + CHMAX[l] + '개 · 긴 음표 ' + HOLDB[l] + '박 이상 · 너비 약 ' + Math.round(WBASE[l]) + '칸' + (l === 1 ? ' · 미끄럼·튕기기 없음' : l === 2 ? ' · 튕기기는 위로만' : ' · 옆 튕기기') })) },
+    { h: '판정', p: ['정확도 = 완벽 100% · 좋음 70% · 아쉬움 30% · 놓침 0% (크리티컬은 두 배 무게).'], rows: [[1, PW], [2, GW], [3, BW]].map(([g, w]) => ({ icon: '◎', name: JUD[g][0], tag: '±' + Math.round(w * 1000) + 'ms', desc: g === 1 ? '콤보 이어짐 · 정확도 100%' : g === 2 ? '콤보 이어짐 · 정확도 70%' : '콤보 끊김 · 정확도 30%' })).concat([{ icon: '◇', name: '틱', tag: '완벽/놓침', desc: '긴 음표·미끄럼: 그 시각에 손가락이 음표 위에 있으면 완벽.' }, { icon: '⤒', name: '떼기', tag: '±' + Math.round(RW[1] * 1000) + '/' + Math.round(RW[2] * 1000) + '/' + Math.round(RW[3] * 1000) + 'ms', desc: '긴 음표 끝에서 손을 떼는 시각: 완벽/좋음/아쉬움. 너무 일찍 떼면 놓침, 끝을 지나 계속 누르고 있으면 아쉬움.' }]) },
+  ];
+
+  L.register({
+    id: 'rhythm', name: '리듬 레인', tag: '실시간 리듬 게임', cat: '아케이드', landscape: true, codex: CODEX,
+    blurb: '지평선에서 달려오는 12칸 판 위로 탭·긴 음표·미끄럼·튕기기·금색 크리티컬! 판마다 새로 합성되는 곡이나 내 음악 파일로 쳐요. 혼자 기록 도전, 친구와는 온라인·LAN 같은 곡 점수 대결(한 폰에 한 명).',
+    tint: '#3a1060',
+    icon: '<path d="M20 8 L36 8 L52 50 L4 50 Z" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".5"/><path d="M28 8 V50" stroke="currentColor" stroke-width="1" opacity=".35"/><rect x="21" y="16" width="10" height="3" rx="1.5" fill="currentColor"/><path d="M27 24 C32 28 22 32 30 38 L36 38 C28 32 38 28 33 24 Z" fill="currentColor" opacity=".6"/><rect x="12" y="38" width="16" height="5" rx="2.5" fill="currentColor"/><path d="M6 44 H50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>',
+    minPlayers: 1, maxPlayers: 4, defaultPlayers: 1, hidden: false, realtime: true, aiDelay: 300,
+    controls: [
+      { id: 'z1', label: '1·2칸 (왼쪽 끝)', keys: ['KeyS', 'KeyA'], pad: ['lt', 'left'] },
+      { id: 'z2', label: '3·4칸', keys: ['KeyD'], pad: ['lb', 'down'] },
+      { id: 'z3', label: '5·6칸', keys: ['KeyF', 'KeyG'], pad: ['x', 'up'] },
+      { id: 'z4', label: '7·8칸', keys: ['KeyJ', 'KeyH'], pad: ['a'] },
+      { id: 'z5', label: '9·10칸', keys: ['KeyK'], pad: ['rb', 'b'] },
+      { id: 'z6', label: '11·12칸 (오른쪽 끝)', keys: ['KeyL', 'Semicolon'], pad: ['rt', 'y'] },
+    ],
+    options: [
+      { id: 'gen', label: '장르', choices: [{ v: 'rand', label: '무작위' }].concat(GKEYS.map((k) => ({ v: k, label: GEN[k].nm }))), def: 'rand' },
+      { id: 'song', label: '곡', tip: '어떤 곡을 연주할지.', choices: [{ v: 'rand', label: '새 곡(무작위)', tip: '판마다 새로 만든 곡.' }, { v: 'daily', label: '오늘의 곡', tip: '날마다 모두 같은 곡.' }].concat(FIXED.map((s, i) => ({ v: 'f' + i, label: '고정 곡 ' + (i + 1) })), [{ v: 'mine', label: '내 음악·곡 묶음(혼자)', tip: '내 음악 파일로 노트를 만들어요(혼자).' }]), def: 'rand' },
+      { id: 'lvl', label: '난이도', choices: [1, 2, 3, 4].map((v) => ({ v, label: DIFF[v] })), def: 2 },
+    ],
+    quick: [
+      '지평선에서 12칸 판을 따라 음표가 달려와요. 판정선에 닿는 순간 그 자리를 톡!',
+      '긴 음표는 꾹, 미끄럼은 누른 채 길 따라, 튕기기는 화살표 쪽으로 휙, 금색은 점수 두 배.',
+      '정확할수록 점수가 올라요. 혼자면 최고 기록, 여럿이면 같은 곡 점수 대결!',
+    ],
+    rules: [
+      { h: '목표', p: [
+        '곡에 맞춰 달려오는 음표를 정확한 순간에 쳐서 점수(최대 1,000,000점)를 모아요.',
+        '혼자 하면 난이도별 최고 기록에 도전. 2~4명이면 모두 같은 곡을 동시에 치고 점수가 높은 사람이 1위예요.',
+      ] },
+      { h: '하는 법', p: [
+        '가로 화면용 게임이에요. 「시작」을 누르면 「딱 딱 딱 딱」 4번 박자를 세 주고 곡이 시작돼요.',
+        '판은 12칸이고, 음표는 2~6칸 너비예요. 음표가 아래 빛나는 선(판정선)에 닿을 때 그 너비 안 아무 데나 톡. 판정선 근처 어디든 여러 손가락으로 눌러도 돼요.',
+        '탭(하늘색): 톡 한 번.',
+        '긴 음표(초록): 머리에서 누르고 끝까지 꾹. 박자마다 「틱」이 있어 그때 손가락이 음표 위에 있으면 점수.',
+        '미끄럼(보라): 누른 채로 손가락을 길을 따라 좌우로 옮겨요. 길 위 ◆가 틱이에요.',
+        '튕기기(분홍, 화살표): 닿는 순간 누르고 화살표 쪽(위·왼쪽·오른쪽)으로 휙 밀어요. 누르기만 하고 안 밀면 놓침.',
+        '크리티컬(금색): 무엇이든 금색이면 점수가 두 배, 효과도 커요.',
+        '선으로 이어진 음표는 동시에 오는 음표 — 두 손가락으로 함께.',
+        'PC: S·D·F·J·K·L이 왼쪽부터 두 칸씩 맡아요(튕기기는 그 키만 눌러도 돼요). 게임패드도 돼요(「⌨ 조작 설정」에서 바꾸기).',
+      ] },
+      { h: '판정 · 점수', p: [
+        '완벽(±0.05초) · 좋음(±0.095초) · 아쉬움(±0.14초) · 놓침. 시간은 곡을 트는 오디오 시계로 재고, 손가락이 닿은 그 순간의 시각으로 판정해요(화면 프레임과 무관). 빈 곳을 눌러도 벌점은 없어요.',
+        '음표 너비 + 양옆 반 칸까지 맞은 걸로 쳐요. 여러 음표가 겹치면 시각이 가장 가까운 것부터.',
+        '틱(긴 음표·미끄럼)은 완벽 아니면 놓침. 긴 음표 끝(작은 막대)에서 손을 떼요: ±0.1초 완벽 · ±0.17초 좋음 · ±0.26초 아쉬움.',
+        '콤보: 완벽·좋음·틱이 이어진 수. 아쉬움이나 놓침이 나오면 0으로.',
+        '정확도 = 완벽 100% · 좋음 70% · 아쉬움 30% · 놓침 0%의 평균(크리티컬은 두 배 무게).',
+        '점수 = 정확도 × 900,000 + (최고 콤보 ÷ 전체 판정 수) × 100,000.',
+        '등급: 98% 이상 S+ · 95% S · 90% A · 80% B · 70% C · 그 아래 D. 혼자 할 때는 C 이상이면 성공이에요.',
+      ] },
+      { h: '곡 · 난이도', p: [
+        '곡은 그때그때 직접 만들어요: 장르(일렉트로닉 · 록 · 재즈풍 · 시네마틱 · 신스웨이브 · 로파이 힙합), 빠르기 90~160 BPM, 조성, 화음 진행까지. 기본은 무작위.',
+        '음표는 곡에서 뽑아요: 킥은 왼쪽·스네어는 오른쪽 탭, 길게 끄는 소리는 긴 음표, 이어지는 멜로디는 음높이를 따라 굽는 미끄럼, 심벌·필인 같은 강세는 금색·튕기기.',
+        '두 손으로 치기 편하게 놓아요: 빠르게 이어지면 손을 번갈아, 손이 엇갈리는 자리는 피하고, 같은 자리 연타는 난이도에 맞게만.',
+        '「곡」: 새 곡(무작위) · 오늘의 곡(날마다 바뀌고 모두 같은 곡) · 고정 곡 1~5. 곡마다 4글자 곡 코드가 있어요. 같은 곡·같은 난이도면 누구나 같은 악보예요.',
+        '난이도: 쉬움은 넓은 음표·박자마다 한 번쯤(미끄럼·튕기기 없음), 보통은 8분음표·미끄럼·위로 튕기기, 어려움은 동시 치기·옆 튕기기, 지옥은 16분음표·좁은 음표까지.',
+      ] },
+      { h: '내 음악', p: [
+        '「곡」에서 「내 음악(혼자)」을 고르면 이 폰에 있는 음악 파일(mp3·m4a·wav·ogg 등)로 칠 수 있어요. 혼자 할 때만 돼요.',
+        '파일은 어디에도 올리지 않아요. 이 폰 안에서 빠르기(중간에 흔들려도 따라가요)·박자·마디 첫 박·구간(인트로/벌스/후렴/브레이크/엔딩)·멜로디 윤곽을 분석해 악보를 만들어요.',
+        '드럼 소리는 탭, 길게 이어지는 음은 긴 음표, 움직이며 이어지는 멜로디는 미끄럼, 마디 첫 박의 센 소리는 금색, 후렴이 시작되는 순간은 튕기기가 돼요. 후렴은 더 촘촘하고 브레이크는 여유 있게.',
+        '5분이 넘는 곡은 앞 5분만 써요. 마지막으로 쓴 곡은 기억해 두어 다음엔 바로 다시 고를 수 있어요.',
+        '「📦 곡 묶음 가져오기」: 음원과 손으로 만든 채보가 함께 든 곡 묶음 파일(.hlsong)을 고르면 이 폰에 저장돼 「내 곡 묶음」에 기본 곡처럼 나와요. 🗑을 두 번 누르면 지워요. 음원이 그 폰에만 있으니 혼자 할 때만 쓸 수 있어요.',
+        '「📤」·「📥 받기」(시험 기능, 설치형 앱): 곡 묶음 옆 📤을 누르면 4글자 코드가 떠요. 받을 기기에서 「📥 받기」에 그 코드를 넣으면 기기끼리 직접 보내고(서버에 저장 안 함), 다 받으면 깨지지 않았는지 검사한 뒤 「내 곡 묶음」에 넣어요.',
+      ] },
+      { h: '판정 오프셋 · 설정', p: [
+        '「⏱ 판정」(판정 오프셋): 소리에 맞춰 버튼을 16번 톡 → 이 폰의 소리·터치 지연을 재서 저장해요. −10·−1·+1·+10 버튼으로 직접 고칠 수도 있어요. 블루투스 이어폰이라면 꼭 한 번!',
+        '「FAST/LATE」: 완벽이 아닐 때 빨리 쳤는지(FAST) 늦게 쳤는지(LATE) 판정 글자 위에 보여 줘요. 곡이 끝나면 평균이 한쪽으로 치우쳤을 때 오프셋을 얼마나 바꾸면 좋을지 알려 줘요.',
+        '「시점」: 레인을 평면·약한 원근(기본)·강한 원근 중에서 골라요. 이 폰에 저장돼요.',
+        '「화면 보정」: 소리는 맞는데 음표가 선에 먼저/늦게 닿아 보이면 20ms씩 옮겨요(판정은 그대로, 그림만).',
+        '「타격음」: 칠 때 나는 소리 켬/끔과 크기. 탭·튕기기·틱·크리티컬이 서로 다른 소리예요. 크기는 설정의 효과음 크기와 곱해져요. 곡은 음악 크기를 따라요.',
+        '「노트 속도」: 1.0~12.0. 슬라이더는 0.5씩, −/+ 버튼은 0.1씩. 시점(평면·원근)이나 화면 크기가 달라도 판정선 근처에서 같은 빠르기로 느껴지게 맞춰요. 일시정지(⏸) 메뉴에서도 바로 바꿀 수 있어요. 「진동」: 완벽·크리티컬일 때 살짝 떨림. 「▶ 미리 듣기」: 후렴을 먼저 들어 봐요. 「📖 음표 안내」: 음표 그림 설명.',
+        '혼자 할 때는 ⏸ 버튼(또는 Esc)으로 멈출 수 있어요. 음악도 같이 멈췄다가 그 자리에서 이어져요.',
+      ] },
+      { h: '대결 · AI', p: [
+        '한 폰에는 한 명만: 친구와는 온라인·LAN 방에서 각자 자기 폰으로. 모두 준비를 누르면 방장 시계에 맞춰 같이 시작하고, 왼쪽 위에 모두의 점수가 실시간으로 보여요.',
+        '판정은 각자 폰에서 해서 인터넷이 조금 느려도 공정해요.',
+        'AI 난이도는 자리마다 쉬움·보통·어려움. 쉬움은 박자가 흔들리고 가끔 놓치고, 어려움은 거의 완벽해요.',
+      ] },
+      { h: '예시', p: [
+        '보통 · 신스웨이브 112 BPM. 벌스는 킥(왼쪽)·스네어(오른쪽) 탭을 두 손 번갈아 → 후렴 첫 박에 금색 튕기기를 위로 휙 → 멜로디를 따라 굽는 미끄럼을 끝까지 따라가 틱 모두 완벽, 콤보 140.',
+        '→ 미끄럼 하나를 중간에 놓침, 콤보 0 → 끝까지 정확도 94.1%로 등급 A, 905,300점.',
+      ] },
+    ],
+    init, actor, apply, ai, result, mount,
+    _t: { packParse, packLoad, packChart, PK, IDB, songEvents, analyzer, customChart, customEvents, build, CUS, cusLoad, cusNotify, setOff: (v) => { A_OFF = v; }, GEN, song, chart, newRun, press, release: () => {}, flickDone, sweep, aiSeat, finalize, simulate, scoreOf, accOf, init, actor, apply, ai, result, gradeOf, xAt },
+  });
+})();

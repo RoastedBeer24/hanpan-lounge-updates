@@ -1,0 +1,734 @@
+/* 여관 주인 — 저녁 영업 세계(순수 로직, DOM 없음 · 노드 시험 가능).
+   홀 배치(0.5m 격자) · 길찾기 · 손님(입장 · 자리 · 주문 · 기다림 · 식사 · 한 잔 더 · 소란 · 계산 · 객실) · 술통 · 솥 · 찬장 · 화덕 · 설거지통 · 쏟은 술
+   · 직원(사람 · AI 자리 · 고용 일꾼) · 결과(out) · 네트워크 묶기. 호스트(로컬)만 진행하고, 손님 기기는 묶은 값을 받아 그림. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const T = G.TAVERN;
+  if (!T) throw new Error('tavern.js가 먼저 필요');
+  const { DR, DS, GU, GUEST, DRINK, DISH, EV, SEASONS, clamp, prng, pickW } = T;
+  const DT = 1 / 30, DUR = 180, ARR_END = 0.84, LAST_CALL = 0.9, CS = 0.5, WX = 18, WZ = 11, GX = 36, GZ = 22;
+  const SPD_P = 2.7, SPD_G = 1.3;
+  const OPS = ['', 'pour', 'plate', 'cook', 'take', 'dump', 'wash', 'serve', 'calm', 'clear', 'mop', 'drop'];
+  const OPI = {}; OPS.forEach((o, i) => { OPI[o] = i; });
+  const NPC = ['scullion', 'hand', 'cookhand', 'bouncer'];
+  const dist = (ax, az, bx, bz) => Math.hypot(ax - bx, az - bz);
+
+  /* ======================= 홀 배치 ======================= */
+  const TABLES = [
+    { x: 4.6, z: 5.5, sh: 'rect', hall: 0 }, { x: 8.6, z: 5.4, sh: 'round', hall: 0 }, { x: 4.6, z: 8.9, sh: 'round', hall: 0 }, { x: 8.6, z: 8.8, sh: 'rect', hall: 0 },
+    { x: 12.6, z: 5.5, sh: 'rect', hall: 1 }, { x: 12.6, z: 8.9, sh: 'round', hall: 1 }, { x: 15.9, z: 5.6, sh: 'round', hall: 2 },
+  ];
+  const BAR = { seats: [7.1, 8.5, 9.9, 11.3], z: 3.4 };
+  const DOOR = { x: 17.6, z: 8.8 }, STAIRS = { x: 16.4, z: 3.75 };
+  const cellOf = (x, z) => [clamp(Math.floor(x / CS), 0, GX - 1), clamp(Math.floor(z / CS), 0, GZ - 1)];
+  const cid = (ix, iz) => iz * GX + ix;
+  function block(blk, x0, z0, x1, z1, pad) {
+    pad = pad == null ? 0.12 : pad;
+    for (let iz = 0; iz < GZ; iz++) for (let ix = 0; ix < GX; ix++) {
+      const cx = (ix + 0.5) * CS, cz = (iz + 0.5) * CS;
+      if (cx > x0 - pad && cx < x1 + pad && cz > z0 - pad && cz < z1 + pad) blk[cid(ix, iz)] = 1;
+    }
+  }
+  function layout(st) {
+    const hall = T.upLv(st, 'hall'), nck = T.caskCap(st);
+    const blk = new Uint8Array(GX * GZ);
+    const S = {};
+    const sta = (id, k, x0, z0, x1, z1, spots, extra) => { S[id] = Object.assign({ id, k, x0, z0, x1, z1, x: (x0 + x1) / 2, z: (z0 + z1) / 2, spots }, extra || {}); block(blk, x0, z0, x1, z1); };
+    sta('pot', 'pot', 0.8, 0, 2.6, 1.2, [[1.7, 1.8]]);
+    sta('oven', 'oven', 3.0, 0, 4.6, 1.2, [[3.8, 1.8]]);
+    sta('board', 'board', 0, 2.4, 1.1, 4.2, [[1.7, 3.3]]);
+    sta('tub', 'tub', 0, 5.0, 1.1, 6.2, [[1.7, 5.6]]);
+    block(blk, 6.2, 0, 13.3, 1.0);   // 술통 선반
+    for (let i = 0; i < nck; i++) { const x = 6.8 + i * 1.08; S['k' + i] = { id: 'k' + i, k: 'cask', i, x0: x - 0.45, z0: 0, x1: x + 0.45, z1: 1.0, x, z: 0.5, spots: [[x, 1.6]] }; }
+    block(blk, 6.2, 2.3, 12.6, 2.9);   // 계산대
+    block(blk, 15.2, 0, 18, 3.2);   // 계단
+    const tbs = [], seats = [];
+    TABLES.forEach((t, ti) => {
+      if (t.hall > hall) return;
+      const tb = { i: tbs.length, ti, x: t.x, z: t.z, sh: t.sh, seats: [], dm: 0, dp: 0, spots: [] };
+      let hx, hz;
+      if (t.sh === 'rect') { hx = 0.75; hz = 0.45; for (const sx of [-0.4, 0.4]) for (const sz of [-1, 1]) seats.push({ tb: tb.i, x: t.x + sx, z: t.z + sz * 0.88, yaw: sz > 0 ? Math.PI : 0, g: -1, brk: 0 }); }
+      else { hx = hz = 0.55; for (let k = 0; k < 3; k++) { const a = k * Math.PI * 2 / 3 + 0.5; seats.push({ tb: tb.i, x: t.x + Math.sin(a) * 0.95, z: t.z + Math.cos(a) * 0.95, yaw: a + Math.PI, g: -1, brk: 0 }); } }
+      tb.x0 = t.x - hx; tb.x1 = t.x + hx; tb.z0 = t.z - hz; tb.z1 = t.z + hz;
+      block(blk, tb.x0, tb.z0, tb.x1, tb.z1, 0.05);
+      tbs.push(tb);
+    });
+    if (hall >= 2) {
+      const tb = { i: tbs.length, ti: -1, bar: 1, x: 9.2, z: 2.6, sh: 'bar', seats: [], dm: 0, dp: 0, spots: [], x0: 6.2, x1: 12.6, z0: 2.3, z1: 2.9 };
+      for (const x of BAR.seats) seats.push({ tb: tb.i, x, z: BAR.z, yaw: Math.PI, g: -1, brk: 0 });
+      tbs.push(tb);
+    }
+    // 닫힌 창고(상자 더미)
+    const crates = [];
+    if (hall < 1) { crates.push([11.6, 4.6, 13.8, 6.4], [11.8, 8.0, 13.6, 9.8]); }
+    if (hall < 2) { crates.push([15.2, 4.8, 16.8, 6.4]); }
+    for (const c of crates) block(blk, c[0], c[1], c[2], c[3]);
+    seats.forEach((s, i) => { tbs[s.tb].seats.push(i); const [ix, iz] = cellOf(s.x, s.z); blk[cid(ix, iz)] = 0; });
+    // 식탁 쓰는 자리: 가장자리 0.7m 밖 후보 중 걸을 수 있고 의자와 겹치지 않는 곳
+    for (const tb of tbs) {
+      const cand = [];
+      if (tb.bar) { for (const x of BAR.seats) cand.push([x, 1.75]); }
+      else {
+        const ex = (tb.x1 - tb.x0) / 2 + 0.65, ez = (tb.z1 - tb.z0) / 2 + 0.65;
+        for (const [dx, dz] of [[-ex, 0], [ex, 0], [0, -ez], [0, ez], [-ex, -ez], [ex, -ez], [-ex, ez], [ex, ez]]) cand.push([tb.x + dx, tb.z + dz]);
+      }
+      for (const p of cand) {
+        if (p[0] < 0.3 || p[0] > WX - 0.3 || p[1] < 0.3 || p[1] > WZ - 0.3) continue;
+        const [ix, iz] = cellOf(p[0], p[1]); if (blk[cid(ix, iz)]) continue;
+        if (!tb.bar && seats.some((s) => s.tb === tb.i && dist(s.x, s.z, p[0], p[1]) < 0.45)) continue;
+        tb.spots.push(p);
+      }
+      if (!tb.spots.length) tb.spots.push([tb.x, tb.z1 + 0.7]);
+    }
+    return { blk, S, tbs, seats, crates, hall, nck };
+  }
+
+  /* ======================= 길찾기 ======================= */
+  const NB = [[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1], [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]];
+  const walk = (blk, x, z) => { if (x < 0.15 || z < 0.15 || x > WX - 0.15 || z > WZ - 0.15) return false; const [ix, iz] = cellOf(x, z); return !blk[cid(ix, iz)]; };
+  function los(blk, x0, z0, x1, z1) {
+    const d = dist(x0, z0, x1, z1), n = Math.ceil(d / 0.2);
+    for (let i = 1; i < n; i++) { const t = i / n; if (!walk(blk, x0 + (x1 - x0) * t, z0 + (z1 - z0) * t)) return false; }
+    return true;
+  }
+  function findPath(Lay, x0, z0, x1, z1) {
+    const blk = Lay.blk;
+    if (los(blk, x0, z0, x1, z1)) return [[x1, z1]];
+    const [sx, sz] = cellOf(x0, z0), [gx, gz] = cellOf(x1, z1);
+    const N = GX * GZ, cost = new Float32Array(N).fill(1e9), prev = new Int32Array(N).fill(-1);
+    const s0 = cid(sx, sz), g0 = cid(gx, gz);
+    cost[s0] = 0;
+    const open = [s0];
+    let found = false;
+    while (open.length) {
+      let bi = 0; for (let i = 1; i < open.length; i++) if (cost[open[i]] < cost[open[bi]]) bi = i;
+      const cur = open[bi]; open[bi] = open[open.length - 1]; open.pop();
+      if (cur === g0) { found = true; break; }
+      const cx = cur % GX, cz = (cur / GX) | 0;
+      for (const [dx, dz, w] of NB) {
+        const nx = cx + dx, nz = cz + dz;
+        if (nx < 0 || nz < 0 || nx >= GX || nz >= GZ) continue;
+        const ni = cid(nx, nz);
+        if (blk[ni] && ni !== g0) continue;
+        if (dx && dz && (blk[cid(cx + dx, cz)] || blk[cid(cx, cz + dz)])) continue;
+        const nc = cost[cur] + w;
+        if (nc < cost[ni]) { if (cost[ni] >= 1e9) open.push(ni); cost[ni] = nc; prev[ni] = cur; }
+      }
+    }
+    if (!found) return null;
+    const cells = [];
+    for (let c = g0; c !== s0 && c >= 0; c = prev[c]) cells.push(c);
+    cells.reverse();
+    const pts = cells.map((c) => [((c % GX) + 0.5) * CS, (((c / GX) | 0) + 0.5) * CS]);
+    if (pts.length) pts[pts.length - 1] = [x1, z1];
+    // 줄이기: 보이는 가장 먼 점까지 건너뜀
+    const out = []; let ax = x0, az = z0, i = 0;
+    while (i < pts.length) {
+      let j = pts.length - 1;
+      while (j > i && !los(blk, ax, az, pts[j][0], pts[j][1])) j--;
+      out.push(pts[j]); ax = pts[j][0]; az = pts[j][1]; i = j + 1;
+    }
+    return out;
+  }
+
+  /* ======================= 세계 만들기 ======================= */
+  const itemCode = (it) => (it.c === 99 ? 300 + Math.min(9, it.m) * 10 + Math.min(9, it.p) : it.c * 10 + (it.q || 0));
+  const itemOf = (code) => (code >= 300 ? { c: 99, m: Math.floor((code - 300) / 10), p: code % 10 } : { c: Math.floor(code / 10), q: code % 10 });
+  const dCode = (r) => 1 + DR[r].i, fCode = (r) => 11 + DS[r].i;
+  const codeNm = (c) => (c < 11 ? DRINK[c - 1].nm : DISH[c - 11].nm);
+  function schedule(st, R) {
+    const E = T.expGuests(st), lv = T.lvOf(st.xp), ss = T.ssnOf(st), e = EV[st.ev];
+    const base = { farm: 3, merc: 2, pilg: 2, peddler: 2, guard: 1.6, hunter: 1.5, friar: 1.1, knight: 1.1, scholar: 1, envoy: 0.6 };
+    const w = {};
+    for (const g of GUEST) { const ex = e && e.mix && e.mix[g.id]; if (g.rep > lv && !ex) continue; w[g.id] = base[g.id] * g.sw[ss] * (ex ? 1 + ex * 1.5 : 1); }
+    const arr = []; let n = 0;
+    while (n < E) {
+      const u = R(), size = u < 0.45 ? 1 : u < 0.86 ? 2 : 3;
+      let t; do { t = R() * ARR_END; } while (R() > (t < 0.15 ? 0.35 + 4.3 * t : t < 0.62 ? 1 : Math.max(0.2, 1 - (t - 0.62) * 3.2)));
+      const t0 = pickW(R, w), tys = [];
+      for (let k = 0; k < size; k++) tys.push(R() < 0.8 ? t0 : pickW(R, w));
+      arr.push({ t: 2 + t * DUR, tys }); n += size;
+    }
+    arr.sort((a, b) => a.t - b.t);
+    return arr;
+  }
+  function newChar(s, x, z, kind) { return { s, kind: kind || '', x, z, yaw: Math.PI, path: null, tgt: null, carry: [], busy: null, think: 0, task: null, ix: x, iz: z, mv: 0, rq: 0 }; }
+  function makeWorld(st, opt) {
+    opt = opt || {};
+    const Lay = layout(st);
+    const R = prng((st.sv ^ 0x9e3779b9) >>> 0);
+    const e = EV[st.ev];
+    const W = {
+      st, Lay, R, rnd: opt.host === false ? Math.random : prng((st.sv + 7) >>> 0), t: 0, dur: DUR, host: opt.host !== false,
+      ch: [], np: [], g: [], gid: 1, arr: schedule(st, R), ai: 0,
+      ck: st.ck.slice(0, T.caskCap(st)).map((c) => (c ? { r: c.r, sv: c.sv, q: T.cQ(st, c), rd: T.cReady(c) ? 1 : 0 } : null)),
+      dish: {}, ov: Array(T.ovenCap(st)).fill(null), tub: { m: 0, p: 0 }, mug: T.mugCap(st), plate: T.plateCap(st), sp: [], spid: 1,
+      cap: T.carryCap(st), comf: T.comfort(st), amb: T.ambience(st), clean: st.clean, rowM: e && e.row ? e.row : 1, reM: e && e.re ? e.re : 1,
+      roomM: SEASONS[T.ssnOf(st)].room, lv: T.lvOf(st.xp),
+      inc: 0, tip: 0, xp: 0, served: 0, lost: 0, angry: 0, roomReq: 0, brk: 0, brawl: 0, burnt: 0, moodSum: 0, moodN: 0, srv: Array(st.n).fill(0),
+      fx: [], fxid: 1, done: false, top: {},
+    };
+    for (const d of DISH) W.dish[d.id] = T.dishStock(st, d.id);
+    // 직원 자리(사람 · AI): 계산대 뒤 · 홀에 나눠 섬
+    const spots = [[9.0, 1.8], [5.4, 3.6], [10.4, 4.2], [2.6, 2.6]];
+    for (let s = 0; s < st.n; s++) { const p = spots[s % 4]; const c = newChar(s, p[0], p[1]); c.ix = p[0]; c.iz = p[1]; W.ch.push(c); }
+    // 고용 일꾼
+    const npSpot = { scullion: [1.75, 6.3], hand: [14.2, 3.9], cookhand: [3.8, 1.85], bouncer: [16.6, 9.8] };
+    for (const k of NPC) if (st.staff.includes(k)) { const p = npSpot[k]; const c = newChar(-1, p[0], p[1], k); c.ix = p[0]; c.iz = p[1]; W.np.push(c); }
+    return W;
+  }
+  function fx(W, k, x, z, v) { W.fx.push([W.fxid++, k, Math.round(x * 10) / 10, Math.round(z * 10) / 10, v == null ? 0 : v, W.t]); if (W.fx.length > 40) W.fx.splice(0, W.fx.length - 40); }
+
+  /* ======================= 수요 세기 ======================= */
+  function pending(W, code) { let n = 0; for (const g of W.g) if (g.st === 2) for (const c of g.want) if (c === code) n++; return n; }
+  function carried(W, code, skip) { let n = 0; for (const c of W.ch) if (c !== skip) for (const it of c.carry) if (it.c === code) n++; for (const c of W.np) for (const it of c.carry) if (it.c === code) n++; return n; }
+  function cooking(W, code) { let n = 0; if (code >= 11) for (const o of W.ov) if (o && 11 + DS[o.r].i === code) n++; return n; }
+  function claimed(W, code, skip) { let n = 0; for (const c of W.ch) if (c !== skip && c.task && c.task.code === code) n++; for (const c of W.np) if (c !== skip && c.task && c.task.code === code) n++; return n; }
+  function stockOf(W, code) {
+    if (code < 11) { let s = 0; const r = DRINK[code - 1].id; for (const c of W.ck) if (c && c.rd && c.r === r) s += c.sv; return s; }
+    return W.dish[DISH[code - 11].id] || 0;
+  }
+  const avail = (W, code) => stockOf(W, code) + carried(W, code) + cooking(W, code) - pending(W, code);
+  const need = (W, code, me) => pending(W, code) - carried(W, code) - cooking(W, code) - claimed(W, code, me);
+  function urg(W, code) { let u = 0; for (const g of W.g) if (g.st === 2 && g.want.includes(code)) u = Math.max(u, 1 - g.pat / g.pat0); return u; }
+
+  /* ======================= 손님 ======================= */
+  function seatGroup(W, k) {
+    const L = W.Lay, tbs = [];
+    for (const tb of L.tbs) {
+      const free = tb.seats.filter((i) => L.seats[i].g < 0 && !L.seats[i].brk);
+      if (tb.bar) { if (k === 1 && free.length) tbs.push({ tb, free, sc: 1 + W.rnd() * 0.5 - (tb.dm + tb.dp ? 1.5 : 0) }); continue; }
+      if (free.length < k) continue;
+      const used = tb.seats.length - free.length;
+      tbs.push({ tb, free, sc: 3 + W.rnd() - (tb.dm + tb.dp ? 2.2 : 0) - used * 0.8 - (free.length - k) * 0.15 });
+    }
+    if (!tbs.length) return null;
+    tbs.sort((a, b) => b.sc - a.sc);
+    return tbs[0].free.slice(0, k);
+  }
+  function spawnGroup(W, a) {
+    const gp = W.gid;
+    const seats = seatGroup(W, a.tys.length);
+    a.tys.forEach((ty, k) => {
+      const G_ = GU[ty], g = { id: W.gid++, ty: G_.i, gp, x: DOOR.x + 0.4, z: DOOR.z + (k - 1) * 0.35, yaw: -Math.PI / 2, st: 0, seat: -1, path: null, t: 0, want: [], got: [], pat: 1, pat0: 1, rowdy: 0, rt: 0, drinks: 0, dishes: 0, room: 0, calm: 0, frac: [], q: [], seen: 0, spills: [], round: 0 };
+      if (seats) { g.seat = seats[k]; W.Lay.seats[g.seat].g = g.id; g.path = findPath(W.Lay, g.x, g.z, W.Lay.seats[g.seat].x, W.Lay.seats[g.seat].z); }
+      W.g.push(g);
+    });
+    fx(W, 'door', DOOR.x, DOOR.z);
+  }
+  function chooseWant(W, g, kind) {
+    const D = GUEST[g.ty], pref = kind === 'd' ? D.dr : D.fd, list = kind === 'd' ? DRINK : DISH, code0 = kind === 'd' ? 1 : 11;
+    const okL = [], w = {};
+    for (const r in pref) { const code = (kind === 'd' ? dCode(r) : fCode(r)); if (avail(W, code) > 0) { okL.push(code); w[code] = pref[r]; } }
+    if (okL.length) return +pickW(W.rnd, w);
+    if (W.rnd() < 0.6) { const any = list.map((x, i) => code0 + i).filter((c) => avail(W, c) > 0); if (any.length) return any[Math.floor(W.rnd() * any.length)]; }
+    return 0;
+  }
+  function order(W, g, first) {
+    const D = GUEST[g.ty]; g.want = [];
+    const lastCall = W.t > W.dur * LAST_CALL;
+    if (first) {
+      if (W.rnd() < D.pd) { const c = chooseWant(W, g, 'd'); if (c) g.want.push(c); }
+      if (W.rnd() < D.pf) { const c = chooseWant(W, g, 'f'); if (c) g.want.push(c); }
+      if (!g.want.length && W.rnd() < 0.7) { const c = chooseWant(W, g, W.rnd() < 0.5 ? 'd' : 'f') || chooseWant(W, g, 'd') || chooseWant(W, g, 'f'); if (c) g.want.push(c); }
+    } else if (!lastCall) { const c = chooseWant(W, g, 'd'); if (c) g.want.push(c); }
+    if (g.want.length) {
+      const pat = D.pat * (1 + Math.min(0.35, W.comf * 0.02)) * (first ? 1 : 0.85) * (D.fus ? 0.95 : 1);
+      g.pat = g.pat0 = pat; g.st = 2; g.round++;
+      return true;
+    }
+    return false;
+  }
+  function freeSeat(W, g) { if (g.seat >= 0) { const s = W.Lay.seats[g.seat]; if (s.g === g.id) s.g = -1; } }
+  function leave(W, g, how) {
+    // how: 'ok' 계산하고 떠남 · 'angry' 화나서 · 'brawl' 싸움 · 'escort' 내보냄 · 'none' 시킬 것 없음 · 'close' 마감
+    const D = GUEST[g.ty];
+    let base = 0; for (const it of g.got) base += (it.c < 11 ? DRINK[it.c - 1].p : DISH[it.c - 11].p) * T.QM[it.q || 2];
+    base = Math.round(base);
+    if (g.seat >= 0) {
+      const s = W.Lay.seats[g.seat], tb = W.Lay.tbs[s.tb];
+      tb.dm += g.drinks; tb.dp += g.dishes;
+    }
+    if (how === 'ok' || how === 'close' || how === 'escort') {
+      if (g.got.length) {
+        const fr = g.frac.length ? g.frac.reduce((a, b) => a + b, 0) / g.frac.length : 0.5;
+        const q = g.q.length ? g.q.reduce((a, b) => a + b, 0) / g.q.length : 2;
+        const s = g.seat >= 0 ? W.Lay.seats[g.seat] : null, tb = s ? W.Lay.tbs[s.tb] : null;
+        const nearSpill = s && W.sp.some((p) => dist(p.x, p.z, s.x, s.z) < 2.2);
+        let m = 0.25 + 0.45 * fr + 0.08 * (q - 2) * (1 + D.fus) + 0.012 * W.comf * (1 + D.fus) + 0.008 * W.amb - (g.dirtyAt ? 0.14 : 0) - (nearSpill ? 0.1 : 0) - (W.clean < 50 ? 0.12 : 0) - (g.seen ? 0.22 : 0) - D.fus * 0.07;
+        if (how === 'escort') m = Math.min(m, 0.2);
+        m = clamp(m, 0, 1);
+        const tip = how === 'escort' ? 0 : Math.round(base * (0.04 + 0.32 * m) * D.w);
+        W.inc += base; W.tip += tip; W.served++;
+        W.moodSum += m; W.moodN++;
+        const xp = how === 'escort' ? 0 : m >= 0.25 ? 1 + Math.round(m * 3) : 0;
+        W.xp += xp;
+        W.top[D.id] = (W.top[D.id] || 0) + 1;
+        if (g.seat >= 0) { const s2 = W.Lay.seats[g.seat]; fx(W, 'pay', s2.x, s2.z, base + tip); }
+        // 객실
+        if (how === 'ok' && W.t > W.dur * 0.42 && W.rnd() < D.room * W.roomM * (1 + W.comf * 0.02) * clamp(m + 0.4, 0.5, 1.2)) { g.room = 1; W.roomReq++; }
+      } else if (how !== 'close') { W.lost++; }
+      else W.lost++;
+    } else if (how === 'angry' || how === 'brawl') {
+      if (g.got.length && how === 'angry') { W.inc += base; fx(W, 'pay', g.x, g.z, base); }
+      W.angry++; W.xp -= 3; if (!g.got.length) W.lost++;
+      fx(W, 'angry', g.x, g.z);
+    } else if (how === 'none') { W.lost++; W.xp -= 1; }
+    freeSeat(W, g);
+    g.st = g.room ? 5 : 4; g.want = []; g.rowdy = 0;
+    const tgt = g.room ? STAIRS : DOOR;
+    g.path = findPath(W.Lay, g.x, g.z, tgt.x, tgt.z) || [[tgt.x, tgt.z]];
+  }
+  function moveAlong(W, o, spd, dt) {
+    if (!o.path || !o.path.length) return true;
+    let rem = spd * dt;
+    while (rem > 0 && o.path.length) {
+      const p = o.path[0], dx = p[0] - o.x, dz = p[1] - o.z, d = Math.hypot(dx, dz);
+      if (d > 1e-4) { const tgt = Math.atan2(dx, dz); let dy = tgt - o.yaw; dy = Math.atan2(Math.sin(dy), Math.cos(dy)); o.yaw += clamp(dy, -12 * dt, 12 * dt); }
+      if (d <= rem) { o.x = p[0]; o.z = p[1]; o.path.shift(); rem -= d; }
+      else { o.x += dx / d * rem; o.z += dz / d * rem; rem = 0; }
+    }
+    o.mv = 1;
+    return !o.path.length;
+  }
+  function slowAt(W, x, z) { for (const p of W.sp) if (dist(p.x, p.z, x, z) < 0.55) return 0.6; return 1; }
+  function guestTick(W, g, dt) {
+    const D = GUEST[g.ty];
+    g.mv = 0;
+    if (g.st === 0) {
+      if (g.seat < 0) {
+        g.t += dt;
+        if (Math.floor(g.t / 0.5) !== Math.floor((g.t - dt) / 0.5)) {
+          const s = seatGroup(W, 1);
+          if (s) { g.seat = s[0]; W.Lay.seats[g.seat].g = g.id; g.path = findPath(W.Lay, g.x, g.z, W.Lay.seats[g.seat].x, W.Lay.seats[g.seat].z); }
+        }
+        if (g.seat < 0) { if (g.x > DOOR.x - 0.6) { g.x -= dt * 0.6; g.mv = 1; } if (g.t > 9) { W.lost++; W.xp -= 1; g.st = 4; g.path = [[DOOR.x, DOOR.z]]; fx(W, 'angry', g.x, g.z); } return; }
+      }
+      if (!g.path) { const s = W.Lay.seats[g.seat]; g.path = findPath(W.Lay, g.x, g.z, s.x, s.z) || [[s.x, s.z]]; }
+      if (moveAlong(W, g, SPD_G * slowAt(W, g.x, g.z), dt)) {
+        const s = W.Lay.seats[g.seat], tb = W.Lay.tbs[s.tb];
+        g.x = s.x; g.z = s.z; g.yaw = s.yaw; g.st = 1; g.t = 1.0 + W.rnd() * 0.6; g.dirtyAt = tb.dm + tb.dp > 0 ? 1 : 0;
+      }
+      return;
+    }
+    if (g.st === 1) { g.t -= dt; if (g.t <= 0) { if (!order(W, g, true)) leave(W, g, 'none'); } return; }
+    if (g.st === 2) {
+      let drain = 1;
+      if (W.g.some((o) => o.rowdy && o !== g && dist(o.x, o.z, g.x, g.z) < 3)) { drain *= 1.6; g.seen = Math.max(g.seen, 0.5); }
+      if (W.sp.some((p) => dist(p.x, p.z, g.x, g.z) < 2)) drain *= 1.15;
+      g.pat -= dt * drain;
+      if (g.rowdy) rowdyTick(W, g, dt);
+      if (g.pat <= 0) leave(W, g, 'angry');
+      return;
+    }
+    if (g.st === 3) {
+      g.t -= dt;
+      for (const sp of g.spills) if (sp > 0 && g.t < sp) { addSpill(W, g); g.spills = g.spills.map((v) => (v === sp ? 0 : v)); }
+      if (g.rowdy) rowdyTick(W, g, dt);
+      if (g.st !== 3) return;
+      if (g.t <= 0) {
+        if (g.drinks < 3 && W.t < W.dur * LAST_CALL && W.rnd() < D.re * W.reM && order(W, g, false)) return;
+        leave(W, g, 'ok');
+      }
+      return;
+    }
+    if (g.st === 4 || g.st === 5) { if (moveAlong(W, g, SPD_G * 1.1, dt)) g.st = 6; }
+  }
+  function addSpill(W, g) {
+    if (W.sp.length >= 10) return;
+    for (let k = 0; k < 8; k++) {
+      const a = W.rnd() * Math.PI * 2, r = 0.6 + W.rnd() * 0.7, x = g.x + Math.sin(a) * r, z = g.z + Math.cos(a) * r;
+      if (walk(W.Lay.blk, x, z) && !W.sp.some((p) => dist(p.x, p.z, x, z) < 0.6)) { W.sp.push({ id: W.spid++, x, z }); fx(W, 'spill', x, z); return; }
+    }
+  }
+  function rowdyTick(W, g, dt) {
+    g.rt -= dt;
+    if (g.rt > 0) return;
+    // 싸움
+    W.brawl++; fx(W, 'brawl', g.x, g.z);
+    if (g.seat >= 0) { W.Lay.seats[g.seat].brk = 1; W.brk++; }
+    addSpill(W, g);
+    for (const o of W.g) {
+      if (o === g || o.st < 1 || o.st > 3) continue;
+      if (dist(o.x, o.z, g.x, g.z) < 2.6) { o.seen = 1; if (W.rnd() < 0.5) leave(W, o, 'brawl'); }
+    }
+    leave(W, g, 'brawl');
+  }
+
+  /* ======================= 쓰기(행동) ======================= */
+  function nearestSpot(spots, x, z) { let b = spots[0], bd = 1e9; for (const p of spots) { const d = dist(p[0], p[1], x, z); if (d < bd) { bd = d; b = p; } } return b; }
+  function targetPos(W, id) {
+    const L = W.Lay;
+    if (L.S[id]) return L.S[id];
+    if (id[0] === 't') return L.tbs[+id.slice(1)] || null;
+    if (id[0] === 's') { const p = W.sp.find((q) => q.id === +id.slice(1)); return p ? { x0: p.x - 0.3, x1: p.x + 0.3, z0: p.z - 0.3, z1: p.z + 0.3, x: p.x, z: p.z, spots: [[p.x, p.z]] } : null; }
+    return null;
+  }
+  function spotsOf(W, id) { const t = targetPos(W, id); return t ? t.spots || [[t.x, t.z]] : null; }
+  function edgeDist(t, x, z) { const dx = Math.max(t.x0 - x, 0, x - t.x1), dz = Math.max(t.z0 - z, 0, z - t.z1); return Math.hypot(dx, dz); }
+  const dishesAt = (st) => DISH.filter((d) => d.st === st);
+  /* 이 자리(c)가 대상(id)을 쓰면 무슨 일이 되는지: {op, T, lbl, ...} 또는 {no: '이유', lbl} */
+  function opFor(W, c, id, ai) {
+    const full = c.carry.length >= W.cap, hasDirty = c.carry.some((it) => it.c === 99);
+    const L = W.Lay;
+    if (id[0] === 'k') {
+      const i = +id.slice(1), ck = W.ck[i];
+      if (!ck) return { no: '빈 통', lbl: (i + 1) + '번 통' };
+      const nm = DR[ck.r].nm;
+      if (!ck.rd) return { no: '발효 중', lbl: (i + 1) + '번 통 · ' + nm };
+      if (ck.sv <= 0) return { no: '바닥남', lbl: (i + 1) + '번 통 · ' + nm };
+      if (full || hasDirty) return { no: hasDirty ? '빈 그릇을 든 채' : '손이 가득', lbl: nm + ' 따르기' };
+      if (W.mug <= 0) return { no: '깨끗한 잔 없음', lbl: nm + ' 따르기' };
+      return { op: 'pour', T: 0.9, lbl: nm + ' 따르기', code: dCode(ck.r) };
+    }
+    if (id === 'pot' || id === 'board') {
+      const list = dishesAt(id).filter((d) => W.dish[d.id] > 0);
+      if (!list.length) return { no: '담을 음식 없음', lbl: id === 'pot' ? '솥' : '찬장' };
+      list.sort((a, b) => (need(W, fCode(b.id), c) - need(W, fCode(a.id), c)) || (W.dish[b.id] - W.dish[a.id]));
+      const d = list[0];
+      if (ai && need(W, fCode(d.id), c) <= 0) return { no: '주문 없음', lbl: d.nm + ' 담기' };
+      if (full || hasDirty) return { no: hasDirty ? '빈 그릇을 든 채' : '손이 가득', lbl: d.nm + ' 담기' };
+      if (W.plate <= 0) return { no: '깨끗한 접시 없음', lbl: d.nm + ' 담기' };
+      return { op: 'plate', T: 0.7, lbl: d.nm + ' 담기', r: d.id, code: fCode(d.id) };
+    }
+    if (id === 'oven') {
+      const di = W.ov.findIndex((o) => o && o.t >= o.T);
+      if (di >= 0 && !full && !hasDirty) return { op: 'take', T: 0.4, lbl: DS[W.ov[di].r].nm + ' 꺼내기', slot: di, code: fCode(W.ov[di].r) };
+      const free = W.ov.indexOf(null);
+      const list = dishesAt('oven').filter((d) => W.dish[d.id] > 0);
+      if (free < 0) return { no: di >= 0 ? (hasDirty ? '빈 그릇을 든 채' : '손이 가득') : '화덕이 가득', lbl: '화덕' };
+      if (!list.length) return { no: '구울 것 없음', lbl: '화덕' };
+      list.sort((a, b) => (need(W, fCode(b.id), c) - need(W, fCode(a.id), c)) || (W.dish[b.id] - W.dish[a.id]));
+      const d = list[0];
+      if (ai && need(W, fCode(d.id), c) <= 0) return { no: '주문 없음', lbl: d.nm + ' 굽기' };
+      if (W.plate <= 0) return { no: '깨끗한 접시 없음', lbl: d.nm + ' 굽기' };
+      return { op: 'cook', T: 0.6, lbl: d.nm + ' 굽기', r: d.id, slot: free, code: fCode(d.id) };
+    }
+    if (id === 'tub') {
+      if (hasDirty) return { op: 'dump', T: 0.3, lbl: '빈 그릇 넣기' };
+      if (W.tub.m + W.tub.p > 0) return { op: 'wash', T: 1.4, lbl: '설거지' };
+      return { no: '씻을 그릇 없음', lbl: '설거지통' };
+    }
+    if (id[0] === 't') {
+      const tb = L.tbs[+id.slice(1)]; if (!tb) return null;
+      let best = null;
+      for (const si of tb.seats) {
+        const g = W.g.find((q) => q.seat === si && q.st === 2); if (!g) continue;
+        for (const it of c.carry) if (it.c !== 99 && g.want.includes(it.c)) { if (!best || g.pat < best.g.pat) best = { g, it }; }
+      }
+      if (best) return { op: 'serve', T: 0.35, lbl: codeNm(best.it.c) + ' 내주기', gid: best.g.id, code: best.it.c };
+      const rg = W.g.find((q) => q.rowdy && q.seat >= 0 && tb.seats.includes(q.seat) && q.st >= 2 && q.st <= 3);
+      if (rg) return { op: 'calm', T: 1.1, lbl: '달래기', gid: rg.id };
+      if (tb.dm + tb.dp > 0) {
+        if (full && !hasDirty) return { no: '손이 가득', lbl: '빈 그릇 치우기' };
+        if (hasDirty) { const d = c.carry.find((it) => it.c === 99); if (d.m + d.p >= 9) return { no: '더 못 듦', lbl: '빈 그릇 치우기' }; }
+        return { op: 'clear', T: 0.7, lbl: '빈 그릇 치우기' };
+      }
+      return { no: '할 일 없음', lbl: '식탁' };
+    }
+    if (id[0] === 's') { if (!W.sp.some((p) => p.id === +id.slice(1))) return null; return { op: 'mop', T: 1.1, lbl: '쏟은 술 닦기' }; }
+    return null;
+  }
+  function startOp(W, c, id, o) {
+    const L = W.Lay;
+    switch (o.op) {
+      case 'pour': { const ck = W.ck[+id.slice(1)]; ck.sv--; W.mug--; c.carry.push({ c: dCode(ck.r), q: ck.q }); break; }
+      case 'plate': W.dish[o.r]--; W.plate--; c.carry.push({ c: fCode(o.r), q: 2 }); break;
+      case 'cook': W.dish[o.r]--; W.plate--; W.ov[o.slot] = { r: o.r, t: 0, T: DS[o.r].ck }; break;
+      case 'take': { const s = W.ov[o.slot]; W.ov[o.slot] = null; c.carry.push({ c: fCode(s.r), q: 2 }); break; }
+      case 'dump': for (let i = c.carry.length - 1; i >= 0; i--) if (c.carry[i].c === 99) { W.tub.m += c.carry[i].m; W.tub.p += c.carry[i].p; c.carry.splice(i, 1); } break;
+      case 'wash': { let k = 4; const lowM = W.mug < W.plate * 1.2; while (k > 0 && W.tub.m + W.tub.p > 0) { if ((lowM && W.tub.m > 0) || W.tub.p <= 0) { W.tub.m--; W.mug++; } else { W.tub.p--; W.plate++; } k--; } break; }
+      case 'serve': {
+        const g = W.g.find((q) => q.id === o.gid); if (!g) break;
+        const k = c.carry.findIndex((it) => it.c === o.code); if (k < 0) break;
+        const it = c.carry.splice(k, 1)[0];
+        g.want.splice(g.want.indexOf(it.c), 1); g.got.push(it); g.frac.push(clamp(g.pat / g.pat0, 0, 1)); g.q.push(it.q || 2);
+        if (it.c < 11) {
+          g.drinks++;
+          const D = GUEST[g.ty];
+          if (g.drinks >= 2 && !g.calm && !g.rowdy && W.rnd() < D.row * W.rowM) { g.rowdy = 1; g.rt = 16; fx(W, 'rowdy', g.x, g.z); }
+          if (W.rnd() < (g.rowdy ? 0.35 : 0.09)) g.spills.push(1 + W.rnd() * 5);
+        } else g.dishes++;
+        g.pat = Math.min(g.pat0, g.pat + g.pat0 * 0.4);
+        if (c.s >= 0 && c.s < W.srv.length) W.srv[c.s]++;
+        fx(W, 'serve', g.x, g.z, it.c);
+        if (!g.want.length) { g.st = 3; g.t = 7 + 3 * (g.drinks + g.dishes > 1 ? 1.5 : 1) + W.rnd() * 3; }
+        break;
+      }
+      case 'calm': {
+        const g = W.g.find((q) => q.id === o.gid); if (!g || !g.rowdy) break;
+        const p = c.kind === 'bouncer' ? 0.85 : 0.68;
+        if (W.rnd() < p) { g.rowdy = 0; g.calm = 1; fx(W, 'calm', g.x, g.z); }
+        else { fx(W, 'escort', g.x, g.z); leave(W, g, 'escort'); }
+        break;
+      }
+      case 'clear': {
+        const tb = L.tbs[+id.slice(1)];
+        let d = c.carry.find((it) => it.c === 99);
+        if (!d) { d = { c: 99, m: 0, p: 0 }; c.carry.push(d); }
+        const tk = Math.min(9 - d.m - d.p, tb.dm + tb.dp);
+        let k = tk; while (k > 0 && tb.dm > 0) { tb.dm--; d.m++; k--; } while (k > 0 && tb.dp > 0) { tb.dp--; d.p++; k--; }
+        break;
+      }
+      case 'mop': { const i = W.sp.findIndex((p) => p.id === +id.slice(1)); if (i >= 0) W.sp.splice(i, 1); break; }
+    }
+    c.busy = { op: o.op, id, t: 0, T: o.T };
+    c.path = null; c.tgt = null;
+    const tp = targetPos(W, id); if (tp) c.yaw = Math.atan2(tp.x - c.x, tp.z - c.z);
+  }
+  /* 가까운 쓸 것 고르기(E 버튼 · 손님 기기 요청) */
+  function allTargets(W) {
+    const ids = Object.keys(W.Lay.S);
+    W.Lay.tbs.forEach((t) => ids.push('t' + t.i));
+    for (const p of W.sp) ids.push('s' + p.id);
+    return ids;
+  }
+  function nearest(W, c, maxD) {
+    let best = null, bd = maxD || 1.15;
+    const fx_ = Math.sin(c.yaw), fz = Math.cos(c.yaw);
+    for (const id of allTargets(W)) {
+      const t = targetPos(W, id); if (!t) continue;
+      let d = edgeDist(t, c.x, c.z);
+      const dx = t.x - c.x, dz = t.z - c.z, l = Math.hypot(dx, dz) || 1;
+      d -= 0.15 * ((dx * fx_ + dz * fz) / l);
+      const o = opFor(W, c, id, false);
+      if (!o) continue;
+      if (o.no) d += 0.35;
+      if (id[0] === 's') d -= 0.1;
+      if (d < bd) { bd = d; best = { id, o }; }
+    }
+    return best;
+  }
+  function tryUse(W, c, id, ai) {
+    if (c.busy) return false;
+    const t = targetPos(W, id); if (!t) return false;
+    if (edgeDist(t, c.x, c.z) > (ai ? 1.3 : 2.2)) return false;
+    const o = opFor(W, c, id, ai);
+    if (!o || o.no) return false;
+    startOp(W, c, id, o);
+    return true;
+  }
+  function dropTop(W, c) {
+    if (c.busy) return false;
+    for (let i = c.carry.length - 1; i >= 0; i--) {
+      const it = c.carry[i]; if (it.c === 99) continue;
+      c.carry.splice(i, 1);
+      if (it.c < 11) W.tub.m++; else W.tub.p++;
+      fx(W, 'drop', c.x, c.z);
+      c.busy = { op: 'drop', id: '', t: 0, T: 0.25 };
+      return true;
+    }
+    return false;
+  }
+
+  /* ======================= 움직임 ======================= */
+  function stepFree(W, c, mx, mz, dt) {
+    const l = Math.hypot(mx, mz); if (l < 0.08) return;
+    const k = Math.min(1, l), sp = SPD_P * slowAt(W, c.x, c.z) * k;
+    const vx = mx / l * sp * dt, vz = mz / l * sp * dt, blk = W.Lay.blk;
+    const okR = (x, z, r) => walk(blk, x + r, z + r) && walk(blk, x - r, z + r) && walk(blk, x + r, z - r) && walk(blk, x - r, z - r);
+    // 조작감: 시작 자리 · 길 따라 걷다 멈춘 자리가 벽 칸에 살짝 걸쳐 있으면 큰 반경으로는 옆으로도 못 움직임 → 작은 반경으로 빠져나오게
+    const R_ = okR(c.x, c.z, 0.199) ? 0.199 : 0.06;
+    const ok = (x, z) => okR(x, z, R_);
+    if (ok(c.x + vx, c.z)) c.x += vx;
+    if (ok(c.x, c.z + vz)) c.z += vz;
+    c.x = clamp(c.x, 0.25, WX - 0.25); c.z = clamp(c.z, 0.25, WZ - 0.25);
+    const tgt = Math.atan2(mx, mz); let dy = tgt - c.yaw; dy = Math.atan2(Math.sin(dy), Math.cos(dy)); c.yaw += clamp(dy, -14 * dt, 14 * dt);
+    c.mv = 1;
+  }
+  function goTo(W, c, id, x, z) {
+    if (id) { const sp = spotsOf(W, id); if (!sp) return false; const p = nearestSpot(sp, c.x, c.z); x = p[0]; z = p[1]; }
+    const path = findPath(W.Lay, c.x, c.z, x, z);
+    if (!path) return false;
+    c.path = path; c.tgt = id || null;
+    return true;
+  }
+  /* 손님 기기 · 사람: 길 따라가다 닿으면 쓰기 */
+  function followTick(W, c, dt, ai) {
+    if (!c.path) return;
+    const arrived = moveAlong(W, c, SPD_P * slowAt(W, c.x, c.z) * (ai === 1 ? 0.9 : 1), dt);
+    if (arrived) {
+      const id = c.tgt; c.path = null; c.tgt = null;
+      if (id && W.host) { if (!tryUse(W, c, id, !!ai) && ai) c.task = null; }
+      else if (id) c.rq = id;   // 손님 기기: 호스트에 쓰기 요청
+    }
+  }
+
+  /* ======================= AI 직원 ======================= */
+  const CODES_D = DRINK.map((d, i) => 1 + i), CODES_F = DISH.map((d, i) => 11 + i);
+  function chooseTask(W, c, lv, hab, allow) {
+    const cand = [];
+    const L = W.Lay;
+    const dd = (t) => edgeDist(t, c.x, c.z);
+    const can = (k) => !allow || allow.includes(k);
+    const free = c.carry.length < W.cap && !c.carry.some((it) => it.c === 99);
+    // 든 것 내주기
+    if (can('serve')) for (const it of c.carry) {
+      if (it.c === 99) continue;
+      for (const g of W.g) {
+        if (g.st !== 2 || !g.want.includes(it.c) || g.seat < 0) continue;
+        const tb = L.tbs[L.seats[g.seat].tb];
+        cand.push({ id: 't' + tb.i, sc: 100 + 50 * (1 - g.pat / g.pat0) - dd(tb) * 2 });
+      }
+    }
+    if (c.carry.some((it) => it.c === 99) && can('dump')) cand.push({ id: 'tub', sc: 88 - dd(L.S.tub) });
+    if (free) {
+      const comboB = lv === 3 && c.carry.length > 0 ? 40 : 0;
+      if (can('pour')) for (const code of CODES_D) {
+        if (need(W, code, c) <= 0 || W.mug <= 0) continue;
+        const r = DRINK[code - 1].id, u = urg(W, code);
+        W.ck.forEach((ck, i) => { if (ck && ck.rd && ck.r === r && ck.sv > 0) { const S = L.S['k' + i]; if (S) cand.push({ id: 'k' + i, sc: 62 + 30 * u - dd(S) * 2 + hab.bar * 14 + (comboB && dd(S) < 3.5 ? comboB : 0), code }); } });
+      }
+      if (can('plate')) for (const code of CODES_F) {
+        const D = DISH[code - 11]; if (D.st === 'oven' || !W.dish[D.id] || W.plate <= 0 || need(W, code, c) <= 0) continue;
+        const S = L.S[D.st]; cand.push({ id: D.st, sc: 60 + 30 * urg(W, code) - dd(S) * 2 + hab.kit * 12 + (comboB && dd(S) < 3.5 ? comboB : 0), code });
+      }
+      if (can('take') && W.ov.some((o) => o && o.t >= o.T)) {
+        const o = W.ov.find((q) => q && q.t >= q.T), code = fCode(o.r);
+        cand.push({ id: 'oven', sc: 74 - dd(L.S.oven) * 2 + hab.kit * 8 + (pending(W, code) > carried(W, code) ? 18 : -25), code });
+      }
+      if (can('calm')) for (const g of W.g) if (g.rowdy && g.seat >= 0 && g.st >= 2 && g.st <= 3) { const tb = L.tbs[L.seats[g.seat].tb]; cand.push({ id: 't' + tb.i, sc: 72 + (16 - g.rt) * 2 - dd(tb) * 2 + hab.brave * 12, calm: 1 }); }
+      if (can('clear')) for (const tb of L.tbs) if (tb.dm + tb.dp > 0) cand.push({ id: 't' + tb.i, sc: 28 + hab.cln * 18 + (W.mug < 3 || W.plate < 2 ? 30 : 0) + (tb.dm + tb.dp) * 2 - dd(tb), clear: 1 });
+      if (can('wash') && W.tub.m + W.tub.p > 0) cand.push({ id: 'tub', sc: (W.mug < 4 || W.plate < 3 ? 50 : W.tub.m + W.tub.p >= 6 ? 24 : 6) + hab.cln * 10 - dd(L.S.tub) });
+      if (can('mop')) for (const p of W.sp) cand.push({ id: 's' + p.id, sc: 20 + hab.cln * 14 - dist(p.x, p.z, c.x, c.z) });
+    }
+    if (can('cook') && W.ov.indexOf(null) >= 0 && W.plate > 0) for (const code of CODES_F) {
+      const D = DISH[code - 11]; if (D.st !== 'oven' || !W.dish[D.id] || need(W, code, c) <= 0) continue;
+      cand.push({ id: 'oven', sc: 56 + 25 * urg(W, code) - dd(L.S.oven) + hab.kit * 16, code });
+    }
+    if (!cand.length) return null;
+    const nz = lv === 1 ? 30 : lv === 2 ? 8 : 2;
+    for (const k of cand) k.sc += (W.rnd() - 0.5) * nz;
+    cand.sort((a, b) => b.sc - a.sc);
+    if (lv === 1 && W.rnd() < 0.22) return cand[Math.floor(W.rnd() * cand.length)];
+    return cand[0];
+  }
+  function aiTick(W, c, lv, hab, dt, allow) {
+    if (c.busy) return;
+    if (c.path) { followTick(W, c, dt, lv === 1 ? 1 : 2); return; }
+    c.think -= dt; if (c.think > 0) return;
+    c.think = [0, 0.95, 0.45, 0.18][lv] * (0.7 + W.rnd() * 0.6);
+    const task = chooseTask(W, c, lv, hab, allow);
+    c.task = task;
+    if (!task) {
+      if (dist(c.x, c.z, c.ix, c.iz) > 0.6 && W.rnd() < 0.5) goTo(W, c, null, c.ix, c.iz);
+      return;
+    }
+    const t = targetPos(W, task.id);
+    if (t && edgeDist(t, c.x, c.z) < 1.0) { if (!tryUse(W, c, task.id, true)) c.task = null; return; }
+    if (!goTo(W, c, task.id)) c.task = null;
+  }
+  const NPC_ALLOW = { hand: ['clear', 'dump', 'mop'], cookhand: ['cook'], bouncer: ['calm'] };
+  function npcTick(W, c, dt) {
+    if (c.busy) return;
+    if (c.kind === 'scullion') {
+      c.think -= dt; if (c.think > 0) return; c.think = 0.3;
+      if (W.tub.m + W.tub.p > 0) {
+        let k = 2; while (k > 0 && W.tub.m + W.tub.p > 0) { if (W.tub.m > 0 && (W.mug <= W.plate || W.tub.p <= 0)) { W.tub.m--; W.mug++; } else { W.tub.p--; W.plate++; } k--; }
+        c.busy = { op: 'wash', id: 'tub', t: 0, T: 1.6 };
+      }
+      return;
+    }
+    aiTick(W, c, 2, { bar: 0, kit: 0.5, cln: 1, brave: 1 }, dt, NPC_ALLOW[c.kind]);
+  }
+
+  /* ======================= 한 걸음 ======================= */
+  /* inputOf(seat, c) → null(AI가 맡음) 또는 {mx, mz, use, drop, go:{id?, x, z}} — 사람 자리(이 기기) */
+  function step(W, dt, inputOf, aiOf) {
+    W.t += dt;
+    // 손님 들이기
+    while (W.ai < W.arr.length && W.arr[W.ai].t <= W.t) { spawnGroup(W, W.arr[W.ai]); W.ai++; }
+    // 화덕
+    for (let i = 0; i < W.ov.length; i++) {
+      const o = W.ov[i]; if (!o) continue;
+      const was = o.t >= o.T; o.t += dt;
+      if (!was && o.t >= o.T) fx(W, 'done', 3.8, 0.6, i);
+      if (o.t > o.T + 30) { W.ov[i] = null; W.burnt++; W.tub.p++; fx(W, 'burn', 3.8, 0.6, i); }
+    }
+    // 직원
+    for (const c of W.ch) {
+      c.mv = 0;
+      if (c.busy) { c.busy.t += dt; if (c.busy.t >= c.busy.T) c.busy = null; continue; }
+      const inp = inputOf ? inputOf(c.s, c) : null;
+      if (inp === 'remote') continue;   // 다른 기기가 움직임(호스트는 위치만 받음)
+      if (inp) {
+        if (inp.go) { goTo(W, c, inp.go.id, inp.go.x, inp.go.z); }
+        if (Math.hypot(inp.mx || 0, inp.mz || 0) > 0.1) { c.path = null; c.tgt = null; stepFree(W, c, inp.mx, inp.mz, dt); }
+        else followTick(W, c, dt, 0);
+        if (inp.use && !c.busy) { const nb = nearest(W, c); if (nb && !nb.o.no) startOp(W, c, nb.id, nb.o); }
+        if (inp.drop && !c.busy) dropTop(W, c);
+      } else if (inp === null && aiOf) {
+        const a = aiOf(c.s); if (a) aiTick(W, c, a.lv, a.hab, dt);
+      }
+    }
+    for (const c of W.np) { c.mv = 0; if (c.busy) { c.busy.t += dt; if (c.busy.t >= c.busy.T) c.busy = null; continue; } npcTick(W, c, dt); }
+    // 손님
+    for (const g of W.g) if (g.st < 6) guestTick(W, g, dt);
+    if (W.g.length > 60) W.g = W.g.filter((g) => g.st < 6);
+    // 마감
+    if (W.t >= W.dur && !W.closed) {
+      W.closed = 1;
+      for (const g of W.g) if (g.st >= 0 && g.st <= 3) { if (g.got.length) leave(W, g, 'close'); else if (g.st >= 1) { W.lost++; freeSeat(W, g); g.st = 4; g.path = findPath(W.Lay, g.x, g.z, DOOR.x, DOOR.z) || [[DOOR.x, DOOR.z]]; } else { g.st = 4; g.path = [[DOOR.x, DOOR.z]]; } }
+    }
+    if (W.closed && !W.done && (W.g.every((g) => g.st >= 6) || W.t > W.dur + 6)) W.done = true;
+  }
+  function out(W) {
+    let dirty = 0; for (const tb of W.Lay.tbs) if (tb.dm + tb.dp > 0) dirty++;
+    const dish = {}; for (const d of DISH) dish[d.id] = W.dish[d.id];
+    let top = null, tn = 0; for (const k in W.top) if (W.top[k] > tn) { tn = W.top[k]; top = k; }
+    return { inc: W.inc, tip: W.tip, xp: Math.round(W.xp), served: W.served, lost: W.lost, angry: W.angry, roomReq: W.roomReq, brk: W.brk, brawl: W.brawl, spill: W.sp.length, dirty,
+      ck: W.ck.map((c) => (c ? c.sv : null)), dish, srv: W.srv.slice(), sat: W.moodN ? Math.round(W.moodSum / W.moodN * 100) / 100 : 0, burnt: W.burnt, top };
+  }
+
+  /* ======================= 네트워크 묶기 ======================= */
+  const r1 = (v) => Math.round(v * 10);
+  function packChar(c) { return [r1(c.x), r1(c.z), Math.round(c.yaw * 50), c.busy ? OPI[c.busy.op] || 0 : 0, c.busy ? Math.round(Math.min(1, c.busy.t / c.busy.T) * 100) : 0, c.carry.map(itemCode), c.mv ? 1 : 0]; }
+  function pack(W) {
+    return {
+      t: Math.round(W.t * 100) / 100,
+      c: W.ch.map(packChar), n: W.np.map((c) => [NPC.indexOf(c.kind)].concat(packChar(c))),
+      g: W.g.filter((g) => g.st < 6).map((g) => [g.id, g.ty, r1(g.x), r1(g.z), Math.round(g.yaw * 50), g.st, g.seat, g.want.slice(), Math.round(clamp(g.pat / g.pat0, 0, 1) * 100), g.rowdy ? Math.max(1, Math.round(g.rt)) : 0, g.drinks, g.dishes, g.mv ? 1 : 0, g.got.length ? itemCode(g.got[g.got.length - 1]) : 0]),
+      tb: W.Lay.tbs.map((t) => [t.dm, t.dp]), bk: W.Lay.seats.map((s, i) => (s.brk ? i : -1)).filter((i) => i >= 0),
+      sp: W.sp.map((p) => [p.id, r1(p.x), r1(p.z)]),
+      ov: W.ov.map((o) => (o ? [DS[o.r].i, Math.round(o.t * 10), o.T] : 0)),
+      ck: W.ck.map((c) => (c ? c.sv : -1)), ds: DISH.map((d) => W.dish[d.id] || 0),
+      m: [W.mug, W.plate, W.tub.m, W.tub.p], $: [W.inc, W.tip, Math.round(W.xp), W.served, W.lost],
+      fx: W.fx.filter((f) => W.t - f[5] < 1.5).map((f) => f.slice(0, 5)),
+    };
+  }
+  /* 손님 기기: 호스트 묶음 → 거울 세계(자기 캐릭터 위치는 건드리지 않음) */
+  function unpack(W, o, mySeat) {
+    if (!o) return;
+    if (typeof o.t === 'number') { if (Math.abs(o.t - W.t) > 0.6) W.t = o.t; else W.t += (o.t - W.t) * 0.1; }
+    const setC = (c, a, mine) => {
+      if (!mine) { c.tx = a[0] / 10; c.tz = a[1] / 10; c.tyaw = a[2] / 50; if (c.x == null || dist(c.x, c.z, c.tx, c.tz) > 4) { c.x = c.tx; c.z = c.tz; } c.mv = a[6]; }
+      c.busy = a[3] ? { op: OPS[a[3]], id: '', t: a[4] / 100, T: 1 } : null;
+      c.carry = (a[5] || []).map(itemOf);
+    };
+    if (Array.isArray(o.c)) o.c.forEach((a, s) => { if (!a || !W.ch[s]) return; setC(W.ch[s], a, s === mySeat); });
+    if (Array.isArray(o.n)) { W.np.length = Math.min(W.np.length, o.n.length); o.n.forEach((a, i) => { let c = W.np[i]; if (!c) { c = W.np[i] = newChar(-1, a[1] / 10, a[2] / 10, NPC[a[0]]); } c.kind = NPC[a[0]]; setC(c, a.slice(1), false); }); }
+    if (Array.isArray(o.g)) {
+      const byId = {}; for (const g of W.g) byId[g.id] = g;
+      W.g = o.g.map((a) => {
+        let g = byId[a[0]];
+        if (!g) g = { id: a[0], x: a[2] / 10, z: a[3] / 10, yaw: a[4] / 50 };
+        g.ty = a[1]; g.tx = a[2] / 10; g.tz = a[3] / 10; g.tyaw = a[4] / 50; g.st = a[5]; g.seat = a[6]; g.want = a[7] || []; g.patF = a[8] / 100; g.rowdy = a[9] ? 1 : 0; g.rt = a[9]; g.drinks = a[10]; g.dishes = a[11]; g.mv = a[12]; g.lastGot = a[13];
+        g.pat = g.patF; g.pat0 = 1;
+        return g;
+      });
+    }
+    if (Array.isArray(o.tb)) o.tb.forEach((a, i) => { const t = W.Lay.tbs[i]; if (t) { t.dm = a[0]; t.dp = a[1]; } });
+    if (Array.isArray(o.bk)) { W.Lay.seats.forEach((s) => { s.brk = 0; }); for (const i of o.bk) if (W.Lay.seats[i]) W.Lay.seats[i].brk = 1; }
+    if (Array.isArray(o.sp)) W.sp = o.sp.map((a) => ({ id: a[0], x: a[1] / 10, z: a[2] / 10 }));
+    if (Array.isArray(o.ov)) W.ov = o.ov.map((a) => (a ? { r: DISH[a[0]].id, t: a[1] / 10, T: a[2] } : null));
+    if (Array.isArray(o.ck)) o.ck.forEach((v, i) => { if (W.ck[i]) W.ck[i].sv = v < 0 ? 0 : v; });
+    if (Array.isArray(o.ds)) DISH.forEach((d, i) => { W.dish[d.id] = o.ds[i] || 0; });
+    if (Array.isArray(o.m)) { W.mug = o.m[0]; W.plate = o.m[1]; W.tub.m = o.m[2]; W.tub.p = o.m[3]; }
+    if (Array.isArray(o.$)) { W.inc = o.$[0]; W.tip = o.$[1]; W.xp = o.$[2]; W.served = o.$[3]; W.lost = o.$[4]; }
+    if (Array.isArray(o.fx)) { W.fxIn = o.fx; }
+  }
+
+  T.sim = { DT, DUR, ARR_END, LAST_CALL, WX, WZ, CS, GX, GZ, OPS, OPI, NPC, TABLES, BAR, DOOR, STAIRS, layout, findPath, walk, makeWorld, step, out, pack, unpack, opFor, tryUse, nearest, dropTop,
+    goTo, targetPos, spotsOf, edgeDist, allTargets, itemCode, itemOf, dCode, fCode, codeNm, pending, need, stockOf, avail, aiTick, chooseTask, newChar, schedule };
+})();

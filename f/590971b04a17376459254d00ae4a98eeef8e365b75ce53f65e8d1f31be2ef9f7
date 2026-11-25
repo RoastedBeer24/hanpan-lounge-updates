@@ -1,0 +1,631 @@
+/* 사흘 밤의 원정 (nightfall) — 사흘 동안 좁혀 드는 폭풍 속에서 파밍하고 밤마다 보스를 잡는 1~3인 협동 소울라이크 로그라이크(3D, PC 전용).
+   체계만 참고(사흘 원정 · 폭풍 원 · 밤 보스 · 은총의 터 레벨업 · 쓰러진 동료를 때려 일으키기). 이름 · 보스 · 그림 · 글은 모두 독자.
+
+   파일 구성 (결정 사항: docs/DECISIONS.md 「사흘 밤의 원정」)
+   - 이 파일: 자료(원정자 6 · 무기 계열 8 · 무기 40 · 무기 기술 · 축복(패시브) · 소모품 · 적 10 · 들판 강자 4 · 밤 보스 6 · 최종 보스 2 · 거점 종류)
+     · 판 상태(고르기 → 원정 → 끝) · 결과 · 규칙 · 도감 · 표지 · L.register — 와 가벼운 입구 화면(3D 파일 불러오기).
+   - assets/nightfall/sim.js: 원정 세계(순수 로직 — 지형 · 거점 배치 · 폭풍 · 전투 · 적/보스 AI · 동료 봇 AI · 네트워크 묶기). node에서도 돎.
+   - assets/nightfall/view.js: 3D 화면(three.js — assets/hyperrace/lib/three.min.js 공용) · 절차 생성 인물/괴물(관절 뼈대 애니메이션) · 조작 · HUD · 온라인.
+   온라인: 세계는 호스트가 돌려 hostSend(15Hz). 손님은 자기 원정자 이동 · 동작을 먼저 그리고(예측) 위치와 누른 동작을 publish, 판정은 호스트. */
+(function () {
+  'use strict';
+  const G = typeof window !== 'undefined' ? window : globalThis;
+  const L = G.Lounge;
+  const ID = 'nightfall';
+  const TITLE = '사흘 밤의 원정';
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  /* 글 문체(사용자 지시 「지나치게 유치하게 구성하지 마. 문체 같은 것부터 신경써서」):
+     화면 글은 짧은 명사형 · 평서(느낌표 · 감탄사 · 의성어 · 이모지 아이콘 없음), 규칙은 합니다체. */
+
+  /* ======================= 희귀도 · 축복 ======================= */
+  const RAR = [
+    { nm: '일반', col: '#a9a39a', mul: 1.0, np: 0 },
+    { nm: '고급', col: '#6f9ad0', mul: 1.1, np: 1 },
+    { nm: '희귀', col: '#a77ad6', mul: 1.2, np: 2 },
+    { nm: '전설', col: '#d9a441', mul: 1.32, np: 2 },
+  ];
+  /* 축복(무기에 붙는 효과) — v: 고급/희귀/전설 값 */
+  const PAS = {
+    atk: { nm: '공격력', f: (v) => '공격력 +' + v + '%', v: [8, 12, 16] },
+    bleed: { nm: '출혈', f: (v) => '공격에 출혈 누적 +' + v, v: [22, 32, 42] },
+    burn: { nm: '화상', f: (v) => '공격에 화상 누적 +' + v, v: [22, 32, 42] },
+    frost: { nm: '서리', f: (v) => '공격에 서리 누적 +' + v, v: [22, 32, 42] },
+    poison: { nm: '독', f: (v) => '공격에 독 누적 +' + v, v: [22, 32, 42] },
+    kheal: { nm: '처치 회복', f: (v) => '적을 쓰러뜨리면 체력 ' + v + '% 회복', v: [3, 5, 7] },
+    leech: { nm: '흡수', f: (v) => '준 피해의 ' + v + '%만큼 체력 회복', v: [2, 3, 4] },
+    stre: { nm: '숨 고르기', f: (v) => '스태미나 회복 +' + v + '%', v: [12, 18, 25] },
+    dodge: { nm: '반격의 틈', f: (v) => '구르기 직후 1초 동안 공격 +' + v + '%', v: [15, 22, 30] },
+    guard: { nm: '굳은 가드', f: (v) => '가드 피해 흡수 +' + v + '%p', v: [8, 12, 16] },
+    art: { nm: '기술 연마', f: (v) => '무기 기술 피해 +' + v + '%', v: [15, 22, 30] },
+    ult: { nm: '결의', f: (v) => '궁극기 게이지 획득 +' + v + '%', v: [15, 22, 30] },
+    crit: { nm: '급소', f: (v) => '치명타(자세 붕괴 · 받아넘기기 뒤) 피해 +' + v + '%', v: [20, 30, 40] },
+    hp: { nm: '강인함', f: (v) => '최대 체력 +' + v + '%', v: [6, 9, 12] },
+    def: { nm: '단단한 몸', f: (v) => '받는 피해 −' + v + '%', v: [5, 8, 11] },
+    rage: { nm: '궁지', f: (v) => '체력 50% 이하일 때 공격력 +' + v + '%', v: [15, 22, 30] },
+  };
+  const PAS_IDS = Object.keys(PAS);
+  const STATUS = {
+    bleed: { nm: '출혈', col: '#b03a3a', d: '쌓이면 터져 최대 체력의 일부를 한 번에 깎음(보스는 덜).' },
+    burn: { nm: '화상', col: '#e07a2e', d: '쌓이면 4초 동안 불탐.' },
+    frost: { nm: '서리', col: '#8fc6e6', d: '쌓이면 피해를 주고 8초 동안 받는 피해 +15% · 느려짐.' },
+    poison: { nm: '독', col: '#7fa23a', d: '쌓이면 10초 동안 서서히 체력을 깎음.' },
+  };
+
+  /* ======================= 무기 계열 · 기술 ======================= */
+  /* 동작: d 길이(초), h 판정 시각(초), r 거리, a 반각(도), m 피해 배수, pz 자세 피해 배수, step 앞으로 나가는 거리, pj 투사체 */
+  const CLS = {
+    sword: { nm: '직검', dmg: 46, pz: 14, st: 13, r: 2.5, art: 'spin', d: '고르게 빠르고 넓게 벰. 다루기 쉬움.',
+      L: [{ d: 0.56, h: [0.3], a: 65, m: 1, step: 0.5 }, { d: 0.56, h: [0.28], a: 65, m: 1.05, step: 0.5 }, { d: 0.72, h: [0.4], a: 90, m: 1.25, step: 0.7 }],
+      H: { d: 1.0, h: [0.62], a: 55, m: 1.9, pz: 2.2, step: 0.9 } },
+    great: { nm: '대검', dmg: 74, pz: 30, st: 20, r: 3.0, art: 'leap', d: '느리지만 한 번이 무겁고 자세를 크게 무너뜨림.',
+      L: [{ d: 0.86, h: [0.5], a: 75, m: 1, step: 0.6 }, { d: 0.86, h: [0.48], a: 75, m: 1.05, step: 0.6 }, { d: 1.0, h: [0.6], a: 100, m: 1.3, step: 0.8 }],
+      H: { d: 1.35, h: [0.88], a: 50, m: 2.0, pz: 2.4, step: 1 } },
+    curved: { nm: '곡도', dmg: 38, pz: 10, st: 11, r: 2.3, art: 'dance', d: '빠른 연속 베기. 출혈 · 화상 축복과 잘 맞음.',
+      L: [{ d: 0.46, h: [0.24], a: 80, m: 1, step: 0.4 }, { d: 0.46, h: [0.22], a: 80, m: 1, step: 0.4 }, { d: 0.52, h: [0.18, 0.34], a: 90, m: 0.75, step: 0.5 }],
+      H: { d: 0.9, h: [0.4, 0.6], a: 70, m: 1.1, pz: 1.6, step: 0.8 } },
+    dagger: { nm: '단검', dmg: 28, pz: 6, st: 9, r: 1.9, art: 'stab', crit: 0.4, d: '가장 빠름. 치명타 피해 +40%.',
+      L: [{ d: 0.36, h: [0.18], a: 55, m: 1, step: 0.35 }, { d: 0.36, h: [0.17], a: 55, m: 1, step: 0.35 }, { d: 0.42, h: [0.22], a: 60, m: 1.15, step: 0.45 }],
+      H: { d: 0.72, h: [0.42], a: 40, m: 2.0, pz: 2, step: 1.6 } },
+    hammer: { nm: '둔기', dmg: 54, pz: 28, st: 15, r: 2.4, art: 'quake', d: '자세 피해가 큼. 방패 든 적에게 강함.',
+      L: [{ d: 0.68, h: [0.4], a: 70, m: 1, step: 0.5 }, { d: 0.68, h: [0.4], a: 70, m: 1.05, step: 0.5 }, { d: 0.85, h: [0.52], a: 85, m: 1.25, step: 0.6 }],
+      H: { d: 1.15, h: [0.75], a: 40, m: 2.0, pz: 2.5, step: 0.8 } },
+    spear: { nm: '창', dmg: 44, pz: 12, st: 12, r: 3.4, art: 'pierce', d: '길게 찌름. 거리를 두고 싸우기 좋음.',
+      L: [{ d: 0.52, h: [0.28], a: 22, m: 1, step: 0.4 }, { d: 0.52, h: [0.28], a: 22, m: 1.05, step: 0.4 }, { d: 0.7, h: [0.4], a: 60, m: 1.2, step: 0.6 }],
+      H: { d: 0.95, h: [0.58], a: 20, m: 1.9, pz: 2, step: 1.2 } },
+    bow: { nm: '활', dmg: 32, pz: 6, st: 10, r: 30, art: 'rain', rng: 1, d: '멀리서 쏨. 강공격은 꿰뚫는 화살.',
+      L: [{ d: 0.5, h: [0.3], m: 1, pj: { spd: 48, r: 0.25, k: 'arrow' } }],
+      H: { d: 1.0, h: [0.75], m: 2.2, pz: 2, pj: { spd: 62, r: 0.3, k: 'arrow', pierce: 1 } } },
+    staff: { nm: '지팡이', dmg: 38, pz: 8, st: 12, r: 26, art: 'lance', rng: 1, d: '마력 탄을 쏨. 약하게 따라가는 탄, 강공격은 터지는 구슬.',
+      L: [{ d: 0.6, h: [0.35], m: 1, pj: { spd: 30, r: 0.35, k: 'bolt', hom: 2.2 } }],
+      H: { d: 1.1, h: [0.8], m: 2.4, pz: 2, pj: { spd: 20, r: 0.5, k: 'orb', boom: 3 } } },
+  };
+  const CLS_IDS = Object.keys(CLS);
+  /* 무기 기술: ty 동작 종류(sim이 구현), st 스태미나 */
+  const ART = {
+    spin: { nm: '회전 베기', ty: 'spin', d: 0.9, h: [0.5], r: 3.0, m: 2.0, st: 25, dsc: '제자리에서 한 바퀴 돌며 주변을 벰.' },
+    leap: { nm: '도약 내려찍기', ty: 'slam', d: 1.3, h: [0.85], r: 3.5, m: 3.0, mv: 4, pz: 3, st: 32, dsc: '앞으로 뛰어올라 내려찍음. 반경 3.5m.' },
+    dance: { nm: '바람 칼춤', ty: 'multi', d: 1.2, h: [0.25, 0.45, 0.65, 0.85], r: 2.7, a: 100, m: 0.8, st: 28, dsc: '네 번 연달아 벰.' },
+    stab: { nm: '급소 찌르기', ty: 'lunge', d: 0.8, h: [0.45], r: 2.2, a: 40, m: 3.2, mv: 5, st: 22, dsc: '5m를 파고들어 찌름. 자세가 무너진 적에게 치명.' },
+    quake: { nm: '대지 울림', ty: 'ring', d: 1.2, h: [0.7], r: 5, m: 2.2, pz: 3, st: 30, dsc: '땅을 내리쳐 반경 5m를 흔듦. 자세 피해 큼.' },
+    pierce: { nm: '꿰뚫기 돌진', ty: 'charge', d: 1.0, h: [0.55], len: 7, w: 1.6, m: 2.4, mv: 7, st: 28, dsc: '7m를 돌진하며 길 위의 적을 모두 꿰뚫음.' },
+    rain: { nm: '화살비', ty: 'rain', d: 1.0, h: [0.5], r: 4, m: 0.9, ticks: 5, st: 30, dsc: '표적 자리(없으면 앞 14m)에 화살 다섯 차례.' },
+    lance: { nm: '빛의 창', ty: 'proj', d: 0.9, h: [0.5], spd: 38, m: 3.0, pierce: 1, k: 'lance', st: 30, dsc: '꿰뚫는 큰 마력 창.' },
+    dusk: { nm: '황혼 파동', ty: 'proj', d: 0.9, h: [0.45], spd: 26, m: 2.6, pierce: 1, k: 'wave', w: 1.6, fx: 'burn', b: 50, st: 30, dsc: '불붙은 넓은 검기를 날림. 꿰뚫고 화상.' },
+    brand: { nm: '왕의 낙인', ty: 'slam', d: 1.5, h: [1.0], r: 5.5, m: 4.2, mv: 3, pz: 4, fx: 'burn', b: 70, st: 40, dsc: '불꽃을 두르고 내려찍음. 반경 5.5m · 화상.' },
+    bloodwind: { nm: '피바람', ty: 'multi', d: 1.3, h: [0.3, 0.6, 0.9], r: 3.4, a: 180, m: 1.0, fx: 'bleed', b: 45, st: 32, dsc: '세 바퀴 돌며 벰. 출혈.' },
+    lastbreath: { nm: '마지막 숨', ty: 'lunge', d: 1.0, h: [0.55], r: 2.4, a: 40, m: 5.5, mv: 7, st: 30, dsc: '7m를 파고드는 일격. 매우 큰 피해.' },
+    thunder: { nm: '낙뢰', ty: 'ring', d: 1.4, h: [0.85], r: 7, m: 3.0, pz: 3, st: 38, dsc: '망치를 들어 반경 7m에 벼락을 부름.' },
+    star: { nm: '별빛 투창', ty: 'proj', d: 0.9, h: [0.5], spd: 45, m: 4.0, pierce: 1, k: 'spear', st: 30, dsc: '빛나는 창을 던져 꿰뚫음.' },
+    sunarrow: { nm: '태양 화살', ty: 'proj', d: 1.1, h: [0.7], spd: 50, m: 2.5, boom: 4, k: 'sun', fx: 'burn', b: 80, st: 32, dsc: '터지는 불화살. 반경 4m · 화상.' },
+    swarm: { nm: '별무리', ty: 'orbs', d: 1.0, h: [0.5], n: 5, spd: 22, m: 1.2, hom: 4, st: 32, dsc: '따라가는 마력 구슬 다섯.' },
+  };
+  /* 무기 40 — t: 나올 수 있는 최저 희귀도(전설은 보스 · 동굴 상자에서만), dm: 계열 기본 피해 배수, fx/b: 타고난 상태 이상 누적 */
+  const W_ = (id, nm, c, t, dm, o, d) => Object.assign({ id, nm, c, t, dm, d }, o || {});
+  const WPN = [
+    W_('sw0', '녹슨 장검', 'sword', 0, 0.95, null, '날이 무뎌진 병사의 검.'),
+    W_('sw1', '기사단 장검', 'sword', 0, 1.0, null, '무너진 기사단의 제식 검.'),
+    W_('sw2', '순례자의 검', 'sword', 1, 1.0, { uq: ['stre', 12] }, '가볍고 오래 휘둘러도 숨이 차지 않음.'),
+    W_('sw3', '서리 맺힌 장검', 'sword', 1, 1.0, { fx: 'frost', b: 26 }, '칼날에 늘 서리가 앉아 있음.'),
+    W_('sw4', '황혼의 맹세검', 'sword', 3, 1.12, { art: 'dusk', uq: ['atk', 18] }, '해 질 녘에 맹세한 기사의 검. 불붙은 검기를 날림.'),
+    W_('gs0', '쇠 대검', 'great', 0, 0.95, null, '두꺼운 쇳덩이.'),
+    W_('gs1', '처형인의 대검', 'great', 0, 1.0, { fx: 'bleed', b: 18 }, '목을 치던 넓은 칼날.'),
+    W_('gs2', '잿불 대검', 'great', 1, 1.0, { fx: 'burn', b: 26 }, '숯처럼 붉게 달아 있음.'),
+    W_('gs3', '무덤지기 대검', 'great', 2, 1.06, { uq: ['def', 8] }, '묘지기가 쓰던 묵직한 칼.'),
+    W_('gs4', '무너진 왕의 대검', 'great', 3, 1.12, { art: 'brand', uq: ['crit', 35] }, '왕좌와 함께 무너진 왕의 칼.'),
+    W_('cv0', '사막 곡도', 'curved', 0, 0.95, null, '모래바람에 닳은 곡도.'),
+    W_('cv1', '유랑자의 곡도', 'curved', 0, 1.0, null, '떠돌이 용병의 손에 익은 칼.'),
+    W_('cv2', '피 맺힌 곡도', 'curved', 1, 1.0, { fx: 'bleed', b: 24 }, '베인 자리가 쉬이 아물지 않음.'),
+    W_('cv3', '달그림자 곡도', 'curved', 2, 1.05, { uq: ['dodge', 25] }, '구른 직후에 날이 선다는 칼.'),
+    W_('cv4', '붉은 매의 쌍곡도', 'curved', 3, 1.12, { art: 'bloodwind', fx: 'bleed', b: 30 }, '붉은 깃 사냥꾼의 한 쌍. 피바람을 일으킴.'),
+    W_('dg0', '단검', 'dagger', 0, 0.95, null, '어디서나 구하는 짧은 칼.'),
+    W_('dg1', '자비의 단검', 'dagger', 0, 1.0, { uq: ['crit', 20] }, '쓰러진 자의 숨을 거두는 칼.'),
+    W_('dg2', '독니 단검', 'dagger', 1, 1.0, { fx: 'poison', b: 30 }, '칼끝에 독이 배어 있음.'),
+    W_('dg3', '그림자 칼날', 'dagger', 2, 1.06, { uq: ['dodge', 25] }, '빛을 먹는 검은 칼날.'),
+    W_('dg4', '마지막 숨의 단검', 'dagger', 3, 1.15, { art: 'lastbreath', uq: ['crit', 40] }, '단 한 번 찌르기 위한 칼.'),
+    W_('hm0', '징 박힌 철퇴', 'hammer', 0, 0.95, null, '머리에 쇠못을 박은 몽둥이.'),
+    W_('hm1', '대장장이 망치', 'hammer', 0, 1.0, null, '모루를 두드리던 망치.'),
+    W_('hm2', '종지기 망치', 'hammer', 1, 1.02, { uq: ['guard', 10] }, '종을 치던 묵직한 망치.'),
+    W_('hm3', '거인 뼈 몽둥이', 'hammer', 2, 1.1, null, '거인의 넓적다리뼈.'),
+    W_('hm4', '천둥 망치', 'hammer', 3, 1.12, { art: 'thunder', uq: ['atk', 15] }, '내려칠 때마다 하늘이 울림.'),
+    W_('sp0', '짧은 창', 'spear', 0, 0.95, null, '보병의 짧은 창.'),
+    W_('sp1', '파수병의 창', 'spear', 0, 1.0, { uq: ['guard', 8] }, '성문 파수병의 긴 창.'),
+    W_('sp2', '서리 송곳 창', 'spear', 1, 1.0, { fx: 'frost', b: 26 }, '얼음 송곳 같은 창끝.'),
+    W_('sp3', '순교자의 미늘창', 'spear', 2, 1.06, { fx: 'bleed', b: 24 }, '미늘이 살을 물고 놓지 않음.'),
+    W_('sp4', '별을 꿰는 창', 'spear', 3, 1.12, { art: 'star', uq: ['art', 30] }, '밤하늘을 겨누던 창. 빛의 창을 던짐.'),
+    W_('bw0', '사냥꾼의 활', 'bow', 0, 0.95, null, '짐승을 쫓던 짧은 활.'),
+    W_('bw1', '뿔 활', 'bow', 0, 1.0, null, '짐승 뿔로 만든 활.'),
+    W_('bw2', '독침 활', 'bow', 1, 1.0, { fx: 'poison', b: 26 }, '화살촉을 독에 담금.'),
+    W_('bw3', '잿빛 장궁', 'bow', 2, 1.08, { uq: ['atk', 10] }, '멀리 쏘는 긴 활.'),
+    W_('bw4', '일몰의 장궁', 'bow', 3, 1.12, { art: 'sunarrow', fx: 'burn', b: 26 }, '해가 지는 쪽을 향해 쏘던 활.'),
+    W_('st0', '견습생의 지팡이', 'staff', 0, 0.95, null, '마력을 겨우 모으는 나무 지팡이.'),
+    W_('st1', '잿불 지팡이', 'staff', 0, 1.0, { fx: 'burn', b: 22 }, '끝에 잿불이 꺼지지 않음.'),
+    W_('st2', '서리 지팡이', 'staff', 1, 1.0, { fx: 'frost', b: 26 }, '차가운 수정을 박은 지팡이.'),
+    W_('st3', '무덤 촛대 지팡이', 'staff', 2, 1.06, { uq: ['kheal', 5] }, '무덤가 촛대를 꺾어 만듦.'),
+    W_('st4', '별무리 지팡이', 'staff', 3, 1.12, { art: 'swarm', uq: ['ult', 25] }, '별을 엮어 만들었다는 지팡이.'),
+  ];
+  const WI = {}; WPN.forEach((w, i) => { WI[w.id] = i; w.i = i; });
+
+  /* ======================= 원정자 6 ======================= */
+  const ARCH = [
+    { id: 'shield', nm: '방패 기사', role: '수호', hp: 1.25, st: 1.1, w0: 'sp1', col: '#7d8a99', ac: '#b9b2a2',
+      pas: { nm: '굳건한 방패', d: '방패를 듦 — 가드 흡수 90% · 가드 스태미나 소모 30% 감소 · 막아 낸 공격마다 궁극기 게이지.' },
+      sk: { nm: '방벽 돌진', cd: 10, d: '방패를 앞세워 8m 돌진. 부딪힌 적에게 피해와 큰 자세 피해.' },
+      ul: { nm: '불굴의 성채', d: '반경 10m 동료가 10초 동안 받는 피해 50% 감소. 주변 적이 이 기사를 노림.' } },
+    { id: 'hunter', nm: '추적자', role: '기습', hp: 0.9, st: 1.15, w0: 'dg0', col: '#4a4f45', ac: '#8a7b5c',
+      pas: { nm: '그림자 걸음', d: '구르기 스태미나 −25% · 구른 직후 1초 동안 공격 +30%.' },
+      sk: { nm: '그림자 도약', cd: 9, d: '앞의 적 뒤로 순간 이동해 찌름. 언제나 치명타.' },
+      ul: { nm: '사냥의 표식', d: '반경 14m 적에게 12초 표식 — 받는 피해 +30%, 표식 적을 때리면 체력 조금 회복.' } },
+    { id: 'ash', nm: '잿빛 주술사', role: '주술', hp: 0.85, st: 1.0, w0: 'st1', col: '#55443f', ac: '#9a5634',
+      pas: { nm: '잿불 순환', d: '적을 쓰러뜨리면 스태미나 30 회복 · 지팡이 피해 +12%.' },
+      sk: { nm: '재의 고리', cd: 12, d: '주변 6m에 불길 고리 — 피해와 화상.' },
+      ul: { nm: '잿불 혜성', d: '표적 자리(없으면 앞 14m)에 1초 뒤 혜성 — 반경 7m 큰 피해와 화상.' } },
+    { id: 'breaker', nm: '무쇠 파쇄자', role: '파쇄', hp: 1.2, st: 1.0, w0: 'gs0', col: '#5b4a3c', ac: '#8f8a80',
+      pas: { nm: '흔들리지 않는 몸', d: '강공격 · 무기 기술 · 궁극기 중 움찔하지 않음 · 그동안 받는 피해 −20%.' },
+      sk: { nm: '대지 내려찍기', cd: 11, d: '앞으로 뛰어 내려찍음 — 반경 4m 피해와 큰 자세 피해.' },
+      ul: { nm: '거인의 일격', d: '기를 모았다 내려침 — 반경 9m 매우 큰 피해. 그 뒤 15초 공격력 +25%.' } },
+    { id: 'archer', nm: '매의 사수', role: '사격', hp: 0.9, st: 1.1, w0: 'bw0', col: '#4d5a49', ac: '#a8956a',
+      pas: { nm: '매의 눈', d: '12m 넘게 떨어진 적에게 피해 +20% · 적의 등을 맞히면 +20%.' },
+      sk: { nm: '연사', cd: 8, d: '화살 다섯 발을 부채꼴로 쏨.' },
+      ul: { nm: '꿰뚫는 한 발', d: '40m를 꿰뚫는 큰 화살 — 매우 큰 피해와 자세 피해.' } },
+    { id: 'priest', nm: '서약의 사제', role: '지원', hp: 1.0, st: 1.0, w0: 'hm0', col: '#6e6a5e', ac: '#d6c79a',
+      pas: { nm: '서약의 손', d: '쓰러진 동료를 두 배 빨리 일으킴 · 일으킨 동료 체력 +20%.' },
+      sk: { nm: '치유의 기도', cd: 14, d: '반경 8m 동료와 자신의 체력 25% 회복.' },
+      ul: { nm: '새벽 성가', d: '반경 12m 쓰러진 동료를 모두 일으키고 체력 50% 회복 · 6초 동안 받는 피해 −30%.' } },
+  ];
+  const AI_ = {}; ARCH.forEach((a, i) => { AI_[a.id] = i; a.i = i; });
+
+  /* ======================= 소모품 ======================= */
+  const ITEM = [
+    { id: 'flask', nm: '성배병', d: '체력 55% 회복. 시작 3회, 예배당마다 최대 +1(최대 6). 은총의 터에서 쉬거나 새 날이 밝으면 다시 참.' },
+    { id: 'fpot', nm: '화염 항아리', ty: 'throw', m: 2.2, boom: 3, fx: 'burn', b: 70, d: '던지면 반경 3m 폭발 · 화상.' },
+    { id: 'ipot', nm: '서리 항아리', ty: 'throw', m: 1.8, boom: 3, fx: 'frost', b: 80, d: '던지면 반경 3m 냉기 · 서리.' },
+    { id: 'knife', nm: '투척 단검', ty: 'knife', m: 1.0, d: '단검 세 자루를 부채꼴로 던짐. 출혈 조금.' },
+    { id: 'incense', nm: '전투의 향', ty: 'buff', d: '30초 동안 공격력 +20%.' },
+    { id: 'leaf', nm: '정화 잎', ty: 'cure', d: '상태 이상을 씻어 내고 체력 15% 회복.' },
+    { id: 'pill', nm: '돌 피부 환약', ty: 'buff', d: '20초 동안 받는 피해 −25%.' },
+  ];
+  const IT = {}; ITEM.forEach((x, i) => { IT[x.id] = i; x.i = i; });
+
+  /* ======================= 적 · 보스 =======================
+     b 몸 형태(hum 사람형 · quad 네발 · crawl 다리 많은 것 · giant 거인 · wyrm 날개 달린 비룡 · float 떠 있는 사제), sc 크기,
+     hp 체력, pz 자세(강인도), dmg 피해, spd 걷기 · run 달리기(m/s), rn 룬, rk 공격 거리 선호(원거리), mv 동작 목록.
+     동작: po 자세(화면), rng 쓰는 거리, d 길이, h 판정 [시각, 모양, 배수, 옵션], w 가중, cd 다시 쓰기까지(초), lg [시작, 끝, 속도] 돌진,
+     tr 이 시각까지 표적을 바라봄, pj 투사체, zn 장판, sm 부르기, ph 이 단계부터.
+     모양: ['arc', 거리, 반각, 방향] · ['circ', 반경, 앞쪽 거리] · ['ring', 안 반경, 바깥 반경](뛰어넘기 가능) · ['line', 길이, 폭] */
+  const A = (r, a, off) => ['arc', r, a, off || 0], C = (r, f) => ['circ', r, f || 0], RG = (r0, r1) => ['ring', r0, r1], LN = (len, w) => ['line', len, w];
+  const EN = {
+    hollow: { nm: '떠도는 망자', b: 'hum', sc: 1, hp: 160, pz: 26, dmg: 40, spd: 2.6, run: 4.6, rn: 45, look: { c: '#5a544b', a: '#3b3630', w: 'sword', hood: 1 }, d: '빈 눈으로 길을 지키는 옛 병사. 느리지만 무리 지어 다님.',
+      mv: [{ nm: '내려베기', po: 'over', rng: 2.3, d: 1.25, h: [[0.65, A(2.4, 60), 1, { pr: 1 }]], w: 3, tr: 0.45 },
+        { nm: '연속 베기', po: 'combo', rng: 2.3, d: 1.5, h: [[0.48, A(2.3, 75), 0.8, { pr: 1 }], [0.98, A(2.3, 75), 0.9, { pr: 1 }]], w: 2, tr: 0.8 }] },
+    spear: { nm: '망자 창병', b: 'hum', sc: 1.02, hp: 170, pz: 28, dmg: 44, spd: 2.6, run: 4.5, rn: 50, look: { c: '#4f4a44', a: '#6d5f4c', w: 'spear', helm: 1 }, d: '긴 창으로 거리를 재는 망자.',
+      mv: [{ nm: '찌르기', po: 'thrust', rng: 3.3, d: 1.2, h: [[0.62, LN(3.6, 1.0), 1, { pr: 1 }]], w: 3, tr: 0.5 },
+        { nm: '휩쓸기', po: 'sweep', rng: 2.8, d: 1.4, h: [[0.75, A(3.1, 95), 1]], w: 1, cd: 3, tr: 0.55 }] },
+    archer: { nm: '망자 궁수', b: 'hum', sc: 0.98, hp: 110, pz: 18, dmg: 34, spd: 2.6, run: 4.6, rn: 50, rk: 14, look: { c: '#4b4a3e', a: '#6b5a3e', w: 'bow', hood: 1 }, d: '언덕 위에서 화살을 쏨. 가까이 붙으면 칼을 뽑음.',
+      mv: [{ nm: '활쏘기', po: 'shoot', rng: 26, min: 4, d: 1.5, h: [], pj: [[0.95, { n: 1, spd: 30, r: 0.25, m: 1, k: 'arrow' }]], w: 3, tr: 0.9 },
+        { nm: '단검 찌르기', po: 'thrust', rng: 2.0, d: 1.0, h: [[0.5, A(2.0, 45), 0.8, { pr: 1 }]], w: 2, tr: 0.4 }] },
+    zealot: { nm: '횃불 광신도', b: 'hum', sc: 1, hp: 140, pz: 22, dmg: 40, spd: 2.8, run: 5.0, rn: 50, look: { c: '#5e3b2c', a: '#2e2420', w: 'torch', hood: 1 }, d: '불붙은 횃불을 휘두르고 기름 항아리를 던짐.',
+      mv: [{ nm: '횃불 휘두르기', po: 'swing', rng: 2.3, d: 1.2, h: [[0.6, A(2.4, 70), 1, { fx: 'burn', b: 35 }]], w: 3, tr: 0.45 },
+        { nm: '기름 항아리', po: 'throw', rng: 13, min: 4, d: 1.5, h: [], pj: [[0.9, { n: 1, spd: 14, r: 0.3, m: 1.1, k: 'pot', lob: 1, boom: 2.5, fx: 'burn', b: 60 }]], w: 2, cd: 6, tr: 0.85 }] },
+    knight: { nm: '몰락한 기사', b: 'hum', sc: 1.12, hp: 520, pz: 90, dmg: 60, spd: 2.4, run: 4.4, rn: 220, elite: 1, shield: 1, look: { c: '#5d5f63', a: '#6e2a24', w: 'sword', helm: 2, shield: 1 }, d: '방패를 든 정예. 앞에서 오는 가벼운 공격은 절반만 들어감. 둔기 · 강공격으로 무너뜨림.',
+      mv: [{ nm: '세 번 베기', po: 'combo', rng: 2.6, d: 2.1, h: [[0.55, A(2.7, 70), 0.9, { pr: 1 }], [1.05, A(2.7, 70), 0.9, { pr: 1 }], [1.6, A(2.8, 60), 1.2]], w: 3, tr: 1.4 },
+        { nm: '방패 밀치기', po: 'thrust', rng: 2.2, d: 1.1, h: [[0.5, A(2.2, 50), 0.7, { pz: 2 }]], w: 2, cd: 3, tr: 0.4 },
+        { nm: '도약 베기', po: 'leap', rng: 7, min: 3.5, d: 1.6, h: [[1.05, C(2.4, 0.5), 1.4, { tg: 1 }]], lg: [0.35, 1.0, 6], w: 1, cd: 6, tr: 0.9 }] },
+    miner: { nm: '광산 노역귀', b: 'hum', sc: 1.08, hp: 220, pz: 40, dmg: 56, spd: 2.3, run: 4.2, rn: 70, look: { c: '#4a3e33', a: '#2b2520', w: 'pick', bare: 1 }, d: '곡괭이를 놓지 못한 노역꾼의 망령.',
+      mv: [{ nm: '곡괭이 내려찍기', po: 'over', rng: 2.2, d: 1.6, h: [[1.0, C(1.6, 1.4), 1.3, { tg: 1 }]], w: 3, tr: 0.75 },
+        { nm: '옆 후리기', po: 'swing', rng: 2.2, d: 1.3, h: [[0.7, A(2.3, 80), 0.9]], w: 2, tr: 0.5 }] },
+    dog: { nm: '굶주린 들개', b: 'quad', sc: 0.7, hp: 85, pz: 14, dmg: 30, spd: 4.5, run: 7.2, rn: 30, look: { c: '#5a4c3e', a: '#2e2620' }, d: '떼로 달려드는 마른 개. 빠르지만 약함.',
+      mv: [{ nm: '물어뜯기', po: 'bite', rng: 2.4, d: 0.9, h: [[0.45, A(1.9, 50), 1]], lg: [0.25, 0.45, 5], w: 3, tr: 0.25 }] },
+    wolf: { nm: '잿빛 늑대', b: 'quad', sc: 0.92, hp: 140, pz: 22, dmg: 40, spd: 5, run: 7.8, rn: 45, look: { c: '#6b6a66', a: '#3b3a37' }, d: '잿빛 털의 늑대. 거리를 벌렸다가 덮침.',
+      mv: [{ nm: '덮치기', po: 'pounce', rng: 6.5, min: 2.5, d: 1.2, h: [[0.7, C(1.6, 0.6), 1.2]], lg: [0.35, 0.7, 9], w: 2, cd: 3, tr: 0.35 },
+        { nm: '물기', po: 'bite', rng: 2.2, d: 0.85, h: [[0.42, A(2.0, 50), 0.9]], w: 3, tr: 0.25 }] },
+    troll: { nm: '바위 거인', b: 'giant', sc: 2.3, hp: 1100, pz: 220, dmg: 90, spd: 2.2, run: 3.4, rn: 600, elite: 1, look: { c: '#6a6358', a: '#4a4038', w: 'club', bare: 1 }, d: '바위 같은 살갗의 거인. 내려찍으면 땅이 울림(뛰어넘기 가능).',
+      mv: [{ nm: '내려찍기', po: 'slam', rng: 4.5, d: 2.0, h: [[1.2, C(2.6, 3), 1.3, { tg: 1 }], [1.32, RG(1.5, 6.5), 0.6, { tg: 1 }]], w: 3, tr: 0.9 },
+        { nm: '휩쓸기', po: 'sweep', rng: 5, d: 1.7, h: [[1.0, A(5.2, 110), 1]], w: 2, tr: 0.7 },
+        { nm: '바위 던지기', po: 'throw', rng: 22, min: 8, d: 2.0, h: [], pj: [[1.25, { n: 1, spd: 18, r: 0.9, m: 1.2, k: 'rock', lob: 1, boom: 3 }]], w: 1, cd: 7, tr: 1.15 }] },
+    crawler: { nm: '동굴 기는것', b: 'crawl', sc: 0.8, hp: 170, pz: 20, dmg: 36, spd: 3.2, run: 5.4, rn: 55, look: { c: '#3d3a33', a: '#6f8a3a' }, d: '동굴 바닥을 기는 다리 많은 것. 독을 뱉음.',
+      mv: [{ nm: '독 뱉기', po: 'spit', rng: 12, min: 3, d: 1.3, h: [], pj: [[0.75, { n: 1, spd: 16, r: 0.35, m: 0.8, k: 'spit', lob: 1, boom: 2, fx: 'poison', b: 55 }]], w: 2, cd: 3, tr: 0.7 },
+        { nm: '뛰어들기', po: 'leap', rng: 5, d: 1.2, h: [[0.75, C(1.8, 0.5), 1, { fx: 'poison', b: 30 }]], lg: [0.3, 0.7, 8], w: 3, tr: 0.3 }] },
+    /* 들판의 강자 */
+    fb_knight: { nm: '무덤지기 기사', b: 'hum', sc: 1.7, hp: 2600, pz: 300, dmg: 92, spd: 2.8, run: 5.2, rn: 1600, fb: 1, look: { c: '#3f4146', a: '#5c1e1e', w: 'great', helm: 2, cape: 1 }, d: '묘지 문을 지키는 큰 기사. 대검 연속기와 도약.',
+      mv: [{ nm: '대검 연속기', po: 'combo', rng: 3.6, d: 2.3, h: [[0.7, A(3.8, 80), 0.9], [1.3, A(3.8, 80), 1.0], [1.9, A(4, 50), 1.3]], w: 3, tr: 1.6 },
+        { nm: '도약 내려찍기', po: 'leap', rng: 10, min: 4, d: 2.0, h: [[1.35, C(3.2, 0.5), 1.6, { tg: 1 }]], lg: [0.5, 1.3, 8], w: 2, cd: 6, tr: 1.2 },
+        { nm: '찌르기', po: 'thrust', rng: 5.5, d: 1.5, h: [[0.9, LN(6.5, 1.4), 1.2, { pr: 1 }]], w: 2, tr: 0.75 },
+        { nm: '회전 베기', po: 'spin', rng: 3.4, d: 1.9, h: [[1.1, A(4.2, 180), 1.1, { tg: 1 }]], w: 1, cd: 5, tr: 0.6 }] },
+    fb_mother: { nm: '동굴 어미', b: 'crawl', sc: 2.1, hp: 2400, pz: 260, dmg: 80, spd: 3, run: 5.5, rn: 1600, fb: 1, look: { c: '#2f2d28', a: '#8aa040' }, d: '동굴 깊은 곳의 큰 기는것. 독을 뿜고 새끼를 부름.',
+      mv: [{ nm: '물기', po: 'bite', rng: 3.4, d: 1.3, h: [[0.7, A(3.6, 55), 1.1]], w: 3, tr: 0.55 },
+        { nm: '독 뿜기', po: 'spray', rng: 8, d: 2.4, h: [[0.9, A(9, 30), 0.3, { fx: 'poison', b: 30, tg: 1 }], [1.2, A(9, 30), 0.3, { fx: 'poison', b: 30 }], [1.5, A(9, 30), 0.3, { fx: 'poison', b: 30 }], [1.8, A(9, 30), 0.3, { fx: 'poison', b: 30 }]], w: 2, cd: 6, tr: 0.8 },
+        { nm: '덮치기', po: 'leap', rng: 10, min: 4, d: 1.7, h: [[1.1, C(3.2, 0.5), 1.4, { tg: 1 }]], lg: [0.45, 1.05, 10], w: 2, cd: 5, tr: 0.45 },
+        { nm: '새끼 부르기', po: 'summon', rng: 30, d: 2.0, h: [], sm: ['crawler', 2], w: 1, cd: 22 }] },
+    fb_alpha: { nm: '잿빛 우두머리', b: 'quad', sc: 1.6, hp: 2200, pz: 220, dmg: 84, spd: 5, run: 8, rn: 1600, fb: 1, look: { c: '#55534f', a: '#2a2826' }, d: '늑대 떼를 이끄는 큰 늑대. 연달아 덮치고 울부짖어 무리를 부름.',
+      mv: [{ nm: '연속 덮치기', po: 'pounce', rng: 9, min: 3, d: 2.0, h: [[0.7, C(2.4, 0.8), 1.1, { tg: 1 }], [1.5, C(2.4, 0.8), 1.1]], lg: [0.35, 1.5, 9], w: 3, cd: 3, tr: 1.2 },
+        { nm: '물어 흔들기', po: 'bite', rng: 3.2, d: 1.2, h: [[0.6, A(3.2, 55), 1.2]], w: 3, tr: 0.45 },
+        { nm: '앞발 휩쓸기', po: 'claw', rng: 3.4, d: 1.3, h: [[0.7, A(3.6, 100), 1]], w: 2, tr: 0.5 },
+        { nm: '울부짖기', po: 'roar', rng: 30, d: 1.8, h: [], sm: ['wolf', 2], w: 1, cd: 25 }] },
+    fb_warden: { nm: '묘지 파수꾼', b: 'giant', sc: 2.0, hp: 3000, pz: 320, dmg: 100, spd: 2.4, run: 3.6, rn: 1600, fb: 1, look: { c: '#77706a', a: '#3c3a44', w: 'hammer', helm: 2 }, d: '돌 갑옷의 거인. 내려찍은 자리에 충격파가 퍼짐(뛰어넘기 가능).',
+      mv: [{ nm: '내려찍기', po: 'slam', rng: 4.2, d: 2.0, h: [[1.2, C(2.8, 2.8), 1.4, { tg: 1 }], [1.35, RG(1.5, 8), 0.7, { tg: 1 }]], w: 3, tr: 0.95 },
+        { nm: '휩쓸기', po: 'sweep', rng: 4.6, d: 1.6, h: [[0.95, A(5, 120), 1.1]], w: 2, tr: 0.7 },
+        { nm: '발 구르기', po: 'stomp', rng: 4, d: 1.4, h: [[0.85, RG(0, 5), 0.8, { tg: 1 }]], w: 1, cd: 4, tr: 0.5 },
+        { nm: '바위 던지기', po: 'throw', rng: 24, min: 8, d: 2.0, h: [], pj: [[1.2, { n: 1, spd: 19, r: 1, m: 1.2, k: 'rock', lob: 1, boom: 3.2 }]], w: 2, cd: 6, tr: 1.1 }] },
+  };
+  /* 밤의 보스 6 + 최종 보스 2 — p2/p3: 단계 문턱(체력 비율), 단계가 오르면 빨라지고 새 동작(ph) */
+  const BOSS = {
+    lion: { nm: '잿갈기 사자', t: '첫째 · 둘째 밤', b: 'quad', sc: 2.6, hp: 12000, pz: 520, dmg: 120, spd: 5, run: 9, rn: 6000, p2: 0.55, look: { c: '#5b4634', a: '#d0612a', mane: 1 },
+      d: '갈기에 꺼지지 않는 잿불을 단 사자. 덮치기 · 앞발 연속 · 울부짖음의 불고리. 둘째 단계부터 지나간 자리가 탐.',
+      mv: [{ nm: '앞발 연속', po: 'claw', rng: 4.2, d: 1.6, h: [[0.55, A(4.4, 80), 0.9], [1.05, A(4.4, 80), 1.0]], w: 3, tr: 0.9 },
+        { nm: '덮치기', po: 'pounce', rng: 14, min: 4, d: 1.6, h: [[1.05, C(3.6, 1), 1.4, { tg: 1 }]], lg: [0.45, 1.0, 13], w: 3, cd: 3, tr: 0.45 },
+        { nm: '불고리', po: 'roar', rng: 7, d: 2.0, h: [[1.25, RG(0, 7.5), 1.0, { tg: 1, fx: 'burn', b: 40 }]], w: 2, cd: 7, tr: 0.3 },
+        { nm: '돌진', po: 'charge', rng: 18, min: 6, d: 1.9, h: [[0.95, LN(4, 3.2), 1.2, { tg: 1 }]], lg: [0.7, 1.5, 16], w: 1, cd: 6, tr: 0.7, zt: 1 },
+        { nm: '잿불 꼬리 휩쓸기', po: 'tail', rng: 5, d: 1.4, h: [[0.8, A(5.5, 140, 180), 1.0, { fx: 'burn', b: 30 }]], w: 2, cd: 4, tr: 0.2, ph: 2 }] },
+    bell: { nm: '종탑의 거인', t: '첫째 · 둘째 밤', b: 'giant', sc: 3.1, hp: 13500, pz: 600, dmg: 130, spd: 2.6, run: 3.6, rn: 6000, p2: 0.5, look: { c: '#6b6157', a: '#9b7b3a', w: 'bell', helm: 0, bare: 1 },
+      d: '무너진 종탑의 종을 망치처럼 휘두르는 거인. 내려찍은 자리의 충격파와 종소리 파동은 뛰어넘을 수 있음.',
+      mv: [{ nm: '휩쓸기', po: 'sweep', rng: 6, d: 1.7, h: [[1.0, A(6.4, 120), 1.0]], w: 3, tr: 0.75 },
+        { nm: '종 내려찍기', po: 'slam', rng: 5.5, d: 2.2, h: [[1.3, C(3.6, 3.6), 1.5, { tg: 1 }], [1.45, RG(2, 10), 0.7, { tg: 1 }]], w: 3, tr: 1.0 },
+        { nm: '발 구르기', po: 'stomp', rng: 5, d: 1.5, h: [[0.9, RG(0, 6.5), 0.8, { tg: 1 }]], w: 2, cd: 4, tr: 0.5 },
+        { nm: '파편 던지기', po: 'throw', rng: 26, min: 9, d: 2.0, h: [], pj: [[1.2, { n: 3, spr: 18, spd: 20, r: 0.9, m: 0.9, k: 'rock', lob: 1, boom: 3 }]], w: 1, cd: 6, tr: 1.1 },
+        { nm: '종소리', po: 'roar', rng: 30, d: 2.8, h: [[1.5, RG(0, 14), 1.1, { tg: 1 }], [2.1, RG(4, 20), 0.8, { tg: 1 }]], w: 2, cd: 10, tr: 0.2, ph: 2 }] },
+    wyrm: { nm: '서리 날개 비룡', t: '첫째 · 둘째 밤', b: 'wyrm', sc: 2.4, hp: 12800, pz: 540, dmg: 120, spd: 3.4, run: 6.5, rn: 6000, p2: 0.55, look: { c: '#56636c', a: '#9fd0ea' },
+      d: '서리 숨결을 뿜는 날개 달린 비룡. 날아올랐다 내리꽂음. 둘째 단계에 얼음비.',
+      mv: [{ nm: '물기', po: 'bite', rng: 4.6, d: 1.3, h: [[0.7, A(4.8, 50), 1.1]], w: 3, tr: 0.55 },
+        { nm: '꼬리 휩쓸기', po: 'tail', rng: 6, d: 1.5, h: [[0.85, A(6.5, 150, 180), 1.0]], w: 2, cd: 3, tr: 0.2 },
+        { nm: '서리 숨결', po: 'breath', rng: 11, d: 2.8, h: [0.9, 1.15, 1.4, 1.65, 1.9, 2.15].map((t, i) => [t, A(13, 26), 0.32, { fx: 'frost', b: 26, tg: i === 0 ? 1 : 0 }]), w: 2, cd: 6, tr: 1.6 },
+        { nm: '내리꽂기', po: 'dive', rng: 24, min: 5, d: 2.6, h: [[2.05, C(5, 0), 1.6, { tg: 1 }]], lg: [1.2, 2.0, 14], air: [0.4, 2.0, 7], w: 1, cd: 9, tr: 1.6 },
+        { nm: '얼음비', po: 'roar', rng: 30, d: 2.0, h: [], zn: [[0.8, { n: 6, r: 3, sp: 9, del: 1.3, m: 0.9, fx: 'frost', b: 40, k: 'ice' }]], w: 2, cd: 9, ph: 2 }] },
+    twins: { nm: '쌍둥이 파수 기사', t: '첫째 · 둘째 밤', b: 'hum', sc: 1.5, hp: 6400, pz: 300, dmg: 105, spd: 3, run: 5.6, rn: 3000, twin: 1, p2: 0, look: { c: '#3e3f44', a: '#8a6a2a', w: 'great', helm: 2, cape: 1 },
+      d: '둘이 함께 나오는 기사. 하나가 쓰러지면 남은 하나가 격분(빨라지고 검기를 날림).',
+      mv: [{ nm: '세 번 베기', po: 'combo', rng: 3.6, d: 2.2, h: [[0.6, A(3.8, 75), 0.85, { pr: 1 }], [1.15, A(3.8, 75), 0.9, { pr: 1 }], [1.75, A(4, 55), 1.2]], w: 3, tr: 1.5 },
+        { nm: '찌르기', po: 'thrust', rng: 6, d: 1.4, h: [[0.85, LN(6.5, 1.4), 1.2, { pr: 1 }]], w: 2, tr: 0.7 },
+        { nm: '도약 베기', po: 'leap', rng: 11, min: 4, d: 1.9, h: [[1.25, C(3, 0.5), 1.4, { tg: 1 }]], lg: [0.45, 1.2, 9], w: 2, cd: 5, tr: 1.1 },
+        { nm: '검기', po: 'swing', rng: 18, min: 5, d: 1.5, h: [], pj: [[0.85, { n: 1, spd: 22, r: 1.2, m: 1.1, k: 'wave', w: 2.4, pierce: 1 }]], w: 2, cd: 4, tr: 0.8, ph: 2 }] },
+    mother: { nm: '늪의 어미', t: '첫째 · 둘째 밤', b: 'crawl', sc: 2.8, hp: 12200, pz: 520, dmg: 115, spd: 3.4, run: 6, rn: 6000, p2: 0.55, look: { c: '#2b2a25', a: '#8fb040' },
+      d: '늪 바닥을 기는 거대한 어미. 독 숨결 · 뛰어들기 · 독 웅덩이. 새끼 떼를 부름.',
+      mv: [{ nm: '물기', po: 'bite', rng: 4.5, d: 1.3, h: [[0.7, A(4.6, 55), 1.1]], w: 3, tr: 0.55 },
+        { nm: '독 숨결', po: 'spray', rng: 9, d: 2.6, h: [0.9, 1.2, 1.5, 1.8, 2.1].map((t, i) => [t, A(11, 30), 0.3, { fx: 'poison', b: 30, tg: i === 0 ? 1 : 0 }]), w: 2, cd: 6, tr: 1.4 },
+        { nm: '뛰어들기', po: 'leap', rng: 14, min: 4, d: 1.8, h: [[1.15, C(4.2, 0.5), 1.4, { tg: 1 }]], lg: [0.45, 1.1, 12], w: 2, cd: 4, tr: 0.45 },
+        { nm: '독 웅덩이', po: 'spit', rng: 22, min: 5, d: 1.8, h: [], zn: [[0.9, { n: 3, r: 2.8, sp: 4, del: 0.8, m: 0.5, fx: 'poison', b: 45, life: 6, tick: 0.6, k: 'pool' }]], w: 2, cd: 6, tr: 0.9 },
+        { nm: '새끼 부르기', po: 'summon', rng: 40, d: 2.0, h: [], sm: ['crawler', 3], w: 1, cd: 26, ph: 2 }] },
+    abyss: { nm: '심연의 사제', t: '첫째 · 둘째 밤', b: 'float', sc: 1.9, hp: 11000, pz: 420, dmg: 110, spd: 3, run: 4.5, rn: 6000, p2: 0.5, rk: 10, look: { c: '#2a2833', a: '#7b6ad0' },
+      d: '공중에 떠서 따라가는 구슬과 빛줄기를 쓰는 사제. 순간 이동. 둘째 단계에 망자를 부름.',
+      mv: [{ nm: '따라가는 구슬', po: 'cast', rng: 24, d: 1.6, h: [], pj: [[0.9, { n: 4, spr: 50, spd: 12, r: 0.45, m: 0.7, k: 'orb2', hom: 2.0 }]], w: 3, cd: 2, tr: 0.9 },
+        { nm: '빛줄기', po: 'beam', rng: 20, d: 2.4, h: [1.2, 1.45, 1.7, 1.95].map((t, i) => [t, LN(22, 2.2), 0.4, { tg: i === 0 ? 1 : 0 }]), w: 2, cd: 6, tr: 1.0 },
+        { nm: '파동', po: 'nova', rng: 6, d: 1.8, h: [[1.15, RG(0, 8), 1.1, { tg: 1 }]], w: 2, cd: 5, tr: 0.2 },
+        { nm: '순간 이동', po: 'blink', rng: 40, d: 1.0, h: [], bl: 0.5, w: 1, cd: 7 },
+        { nm: '망자 부르기', po: 'summon', rng: 40, d: 2.0, h: [], sm: ['hollow', 2], w: 1, cd: 22, ph: 2 }] },
+    lord: { nm: '밤의 군주', t: '셋째 날 · 최종', b: 'giant', sc: 2.2, hp: 26000, pz: 900, dmg: 130, spd: 3, run: 5.5, rn: 0, fin: 1, p2: 0.66, p3: 0.33, look: { c: '#1f1e24', a: '#7c5cff', w: 'great', helm: 3, cape: 1 },
+      d: '사흘째 밤을 다스리는 군주. 대검 연속기 · 땅을 가르는 어둠 파동 · 끌어당긴 뒤 터뜨리는 중력. 마지막 단계에 어둠이 내려앉음.',
+      mv: [{ nm: '대검 연속기', po: 'combo', rng: 5, d: 2.4, h: [[0.65, A(5.2, 80), 0.9], [1.25, A(5.2, 80), 1.0], [1.95, A(5.5, 50), 1.3]], w: 3, tr: 1.7 },
+        { nm: '도약 내려찍기', po: 'leap', rng: 14, min: 5, d: 2.1, h: [[1.4, C(4.2, 0.5), 1.5, { tg: 1 }], [1.55, RG(2, 9), 0.7, { tg: 1 }]], lg: [0.5, 1.35, 12], w: 2, cd: 5, tr: 1.3 },
+        { nm: '어둠 파동', po: 'swing', rng: 22, min: 5, d: 1.6, h: [], pj: [[0.95, { n: 3, spr: 25, spd: 20, r: 1.1, m: 1.0, k: 'dark', w: 2.4, pierce: 1 }]], w: 2, cd: 4, tr: 0.9 },
+        { nm: '중력', po: 'nova', rng: 30, d: 2.8, h: [[2.2, RG(0, 10), 1.4, { tg: 1 }]], pull: [0.4, 2.0, 5], w: 2, cd: 10, tr: 0.2, ph: 2 },
+        { nm: '어둠 내려앉기', po: 'roar', rng: 40, d: 2.0, h: [], zn: [[0.6, { n: 7, r: 3.4, sp: 11, del: 1.4, m: 1.0, k: 'void' }]], w: 2, cd: 8, ph: 3 }] },
+    eclipse: { nm: '일식의 짐승', t: '셋째 날 · 최종', b: 'wyrm', sc: 3.1, hp: 26000, pz: 900, dmg: 125, spd: 3.6, run: 7.5, rn: 0, fin: 1, p2: 0.66, p3: 0.33, look: { c: '#25221f', a: '#f0b44a' },
+      d: '해를 가리는 짐승. 일식 광선 · 돌진 · 떨어지는 유성. 마지막 단계에 일식 파동.',
+      mv: [{ nm: '물기', po: 'bite', rng: 5.6, d: 1.3, h: [[0.7, A(5.8, 50), 1.1]], w: 3, tr: 0.55 },
+        { nm: '꼬리 휩쓸기', po: 'tail', rng: 7, d: 1.5, h: [[0.85, A(7.5, 150, 180), 1.0]], w: 2, cd: 3, tr: 0.2 },
+        { nm: '일식 광선', po: 'breath', rng: 22, d: 2.8, h: [1.1, 1.35, 1.6, 1.85, 2.1].map((t, i) => [t, LN(26, 3), 0.4, { tg: i === 0 ? 1 : 0, fx: 'burn', b: 20 }]), w: 2, cd: 6, tr: 1.0 },
+        { nm: '돌진', po: 'charge', rng: 22, min: 6, d: 2.0, h: [[1.0, LN(5, 4), 1.3, { tg: 1 }]], lg: [0.75, 1.6, 17], w: 2, cd: 6, tr: 0.75 },
+        { nm: '유성', po: 'roar', rng: 40, d: 2.0, h: [], zn: [[0.7, { n: 6, r: 3.2, sp: 10, del: 1.4, m: 1.0, fx: 'burn', b: 40, k: 'meteor' }]], w: 2, cd: 8, ph: 2 },
+        { nm: '일식 파동', po: 'nova', rng: 40, d: 2.6, h: [[1.8, RG(0, 12), 1.3, { tg: 1 }], [2.3, RG(6, 22), 0.9, { tg: 1 }]], w: 2, cd: 9, tr: 0.2, ph: 3 }] },
+  };
+  const NIGHT_IDS = ['lion', 'bell', 'wyrm', 'twins', 'mother', 'abyss'], FINAL_IDS = ['lord', 'eclipse'];
+  const ENEMY_IDS = ['hollow', 'spear', 'archer', 'zealot', 'knight', 'miner', 'dog', 'wolf', 'troll', 'crawler'], FB_IDS = ['fb_knight', 'fb_mother', 'fb_alpha', 'fb_warden'];
+  for (const k in EN) EN[k].id = k;
+  for (const k in BOSS) { BOSS[k].id = k; BOSS[k].boss = 1; }
+  const ET = Object.assign({}, EN, BOSS);   // 모든 적 종류(id → 자료)
+
+  /* ======================= 거점 종류 ======================= */
+  const POI = {
+    grace: { nm: '은총의 터', col: '#e8c46a', d: '쉬면 성배병이 다시 차고, 모은 룬만큼 레벨이 오름(E).' },
+    fort: { nm: '무너진 요새', col: '#b9a48a', d: '망자 무리와 몰락한 기사가 지킴. 안쪽 상자에 고급 이상 무기.' },
+    camp: { nm: '야영지', col: '#c97a4a', d: '광신도 · 들개 몇. 소모품 꾸러미.' },
+    church: { nm: '버려진 예배당', col: '#d8d0b8', d: '안쪽 제단에 닿으면 성배병 최대 횟수 +1(사람마다 한 번).' },
+    mine: { nm: '폐광', col: '#9a8a70', d: '광산 노역귀 무리. 단련석 — 든 무기 강화 +1(최대 +3).' },
+    cave: { nm: '동굴', col: '#8a8f7a', d: '바위 굴 안쪽에 들판의 강자. 희귀 이상 무기.' },
+    boss: { nm: '들판의 강자', col: '#c05a4a', d: '홀로 서 있는 강한 적. 희귀 이상 무기와 많은 룬.' },
+    ruin: { nm: '폐허', col: '#a0a0a0', d: '적 몇과 상자 하나.' },
+  };
+  const LENS = {
+    std: { nm: '정식', day: 480, tip: '낮 8분 · 한 판 약 30분' },
+    short: { nm: '짧게', day: 300, tip: '낮 5분 · 한 판 약 20분' },
+    taste: { nm: '맛보기', day: 110, hpm: 0.5, rnm: 2.4, tip: '낮 110초 · 적과 보스 체력 절반 · 룬 2.4배 — 맛보기 · 시험용' },
+  };
+  const DAY_NM = ['첫째 날', '둘째 날', '셋째 날'];
+  const NIGHT_NM = ['첫째 밤', '둘째 밤'];
+
+  /* 레벨 · 수치 */
+  const MAXLV = 15;
+  const lvCost = (l) => Math.round(100 * Math.pow(l, 1.75) + 150);
+  const lvMul = (l) => 1 + 0.065 * (l - 1);
+  const baseHP = (l, a) => Math.round((300 + 62 * (l - 1)) * ARCH[a].hp);
+  const baseST = (l, a) => Math.round((90 + 3 * (l - 1)) * ARCH[a].st);
+  /* 무기 하나(인스턴스): [무기 번호, 희귀도, 강화, 축복1, 축복2] — 축복은 PAS 키 */
+  function wDmg(wi) { const W = WPN[wi[0]], c = CLS[W.c]; return c.dmg * W.dm * RAR[wi[1]].mul * (1 + 0.1 * (wi[2] || 0)); }
+  function wPas(wi) {
+    const o = []; const W = WPN[wi[0]], r = wi[1];
+    if (W.uq) o.push([W.uq[0], W.uq[1]]);
+    for (let i = 3; i < wi.length; i++) if (wi[i] && PAS[wi[i]]) o.push([wi[i], PAS[wi[i]].v[Math.max(0, Math.min(2, r - 1))]]);
+    return o;
+  }
+  function wName(wi) { return WPN[wi[0]].nm + (wi[2] ? ' +' + wi[2] : ''); }
+  function wArt(wi) { return ART[WPN[wi[0]].art || CLS[WPN[wi[0]].c].art]; }
+
+  /* ======================= 아이콘 (SVG, 이모지 없음) ======================= */
+  const svgW = (inner, sz, vb) => '<svg viewBox="' + (vb || '0 0 56 56') + '" width="' + (sz || 28) + '" height="' + (sz || 28) + '">' + inner + '</svg>';
+  const CLS_IC = {
+    sword: (c) => '<path d="M28 6l4 6v26h-8V12z" fill="' + c + '"/><rect x="18" y="38" width="20" height="4" fill="' + c + '"/><rect x="26" y="42" width="4" height="9" fill="' + c + '" opacity=".7"/>',
+    great: (c) => '<path d="M28 3l6 7v28H22V10z" fill="' + c + '"/><rect x="15" y="38" width="26" height="5" fill="' + c + '"/><rect x="25.5" y="43" width="5" height="10" fill="' + c + '" opacity=".7"/>',
+    curved: (c) => '<path d="M20 44C14 30 22 14 40 6c-10 10-14 22-12 36z" fill="' + c + '"/><rect x="15" y="42" width="14" height="4" rx="1" fill="' + c + '" transform="rotate(-20 22 44)"/>',
+    dagger: (c) => '<path d="M28 14l3 5v16h-6V19z" fill="' + c + '"/><rect x="21" y="35" width="14" height="3" fill="' + c + '"/><rect x="26.5" y="38" width="3" height="8" fill="' + c + '" opacity=".7"/>',
+    hammer: (c) => '<rect x="16" y="8" width="24" height="14" rx="2" fill="' + c + '"/><rect x="26" y="22" width="4" height="28" fill="' + c + '" opacity=".75"/>',
+    spear: (c) => '<path d="M28 3l5 11h-10z" fill="' + c + '"/><rect x="26.5" y="14" width="3" height="38" fill="' + c + '" opacity=".75"/>',
+    bow: (c) => '<path d="M18 6c18 8 18 36 0 44" fill="none" stroke="' + c + '" stroke-width="4"/><path d="M18 6v44" stroke="' + c + '" stroke-width="1.5" opacity=".7"/><path d="M14 28h30l-5-4m5 4l-5 4" stroke="' + c + '" stroke-width="2" fill="none"/>',
+    staff: (c) => '<circle cx="30" cy="10" r="6" fill="' + c + '"/><rect x="27" y="16" width="3.5" height="36" fill="' + c + '" opacity=".75"/><path d="M24 14l-4-6m16 6l4-6" stroke="' + c + '" stroke-width="2"/>',
+  };
+  const BODY_IC = {
+    hum: (c) => '<circle cx="28" cy="13" r="6" fill="' + c + '"/><path d="M18 50l3-26q7-5 14 0l3 26h-6l-4-16-4 16z" fill="' + c + '"/>',
+    giant: (c) => '<circle cx="28" cy="11" r="5" fill="' + c + '"/><path d="M12 52l4-30q12-8 24 0l4 30h-9l-7-18-7 18z" fill="' + c + '"/>',
+    quad: (c) => '<path d="M8 30q4-10 14-8h14l8-8 6 4-4 8v12l-4 10h-4l1-10h-18l-3 10h-4l1-12q-6-2-7-6z" fill="' + c + '"/>',
+    crawl: (c) => '<ellipse cx="28" cy="30" rx="13" ry="8" fill="' + c + '"/><path d="M16 28l-10-8m10 12l-12 2m12 2l-10 10M40 28l10-8m-10 12l12 2m-12 2l10 10" stroke="' + c + '" stroke-width="3"/>',
+    wyrm: (c) => '<path d="M10 40q8-4 14-4l4-12 8-4 8 2-6 4 4 6-8-2-2 10q6 4 14 2-8 8-20 4l-16 2z" fill="' + c + '"/><path d="M26 24L12 8l20 10z" fill="' + c + '" opacity=".75"/>',
+    float: (c) => '<circle cx="28" cy="12" r="6" fill="' + c + '"/><path d="M16 46l6-28q6-4 12 0l6 28q-12 6-24 0z" fill="' + c + '"/><circle cx="44" cy="16" r="3" fill="' + c + '"/>',
+  };
+  const ARCH_IC = (a, c) => '<path d="M28 4l20 8v14c0 14-9 22-20 26C17 48 8 40 8 26V12z" fill="none" stroke="' + c + '" stroke-width="2.5"/>' + '<g transform="translate(10 10) scale(.64)">' + CLS_IC[WPN[WI[ARCH[a].w0]].c](c) + '</g>';
+  const ITEM_IC = (k, c) => ({
+    flask: '<path d="M22 6h12v8l8 12v20a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V26l8-12z" fill="none" stroke="' + c + '" stroke-width="3"/><path d="M17 32h22v14H17z" fill="' + c + '"/>',
+    fpot: '<circle cx="28" cy="32" r="14" fill="' + c + '"/><rect x="23" y="12" width="10" height="8" fill="' + c + '"/><path d="M28 6q6 4 0 8q-6 -4 0 -8" fill="#e07a2e"/>',
+    ipot: '<circle cx="28" cy="32" r="14" fill="' + c + '"/><rect x="23" y="12" width="10" height="8" fill="' + c + '"/><path d="M22 32h12M28 26v12" stroke="#8fc6e6" stroke-width="3"/>',
+    knife: '<path d="M14 42L40 8l3 3-24 34z" fill="' + c + '"/><path d="M22 46L46 16l3 3-22 30z" fill="' + c + '" opacity=".6"/>',
+    incense: '<rect x="18" y="34" width="20" height="14" rx="2" fill="' + c + '"/><path d="M28 32q-6-8 0-14t0-14" stroke="' + c + '" stroke-width="2.5" fill="none"/>',
+    leaf: '<path d="M10 46C10 20 30 8 48 8c0 22-14 38-38 38z" fill="' + c + '"/><path d="M12 44L40 16" stroke="#1b1712" stroke-width="2"/>',
+    pill: '<rect x="12" y="20" width="32" height="16" rx="8" fill="' + c + '"/><path d="M28 20v16" stroke="#1b1712" stroke-width="2"/>',
+  }[k] || '');
+  const POI_IC = (k, c) => ({
+    grace: '<path d="M28 6c4 10 10 14 10 24a10 10 0 0 1-20 0c0-10 6-14 10-24z" fill="' + c + '"/>',
+    fort: '<path d="M8 48V20h8v6h6v-6h12v6h6v-6h8v28z" fill="' + c + '"/>',
+    camp: '<path d="M6 46L28 10l22 36z" fill="' + c + '"/><path d="M28 46l-6-12h12z" fill="#1b1712"/>',
+    church: '<path d="M14 48V24l14-12 14 12v24z" fill="' + c + '"/><path d="M28 2v12M24 6h8" stroke="' + c + '" stroke-width="3"/>',
+    mine: '<path d="M8 48V22h40v26h-8V30H16v18z" fill="' + c + '"/>',
+    cave: '<path d="M4 48C8 22 20 10 30 12s20 14 22 36z" fill="' + c + '"/><path d="M18 48c2-12 8-18 12-18s10 6 12 18z" fill="#1b1712"/>',
+    boss: '<path d="M28 6l6 14 16 2-12 10 4 16-14-8-14 8 4-16L6 22l16-2z" fill="' + c + '"/>',
+    ruin: '<rect x="10" y="20" width="8" height="28" fill="' + c + '"/><rect x="24" y="30" width="8" height="18" fill="' + c + '"/><rect x="38" y="14" width="8" height="34" fill="' + c + '"/>',
+  }[k] || '');
+
+  /* ======================= 판 상태 ======================= */
+  function init(players, opts) {
+    opts = opts || {};
+    const n = players.length, R = Math.random;
+    return {
+      v: 1, rid: 1 + Math.floor(R() * 1e6), seed: 1 + Math.floor(R() * 2e9), n, ph: 'pick',
+      nm: players.map((p) => String(p.name || '').slice(0, 12)), ai: players.map((p) => !!p.ai), lv: players.map((p) => (p.ai ? p.lv || 2 : 0)),
+      pk: Array(n).fill(-1), len: LENS[opts.len] ? opts.len : 'std', fin: FINAL_IDS.includes(opts.fin) ? opts.fin : 'rnd', seq: 1,
+      wph: 'pick', day: 0, boss: '', res: null,
+    };
+  }
+  function result(s) {
+    if (!s || s.ph !== 'done' || !s.res) return null;
+    const r = s.res, all = [...Array(s.n).keys()];
+    const sv = (k) => (r.st || []).map((x) => String(x ? x[k] || 0 : 0).replace(/\B(?=(\d{3})+(?!\d))/g, ','));
+    const hl = [];
+    if (r.win) hl.push('최종 보스 「' + (BOSS[r.fin] ? BOSS[r.fin].nm : '') + '」 처치');
+    (r.bosses || []).forEach((b, i) => { if (b && BOSS[b] && (i === 0 || (r.killed && r.killed[i - 1]))) hl.push(NIGHT_NM[i] + ' · ' + BOSS[b].nm + (r.killed && r.killed[i] ? ' 처치' : '')); });
+    if (r.time) hl.push('원정 시간 ' + Math.floor(r.time / 60) + '분 ' + Math.round(r.time % 60) + '초');
+    return {
+      winners: r.win ? all : [],
+      title: r.win ? '원정 완수' : '원정 실패',
+      text: r.win ? '사흘째 밤을 넘겼다.' : (r.where || '모두 쓰러졌다.'),
+      highlights: hl.slice(0, 4),
+      stats: [
+        { label: '원정자', values: (r.arch || []).map((a) => (ARCH[a] ? ARCH[a].nm : '')) },
+        { label: '레벨', values: sv('lv') },
+        { label: '준 피해', values: sv('dmg') },
+        { label: '쓰러뜨린 적', values: sv('kill') },
+        { label: '일으킨 동료', values: sv('rev') },
+        { label: '쓰러진 횟수', values: sv('down'), low: true },
+      ],
+    };
+  }
+  const PH_NM = { pick: '원정자 고르기', day: '낮', night: '밤 · 보스', dawn: '새벽', rest: '마지막 준비', final: '최종 결전', won: '원정 완수', lost: '원정 실패' };
+  function hint(st, seat) {
+    if (!st) return null;
+    if (st.ph === 'pick') return ['원정자 고르기', '여섯 원정자 가운데 하나를 고릅니다. 같은 원정자를 여럿이 골라도 됩니다.', '카드를 누르면 고유 능력 · 기술 · 궁극기가 보입니다. 모두 고르면 출발합니다.'];
+    const o = [st.wph === 'night' ? NIGHT_NM[Math.min(1, Math.max(0, st.day - 1))] + ' · 보스' : st.wph === 'final' || st.wph === 'rest' ? '셋째 날 · ' + PH_NM[st.wph] : (st.day ? DAY_NM[Math.min(2, st.day - 1)] + ' · ' : '') + (PH_NM[st.wph] || '')];
+    if (st.wph === 'day') {
+      o.push('거점(요새 · 동굴 · 폐광 · 예배당 · 들판의 강자)을 돌며 적을 쓰러뜨려 룬과 무기를 모읍니다.');
+      o.push('은총의 터에서 E로 쉬면 모은 룬만큼 레벨이 오르고 성배병이 다시 찹니다.');
+      o.push('폭풍의 원이 좁혀집니다. 원 밖에서는 체력이 깎입니다. 해가 지면 원 한가운데에 밤의 보스.');
+    } else if (st.wph === 'night' || st.wph === 'final') {
+      o.push('보스의 큰 동작은 바닥에 붉은 표시가 먼저 뜹니다. 구르기(Shift)로 피하고, 둥근 충격파는 뛰어(Space) 넘습니다.');
+      o.push('쓰러진 동료는 때려서 일으킵니다. 모두 쓰러지면 원정 실패.');
+      if (st.boss && BOSS[st.boss]) o.push('지금 보스: ' + BOSS[st.boss].nm + ' — ' + BOSS[st.boss].d);
+    } else if (st.wph === 'rest') o.push('최종 결전 앞 은총의 터. 쉬어서 레벨을 올리고 무기를 고른 뒤 안쪽 원으로 들어갑니다.');
+    o.push('조작: WASD 이동 · 마우스 시점 · 왼쪽/오른쪽 클릭 약공격/강공격 · Shift 구르기(누르고 있으면 달리기) · C 가드 · Q 표적 고정.');
+    void seat;
+    return o.slice(0, 6);
+  }
+
+  /* ======================= 규칙 · 도감 ======================= */
+  const RULES = [
+    { h: '목표', p: ['사흘에 걸친 원정입니다. 낮에는 좁혀 드는 폭풍 속에서 적을 쓰러뜨리며 강해지고, 해가 지면 폭풍이 닫힌 원 안에서 밤의 보스와 싸웁니다.', '첫째 낮 → 첫째 밤 보스 → 둘째 낮 → 둘째 밤 보스 → 셋째 날 최종 보스. 최종 보스를 쓰러뜨리면 모두 함께 이깁니다.', '1~3명이 각자 PC로 함께합니다(한 기기에 한 명). 빈자리는 AI 동료가 채웁니다.'] },
+    { h: '원정자', p: ARCH.map((a) => a.nm + '(' + a.role + ') — ' + a.pas.nm + ' · 기술 「' + a.sk.nm + '」 · 궁극기 「' + a.ul.nm + '」').concat(['기술(F)은 다시 쓰기까지 시간이 걸리고, 궁극기(R)는 싸우며 게이지를 채웁니다.']) },
+    { h: '낮', p: ['폭풍의 원은 두 번에 걸쳐 좁혀집니다. 원 밖에 있으면 체력이 깎입니다. 위쪽 띠에 다음 수축까지 남은 시간이 보입니다.', '거점: ' + Object.keys(POI).map((k) => POI[k].nm).join(' · ') + '. 지도(M)와 오른쪽 위 작은 지도에 표시됩니다.', '적을 쓰러뜨리면 룬을 얻습니다(룬은 모두가 똑같이 받습니다). 은총의 터에서 E로 쉬면 모은 룬만큼 레벨이 오르고 성배병이 다시 찹니다.', '해 질 무렵 마지막 원 한가운데에 은총의 터가 생깁니다. 보스가 오기 전에 쉬어 두십시오.'] },
+    { h: '밤 · 최종 결전', p: ['낮이 끝나면 닫힌 원 한가운데에 보스가 나타납니다. 보스를 쓰러뜨리면 새벽이 오고 다음 날이 시작됩니다.', '보스는 체력이 줄면 단계가 바뀌어 빨라지고 새 동작을 씁니다. 큰 동작은 바닥에 붉은 표시가 먼저 뜹니다.', '둘째 밤을 넘기면 최종 결전 앞 은총의 터로 옮겨집니다. 준비를 마치고 원 안으로 들어가면 최종 보스.'] },
+    { h: '싸움', p: ['약공격(왼쪽 클릭)은 이어서 누르면 연속기, 강공격(오른쪽 클릭)은 느리지만 자세를 크게 무너뜨립니다. 무기 기술(X · 가운데 클릭)은 무기마다 다릅니다.', '공격 · 구르기 · 달리기 · 가드는 스태미나를 씁니다. 구르는 동안 잠깐 무적입니다.', '가드(C 누르고 있기)는 앞에서 오는 공격을 막습니다. 맞기 직전에 가드를 누르면 받아넘기기 — 적이 비틀거리고 다음 일격이 치명타가 됩니다(보스의 큰 동작은 받아넘길 수 없습니다).', '자세 피해가 쌓이면 적이 무너집니다(보스는 크게 휘청임). 무너진 적에게 들어가는 공격은 치명타입니다.', '둥근 충격파(가운데에서 퍼지는 고리)는 뛰어(Space) 넘을 수 있습니다.', '바닥 표시: 붉은색은 그 자리를 벗어나거나 구를 것, 호박색 고리는 뛰어넘을 것. 표시가 짙어질수록 맞기 직전입니다.'] },
+    { h: '쓰러짐', p: ['체력이 0이 되면 쓰러집니다. 동료가 쓰러진 원정자를 공격하면 게이지가 차서 일어납니다(피해는 들어가지 않습니다).', '낮에 쓰러져 20초 안에 일어나지 못하면 가장 가까운 은총의 터에서 다시 일어납니다(레벨 1 내려감 · 체력 60%).', '밤 · 최종 결전에서 모두 쓰러지면 원정 실패입니다. 혼자일 때는 보스마다 한 번, 쓰러진 뒤 스스로 일어납니다.'] },
+    { h: '무기 · 소모품', p: ['무기는 여덟 계열(' + CLS_IDS.map((k) => CLS[k].nm).join(' · ') + ')에 모두 40가지. 희귀도(일반 · 고급 · 희귀 · 전설)가 높을수록 피해가 크고 축복(효과)이 붙습니다.', '무기는 세 자루까지 지니고 Z(또는 마우스 휠)로 바꿉니다. 가득 찼을 때 주우면 든 무기와 바꿉니다. 축복은 들고 있는 무기 것만 적용됩니다.', '1 성배병 · 2~4 소모품(' + ITEM.slice(1).map((x) => x.nm).join(' · ') + ').', '상태 이상: ' + Object.keys(STATUS).map((k) => STATUS[k].nm + ' — ' + STATUS[k].d).join(' ')] },
+    { h: '조작', p: ['WASD 이동 · 마우스를 움직이면 바로 시점(Esc: 마우스 풀기) · 왼쪽/오른쪽 클릭 약공격/강공격 · X 무기 기술 · C 가드 · Shift 구르기(누르고 있으면 달리기) · Space 점프 · Q 표적 고정 · E 줍기 · 상자 · 은총 · F 기술 · R 궁극기 · 1~4 성배병 · 소모품 · Z 무기 바꾸기 · M 지도.', '게임패드: 왼쪽 스틱 이동 · 오른쪽 스틱 시점 · RB/RT 약/강공격 · LB 가드 · LT 무기 기술 · B 구르기 · A 점프 · R3 표적 · X 상호작용 · Y 기술 · L3 궁극기 · 십자키 소모품. 키는 「⌨ 조작 설정」에서 바꿉니다.', 'PC 전용 게임입니다(터치만 되는 기기에서는 시작할 수 없습니다).'] },
+    { h: 'AI 동료', p: ['AI 난이도는 자리마다 쉬움 · 보통 · 어려움. 쉬움은 붉은 표시를 늦게 보고 자주 맞으며, 어려움은 피하고 받아넘기고 동료를 먼저 일으킵니다.', 'AI 동료마다 버릇(대담함 · 신중함 · 욕심 · 거리 두기)이 다릅니다. 사람이 있으면 사람 곁을 지키며 싸우고, 모두 AI면 스스로 거점을 돕니다.'] },
+    { h: '그래픽', p: ['설정 화면 「그래픽 품질(이 기기)」: 낮음 · 보통(기본) · 높음. 끊기면 낮음으로.'] },
+    { h: '만든 사람', p: ['원정자 · 적 · 보스 · 지형 · 거점은 모두 코드로 만든 3D 형상과 관절 뼈대 동작(외부 모델 · 그림 없음). 효과음 · 음악은 앱 합성음.', '3D 엔진: three.js (MIT, 하이퍼 레이스와 같은 파일). 출처: app/assets/nightfall/CREDITS.txt', '체계 참고: 사흘 원정형 협동 액션 로그라이크(폭풍 원 · 밤 보스 · 은총에서 레벨업). 이름 · 보스 · 그림 · 글은 이 게임만의 것입니다.'] },
+  ];
+  function shapeTxt(h) { const s = h[1]; return s[0] === 'arc' ? '부채꼴 ' + s[1] + 'm' : s[0] === 'circ' ? '원 ' + s[1] + 'm' : s[0] === 'ring' ? '충격파 ' + s[2] + 'm(뛰어넘기)' : '직선 ' + s[1] + 'm'; }
+  function movesTxt(e) { return e.mv.map((m) => m.nm + (m.ph ? '(' + m.ph + '단계)' : '')).join(' · '); }
+  function codexData() {
+    const r = (icon, name, tag, desc) => ({ icon: svgW(icon), name, tag, desc });
+    return [
+      { h: '원정자', p: ['판마다 하나를 골라 레벨 1에서 시작합니다. 판 밖 성장은 없습니다.'], rows: ARCH.map((a, i) => r(ARCH_IC(i, a.ac), a.nm, a.role + ' · 체력 ×' + a.hp + ' · 시작 ' + WPN[WI[a.w0]].nm, a.pas.nm + ' — ' + a.pas.d + ' / 기술 ' + a.sk.nm + '(' + a.sk.cd + '초) — ' + a.sk.d + ' / 궁극기 ' + a.ul.nm + ' — ' + a.ul.d)) },
+      { h: '무기 계열', p: ['계열마다 동작과 기본 무기 기술이 다릅니다. 피해는 일반 희귀도 · 강화 0 기준.'], rows: CLS_IDS.map((k) => { const c = CLS[k]; return r(CLS_IC[k]('#c9b48a'), c.nm, '피해 ' + c.dmg + ' · 자세 ' + c.pz + ' · 스태미나 ' + c.st, c.d + ' 기술 「' + ART[c.art].nm + '」 — ' + ART[c.art].dsc); }) },
+      { h: '무기', p: ['희귀도 피해 배수: ' + RAR.map((x) => x.nm + ' ×' + x.mul).join(' · ') + '. 축복 수: 고급 1 · 희귀 2 · 전설 2 + 고유. 전설 무기는 보스 · 동굴에서만.'], rows: WPN.map((w) => { const c = CLS[w.c]; const a = ART[w.art || c.art]; return r(CLS_IC[w.c](RAR[w.t].col), w.nm, c.nm + ' · ' + RAR[w.t].nm + ' 이상', '피해 ' + Math.round(c.dmg * w.dm) + (w.fx ? ' · ' + STATUS[w.fx].nm + ' 누적 ' + w.b : '') + (w.uq ? ' · 고유 축복: ' + PAS[w.uq[0]].f(w.uq[1]) : '') + ' · 기술 「' + a.nm + '」 · ' + w.d); }) },
+      { h: '축복 · 상태 이상', p: ['고급 · 희귀 · 전설 무기에 무작위로 붙습니다(값은 희귀도에 따라).'], rows: PAS_IDS.map((k) => r(CLS_IC.sword('#8f8a7a'), PAS[k].nm, '고급/희귀/전설', PAS[k].v.map((v) => PAS[k].f(v)).join(' / '))).concat(Object.keys(STATUS).map((k) => r('<circle cx="28" cy="28" r="16" fill="' + STATUS[k].col + '"/>', STATUS[k].nm, '상태 이상', STATUS[k].d))) },
+      { h: '소모품', p: ['1번 칸은 성배병, 2~4번 칸에 주운 소모품(칸마다 최대 3개).'], rows: ITEM.map((x) => r(ITEM_IC(x.id, '#c9b48a'), x.nm, x.id === 'flask' ? '1번 칸' : '소모품', x.d)) },
+      { h: '적', p: ['낮의 들판 · 거점에 사는 적. 둘째 날에는 더 단단하고 아픕니다.'], rows: ENEMY_IDS.concat(FB_IDS).map((k) => { const e = EN[k]; return r(BODY_IC[e.b](e.fb ? '#c05a4a' : e.elite ? '#b9a48a' : '#8f8a7a'), e.nm, (e.fb ? '들판의 강자' : e.elite ? '정예' : '일반') + ' · 체력 ' + e.hp + ' · 룬 ' + e.rn, e.d + ' 동작: ' + movesTxt(e)); }) },
+      { h: '보스', p: ['밤의 보스는 판마다 여섯 가운데 둘(겹치지 않음), 최종 보스는 둘 가운데 하나. 체력은 함께하는 인원에 따라 늘어납니다.'], rows: NIGHT_IDS.concat(FINAL_IDS).map((k) => { const b = BOSS[k]; return r(BODY_IC[b.b](b.fin ? '#d9a441' : '#a77ad6'), b.nm, b.t + ' · 체력 ' + b.hp + (b.twin ? ' ×2' : ''), b.d + ' 동작: ' + movesTxt(b) + ' · 큰 동작: ' + b.mv.filter((m) => m.h.some((x) => x[3] && x[3].tg)).map((m) => m.nm + '(' + shapeTxt(m.h[0]) + ')').join(' · ')); }) },
+      { h: '거점', p: ['거점 배치는 판마다 무작위입니다(지형은 같음).'], rows: Object.keys(POI).map((k) => r(POI_IC(k, POI[k].col), POI[k].nm, '거점', POI[k].d)) },
+    ];
+  }
+
+  /* ======================= 표지 (640×360) ======================= */
+  function preview(cv) {
+    const g = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const sky = g.createLinearGradient(0, 0, 0, h); sky.addColorStop(0, '#1a1824'); sky.addColorStop(0.45, '#4a2e33'); sky.addColorStop(0.7, '#a8583a'); sky.addColorStop(1, '#2a1c18');
+    g.fillStyle = sky; g.fillRect(0, 0, w, h);
+    const sg = g.createRadialGradient(w * 0.5, h * 0.66, 4, w * 0.5, h * 0.66, w * 0.35); sg.addColorStop(0, 'rgba(255,190,110,.75)'); sg.addColorStop(1, 'rgba(255,120,60,0)');
+    g.fillStyle = sg; g.fillRect(0, 0, w, h);
+    // 폭풍의 벽
+    for (let i = 0; i < 2; i++) { const x0 = i ? w * 0.86 : w * 0.02, ww = w * 0.14; const sw = g.createLinearGradient(x0, 0, x0 + ww, 0); sw.addColorStop(i ? 0 : 1, 'rgba(160,40,60,0)'); sw.addColorStop(i ? 1 : 0, 'rgba(150,40,70,.65)'); g.fillStyle = sw; g.fillRect(x0, 0, ww, h); }
+    // 먼 산
+    g.fillStyle = '#2a1d1f'; g.beginPath(); g.moveTo(0, h * 0.7); for (let x = 0; x <= w; x += 20) g.lineTo(x, h * 0.62 - Math.sin(x * 0.013) * 22 - Math.sin(x * 0.041) * 9); g.lineTo(w, h); g.lineTo(0, h); g.fill();
+    // 거인 실루엣
+    g.fillStyle = '#120d10'; const gx = w * 0.62, gy = h * 0.74;
+    g.beginPath(); g.moveTo(gx - 46, gy); g.lineTo(gx - 38, gy - 120); g.quadraticCurveTo(gx, gy - 150, gx + 38, gy - 120); g.lineTo(gx + 46, gy); g.fill();
+    g.beginPath(); g.arc(gx, gy - 158, 17, 0, Math.PI * 2); g.fill();
+    g.fillRect(gx + 34, gy - 132, 70, 12); g.fillRect(gx + 96, gy - 150, 26, 48);
+    g.fillStyle = 'rgba(124,92,255,.85)'; g.fillRect(gx - 7, gy - 162, 4, 3); g.fillRect(gx + 3, gy - 162, 4, 3);
+    // 땅
+    g.fillStyle = '#15100e'; g.fillRect(0, h * 0.74, w, h * 0.26);
+    // 세 원정자
+    const fig = (x, s, wpn) => {
+      g.fillStyle = '#0b0809'; const y = h * 0.86;
+      g.beginPath(); g.moveTo(x - 9 * s, y); g.lineTo(x - 7 * s, y - 34 * s); g.lineTo(x + 7 * s, y - 34 * s); g.lineTo(x + 9 * s, y); g.fill();
+      g.beginPath(); g.arc(x, y - 40 * s, 6 * s, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = '#0b0809'; g.lineWidth = 3 * s; g.beginPath();
+      if (wpn === 0) { g.moveTo(x + 8 * s, y - 28 * s); g.lineTo(x + 26 * s, y - 62 * s); }
+      else if (wpn === 1) { g.moveTo(x - 10 * s, y - 30 * s); g.lineTo(x - 18 * s, y - 70 * s); }
+      else { g.arc(x + 14 * s, y - 32 * s, 14 * s, -1.2, 1.2); }
+      g.stroke();
+      g.strokeStyle = 'rgba(255,170,100,.55)'; g.lineWidth = 1.2; g.beginPath(); g.moveTo(x + 7 * s, y - 34 * s); g.lineTo(x + 9 * s, y); g.stroke();
+    };
+    fig(w * 0.24, 1.25, 0); fig(w * 0.32, 1.12, 1); fig(w * 0.4, 1.18, 2);
+    g.fillStyle = 'rgba(10,7,8,.6)'; g.fillRect(0, h - 58, w, 58);
+    g.fillStyle = '#efe2c8'; g.font = '30px "Nanum Myeongjo","Noto Serif KR",Batang,serif'; g.textBaseline = 'middle'; g.fillText(TITLE, 24, h - 29);
+    g.font = '14px "IBM Plex Sans KR",sans-serif'; g.fillStyle = 'rgba(239,226,200,.72)'; g.fillText('좁혀 드는 폭풍 · 밤의 보스 · 1~3명 협동', 250, h - 28);
+  }
+
+  /* ======================= 입구 화면 (3D 불러오기) ======================= */
+  const TIERS = [
+    { id: 'low', nm: '낮음', tip: '그림자 없음 · 가까운 풀 없음 · 배율 낮게 — 끊길 때', pr: 1, shadow: 0, aa: false, trees: 0.5, fog: 1.25 },
+    { id: 'mid', nm: '보통', tip: '해 그림자 · 보통 배율', pr: 1.25, shadow: 2048, aa: true, trees: 0.8, fog: 1 },
+    { id: 'high', nm: '높음', tip: '고운 그림자 · 풀 · 고해상도', pr: 2, shadow: 4096, aa: true, trees: 1, fog: 0.85 },
+  ];
+  const store = { get(k, d) { try { const v = localStorage.getItem('nightfall.' + k); return v == null ? d : v; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('nightfall.' + k, v); } catch (e) {} } };
+  function gfxTier() { const v = store.get('gfx', ''); return TIERS.some((t) => t.id === v) ? v : 'mid'; }
+  const scripts = {};
+  function loadScript(src) {
+    if (!scripts[src]) scripts[src] = new Promise((ok, no) => {
+      const el = document.createElement('script'); el.src = src; el.async = true;
+      el.onload = () => ok(); el.onerror = () => { delete scripts[src]; no(new Error('불러오기 실패: ' + src)); };
+      document.head.appendChild(el);
+    });
+    return scripts[src];
+  }
+  function loadCore() {
+    return (G.THREE ? Promise.resolve() : loadScript('assets/hyperrace/lib/three.min.js'))
+      .then(() => (API.sim ? null : loadScript('assets/nightfall/sim.js')))
+      .then(() => (G.NIGHTFALL_VIEW ? null : loadScript('assets/nightfall/view.js')));
+  }
+  function webglOK() { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } }
+  const CONTROLS = [
+    { id: 'up', label: '앞으로', keys: ['KeyW'], pad: ['ly-'] },
+    { id: 'down', label: '뒤로', keys: ['KeyS'], pad: ['ly+'] },
+    { id: 'left', label: '왼쪽', keys: ['KeyA'], pad: ['lx-'] },
+    { id: 'right', label: '오른쪽', keys: ['KeyD'], pad: ['lx+'] },
+    { id: 'camL', label: '시점 왼쪽(마우스 대신)', keys: ['ArrowLeft'], pad: ['rx-'] },
+    { id: 'camR', label: '시점 오른쪽', keys: ['ArrowRight'], pad: ['rx+'] },
+    { id: 'camU', label: '시점 위', keys: ['ArrowUp'], pad: ['ry-'] },
+    { id: 'camD', label: '시점 아래', keys: ['ArrowDown'], pad: ['ry+'] },
+    { id: 'light', label: '약공격 (마우스 왼쪽)', keys: ['KeyJ'], pad: ['rb'] },
+    { id: 'heavy', label: '강공격 (마우스 오른쪽)', keys: ['KeyK'], pad: ['rt'] },
+    { id: 'art', label: '무기 기술 (마우스 가운데)', keys: ['KeyX'], pad: ['lt'] },
+    { id: 'guard', label: '가드 · 받아넘기기(누르고 있기)', keys: ['KeyC'], pad: ['lb'] },
+    { id: 'dodge', label: '구르기 · 누르고 있으면 달리기', keys: ['ShiftLeft', 'ShiftRight'], pad: ['b'] },
+    { id: 'jump', label: '점프', keys: ['Space'], pad: ['a'] },
+    { id: 'lock', label: '표적 고정', keys: ['KeyQ'], pad: ['rs'] },
+    { id: 'use', label: '상호작용(줍기 · 상자 · 은총)', keys: ['KeyE'], pad: ['x'] },
+    { id: 'skill', label: '원정자 기술', keys: ['KeyF'], pad: ['y'] },
+    { id: 'ult', label: '궁극기', keys: ['KeyR'], pad: ['ls'] },
+    { id: 'i1', label: '성배병', keys: ['Digit1'], pad: ['up'] },
+    { id: 'i2', label: '소모품 2', keys: ['Digit2'], pad: ['right'] },
+    { id: 'i3', label: '소모품 3', keys: ['Digit3'], pad: ['down'] },
+    { id: 'i4', label: '소모품 4', keys: ['Digit4'], pad: ['left'] },
+    { id: 'swap', label: '무기 바꾸기 (마우스 휠)', keys: ['KeyZ'], pad: ['back'] },
+    { id: 'map', label: '지도', keys: ['KeyM'], pad: [] },
+  ];
+
+  const API = { ID, TITLE, RAR, PAS, PAS_IDS, STATUS, CLS, CLS_IDS, ART, WPN, WI, ARCH, AI_, ITEM, IT, EN, BOSS, ET, NIGHT_IDS, FINAL_IDS, ENEMY_IDS, FB_IDS, POI, LENS, DAY_NM, NIGHT_NM, PH_NM,
+    MAXLV, lvCost, lvMul, baseHP, baseST, wDmg, wPas, wName, wArt, clamp, svgW, CLS_IC, BODY_IC, ARCH_IC, ITEM_IC, POI_IC, TIERS, store, gfxTier, init, result, hint };
+
+  function mount(root, api) {
+    const h = L.h;
+    let view = null, dead = false, last = null, lastPrev = null;
+    const box = h('div', { style: { position: 'absolute', inset: '0', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'radial-gradient(circle at 50% 46%,#3a2422,#0d0a0b)', color: '#efe2c8', zIndex: 5, textAlign: 'center', padding: '16px' } });
+    const t1 = h('div', { style: { fontFamily: '"Nanum Myeongjo","Noto Serif KR",Batang,serif', fontSize: '30px', letterSpacing: '3px' }, text: TITLE });
+    const t2 = h('div', { style: { fontSize: '13px', opacity: '.72' }, text: '해가 기우는 중' });
+    const bar = h('div', { style: { width: '220px', height: '4px', borderRadius: '2px', background: 'rgba(255,240,210,.12)', overflow: 'hidden' } }, h('div', { style: { width: '8%', height: '100%', background: '#b8743e', transition: 'width .2s' } }));
+    box.append(t1, t2, bar);
+    root.append(box);
+    const prog = (f, txt) => { if (bar.firstChild) bar.firstChild.style.width = Math.round(clamp(f, 0.05, 1) * 100) + '%'; if (txt) t2.textContent = txt; };
+    if (!webglOK()) prog(1, '이 기기(브라우저)에서는 3D 그래픽(WebGL)을 켤 수 없습니다.');
+    else loadCore().then(() => {
+      if (dead) return;
+      prog(0.45, '지형을 펼치는 중');
+      view = G.NIGHTFALL_VIEW.mount(root, api, API, { progress: prog, ready() { box.remove(); } });
+      if (last) view.update(last, lastPrev);
+    }).catch((e) => { prog(1, '3D 파일을 불러오지 못했습니다. (' + (e && e.message || e) + ')'); });
+    return {
+      update(s, p) { last = s; lastPrev = p; if (view) view.update(s, p); },
+      destroy() { dead = true; if (view) view.destroy(); box.remove(); },
+      pause() { if (view && view.pause) view.pause(); },
+      resume() { if (view && view.resume) view.resume(); },
+    };
+  }
+
+  const ICON = '<path d="M38 6a20 20 0 1 0 12 30A16 16 0 1 1 38 6z" fill="currentColor" opacity=".55"/><path d="M27 12l3 4v24h-6V16z" fill="currentColor"/><rect x="19" y="40" width="16" height="3.5" fill="currentColor"/><rect x="25.5" y="43.5" width="3" height="8" fill="currentColor"/>';
+
+  if (L) L.register({
+    id: ID, name: TITLE, tag: '협동 소울라이크', cat: '협동', icon: ICON, tint: '#2a1a22', coop: true, pcOnly: true,
+    blurb: '사흘 동안 좁혀 드는 폭풍 속에서 거점을 돌며 무기와 룬을 모으고, 해가 지면 닫힌 원 안에서 밤의 보스와 싸웁니다. 셋째 날 최종 보스를 쓰러뜨리면 원정 완수. 1~3명 협동 · 3D 액션(PC 전용).',
+    time: '15–35분', landscape: true, realtime: true, aiDelay: 0, mood: 'tension', ambient: 'wind', sidePanel: false, contextMenu: true, menuCorner: 'tr',
+    minPlayers: 1, maxPlayers: 3, defaultPlayers: 3,
+    options: [
+      { id: 'len', label: '원정 길이', tip: '낮 길이. 맛보기는 적 · 보스 체력 절반 · 룬 2.4배의 짧은 판.', choices: Object.keys(LENS).map((k) => ({ v: k, label: LENS[k].nm, tip: LENS[k].tip })), def: 'std' },
+      { id: 'fin', label: '최종 보스', tip: '셋째 날의 보스. 무작위면 판마다 바뀜. 밤의 보스 둘은 늘 무작위.', choices: [{ v: 'rnd', label: '무작위' }].concat(FINAL_IDS.map((k) => ({ v: k, label: BOSS[k].nm, tip: BOSS[k].d }))), def: 'rnd' },
+    ],
+    setupExtra(opts, ctx) {
+      const h = L.h, wrap = h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center', margin: '6px 0' } });
+      const draw = () => {
+        wrap.innerHTML = '';
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 2px' }, text: '그래픽 품질(이 기기)' }));
+        for (const t of TIERS) wrap.append(h('button', { class: 'btn sm' + (gfxTier() === t.id ? ' primary' : ''), title: t.tip, style: { minHeight: '44px' }, text: t.nm, onclick() { store.set('gfx', t.id); draw(); } }));
+        // 마우스 감도(이 기기) — 시점 돌리기
+        const sv = +store.get('sens', 1);
+        wrap.append(h('span', { class: 'muted', style: { fontSize: '13px', margin: '0 4px 0 10px' }, text: '마우스 감도' }));
+        for (const [v, nm] of [[0.6, '낮게'], [1, '보통'], [1.5, '높게'], [2.2, '아주 높게']]) wrap.append(h('button', { class: 'btn sm' + (Math.abs(sv - v) < 0.01 ? ' primary' : ''), style: { minHeight: '44px' }, text: nm, onclick() { store.set('sens', v); draw(); } }));
+      };
+      draw(); void ctx; void opts;
+      return wrap;
+    },
+    controls: CONTROLS,
+    quick: ['낮: 폭풍이 좁혀 드는 동안 거점을 돌며 룬 · 무기를 모으고 은총의 터(E)에서 레벨을 올림', '밤: 닫힌 원 안에서 보스와 싸움 — 붉은 표시는 구르기(Shift), 둥근 충격파는 점프(Space)', '쓰러진 동료는 때려서 일으킴. 밤에 모두 쓰러지면 실패', '셋째 날 최종 보스를 쓰러뜨리면 원정 완수'],
+    rules: RULES,
+    get codex() { return codexData(); },
+    preview, hint,
+    init,
+    actor: () => null,
+    apply() { throw new Error('realtime game: no turn actions'); },
+    ai: () => null,
+    result,
+    mount,
+    _t: API,
+  });
+  G.NIGHTFALL = API;
+  if (typeof module === 'object' && module) module.exports = API;
+})();
